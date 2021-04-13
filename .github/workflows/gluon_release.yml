@@ -127,7 +127,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        iex "$env:MX_PATH\mx fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME"
+        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME"
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
@@ -138,8 +138,8 @@ jobs:
       run: |
         echo $env:JAVA_HOME
         iex "$env:JAVA_HOME\bin\java -version"
-        iex "$env:MX_PATH\mx --primary-suite-path vm build"
-        $GRAALVM_HOME = (iex "$env:MX_PATH\mx --primary-suite-path vm graalvm-home") | Out-String
+        iex "$env:MX_PATH\mx.cmd --primary-suite-path vm build"
+        $GRAALVM_HOME = (iex "$env:MX_PATH\mx.cmd --primary-suite-path vm graalvm-home") | Out-String
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       shell: bash
