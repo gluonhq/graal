@@ -47,7 +47,8 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        ls -R
+        mv latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
@@ -93,7 +94,7 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
