@@ -56,8 +56,6 @@ jobs:
         path: |
           graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
 
-
-jobs:
   build-graalvm-darwin:
     runs-on: macos-11.0
     steps:
@@ -102,8 +100,6 @@ jobs:
         path: |
           graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip
 
-
-jobs:
   build-graalvm-windows:
     runs-on: windows-2019
     steps:
@@ -153,7 +149,6 @@ jobs:
         path: |
           graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip
 
-jobs:
   create-release:
     runs-on: ubuntu-20.04
     needs:
