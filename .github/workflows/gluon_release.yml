@@ -47,15 +47,16 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        ls -R
-        mv latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        ls -l
+        ls -l graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-linux
         path: |
-          graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
+          graalvm-svm-linux-gluon-${{ env.RELEASE_VERSION }}.zip
 
   build-graalvm-darwin:
     runs-on: macos-10.15
@@ -94,14 +95,14 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        mv latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-darwin
         path: |
-          graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip
+          graalvm-svm-darwin-gluon-${{ env.RELEASE_VERSION }}.zip
 
   build-graalvm-windows:
     runs-on: windows-2019
@@ -126,7 +127,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        $MX_PATH\mx fetch-jdk --java-distribution $JDK --to jdk-dl --alias $JAVA_HOME
+        $env:MX_PATH\mx fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
@@ -135,10 +136,10 @@ jobs:
         FORCE_BASH_LAUNCHERS: polyglot
         SKIP_LIBRARIES: polyglot
       run: |
-        echo $JAVA_HOME
-        $JAVA_HOME\bin\java -version
-        $MX_PATH\mx --primary-suite-path vm build
-        $GRAALVM_HOME = ($MX_PATH\mx --primary-suite-path vm graalvm-home) | Out-String
+        echo $env:JAVA_HOME
+        $env:JAVA_HOME\bin\java -version
+        $env:MX_PATH\mx --primary-suite-path vm build
+        $GRAALVM_HOME = ($env:MX_PATH\mx --primary-suite-path vm graalvm-home) | Out-String
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       shell: bash
@@ -150,7 +151,7 @@ jobs:
       with:
         name: graalvm-zip-windows
         path: |
-          graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip
+          graalvm-svm-windows-gluon-${{ env.RELEASE_VERSION }}.zip
 
   create-release:
     runs-on: ubuntu-20.04
