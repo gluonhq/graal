@@ -8,12 +8,14 @@ on:
 env:
   RELEASE_VERSION: 21.1.0
   LANG: en_US.UTF-8
-  JAVA_HOME: ${{ github.workspace }}/jdk
-  MX_PATH: ${{ github.workspace }}/mx
+  JDK: "labsjdk-ce-11"
 
 jobs:
   build-graalvm-linux:
     runs-on: ubuntu-20.04
+    env:
+      JAVA_HOME: ${{ github.workspace }}/jdk
+      MX_PATH: ${{ github.workspace }}/mx
     steps:
     - uses: actions/checkout@v2
       with:
@@ -30,8 +32,6 @@ jobs:
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
     - name: Get JDK
-      env:
-        JDK: "labsjdk-ce-11"
       run: |
         mkdir jdk-dl
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
@@ -58,6 +58,10 @@ jobs:
 
   build-graalvm-darwin:
     runs-on: macos-10.15
+    env:
+      JAVA_ROOT: ${{ github.workspace }}/jdk
+      JAVA_HOME: ${{ github.workspace }}/jdk/Contents/Home
+      MX_PATH: ${{ github.workspace }}/mx
     steps:
     - uses: actions/checkout@v2
       with:
@@ -74,11 +78,9 @@ jobs:
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
     - name: Get JDK
-      env:
-        JDK: "labsjdk-ce-11"
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_ROOT}
     - name: Build GraalVM
       env:
         DISABLE_LIBPOLYGLOT: true
@@ -102,6 +104,9 @@ jobs:
 
   build-graalvm-windows:
     runs-on: windows-2019
+    env:
+      JAVA_HOME: ${{ github.workspace }}\jdk
+      MX_PATH: ${{ github.workspace }}\mx
     steps:
     - uses: actions/checkout@v2
       with:
@@ -118,11 +123,9 @@ jobs:
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
     - name: Get JDK
-      env:
-        JDK: "labsjdk-ce-11"
       run: |
         mkdir jdk-dl
-        ${MX_PATH}\mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+        $MX_PATH\mx fetch-jdk --java-distribution $JDK --to jdk-dl --alias $JAVA_HOME
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
@@ -131,10 +134,10 @@ jobs:
         FORCE_BASH_LAUNCHERS: polyglot
         SKIP_LIBRARIES: polyglot
       run: |
-        echo ${JAVA_HOME}
-        ${JAVA_HOME}\bin\java -version
-        ${MX_PATH}\mx --primary-suite-path vm build
-        $GRAALVM_HOME = (${MX_PATH}\mx --primary-suite-path vm graalvm-home) | Out-String
+        echo $JAVA_HOME
+        $JAVA_HOME\bin\java -version
+        $MX_PATH\mx --primary-suite-path vm build
+        $GRAALVM_HOME = ($MX_PATH\mx --primary-suite-path vm graalvm-home) | Out-String
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       shell: bash
