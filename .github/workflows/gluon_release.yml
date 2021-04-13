@@ -50,11 +50,11 @@ jobs:
         mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
         cd vm && zip -r ../graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
-        uses: actions/upload-artifact@v2
-        with:
-          name: graalvm-zip-linux
-          path: |
-            graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-linux
+        path: |
+          graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
 
 
 jobs:
@@ -96,11 +96,11 @@ jobs:
         mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         cd vm && zip -r ../graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
-        uses: actions/upload-artifact@v2
-        with:
-          name: graalvm-zip-darwin
-          path: |
-            graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-darwin
+        path: |
+          graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip
 
 
 jobs:
@@ -147,11 +147,11 @@ jobs:
         mv vm/latest_graalvm_home graalvm-svm-windows-gluon-${RELEASE_VERSION}
         cd vm && zip -r ../graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
     - name: Archive distribution
-        uses: actions/upload-artifact@v2
-        with:
-          name: graalvm-zip-windows
-          path: |
-            graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-windows
+        path: |
+          graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip
 
 jobs:
   create-release:
