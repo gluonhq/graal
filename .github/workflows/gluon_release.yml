@@ -134,6 +134,10 @@ jobs:
       run: |
         mkdir jdk-dl
         iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME"
+    - name: Set up Visual Studio shell
+      uses: egor-tensin/vs-shell@v2
+      with:
+        arch: x64
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
@@ -144,8 +148,6 @@ jobs:
       run: |
         echo $env:JAVA_HOME
         echo $env:PATH
-        gcm dumpbin
-        gcm dumpbin.exe
         iex "$env:JAVA_HOME\bin\java -version"
         iex "$env:MX_PATH\mx.cmd --primary-suite-path vm build"
         $GRAALVM_HOME = (iex "$env:MX_PATH\mx.cmd --primary-suite-path vm graalvm-home") | Out-String
