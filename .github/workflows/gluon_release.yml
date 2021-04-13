@@ -40,7 +40,7 @@ jobs:
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
         FORCE_BASH_LAUNCHERS: false
-        LINKY_LAYOUT: *.jar
+        LINKY_LAYOUT: "*.jar"
       run: |
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
@@ -86,7 +86,7 @@ jobs:
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
         FORCE_BASH_LAUNCHERS: false
-        LINKY_LAYOUT: *.jar
+        LINKY_LAYOUT: "*.jar"
       run: |
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
