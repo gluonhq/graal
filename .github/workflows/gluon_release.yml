@@ -47,10 +47,6 @@ jobs:
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
         ${MX_PATH}/mx --dy /substratevm build
-        GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
-        ls -l
-        ls -R latest_graalvm_home/
-        echo "::set-output name=graalvm-home-dir::${GRAALVM_HOME}"
     - name: Create distribution
       working-directory: ./vm
       run: |
@@ -61,7 +57,7 @@ jobs:
       with:
         name: graalvm-zip-linux
         path: |
-          graalvm-svm-linux-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-linux-gluon-${{ env.RELEASE_VERSION }}.zip
 
   build-graalvm-darwin:
     runs-on: macos-10.15
@@ -100,19 +96,17 @@ jobs:
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
         ${MX_PATH}/mx --dy /substratevm build
-        GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
-        echo "::set-output name=graalvm-home-dir::${GRAALVM_HOME}"
     - name: Create distribution
       working-directory: ./vm
       run: |
-        mv ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-darwin
         path: |
-          graalvm-svm-darwin-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-darwin-gluon-${{ env.RELEASE_VERSION }}.zip
 
   build-graalvm-windows:
     runs-on: windows-2019
@@ -152,10 +146,10 @@ jobs:
       working-directory: ./vm
       run: |
         echo $env:JAVA_HOME
-        echo $env:PATH
         iex "$env:JAVA_HOME\bin\java -version"
         iex "$env:MX_PATH\mx.cmd build"
         $GRAALVM_HOME = (iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String
+        Get-ChildItem -Path $GRAALVM_HOME
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       working-directory: ./vm
@@ -167,7 +161,7 @@ jobs:
       with:
         name: graalvm-zip-windows
         path: |
-          graalvm-svm-windows-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-windows-gluon-${{ env.RELEASE_VERSION }}.zip
 
   create-release:
     runs-on: ubuntu-20.04
