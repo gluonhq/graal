@@ -47,7 +47,7 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv sdk/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
         ls -l
         ls -l graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
@@ -95,7 +95,7 @@ jobs:
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
     - name: Create distribution
       run: |
-        mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv sdk/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
@@ -127,7 +127,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        $env:MX_PATH\mx fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME
+        iex "$env:MX_PATH\mx fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME"
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
@@ -137,9 +137,9 @@ jobs:
         SKIP_LIBRARIES: polyglot
       run: |
         echo $env:JAVA_HOME
-        $env:JAVA_HOME\bin\java -version
-        $env:MX_PATH\mx --primary-suite-path vm build
-        $GRAALVM_HOME = ($env:MX_PATH\mx --primary-suite-path vm graalvm-home) | Out-String
+        iex "$env:JAVA_HOME\bin\java -version"
+        iex "$env:MX_PATH\mx --primary-suite-path vm build"
+        $GRAALVM_HOME = (iex "$env:MX_PATH\mx --primary-suite-path vm graalvm-home") | Out-String
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       shell: bash
