@@ -99,7 +99,7 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        mv latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
@@ -148,7 +148,7 @@ jobs:
         echo $env:JAVA_HOME
         iex "$env:JAVA_HOME\bin\java -version"
         iex "$env:MX_PATH\mx.cmd build"
-        $GRAALVM_HOME = (iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String
+        $GRAALVM_HOME = ((iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String).trim()
         Get-ChildItem -Path $GRAALVM_HOME
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
