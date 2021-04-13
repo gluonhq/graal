@@ -49,12 +49,13 @@ jobs:
         ${MX_PATH}/mx --dy /substratevm build
         GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
         ls -l
-        ls -l latest_graalvm_home
+        ls -R latest_graalvm_home/
         echo "::set-output name=graalvm-home-dir::${GRAALVM_HOME}"
     - name: Create distribution
       working-directory: ./vm
       run: |
-        mv ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+#        mv ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
@@ -158,12 +159,10 @@ jobs:
         $GRAALVM_HOME = (iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
-      shell: bash
       working-directory: ./vm
       run: |
-        set GRAALVM_HOME=`wslpath -a ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }}`
-        mv ${GRAALVM_HOME} graalvm-svm-windows-gluon-${RELEASE_VERSION}
-        zip -r graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
+        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-gluon-$env:RELEASE_VERSION
+        Compress-Archive -Path graalvm-svm-windows-gluon-$env:RELEASE_VERSION -DestinationPath graalvm-svm-windows-gluon-$env:RELEASE_VERSION.zip
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
