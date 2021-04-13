@@ -6,7 +6,7 @@ on:
       - '*'
 
 env:
-  RELEASE_VERSION: 21.1.0
+  RELEASE_VERSION: 21.1.0-dev
   LANG: en_US.UTF-8
   JDK: "labsjdk-ce-11"
 
@@ -149,7 +149,6 @@ jobs:
         iex "$env:JAVA_HOME\bin\java -version"
         iex "$env:MX_PATH\mx.cmd build"
         $GRAALVM_HOME = ((iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String).trim()
-        Get-ChildItem -Path $GRAALVM_HOME
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
       working-directory: ./vm
@@ -176,6 +175,9 @@ jobs:
     - uses: actions/download-artifact@v2
       with:
         path: artifacts
+    - name: List artifacts
+      run: |
+        ls -R artifacts
     - name: Create release
       uses: ncipollo/release-action@v1
       with:
@@ -184,4 +186,4 @@ jobs:
           This is a Gluon build of GraalVM.
           Based on Gluon Graal commit: ${{ github.sha }}
         token: ${{ secrets.GITHUB_TOKEN }}
-        artifacts: artifacts/*.zip
+        artifacts: "artifacts/graalvm-zip-linux/*.zip,artifacts/graalvm-zip-darwin/*.zip,artifacts/graalvm-zip-windows/*.zip"
