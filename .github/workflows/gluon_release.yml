@@ -125,20 +125,15 @@ jobs:
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
     - name: Build GraalVM
       env:
-        DEFAULT_DYNAMIC_IMPORTS=/substratevm,/tools
-        EXCLUDE_COMPONENTS=nju,llp,dis,pbm,llmulrl
-        FORCE_BASH_LAUNCHERS=polyglot
-        SKIP_LIBRARIES=polyglot
+        DEFAULT_DYNAMIC_IMPORTS: /substratevm,/tools
+        EXCLUDE_COMPONENTS: nju,llp,dis,pbm,llmulrl
+        FORCE_BASH_LAUNCHERS: polyglot
+        SKIP_LIBRARIES: polyglot
       run: |
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
         ${MX_PATH}/mx --primary-suite-path vm build
     - name: Create distribution
-      env:
-        DEFAULT_DYNAMIC_IMPORTS=/substratevm,/tools
-        EXCLUDE_COMPONENTS=nju,llp,dis,pbm,llmulrl
-        FORCE_BASH_LAUNCHERS=polyglot
-        SKIP_LIBRARIES=polyglot
       run: |
         mv vm/latest_graalvm_home graalvm-svm-windows-gluon-${RELEASE_VERSION}
         cd vm && zip -r ../graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
