@@ -48,7 +48,7 @@ jobs:
     - name: Create distribution
       run: |
         mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
-        cd vm && zip -r ../graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -57,7 +57,7 @@ jobs:
           graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
 
   build-graalvm-darwin:
-    runs-on: macos-11.0
+    runs-on: macos-10.15
     steps:
     - uses: actions/checkout@v2
       with:
@@ -92,7 +92,7 @@ jobs:
     - name: Create distribution
       run: |
         mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
-        cd vm && zip -r ../graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -122,8 +122,9 @@ jobs:
         JDK: "labsjdk-ce-11"
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+        ${MX_PATH}\mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
     - name: Build GraalVM
+      id: windows-build-graalvm
       env:
         DEFAULT_DYNAMIC_IMPORTS: /substratevm,/tools
         EXCLUDE_COMPONENTS: nju,llp,dis,pbm,llmulrl
@@ -131,12 +132,15 @@ jobs:
         SKIP_LIBRARIES: polyglot
       run: |
         echo ${JAVA_HOME}
-        ${JAVA_HOME}/bin/java -version
-        ${MX_PATH}/mx --primary-suite-path vm build
+        ${JAVA_HOME}\bin\java -version
+        ${MX_PATH}\mx --primary-suite-path vm build
+        $GRAALVM_HOME = (${MX_PATH}\mx --primary-suite-path vm graalvm-home) | Out-String
+        echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
     - name: Create distribution
+      shell: bash
       run: |
-        mv vm/latest_graalvm_home graalvm-svm-windows-gluon-${RELEASE_VERSION}
-        cd vm && zip -r ../graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
+        mv ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-gluon-${RELEASE_VERSION}
+        zip -r graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
