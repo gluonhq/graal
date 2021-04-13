@@ -36,6 +36,7 @@ jobs:
         mkdir jdk-dl
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
     - name: Build GraalVM
+      id: linux-build-graalvm
       env:
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
@@ -45,11 +46,11 @@ jobs:
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
+        GRAALVM_HOME=`${MX_PATH}/mx --primary-suite-path vm --dy /substratevm graalvm-home`
+        echo "::set-output name=graalvm-home-dir::${GRAALVM_HOME}"
     - name: Create distribution
       run: |
-        mv sdk/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
-        ls -l
-        ls -l graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-linux-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
@@ -84,6 +85,7 @@ jobs:
         mkdir jdk-dl
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_ROOT}
     - name: Build GraalVM
+      id: darwin-build-graalvm
       env:
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
@@ -93,9 +95,11 @@ jobs:
         echo ${JAVA_HOME}
         ${JAVA_HOME}/bin/java -version
         ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
+        GRAALVM_HOME=`${MX_PATH}/mx --primary-suite-path vm --dy /substratevm graalvm-home`
+        echo "::set-output name=graalvm-home-dir::${GRAALVM_HOME}"
     - name: Create distribution
       run: |
-        mv sdk/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-darwin-gluon-${RELEASE_VERSION}
         zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
