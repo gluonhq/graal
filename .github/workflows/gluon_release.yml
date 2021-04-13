@@ -1,0 +1,178 @@
+name: Gluon Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+env:
+  RELEASE_VERSION: 21.1.0
+  LANG: en_US.UTF-8
+  JAVA_HOME: ${{ github.workspace }}/jdk
+  MX_PATH: ${{ github.workspace }}/mx
+
+jobs:
+  build-graalvm-linux:
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - name: Get JDK
+      env:
+        JDK: "labsjdk-ce-11"
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+    - name: Build GraalVM
+      env:
+        DISABLE_LIBPOLYGLOT: true
+        DISABLE_POLYGLOT: true
+        FORCE_BASH_LAUNCHERS: false
+        LINKY_LAYOUT: *.jar
+      run: |
+        echo ${JAVA_HOME}
+        ${JAVA_HOME}/bin/java -version
+        ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
+    - name: Create distribution
+      run: |
+        mv vm/latest_graalvm_home graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        cd vm && zip -r ../graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
+    - name: Archive distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: graalvm-zip-linux
+          path: |
+            graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip
+
+
+jobs:
+  build-graalvm-darwin:
+    runs-on: macos-11.0
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - name: Get JDK
+      env:
+        JDK: "labsjdk-ce-11"
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+    - name: Build GraalVM
+      env:
+        DISABLE_LIBPOLYGLOT: true
+        DISABLE_POLYGLOT: true
+        FORCE_BASH_LAUNCHERS: false
+        LINKY_LAYOUT: *.jar
+      run: |
+        echo ${JAVA_HOME}
+        ${JAVA_HOME}/bin/java -version
+        ${MX_PATH}/mx --primary-suite-path vm --dy /substratevm build
+    - name: Create distribution
+      run: |
+        mv vm/latest_graalvm_home graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        cd vm && zip -r ../graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+    - name: Archive distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: graalvm-zip-darwin
+          path: |
+            graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip
+
+
+jobs:
+  build-graalvm-windows:
+    runs-on: windows-2019
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - name: Get JDK
+      env:
+        JDK: "labsjdk-ce-11"
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+    - name: Build GraalVM
+      env:
+        DEFAULT_DYNAMIC_IMPORTS=/substratevm,/tools
+        EXCLUDE_COMPONENTS=nju,llp,dis,pbm,llmulrl
+        FORCE_BASH_LAUNCHERS=polyglot
+        SKIP_LIBRARIES=polyglot
+      run: |
+        echo ${JAVA_HOME}
+        ${JAVA_HOME}/bin/java -version
+        ${MX_PATH}/mx --primary-suite-path vm build
+    - name: Create distribution
+      env:
+        DEFAULT_DYNAMIC_IMPORTS=/substratevm,/tools
+        EXCLUDE_COMPONENTS=nju,llp,dis,pbm,llmulrl
+        FORCE_BASH_LAUNCHERS=polyglot
+        SKIP_LIBRARIES=polyglot
+      run: |
+        mv vm/latest_graalvm_home graalvm-svm-windows-gluon-${RELEASE_VERSION}
+        cd vm && zip -r ../graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip graalvm-svm-windows-gluon-${RELEASE_VERSION}
+    - name: Archive distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: graalvm-zip-windows
+          path: |
+            graalvm-svm-windows-gluon-${RELEASE_VERSION}.zip
+
+jobs:
+  create-release:
+    runs-on: ubuntu-20.04
+    needs:
+      - build-graalvm-linux
+      - build-graalvm-darwin
+      - build-graalvm-windows
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/download-artifact@v2
+      with:
+        path: artifacts
+    - name: Create release
+      uses: ncipollo/release-action@v1
+      with:
+        name: GraalVM CE Gluon ${{ github.ref }}
+        body: |
+          This is a Gluon build of GraalVM.
+          Based on Gluon Graal commit: ${{ github.sha }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: artifacts/*.zip
