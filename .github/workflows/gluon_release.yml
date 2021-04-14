@@ -52,8 +52,9 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        mv ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-linux-gluon-${RELEASE_VERSION}
-        zip -r graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
+        mv `ls -1 | head -n1` graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -103,9 +104,9 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        GRAALVM_HOME=${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}
-        mv ${GRAALVM_HOME:0:$((${#GRAALVM_HOME}-14))} graalvm-svm-darwin-gluon-${RELEASE_VERSION}
-        zip -r graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
+        mv `ls -1 | head -n1` graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
