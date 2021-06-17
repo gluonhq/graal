@@ -25,7 +25,6 @@
 package com.oracle.svm.core.jdk;
 
 import java.io.ByteArrayInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.MalformedURLException;
@@ -126,26 +125,8 @@ public final class Resources {
 
     public static URL createURL(String name, byte[] resourceBytes) {
         class Conn extends URLConnection {
-
-            private InputStream in;
-            private long length = -1L;
-
             Conn(URL url) {
                 super(url);
-
-                // remove "resource:" from url to get the resource name
-                String resName = url.toString().substring(1 + JavaNetSubstitutions.RESOURCE_PROTOCOL.length());
-                if (resName.equals(name)) {
-                    in = new ByteArrayInputStream(resourceBytes);
-                    length = resourceBytes.length;
-                } else {
-                    final List<byte[]> bytes = singleton().resources.get(resName);
-                    if (bytes != null && !bytes.isEmpty()) {
-                        byte[] resBytes = bytes.get(0);
-                        in = new ByteArrayInputStream(resBytes);
-                        length = resBytes.length;
-                    }
-                }
             }
 
             @Override
@@ -154,20 +135,17 @@ public final class Resources {
 
             @Override
             public InputStream getInputStream() throws IOException {
-                if (in == null) {
-                    throw new FileNotFoundException(url.toString());
-                }
-                return in;
+                return new ByteArrayInputStream(resourceBytes);
             }
 
             @Override
             public long getContentLengthLong() {
-                return length;
+                return resourceBytes.length;
             }
         }
 
         try {
-            return new URL(JavaNetSubstitutions.RESOURCE_PROTOCOL, null, -1, name, new URLStreamHandler() {
+            return new URL("resource", null, -1, name, new URLStreamHandler() {
                 @Override
                 protected URLConnection openConnection(URL u) throws IOException {
                     return new Conn(u);
