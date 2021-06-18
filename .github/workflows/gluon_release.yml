@@ -6,12 +6,24 @@ on:
       - '*'
 
 env:
-  RELEASE_VERSION: 21.1.0-dev
   LANG: en_US.UTF-8
   JDK: "labsjdk-ce-11"
 
 jobs:
+  determine-version:
+    runs-on: ubuntu-20.04
+    outputs:
+      simpleTag: ${{ steps.fetchSimpleTag.outputs.tag }}
+      version: ${{ steps.fetchVersion.outputs.version }}
+    steps:
+    - id: fetchSimpleTag
+      run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
+    - id: fetchVersion
+      run: echo ::set-output name=version::$(echo $GITHUB_REF | sed -E "s/.*(gluon-.*-(dev|Final)).*/\1/g")
+
   build-graalvm-linux:
+    needs:
+      - determine-version
     runs-on: ubuntu-20.04
     env:
       JAVA_HOME: ${{ github.workspace }}/jdk
@@ -53,16 +65,18 @@ jobs:
       working-directory: ./vm
       run: |
         cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
-        mv `ls -1 | head -n1` graalvm-svm-linux-gluon-${RELEASE_VERSION}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-gluon-${RELEASE_VERSION}.zip graalvm-svm-linux-gluon-${RELEASE_VERSION}
+        mv `ls -1 | head -n1` graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-linux
         path: |
-          vm/graalvm-svm-linux-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip
 
   build-graalvm-darwin:
+    needs:
+      - determine-version
     runs-on: macos-10.15
     env:
       JAVA_ROOT: ${{ github.workspace }}/jdk
@@ -105,16 +119,18 @@ jobs:
       working-directory: ./vm
       run: |
         cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
-        mv `ls -1 | head -n1` graalvm-svm-darwin-gluon-${RELEASE_VERSION}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-gluon-${RELEASE_VERSION}.zip graalvm-svm-darwin-gluon-${RELEASE_VERSION}
+        mv `ls -1 | head -n1` graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-darwin
         path: |
-          vm/graalvm-svm-darwin-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip
 
   build-graalvm-windows:
+    needs:
+      - determine-version
     runs-on: windows-2019
     env:
       JAVA_HOME: ${{ github.workspace }}\jdk
@@ -159,18 +175,19 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-gluon-$env:RELEASE_VERSION
-        Compress-Archive -Path graalvm-svm-windows-gluon-$env:RELEASE_VERSION -DestinationPath graalvm-svm-windows-gluon-$env:RELEASE_VERSION.zip
+        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-${{ needs.determine-version.outputs.version }}
+        Compress-Archive -Path graalvm-svm-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-windows-${{ needs.determine-version.outputs.version }}.zip
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-windows
         path: |
-          vm/graalvm-svm-windows-gluon-${{ env.RELEASE_VERSION }}.zip
+          vm/graalvm-svm-windows-${{ needs.determine-version.outputs.version }}.zip
 
   create-release:
     runs-on: ubuntu-20.04
     needs:
+      - determine-version
       - build-graalvm-linux
       - build-graalvm-darwin
       - build-graalvm-windows
@@ -184,7 +201,7 @@ jobs:
     - name: Create release
       uses: ncipollo/release-action@v1
       with:
-        name: GraalVM CE Gluon ${{ github.ref }}
+        name: GraalVM CE Gluon ${{ needs.determine-version.outputs.simpleTag }}
         body: |
           This is a Gluon build of GraalVM.
           Based on Gluon Graal commit: ${{ github.sha }}
