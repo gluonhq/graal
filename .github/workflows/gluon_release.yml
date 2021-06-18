@@ -198,10 +198,13 @@ jobs:
     - uses: actions/download-artifact@v2
       with:
         path: artifacts
+    - name: Create release name
+      id: create-release-name
+      run: echo ::set-output name=releaseName::$(echo ${{ needs.determine-version.outputs.simpleTag }} | sed "s/gluon-/Gluon /g")
     - name: Create release
       uses: ncipollo/release-action@v1
       with:
-        name: GraalVM CE Gluon ${{ needs.determine-version.outputs.simpleTag }}
+        name: GraalVM CE ${{ steps.create-release-name.outputs.releaseName }}
         body: |
           This is a Gluon build of GraalVM.
           Based on Gluon Graal commit: ${{ github.sha }}
