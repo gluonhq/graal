@@ -33,6 +33,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -252,6 +253,7 @@ public final class ResourcesFeature implements Feature {
         Map<String, List<String>> matchedDirectoryResources = new HashMap<>();
         Set<String> allEntries = new HashSet<>();
         ArrayList<File> queue = new ArrayList<>();
+        String separator = FileSystems.getDefault().getSeparator();
 
         queue.add(root);
         while (!queue.isEmpty()) {
@@ -259,6 +261,8 @@ public final class ResourcesFeature implements Feature {
             String relativeFilePath = "";
             if (file != root) {
                 relativeFilePath = file.getAbsolutePath().substring(root.getAbsolutePath().length() + 1);
+                /* Java resources always use / as the path separator, as do our resource inclusion patterns. */
+                relativeFilePath = relativeFilePath.replace(separator, "/");
             }
             if (file.isDirectory()) {
                 if (!relativeFilePath.isEmpty()) {
