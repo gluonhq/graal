@@ -54,10 +54,10 @@ jobs:
       run: |
         mkdir jdk-dl
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
-        echo "JAVA_HOME=${LABS_HOME}" >> $GITHUB_ENV
     - name: Build GraalVM
       id: linux-build-graalvm
       env:
+        JAVA_HOME: ${{ env.LABS_HOME }}
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
         FORCE_BASH_LAUNCHERS: false
@@ -74,7 +74,7 @@ jobs:
       run: |
         cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
         mv `ls -1 | head -n1` graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -116,10 +116,10 @@ jobs:
       run: |
         mkdir jdk-dl
         ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
-        echo "JAVA_HOME=${LABS_HOME}/Contents/Home" >> $GITHUB_ENV
     - name: Build GraalVM
       id: darwin-build-graalvm
       env:
+        JAVA_HOME: ${{ env.LABS_HOME }}/Contents/Home
         DISABLE_LIBPOLYGLOT: true
         DISABLE_POLYGLOT: true
         FORCE_BASH_LAUNCHERS: false
@@ -136,7 +136,7 @@ jobs:
       run: |
         cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
         mv `ls -1 | head -n1` graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -178,7 +178,6 @@ jobs:
       run: |
         mkdir jdk-dl
         iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:LABS_HOME"
-        echo "JAVA_HOME=${LABS_HOME}" >> $GITHUB_ENV
     - name: Set up Visual Studio shell
       uses: egor-tensin/vs-shell@v2
       with:
@@ -186,6 +185,7 @@ jobs:
     - name: Build GraalVM
       id: windows-build-graalvm
       env:
+        JAVA_HOME: ${{ env.LABS_HOME }}
         DEFAULT_DYNAMIC_IMPORTS: /substratevm,/tools
         EXCLUDE_COMPONENTS: nju,llp,dis,pbm,llmulrl
         FORCE_BASH_LAUNCHERS: polyglot
