@@ -25,7 +25,8 @@ jobs:
       - determine-version
     runs-on: ubuntu-20.04
     strategy:
-      jdk: [11, 17]
+      matrix:
+        jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_HOME: ${{ github.workspace }}/jdk
@@ -81,7 +82,8 @@ jobs:
       - determine-version
     runs-on: macos-10.15
     strategy:
-      jdk: [11, 17]
+      matrix:
+        jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_ROOT: ${{ github.workspace }}/jdk
@@ -138,7 +140,8 @@ jobs:
       - determine-version
     runs-on: windows-2019
     strategy:
-      jdk: [11, 17]
+      matrix:
+        jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_HOME: ${{ github.workspace }}\jdk
