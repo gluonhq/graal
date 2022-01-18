@@ -46,6 +46,10 @@ jobs:
         path: ~/.mx
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
     - name: Get JDK
       run: |
         mkdir jdk-dl
@@ -104,6 +108,10 @@ jobs:
         path: ~/.mx
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
     - name: Get JDK
       run: |
         mkdir jdk-dl
@@ -161,6 +169,10 @@ jobs:
         path: ~/.mx
         key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
         restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
     - name: Get JDK
       run: |
         mkdir jdk-dl
