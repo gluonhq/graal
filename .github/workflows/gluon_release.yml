@@ -1,0 +1,237 @@
+name: Gluon Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+env:
+  LANG: en_US.UTF-8
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-20.04
+    outputs:
+      simpleTag: ${{ steps.fetchSimpleTag.outputs.tag }}
+      version: ${{ steps.fetchVersion.outputs.version }}
+    steps:
+    - id: fetchSimpleTag
+      run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
+    - id: fetchVersion
+      run: echo ::set-output name=version::$(echo $GITHUB_REF | sed -E "s/.*(gluon-.*-(dev|Final)).*/\1/g")
+
+  build-graalvm-linux:
+    needs:
+      - determine-version
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        jdk: [11, 17]
+    env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
+      LABS_HOME: ${{ github.workspace }}/jdk
+      MX_PATH: ${{ github.workspace }}/mx
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
+    - name: Get JDK
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+    - name: Build GraalVM
+      id: linux-build-graalvm
+      env:
+        JAVA_HOME: ${{ env.LABS_HOME }}
+        DISABLE_LIBPOLYGLOT: true
+        DISABLE_POLYGLOT: true
+        FORCE_BASH_LAUNCHERS: false
+        LINKY_LAYOUT: "*.jar"
+      working-directory: ./vm
+      run: |
+        echo ${JAVA_HOME}
+        ${JAVA_HOME}/bin/java -version
+        ${MX_PATH}/mx --dy /substratevm build
+        GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
+        echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+    - name: Create distribution
+      working-directory: ./vm
+      run: |
+        cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
+        mv `ls -1 | head -n1` graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
+    - name: Archive distribution
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-linux
+        path: |
+          vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip
+
+  build-graalvm-darwin:
+    needs:
+      - determine-version
+    runs-on: macos-10.15
+    strategy:
+      matrix:
+        jdk: [11, 17]
+    env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
+      LABS_HOME: ${{ github.workspace }}/jdk
+      MX_PATH: ${{ github.workspace }}/mx
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
+    - name: Get JDK
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+    - name: Build GraalVM
+      id: darwin-build-graalvm
+      env:
+        JAVA_HOME: ${{ env.LABS_HOME }}/Contents/Home
+        DISABLE_LIBPOLYGLOT: true
+        DISABLE_POLYGLOT: true
+        FORCE_BASH_LAUNCHERS: false
+        LINKY_LAYOUT: "*.jar"
+      working-directory: ./vm
+      run: |
+        echo ${JAVA_HOME}
+        ${JAVA_HOME}/bin/java -version
+        ${MX_PATH}/mx --dy /substratevm build
+        GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
+        echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+    - name: Create distribution
+      working-directory: ./vm
+      run: |
+        cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
+        mv `ls -1 | head -n1` graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
+    - name: Archive distribution
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-darwin
+        path: |
+          vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip
+
+  build-graalvm-windows:
+    needs:
+      - determine-version
+    runs-on: windows-2019
+    strategy:
+      matrix:
+        jdk: [11, 17]
+    env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
+      LABS_HOME: ${{ github.workspace }}\jdk
+      MX_PATH: ${{ github.workspace }}\mx
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/mx.git
+        fetch-depth: 1
+        ref: master
+        path: ${{ env.MX_PATH }}
+    - uses: actions/cache@v1
+      with:
+        path: ~/.mx
+        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+        restore-keys: ${{ runner.os }}-mx-
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.jdk }}
+    - name: Get JDK
+      run: |
+        mkdir jdk-dl
+        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:LABS_HOME"
+    - name: Set up Visual Studio shell
+      uses: egor-tensin/vs-shell@v2
+      with:
+        arch: x64
+    - name: Build GraalVM
+      id: windows-build-graalvm
+      env:
+        JAVA_HOME: ${{ env.LABS_HOME }}
+        DEFAULT_DYNAMIC_IMPORTS: /substratevm,/tools
+        EXCLUDE_COMPONENTS: nju,llp,dis,pbm,llmulrl
+        FORCE_BASH_LAUNCHERS: polyglot
+        SKIP_LIBRARIES: polyglot
+      working-directory: ./vm
+      run: |
+        echo $env:JAVA_HOME
+        iex "$env:JAVA_HOME\bin\java -version"
+        iex "$env:MX_PATH\mx.cmd build"
+        $GRAALVM_HOME = ((iex "$env:MX_PATH\mx.cmd graalvm-home") | Out-String).trim()
+        echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+    - name: Create distribution
+      working-directory: ./vm
+      run: |
+        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-${{ needs.determine-version.outputs.version }}
+        Compress-Archive -Path graalvm-svm-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
+    - name: Archive distribution
+      uses: actions/upload-artifact@v2
+      with:
+        name: graalvm-zip-windows
+        path: |
+          vm/graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
+
+  create-release:
+    runs-on: ubuntu-20.04
+    needs:
+      - determine-version
+      - build-graalvm-linux
+      - build-graalvm-darwin
+      - build-graalvm-windows
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 1
+    - uses: actions/download-artifact@v2
+      with:
+        path: artifacts
+    - name: Create release name
+      id: create-release-name
+      run: echo ::set-output name=releaseName::$(echo ${{ needs.determine-version.outputs.simpleTag }} | sed "s/gluon-/Gluon /g")
+    - name: Create release
+      uses: ncipollo/release-action@v1
+      with:
+        name: GraalVM CE ${{ steps.create-release-name.outputs.releaseName }}
+        body: |
+          This is a Gluon build of GraalVM.
+          Based on Gluon Graal commit: ${{ github.sha }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: "artifacts/graalvm-zip-linux/*.zip,artifacts/graalvm-zip-darwin/*.zip,artifacts/graalvm-zip-windows/*.zip"
