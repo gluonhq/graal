@@ -29,7 +29,7 @@ jobs:
         jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
-      JAVA_HOME: ${{ github.workspace }}/jdk
+      LABS_HOME: ${{ github.workspace }}/jdk
       MX_PATH: ${{ github.workspace }}/mx
     steps:
     - uses: actions/checkout@v2
@@ -53,7 +53,8 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+        echo "JAVA_HOME=${LABS_HOME}" >> $GITHUB_ENV
     - name: Build GraalVM
       id: linux-build-graalvm
       env:
@@ -90,8 +91,7 @@ jobs:
         jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
-      JAVA_ROOT: ${{ github.workspace }}/jdk
-      JAVA_HOME: ${{ github.workspace }}/jdk/Contents/Home
+      LABS_HOME: ${{ github.workspace }}/jdk
       MX_PATH: ${{ github.workspace }}/mx
     steps:
     - uses: actions/checkout@v2
@@ -115,7 +115,8 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${JAVA_ROOT}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+        echo "JAVA_HOME=${LABS_HOME}/Contents/Home" >> $GITHUB_ENV
     - name: Build GraalVM
       id: darwin-build-graalvm
       env:
@@ -152,7 +153,7 @@ jobs:
         jdk: [11, 17]
     env:
       JDK: labsjdk-ce-${{ matrix.jdk }}
-      JAVA_HOME: ${{ github.workspace }}\jdk
+      LABS_HOME: ${{ github.workspace }}\jdk
       MX_PATH: ${{ github.workspace }}\mx
     steps:
     - uses: actions/checkout@v2
@@ -176,7 +177,8 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:JAVA_HOME"
+        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:LABS_HOME"
+        echo "JAVA_HOME=${LABS_HOME}" >> $GITHUB_ENV
     - name: Set up Visual Studio shell
       uses: egor-tensin/vs-shell@v2
       with:
