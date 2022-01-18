@@ -53,7 +53,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --configuration ${MX_PATH}/common.json --to jdk-dl --alias ${LABS_HOME}
     - name: Build GraalVM
       id: linux-build-graalvm
       env:
@@ -115,7 +115,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --configuration ${MX_PATH}/common.json --to jdk-dl --alias ${LABS_HOME}
     - name: Build GraalVM
       id: darwin-build-graalvm
       env:
@@ -177,7 +177,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:LABS_HOME"
+        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --configuration $env:MX_PATH\common.json --to jdk-dl --alias $env:LABS_HOME"
     - name: Set up Visual Studio shell
       uses: egor-tensin/vs-shell@v2
       with:
