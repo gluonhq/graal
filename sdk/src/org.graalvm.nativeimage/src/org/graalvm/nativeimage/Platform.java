@@ -293,7 +293,7 @@ public interface Platform {
      *
      * @since 19.0
      */
-    final class DARWIN_AMD64 implements DARWIN, AMD64 {
+    class DARWIN_AMD64 implements DARWIN, AMD64 {
 
         /**
          * Instantiates a marker instance of this platform.
@@ -309,7 +309,7 @@ public interface Platform {
      *
      * @since 2.0
      */
-    final class DARWIN_AARCH64 implements DARWIN, AARCH64 {
+    class DARWIN_AARCH64 implements DARWIN, AARCH64 {
 
         /**
          * Instantiates a marker instance of this platform.
@@ -325,7 +325,7 @@ public interface Platform {
      *
      * @since 21.0
      */
-    final class IOS_AARCH64 implements IOS, AARCH64 {
+    final class IOS_AARCH64 extends DARWIN_AARCH64 implements IOS, AARCH64 {
 
         /**
          * Instantiates a marker instance of this platform.
@@ -341,7 +341,7 @@ public interface Platform {
      *
      * @since 21.3
      */
-    final class IOS_AMD64 implements IOS, AMD64 {
+    final class IOS_AMD64 extends DARWIN_AMD64 implements IOS, AMD64 {
 
         /**
          * Instantiates a marker instance of this platform.
