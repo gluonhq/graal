@@ -7,7 +7,6 @@ on:
 
 env:
   LANG: en_US.UTF-8
-  JDK: "labsjdk-ce-11"
 
 jobs:
   determine-version:
@@ -25,7 +24,10 @@ jobs:
     needs:
       - determine-version
     runs-on: ubuntu-20.04
+    strategy:
+      jdk: [11, 17]
     env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_HOME: ${{ github.workspace }}/jdk
       MX_PATH: ${{ github.workspace }}/mx
     steps:
@@ -66,19 +68,22 @@ jobs:
       run: |
         cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
         mv `ls -1 | head -n1` graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-linux
         path: |
-          vm/graalvm-svm-linux-${{ needs.determine-version.outputs.version }}.zip
+          vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip
 
   build-graalvm-darwin:
     needs:
       - determine-version
     runs-on: macos-10.15
+    strategy:
+      jdk: [11, 17]
     env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_ROOT: ${{ github.workspace }}/jdk
       JAVA_HOME: ${{ github.workspace }}/jdk/Contents/Home
       MX_PATH: ${{ github.workspace }}/mx
@@ -120,19 +125,22 @@ jobs:
       run: |
         cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
         mv `ls -1 | head -n1` graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-darwin
         path: |
-          vm/graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}.zip
+          vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip
 
   build-graalvm-windows:
     needs:
       - determine-version
     runs-on: windows-2019
+    strategy:
+      jdk: [11, 17]
     env:
+      JDK: labsjdk-ce-${{ matrix.jdk }}
       JAVA_HOME: ${{ github.workspace }}\jdk
       MX_PATH: ${{ github.workspace }}\mx
     steps:
@@ -176,13 +184,13 @@ jobs:
       working-directory: ./vm
       run: |
         move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-${{ needs.determine-version.outputs.version }}
-        Compress-Archive -Path graalvm-svm-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-windows-${{ needs.determine-version.outputs.version }}.zip
+        Compress-Archive -Path graalvm-svm-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-windows
         path: |
-          vm/graalvm-svm-windows-${{ needs.determine-version.outputs.version }}.zip
+          vm/graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
 
   create-release:
     runs-on: ubuntu-20.04
