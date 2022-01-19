@@ -73,8 +73,8 @@ jobs:
       working-directory: ./vm
       run: |
         cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
-        mv `ls -1 | head -n1` graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-linux-${{ needs.determine-version.outputs.version }}
+        mv `ls -1 | head -n1` graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -135,8 +135,8 @@ jobs:
       working-directory: ./vm
       run: |
         cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
-        mv `ls -1 | head -n1` graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-darwin-${{ needs.determine-version.outputs.version }}
+        mv `ls -1 | head -n1` graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
+        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
@@ -200,8 +200,8 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-windows-${{ needs.determine-version.outputs.version }}
-        Compress-Archive -Path graalvm-svm-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
+        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}
+        Compress-Archive -Path graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
