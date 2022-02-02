@@ -1,3 +1,6 @@
+# Builds GraalVM for Linux, Windows and macOS, wiht JDK 11 and 17,
+# and replaces java static libraries on Linux 17 after building them with gcc 9.3
+
 name: Gluon Release
 
 on:
@@ -7,6 +10,7 @@ on:
 
 env:
   LANG: en_US.UTF-8
+  JVMCI_VERSION: jvmci-22.0-b05
 
 jobs:
   determine-version:
@@ -20,9 +24,42 @@ jobs:
     - id: fetchVersion
       run: echo ::set-output name=version::$(echo $GITHUB_REF | sed -E "s/.*(gluon-.*-(dev|Final)).*/\1/g")
 
+  build-labsjdk-static:
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        repository: graalvm/labs-openjdk-17.git
+        fetch-depth: 1
+        ref: ${{ env.JVMCI_VERSION }}
+        
+    - name: Update libraries Libraries
+      run: |
+          sudo apt update
+          sudo apt install libx11-dev libxext-dev libxrender-dev libxrandr-dev libxtst-dev libxt-dev libcups2-dev libasound2-dev
+    
+    - name: Build static libs
+      run: |
+        sh configure --with-conf-name=labsjdk --with-version-opt=${{ env.JVMCI_VERSION }} --with-native-debug-symbols=none --with-version-pre= '--with-vendor-name=GraalVM Community' --with-vendor-url=https://www.graalvm.org/ --with-vendor-bug-url=https://github.com/oracle/graal/issues --with-vendor-vm-bug-url=https://github.com/oracle/graal/issues
+        make CONF_NAME=labsjdk static-libs-image
+        
+    - name: Create zip
+      run: |
+        mkdir labsjdk-ce-17-${{ env.JVMCI_VERSION }}-static-libs
+        cp build/labsjdk/images/static-libs/lib/* labsjdk-ce-17-${{ env.JVMCI_VERSION }}-static-libs/
+        zip -r labsjdk-17-static-libs-linux.zip labsjdk-ce-17-${{ env.JVMCI_VERSION }}-static-libs
+        
+    - name: Upload zip
+      uses: actions/upload-artifact@v2
+      with:
+        name: labsjdk-17-static-libs-linux.zip
+        path: labsjdk-17-static-libs-linux.zip
+        retention-days: 1
+
   build-graalvm-linux:
     needs:
       - determine-version
+      - build-labsjdk-static
     runs-on: ubuntu-20.04
     strategy:
       matrix:
@@ -31,6 +68,7 @@ jobs:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       LABS_HOME: ${{ github.workspace }}/jdk
       MX_PATH: ${{ github.workspace }}/mx
+      GRAALVM_SVM: graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v2
       with:
@@ -53,7 +91,12 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --configuration ${MX_PATH}/common.json --to jdk-dl --alias ${LABS_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}      
+    - name: Download labsjdk static zip
+      if: matrix.jdk == '17'
+      uses: actions/download-artifact@v2
+      with:
+        name: labsjdk-17-static-libs-linux.zip
     - name: Build GraalVM
       id: linux-build-graalvm
       env:
@@ -69,18 +112,27 @@ jobs:
         ${MX_PATH}/mx --dy /substratevm build
         GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
         echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+      
     - name: Create distribution
       working-directory: ./vm
       run: |
         cd ${{ steps.linux-build-graalvm.outputs.graalvm-home-dir }}/..
-        mv `ls -1 | head -n1` graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}
+        mv `ls -1 | head -n1` ${{ env.GRAALVM_SVM }}
+        if [[ ${{ matrix.jdk }} == "17" ]]
+        then
+          echo "Replace static libs under linux-amd64/glibc"
+          rm ${{ env.GRAALVM_SVM }}/lib/static/linux-amd64/glibc/*.a
+          unzip -j ${{ github.workspace }}/labsjdk-17-static-libs-linux.zip -d ${{ env.GRAALVM_SVM }}/lib/static/linux-amd64/glibc/
+        fi
+        echo >> ${{ env.GRAALVM_SVM }}/release && echo "VENDOR=Gluon" >> ${{ env.GRAALVM_SVM }}/release
+        zip -r ${{ github.workspace }}/vm/${{ env.GRAALVM_SVM }}.zip ${{ env.GRAALVM_SVM }}
+
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-linux
         path: |
-          vm/graalvm-svm-java${{ matrix.jdk }}-linux-${{ needs.determine-version.outputs.version }}.zip
+          vm/${{ env.GRAALVM_SVM }}.zip
 
   build-graalvm-darwin:
     needs:
@@ -93,6 +145,7 @@ jobs:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       LABS_HOME: ${{ github.workspace }}/jdk
       MX_PATH: ${{ github.workspace }}/mx
+      GRAALVM_SVM: graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v2
       with:
@@ -115,7 +168,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --configuration ${MX_PATH}/common.json --to jdk-dl --alias ${LABS_HOME}
+        ${MX_PATH}/mx fetch-jdk --java-distribution ${JDK} --to jdk-dl --alias ${LABS_HOME}
     - name: Build GraalVM
       id: darwin-build-graalvm
       env:
@@ -135,14 +188,15 @@ jobs:
       working-directory: ./vm
       run: |
         cd ${{ steps.darwin-build-graalvm.outputs.graalvm-home-dir }}/../../..
-        mv `ls -1 | head -n1` graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
-        zip -r ${{ github.workspace }}/vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}
+        mv `ls -1 | head -n1` ${{ env.GRAALVM_SVM }}
+        echo >> ${{ env.GRAALVM_SVM }}/Contents/Home/release && echo "VENDOR=Gluon" >> ${{ env.GRAALVM_SVM }}/Contents/Home/release
+        zip -r ${{ github.workspace }}/vm/${{ env.GRAALVM_SVM }}.zip ${{ env.GRAALVM_SVM }}
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-darwin
         path: |
-          vm/graalvm-svm-java${{ matrix.jdk }}-darwin-${{ needs.determine-version.outputs.version }}.zip
+          vm/${{ env.GRAALVM_SVM }}.zip
 
   build-graalvm-windows:
     needs:
@@ -155,6 +209,7 @@ jobs:
       JDK: labsjdk-ce-${{ matrix.jdk }}
       LABS_HOME: ${{ github.workspace }}\jdk
       MX_PATH: ${{ github.workspace }}\mx
+      GRAALVM_SVM: graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v2
       with:
@@ -177,7 +232,7 @@ jobs:
     - name: Get JDK
       run: |
         mkdir jdk-dl
-        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --configuration $env:MX_PATH\common.json --to jdk-dl --alias $env:LABS_HOME"
+        iex "$env:MX_PATH\mx.cmd fetch-jdk --java-distribution $env:JDK --to jdk-dl --alias $env:LABS_HOME"
     - name: Set up Visual Studio shell
       uses: egor-tensin/vs-shell@v2
       with:
@@ -200,14 +255,15 @@ jobs:
     - name: Create distribution
       working-directory: ./vm
       run: |
-        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}
-        Compress-Archive -Path graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }} -DestinationPath graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
+        move ${{ steps.windows-build-graalvm.outputs.graalvm-home-dir }} ${{ env.GRAALVM_SVM }}
+        echo '' >> ${{ env.GRAALVM_SVM }}/release && echo VENDOR=Gluon >> ${{ env.GRAALVM_SVM }}/release
+        Compress-Archive -Path ${{ env.GRAALVM_SVM }} -DestinationPath ${{ env.GRAALVM_SVM }}.zip
     - name: Archive distribution
       uses: actions/upload-artifact@v2
       with:
         name: graalvm-zip-windows
         path: |
-          vm/graalvm-svm-java${{ matrix.jdk }}-windows-${{ needs.determine-version.outputs.version }}.zip
+          vm/${{ env.GRAALVM_SVM }}.zip
 
   create-release:
     runs-on: ubuntu-20.04
