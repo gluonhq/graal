@@ -46,7 +46,9 @@ public class LinuxSystemPropertiesSupport extends PosixSystemPropertiesSupport {
          * to be completely correct, we would have to use the value from libjava, but since it is
          * normally initialized to `/tmp` via `P_tmpdir`, this should be fine for now.
          */
-        return "/tmp";
+        // On Android, this property should be set before GraalVM is launched, with the 
+        // path of the application's sandbox as tmp dir:
+        return System.getProperty("android.tmpdir", "/tmp");
     }
 
     private static final String DEFAULT_LIBPATH = "/usr/lib64:/lib64:/lib:/usr/lib";
