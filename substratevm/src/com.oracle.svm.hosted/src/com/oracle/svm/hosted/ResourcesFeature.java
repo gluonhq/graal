@@ -338,7 +338,7 @@ public final class ResourcesFeature implements InternalFeature {
                 alreadyProcessedResources.add(url.toString());
                 try {
                     boolean fromJar = url.getProtocol().equalsIgnoreCase("jar");
-                    boolean isDirectory = ResourcesUtils.resourceIsDirectory(url, fromJar, resourcePath);
+                    boolean isDirectory = ResourcesUtils.resourceIsDirectory(url, fromJar);
                     if (isDirectory) {
                         String content = ResourcesUtils.getDirectoryContent(fromJar ? url.toString() : Paths.get(url.toURI()).toString(), fromJar);
                         Resources.singleton().registerDirectoryResource(null, resourcePath, content, fromJar);
