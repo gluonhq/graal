@@ -443,7 +443,8 @@ public abstract class NativeImage extends AbstractImage {
             // Read-only data section
             final RelocatableBuffer roDataBuffer = new RelocatableBuffer(roSectionSize, objectFile.getByteOrder());
             final ProgbitsSectionImpl roDataImpl = new BasicProgbitsSectionImpl(roDataBuffer.getBackingArray());
-            roDataSection = objectFile.newProgbitsSection(SectionName.RODATA.getFormatDependentName(objectFile.getFormat()), pageSize, false, false, roDataImpl);
+	    // Gluon: make this section writable too
+            roDataSection = objectFile.newProgbitsSection(SectionName.RODATA.getFormatDependentName(objectFile.getFormat()), pageSize, true, false, roDataImpl);
 
             // Read-write data section
             final RelocatableBuffer rwDataBuffer = new RelocatableBuffer(rwSectionSize, objectFile.getByteOrder());
