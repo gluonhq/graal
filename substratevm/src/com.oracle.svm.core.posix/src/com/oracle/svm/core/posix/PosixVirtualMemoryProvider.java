@@ -35,7 +35,6 @@ import static com.oracle.svm.core.posix.headers.Mman.PROT_NONE;
 import static com.oracle.svm.core.posix.headers.Mman.PROT_READ;
 import static com.oracle.svm.core.posix.headers.Mman.PROT_WRITE;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mmap;
-import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mymmap;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mprotect;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.munmap;
 import static org.graalvm.word.WordFactory.nullPointer;
