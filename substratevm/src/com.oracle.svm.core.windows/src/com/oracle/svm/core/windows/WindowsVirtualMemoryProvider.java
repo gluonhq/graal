@@ -363,6 +363,21 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
         return MemoryAPI.VirtualAlloc(start, nbytes, MemoryAPI.MEM_COMMIT(), accessAsProt(access));
     }
 
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public Pointer mycommit(PointerBase start, UnsignedWord nbytes, int access) {
+        if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
+            return WordFactory.nullPointer();
+        }
+
+        /*
+         * VirtualAlloc only guarantees the zeroing for freshly committed pages (i.e., the content
+         * of pages that were already committed earlier won't be touched).
+         */
+        return MemoryAPI.VirtualAlloc(start, nbytes, MemoryAPI.MEM_COMMIT(), accessAsProt(access));
+    }
+
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public int protect(PointerBase start, UnsignedWord nbytes, int access) {

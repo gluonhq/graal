@@ -90,6 +90,15 @@ public class Mman {
         public static native Pointer mmap(PointerBase addr, UnsignedWord len, int prot, int flags, int fd, long offset);
 
         @CFunction(transition = Transition.NO_TRANSITION)
+        public static native Pointer mymmap(PointerBase addr, UnsignedWord len, int prot, int flags, int fd, long offset);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native Pointer myprint(PointerBase addr);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native Pointer myprinti(int val);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
         public static native int munmap(PointerBase addr, UnsignedWord len);
 
         @CFunction(transition = Transition.NO_TRANSITION)

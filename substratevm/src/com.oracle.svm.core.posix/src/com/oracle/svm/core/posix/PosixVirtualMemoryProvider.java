@@ -35,6 +35,7 @@ import static com.oracle.svm.core.posix.headers.Mman.PROT_NONE;
 import static com.oracle.svm.core.posix.headers.Mman.PROT_READ;
 import static com.oracle.svm.core.posix.headers.Mman.PROT_WRITE;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mmap;
+import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mymmap;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mprotect;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.munmap;
 import static org.graalvm.word.WordFactory.nullPointer;
@@ -177,6 +178,26 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
         }
         /* The memory returned by mmap is guaranteed to be zeroed. */
         final Pointer result = mmap(start, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
+        return result.notEqual(MAP_FAILED()) ? result : nullPointer();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public Pointer mycommit(PointerBase start, UnsignedWord nbytes, int access) {
+        if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
+            return WordFactory.nullPointer();
+        }
+
+        int flags = MAP_ANON() | MAP_PRIVATE();
+        if (start.isNonNull()) {
+             flags |= MAP_FIXED();
+        }
+
+        if (Platform.includedIn(Platform.MACOS_AARCH64.class) && (access & Access.FUTURE_EXECUTE) != 0) {
+            flags |= MAP_JIT();
+        }
+        /* The memory returned by mmap is guaranteed to be zeroed. */
+        final Pointer result = mymmap(start, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
         return result.notEqual(MAP_FAILED()) ? result : nullPointer();
     }
 
