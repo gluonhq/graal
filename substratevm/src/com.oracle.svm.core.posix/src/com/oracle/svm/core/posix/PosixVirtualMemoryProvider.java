@@ -183,26 +183,6 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public Pointer mycommit(PointerBase start, UnsignedWord nbytes, int access) {
-        if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
-            return WordFactory.nullPointer();
-        }
-
-        int flags = MAP_ANON() | MAP_PRIVATE();
-        if (start.isNonNull()) {
-             flags |= MAP_FIXED();
-        }
-
-        if (Platform.includedIn(Platform.MACOS_AARCH64.class) && (access & Access.FUTURE_EXECUTE) != 0) {
-            flags |= MAP_JIT();
-        }
-        /* The memory returned by mmap is guaranteed to be zeroed. */
-        final Pointer result = mymmap(start, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
-        return result.notEqual(MAP_FAILED()) ? result : nullPointer();
-    }
-
-    @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public int protect(PointerBase start, UnsignedWord nbytes, int access) {
         if (start.isNull() || !isAligned(start) || nbytes.equal(0)) {
             return -1;
