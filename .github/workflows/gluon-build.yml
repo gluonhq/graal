@@ -1,0 +1,162 @@
+# Builds GraalVM 24-ea for Linux (x86_64), Windows (x86_64) and macOS (amd64/aarch64), with JDK 21
+
+name: Gluon Build
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    branches:
+      - 'master'
+  workflow_dispatch:
+
+env:
+  LANG: en_US.UTF-8
+
+jobs:
+  build-graalvm-gluon:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-latest, ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            ARCH: "amd64"
+            HOME: ""
+            NAME: "linux"
+          - os: macos-13
+            ARCH: "amd64"
+            HOME: "/Contents/Home"
+            NAME: "darwin"
+          - os: macos-latest
+            ARCH: "aarch64"
+            HOME: "/Contents/Home"
+            NAME: "darwin"
+    env:
+      LABS_LINK: https://github.com/graalvm/labs-openjdk/releases/download/23%2B25-jvmci-b01/
+      LABS_TAG: 23+25-jvmci-b01
+      LABS_HOME: ${{ github.workspace }}/jdk
+      MX_PYTHON: python3.9
+      MX_PATH: ${{ github.workspace }}/mx
+      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-24.1
+      DYNAMIC_IMPORTS: "/substratevm"
+      DISABLE_POLYGLOT: true
+      DISABLE_LIBPOLYGLOT: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: graalvm/mx
+          fetch-depth: 1
+          ref: master
+          path: ${{ env.MX_PATH }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.mx
+          key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+          restore-keys: ${{ runner.os }}-mx-
+      - name: Set up Python
+        if: matrix.os == 'macos-13' || matrix.os == 'ubuntu-latest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Get LabsJDK
+        run: |
+          wget ${{ env.LABS_LINK }}labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz -O labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz
+          tar -xf labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz
+          echo "JAVA_HOME=${{ github.workspace }}/labsjdk-ce-23-jvmci-b01${{ matrix.HOME }}" >> ${GITHUB_ENV}
+      - name: Build GraalVM
+        id: build-graalvm
+        run: |
+          cd substratevm
+          ${MX_PATH}/mx --dy /substratevm build
+          GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
+          echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+          cd ..
+      - name: Create distribution
+        working-directory: ./vm
+        run: |
+          cd ${{ steps.build-graalvm.outputs.graalvm-home-dir }}/..
+          if [[ ${{ matrix.os }} != 'ubuntu-latest' ]]
+          then
+            cd ../..
+          fi
+          mv `ls -1 | head -n1` ${{ env.GRAALVM_SVM }}
+          echo >> ${{ env.GRAALVM_SVM }}/release && echo "VENDOR=Gluon" >> ${{ env.GRAALVM_SVM }}/release
+          tar -czvf ${{ github.workspace }}/vm/${{ env.GRAALVM_SVM }}.tar.gz ${{ env.GRAALVM_SVM }}
+      - name: Archive distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: graalvm-zip-${{ matrix.NAME }}-${{ matrix.ARCH }}
+          path: |
+            vm/${{ env.GRAALVM_SVM }}.tar.gz
+
+  build-graalvm-gluon-windows:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        include:
+          - os: windows-latest
+            ARCH: "amd64"
+            HOME: ""
+            NAME: "windows"
+    env:
+      LABS_LINK: https://github.com/graalvm/labs-openjdk/releases/download/23%2B25-jvmci-b01/
+      LABS_TAG: 23+25-jvmci-b01
+      LABS_HOME: ${{ github.workspace }}/jdk
+      MX_PYTHON: 'python'
+      MX_PATH: ${{ github.workspace }}/mx
+      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-24.1
+      DYNAMIC_IMPORTS: "/substratevm"
+      DISABLE_POLYGLOT: true
+      DISABLE_LIBPOLYGLOT: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: graalvm/mx
+          fetch-depth: 1
+          ref: master
+          path: ${{ env.MX_PATH }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.mx
+          key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
+          restore-keys: ${{ runner.os }}-mx-
+      - name: Get LabsJDK (windows)
+        run: |
+          Invoke-WebRequest ${{ env.LABS_LINK }}labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz -OutFile labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz
+          tar -xf .\labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz
+      - name: Build GraalVM (windows)
+        env:
+          JAVA_HOME: ${{ github.workspace }}/labsjdk-ce-23-jvmci-b01${{ matrix.HOME }}
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          call ${{ env.MX_PATH }}\mx.cmd -p substratevm build
+          call ${{ env.MX_PATH }}\mx.cmd -p substratevm graalvm-home > graalvm-home-with-forward-slashes.txt
+          set /p GRAALVM_HOME=<graalvm-home-with-forward-slashes.txt
+          setlocal enabledelayedexpansion
+          set "GRAALVM_HOME=%GRAALVM_HOME:/=\%"
+          echo "::set-output name=graalvm-home-dir::%GRAALVM_HOME%"
+          echo GRAALVM_HOME=%GRAALVM_HOME% >> %GITHUB_ENV%
+      - name: Create distribution
+        working-directory: ./vm
+        run: |
+          move ${{ env.GRAALVM_HOME}} ${{ env.GRAALVM_SVM }}
+          echo '' >> ${{ env.GRAALVM_SVM }}/release && echo VENDOR=Gluon >> ${{ env.GRAALVM_SVM }}/release
+          Compress-Archive -Path ${{ env.GRAALVM_SVM }} -DestinationPath ${{ env.GRAALVM_SVM }}.zip
+      - name: Archive distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: graalvm-zip-${{ matrix.NAME }}-${{ matrix.ARCH }}
+          path: |
+            vm/${{ env.GRAALVM_SVM }}.zip
