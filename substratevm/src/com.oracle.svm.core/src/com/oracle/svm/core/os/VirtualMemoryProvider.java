@@ -142,7 +142,6 @@ public interface VirtualMemoryProvider {
      * @return The start of the committed address range, or {@link WordFactory#nullPointer()} in
      *         case of an error, such as inadequate physical memory.
      */
-    Pointer mycommit(PointerBase start, UnsignedWord nbytes, int access);
     Pointer commit(PointerBase start, UnsignedWord nbytes, int access);
 
     /**
