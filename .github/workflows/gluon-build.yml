@@ -5,10 +5,10 @@ name: Gluon Build
 on:
   push:
     branches:
-      - 'master'
+      - 'gluon24'
   pull_request:
     branches:
-      - 'master'
+      - 'gluon24'
   workflow_dispatch:
 
 env:
