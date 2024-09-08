@@ -70,17 +70,15 @@ jobs:
           tar -xf labsjdk-ce-${{ env.LABS_TAG }}-${{ matrix.NAME }}-${{ matrix.ARCH }}.tar.gz
           echo "JAVA_HOME=${{ github.workspace }}/labsjdk-ce-23-jvmci-b01${{ matrix.HOME }}" >> ${GITHUB_ENV}
       - name: Build GraalVM
-        id: build-graalvm
         run: |
           cd substratevm
-          ${MX_PATH}/mx --dy /substratevm build
-          GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`
-          echo "::set-output name=graalvm-home-dir::$GRAALVM_HOME"
+          ${MX_PATH}/mx --dy /substratevm --native-images=lib:native-image-agent build
+          echo "GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`" >> ${GITHUB_ENV}
           cd ..
       - name: Create distribution
         working-directory: ./vm
         run: |
-          cd ${{ steps.build-graalvm.outputs.graalvm-home-dir }}/..
+          cd ${{ env.GRAALVM_HOME }}/..
           if [[ ${{ matrix.os }} != 'ubuntu-latest' ]]
           then
             cd ../..
@@ -141,7 +139,8 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          call ${{ env.MX_PATH }}\mx.cmd -p substratevm build
+          call ${{ env.MX_PATH }}\mx.cmd clean
+          call ${{ env.MX_PATH }}\mx.cmd -p substratevm --dy /substratevm --native-images=lib:native-image-agent build
           call ${{ env.MX_PATH }}\mx.cmd -p substratevm graalvm-home > graalvm-home-with-forward-slashes.txt
           set /p GRAALVM_HOME=<graalvm-home-with-forward-slashes.txt
           setlocal enabledelayedexpansion
