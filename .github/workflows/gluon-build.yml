@@ -72,8 +72,9 @@ jobs:
       - name: Build GraalVM
         run: |
           cd substratevm
+          ${MX_PATH}/mx clean
           ${MX_PATH}/mx --dy /substratevm --native-images=lib:native-image-agent build
-          echo "GRAALVM_HOME=`${MX_PATH}/mx --dy /substratevm graalvm-home`" >> ${GITHUB_ENV}
+          echo "GRAALVM_HOME=`${MX_PATH}/mx graalvm-home`" >> ${GITHUB_ENV}
           cd ..
       - name: Create distribution
         working-directory: ./vm
