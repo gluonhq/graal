@@ -40,7 +40,7 @@ jobs:
       LABS_HOME: ${{ github.workspace }}/jdk
       MX_PYTHON: python3.9
       MX_PATH: ${{ github.workspace }}/mx
-      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-24.1
+      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-23+25.1
       DYNAMIC_IMPORTS: "/substratevm"
       DISABLE_POLYGLOT: true
       DISABLE_LIBPOLYGLOT: true
@@ -110,7 +110,7 @@ jobs:
       LABS_HOME: ${{ github.workspace }}/jdk
       MX_PYTHON: 'python'
       MX_PATH: ${{ github.workspace }}/mx
-      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-24.1
+      GRAALVM_SVM: graalvm-java23-${{ matrix.NAME }}-23+25.1
       DYNAMIC_IMPORTS: "/substratevm"
       DISABLE_POLYGLOT: true
       DISABLE_LIBPOLYGLOT: true
