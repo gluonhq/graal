@@ -72,9 +72,8 @@ jobs:
       - name: Build GraalVM
         run: |
           cd substratevm
-          ${MX_PATH}/mx clean
           ${MX_PATH}/mx --dy /substratevm --native-images=lib:native-image-agent build
-          echo "GRAALVM_HOME=`${MX_PATH}/mx graalvm-home`" >> ${GITHUB_ENV}
+          echo "GRAALVM_HOME=`${MX_PATH}/mx --native-images=lib:native-image-agent graalvm-home`" >> ${GITHUB_ENV}
           cd ..
       - name: Create distribution
         working-directory: ./vm
@@ -140,9 +139,8 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          call ${{ env.MX_PATH }}\mx.cmd clean
           call ${{ env.MX_PATH }}\mx.cmd -p substratevm --dy /substratevm --native-images=lib:native-image-agent build
-          call ${{ env.MX_PATH }}\mx.cmd -p substratevm graalvm-home > graalvm-home-with-forward-slashes.txt
+          call ${{ env.MX_PATH }}\mx.cmd -p substratevm --native-images=lib:native-image-agent graalvm-home > graalvm-home-with-forward-slashes.txt
           set /p GRAALVM_HOME=<graalvm-home-with-forward-slashes.txt
           setlocal enabledelayedexpansion
           set "GRAALVM_HOME=%GRAALVM_HOME:/=\%"
