@@ -28,17 +28,22 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.ReservedRegisters;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.code.Register;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class AArch64ReservedRegisters extends ReservedRegisters {
 
     public static final Register THREAD_REGISTER = AArch64.r28;
-    public static final Register HEAP_BASE_REGISTER_CANDIDATE = AArch64.r27;
+    public static final Register HEAP_BASE_REGISTER = AArch64.r27;
+    public static final Register CODE_BASE_REGISTER_CANDIDATE = AArch64.r26;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     AArch64ReservedRegisters() {
-        super(AArch64.sp, THREAD_REGISTER, HEAP_BASE_REGISTER_CANDIDATE);
+        super(AArch64.sp, THREAD_REGISTER, HEAP_BASE_REGISTER, CODE_BASE_REGISTER_CANDIDATE);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -50,7 +50,7 @@ import org.graalvm.options.OptionValues;
 import com.oracle.truffle.api.Option;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument.Registration;
-import com.oracle.truffle.tools.dap.server.DebugProtocolServerImpl;
+import com.oracle.truffle.tools.dap.server.DebugProtocolServerListener;
 import com.oracle.truffle.tools.dap.server.ExecutionContext;
 
 @Registration(id = DAPInstrument.ID, name = "Debug Protocol Server", version = "0.1", website = "https://www.graalvm.org/tools/dap/")
@@ -65,6 +65,8 @@ public final class DAPInstrument extends TruffleInstrument {
     static final OptionType<HostAndPort> ADDRESS_OR_BOOLEAN = new OptionType<>("[[host:]port]", (address) -> {
         if (address.isEmpty() || address.equals("true")) {
             return DEFAULT_ADDRESS;
+        } else if (address.equals("false")) {
+            return HostAndPort.disabled();
         } else {
             return HostAndPort.parse(address);
         }
@@ -153,12 +155,12 @@ public final class DAPInstrument extends TruffleInstrument {
     @Option(help = "Requested maximum length of the Socket queue of incoming connections (default: unspecified).", usageSyntax = "[0, inf)", category = OptionCategory.EXPERT) //
     static final OptionKey<Integer> SocketBacklogSize = new OptionKey<>(-1);
 
-    private DebugProtocolServerImpl dapServer;
+    private DebugProtocolServerListener dapServer;
 
     @Override
     protected void onCreate(Env env) {
         options = env.getOptions();
-        if (options.hasSetOptions()) {
+        if (options.hasSetOptions() && options.get(Dap).isEnabled()) {
             launchServer(env, new PrintWriter(env.out(), true), new PrintWriter(env.err(), true));
         }
     }
@@ -215,7 +217,8 @@ public final class DAPInstrument extends TruffleInstrument {
             final int port = socketAddress.getPort();
             final ExecutionContext context = new ExecutionContext(env, info, err, options.get(Internal), options.get(Initialization));
             final ServerSocket serverSocket = new ServerSocket(port, options.get(SocketBacklogSize), socketAddress.getAddress());
-            dapServer = DebugProtocolServerImpl.create(context, options.get(Suspend), options.get(WaitAttached), options.get(Initialization), options.get(SourcePath));
+            serverSocket.setReuseAddress(true);
+            dapServer = new DebugProtocolServerListener(context, options.get(Suspend), options.get(WaitAttached), options.get(Initialization), options.get(SourcePath));
             dapServer.start(serverSocket).exceptionally(throwable -> {
                 throwable.printStackTrace(err);
                 return null;
@@ -230,19 +233,31 @@ public final class DAPInstrument extends TruffleInstrument {
 
     static final class HostAndPort {
 
+        private final boolean enabled;
         private final String host;
         private String portStr;
         private int port;
         private InetAddress inetAddress;
 
+        private HostAndPort() {
+            this.enabled = false;
+            this.host = null;
+        }
+
         private HostAndPort(String host, int port) {
+            this.enabled = true;
             this.host = host;
             this.port = port;
         }
 
         private HostAndPort(String host, String portStr) {
+            this.enabled = true;
             this.host = host;
             this.portStr = portStr;
+        }
+
+        static HostAndPort disabled() {
+            return new HostAndPort();
         }
 
         static HostAndPort parse(String address) {
@@ -267,6 +282,9 @@ public final class DAPInstrument extends TruffleInstrument {
         }
 
         void verify() {
+            if (!enabled) {
+                return;
+            }
             // Check port:
             if (port == 0) {
                 try {
@@ -298,6 +316,10 @@ public final class DAPInstrument extends TruffleInstrument {
                 }
             }
             return hostName + ":" + port;
+        }
+
+        boolean isEnabled() {
+            return enabled;
         }
 
         InetSocketAddress createSocket() {

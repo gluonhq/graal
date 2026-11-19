@@ -27,6 +27,11 @@ package com.oracle.svm.core.graal.nodes;
 import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_4;
 import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_8;
 
+import org.graalvm.word.LocationIdentity;
+import org.graalvm.word.Pointer;
+
+import com.oracle.svm.core.SubstrateTarget;
+
 import jdk.graal.compiler.graph.IterableNodeType;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
@@ -34,9 +39,6 @@ import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.Lowerable;
-import org.graalvm.word.LocationIdentity;
-
-import com.oracle.svm.core.FrameAccess;
 
 /**
  * Puts the VaList in a StackValue, used as a layer to access and modify it.
@@ -48,7 +50,7 @@ public final class VaListInitializationNode extends FixedWithNextNode implements
     @Input protected ValueNode vaList;
 
     public VaListInitializationNode(ValueNode vaList) {
-        super(TYPE, FrameAccess.getWordStamp());
+        super(TYPE, SubstrateTarget.getWordStamp());
         this.vaList = vaList;
     }
 
@@ -60,4 +62,7 @@ public final class VaListInitializationNode extends FixedWithNextNode implements
     public LocationIdentity getKilledLocationIdentity() {
         return LocationIdentity.any();
     }
+
+    @NodeIntrinsic
+    public static native Pointer vaListInitialization(Pointer vaList);
 }

@@ -11,6 +11,8 @@ assignees: ''
 
 Please include the following information:
 
+Use this template for concrete feature requests. For support questions or open-ended design discussion, please use [GitHub Discussions](https://github.com/oracle/graal/discussions) or the [GraalVM Slack workspace](https://www.graalvm.org/slack-invitation/).
+
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. E.g. I'm always frustrated when [...]
 

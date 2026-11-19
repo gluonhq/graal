@@ -28,14 +28,23 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.code.AbstractRuntimeCodeInstaller.RuntimeCodeInstallerPlatformHelper;
-import com.oracle.svm.core.code.CodeInfo;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-@AutomaticallyRegisteredImageSingleton(RuntimeCodeInstallerPlatformHelper.class)
+@AutomaticallyRegisteredImageSingleton(value = RuntimeCodeInstallerPlatformHelper.class)
 @Platforms(Platform.AMD64.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class AMD64RuntimeCodeInstallerPlatformHelper implements RuntimeCodeInstallerPlatformHelper {
 
     @Override
-    public void performCodeSynchronization(CodeInfo codeInfo) {
+    public boolean needsInstructionCacheSynchronization() {
+        return false;
+    }
+
+    @Override
+    public void performCodeSynchronization(long codeStart, long codeSize) {
     }
 }

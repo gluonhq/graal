@@ -53,12 +53,8 @@ workingsets.xml
 bench-results.json
 jmh_result.json
 /vm/src/installer/dist/
-/tools/generators/node_modules/
-/tools/generators/out/
-visualizer/IdealGraphVisualizer/*/build/
-visualizer/IdealGraphVisualizer/build/
-visualizer/IdealGraphVisualizer/dist/
-visualizer/IdealGraphVisualizer/nbplatform/
+visualizer/IdealGraphVisualizer/*/target/
+visualizer/C1Visualizer/*/target/
 /.src-rev
 *.interp
 *.tokens

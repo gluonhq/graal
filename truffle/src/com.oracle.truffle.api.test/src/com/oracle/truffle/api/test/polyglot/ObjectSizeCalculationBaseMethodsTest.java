@@ -139,6 +139,12 @@ public class ObjectSizeCalculationBaseMethodsTest {
     @Test
     public void testBaseInstanceSize() {
         TruffleTestAssumptions.assumeOptimizingRuntime();
+        /*
+         * This test directly uses the host Truffle runtime. In a polyglot isolate, the guest
+         * Truffle runtime is an optimizing runtime, so it satisfies assumeOptimizingRuntime().
+         * However, the host Truffle runtime may still be an interpreter-only runtime.
+         */
+        TruffleTestAssumptions.assumeWeakEncapsulation();
 
         Assert.assertTrue(TestAPIAccessor.runtimeAccess().getBaseInstanceSize(InstanceSizeTest.class) > 16);
         Assert.assertTrue(TestAPIAccessor.runtimeAccess().getBaseInstanceSize(InstanceSizeTest2.class) > 16);
@@ -147,6 +153,12 @@ public class ObjectSizeCalculationBaseMethodsTest {
     @Test
     public void testResolvedFields() {
         TruffleTestAssumptions.assumeOptimizingRuntime();
+        /*
+         * This test directly uses the host Truffle runtime. In a polyglot isolate, the guest
+         * Truffle runtime is an optimizing runtime, so it satisfies assumeOptimizingRuntime().
+         * However, the host Truffle runtime may still be an interpreter-only runtime.
+         */
+        TruffleTestAssumptions.assumeWeakEncapsulation();
         Object ist = new InstanceSizeTest(1, 2, 3, "Jarmil");
         Object ist2 = new InstanceSizeTest2(1, 2, 3, "We", "Are", "Brothers");
         int[] fieldOffsets = TestAPIAccessor.runtimeAccess().getFieldOffsets(ist.getClass(), false, true);
@@ -171,6 +183,12 @@ public class ObjectSizeCalculationBaseMethodsTest {
     @Test
     public void testReferenceFields() {
         TruffleTestAssumptions.assumeOptimizingRuntime();
+        /*
+         * This test directly uses the host Truffle runtime. In a polyglot isolate, the guest
+         * Truffle runtime is an optimizing runtime, so it satisfies assumeOptimizingRuntime().
+         * However, the host Truffle runtime may still be an interpreter-only runtime.
+         */
+        TruffleTestAssumptions.assumeWeakEncapsulation();
 
         String stringReferent = "stringReferent";
         MyWeakReference ref = new MyWeakReference(stringReferent, new ReferenceQueue<>());

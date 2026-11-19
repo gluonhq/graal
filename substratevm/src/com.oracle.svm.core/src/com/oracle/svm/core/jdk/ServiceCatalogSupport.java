@@ -35,13 +35,19 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.core.encoder.SymbolEncoder;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.internal.module.ServicesCatalog;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 @Platforms(Platform.HOSTED_ONLY.class)
 public class ServiceCatalogSupport {
     final ConcurrentHashMap<String, Set<String>> omittedServiceProviders = new ConcurrentHashMap<>();
@@ -63,16 +69,14 @@ public class ServiceCatalogSupport {
 
     @SuppressWarnings("unchecked")
     public void enableServiceCatalogMapTransformer(Feature.BeforeAnalysisAccess access) {
-        access.registerFieldValueTransformer(ReflectionUtil.lookupField(ServicesCatalog.class, "map"), (receiver, original) -> {
+        access.registerFieldValueTransformer(ReflectionUtil.lookupField(ServicesCatalog.class, "map"), (_, original) -> {
             VMError.guarantee(sealed);
             ConcurrentHashMap<String, List<ServicesCatalog.ServiceProvider>> map = (ConcurrentHashMap<String, List<ServicesCatalog.ServiceProvider>>) original;
             final ConcurrentHashMap<String, List<ServicesCatalog.ServiceProvider>> res = new ConcurrentHashMap<>();
             map.forEach((key, value) -> {
                 if (omittedServiceProviders.containsKey(key)) {
                     var omittedServices = omittedServiceProviders.get(key);
-                    List<ServicesCatalog.ServiceProvider> filtered = value.stream()
-                                    .filter(v -> !omittedServices.contains(v.providerName()))
-                                    .collect(Collectors.toList());
+                    List<ServicesCatalog.ServiceProvider> filtered = value.stream().filter(v -> !omittedServices.contains(v.providerName())).collect(Collectors.toList());
                     res.put(key, filtered);
                 } else {
                     res.put(key, value);
@@ -86,11 +90,25 @@ public class ServiceCatalogSupport {
             String service = ((ModuleDescriptor.Provides) receiver).service();
             if (omittedServiceProviders.containsKey(service)) {
                 var omittedProviders = omittedServiceProviders.get(service);
-                providers = providers.stream()
-                                .filter(p -> !omittedProviders.contains(p))
-                                .collect(Collectors.toList());
+                providers = providers.stream().filter(p -> !omittedProviders.contains(p)).toList();
             }
-            return providers;
+            SymbolEncoder encoder = SymbolEncoder.singleton();
+            return providers.stream().map(encoder::encodeClass).toList();
+        });
+        registerModuleDescriptorSetTransformer(access, ModuleDescriptor.class, "requires");
+        registerModuleDescriptorSetTransformer(access, ModuleDescriptor.class, "exports");
+        registerModuleDescriptorSetTransformer(access, ModuleDescriptor.class, "opens");
+        registerModuleDescriptorSetTransformer(access, ModuleDescriptor.class, "provides");
+        registerModuleDescriptorSetTransformer(access, ModuleDescriptor.class, "packages");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void registerModuleDescriptorSetTransformer(Feature.BeforeAnalysisAccess access, Class<?> clazz, String fieldName) {
+        access.registerAsInHeap(Set.of().getClass());
+        access.registerAsInHeap(Set.of("", "x").getClass());
+        access.registerFieldValueTransformer(ReflectionUtil.lookupField(clazz, fieldName), (_, original) -> {
+            Set<Object> set = (Set<Object>) original;
+            return Set.copyOf(set);
         });
     }
 }

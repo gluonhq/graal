@@ -24,98 +24,130 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.BuildPhaseProvider.AfterHeapLayout;
-import com.oracle.svm.core.Isolates;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterHeapLayout;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.genscavenge.AlignedHeapChunk.AlignedHeader;
 import com.oracle.svm.core.genscavenge.UnalignedHeapChunk.UnalignedHeader;
-import com.oracle.svm.core.heap.UnknownObjectField;
-import com.oracle.svm.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.log.Log;
-
-import jdk.graal.compiler.word.Word;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.MultiLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 /**
  * Information on the multiple partitions that make up the image heap, which don't necessarily form
  * a contiguous block of memory (there can be holes in between), and their boundaries.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = MultiLayer.class)
 public final class ImageHeapInfo {
     /** Indicates no chunk with {@link #initialize} chunk offset parameters. */
     public static final long NO_CHUNK = -1;
 
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstReadOnlyRegularObject;
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastReadOnlyRegularObject;
+    /* All read-only objects that are located in aligned chunks. */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstAlignedReadOnlyObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastAlignedReadOnlyObject;
 
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstReadOnlyRelocatableObject;
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastReadOnlyRelocatableObject;
+    /*
+     * The read-only objects that contain relocatable pointers. This is a subset of all the
+     * read-only objects that are located in aligned chunks.
+     */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstAlignedReadOnlyRelocatableObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastAlignedReadOnlyRelocatableObject;
 
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstWritableRegularObject;
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastWritableRegularObject;
+    /* All writable objects that are located in aligned chunks. */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstAlignedWritableObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastAlignedWritableObject;
 
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstWritableHugeObject;
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastWritableHugeObject;
+    /*
+     * The writable objects that need to be patched. This is a subset of all the writable objects
+     * that are located in aligned chunks.
+     */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstAlignedWritablePatchedObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastAlignedWritablePatchedObject;
 
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstReadOnlyHugeObject;
-    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastReadOnlyHugeObject;
+    /* All writable objects that are located in unaligned chunks. */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstUnalignedWritableObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastUnalignedWritableObject;
 
+    /* All read-only objects that are located in unaligned chunks. */
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstUnalignedReadOnlyObject;
+    @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastUnalignedReadOnlyObject;
+
+    /* The first/last object in the image heap. */
     @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object firstObject;
     @UnknownObjectField(availability = AfterHeapLayout.class, canBeNull = true) public Object lastObject;
 
-    // All offsets are relative to the heap base.
+    /* All offsets are relative to the heap base. */
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) public long offsetOfFirstWritableAlignedChunk;
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) public long offsetOfFirstWritableUnalignedChunk;
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) public long offsetOfLastWritableUnalignedChunk;
 
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) public int dynamicHubCount;
 
-    public final ImageHeapInfo next;
-
     public ImageHeapInfo() {
-        this(null);
-    }
-
-    public ImageHeapInfo(ImageHeapInfo next) {
-        this.next = next;
     }
 
     @SuppressWarnings("hiding")
-    public void initialize(Object firstReadOnlyRegularObject, Object lastReadOnlyRegularObject, Object firstReadOnlyRelocatableObject, Object lastReadOnlyRelocatableObject,
-                    Object firstWritableRegularObject, Object lastWritableRegularObject, Object firstWritableHugeObject, Object lastWritableHugeObject,
-                    Object firstReadOnlyHugeObject, Object lastReadOnlyHugeObject, long offsetOfFirstWritableAlignedChunk, long offsetOfFirstWritableUnalignedChunk,
-                    long offsetOfLastWritableUnalignedChunk, int dynamicHubCount) {
+    public void initialize(Object firstAlignedReadOnlyObject, Object lastAlignedReadOnlyObject,
+                    Object firstAlignedReadOnlyRelocatableObject, Object lastAlignedReadOnlyRelocatableObject,
+                    Object firstAlignedWritableObject, Object lastAlignedWritableObject,
+                    Object firstAlignedWritablePatchedObject, Object lastAlignedWritablePatchedObject,
+                    Object firstUnalignedWritableObject, Object lastUnalignedWritableObject,
+                    Object firstUnalignedReadOnlyObject, Object lastUnalignedReadOnlyObject,
+                    long offsetOfFirstWritableAlignedChunk, long offsetOfFirstWritableUnalignedChunk, long offsetOfLastWritableUnalignedChunk,
+                    int dynamicHubCount) {
         assert offsetOfFirstWritableAlignedChunk == NO_CHUNK || offsetOfFirstWritableAlignedChunk >= 0;
         assert offsetOfFirstWritableUnalignedChunk == NO_CHUNK || offsetOfFirstWritableUnalignedChunk >= 0;
 
-        this.firstReadOnlyRegularObject = firstReadOnlyRegularObject;
-        this.lastReadOnlyRegularObject = lastReadOnlyRegularObject;
-        this.firstReadOnlyRelocatableObject = firstReadOnlyRelocatableObject;
-        this.lastReadOnlyRelocatableObject = lastReadOnlyRelocatableObject;
-        this.firstWritableRegularObject = firstWritableRegularObject;
-        this.lastWritableRegularObject = lastWritableRegularObject;
-        this.firstWritableHugeObject = firstWritableHugeObject;
-        this.lastWritableHugeObject = lastWritableHugeObject;
-        this.firstReadOnlyHugeObject = firstReadOnlyHugeObject;
-        this.lastReadOnlyHugeObject = lastReadOnlyHugeObject;
+        this.firstAlignedReadOnlyObject = firstAlignedReadOnlyObject;
+        this.lastAlignedReadOnlyObject = lastAlignedReadOnlyObject;
+        this.firstAlignedReadOnlyRelocatableObject = firstAlignedReadOnlyRelocatableObject;
+        this.lastAlignedReadOnlyRelocatableObject = lastAlignedReadOnlyRelocatableObject;
+        this.firstAlignedWritableObject = firstAlignedWritableObject;
+        this.lastAlignedWritableObject = lastAlignedWritableObject;
+        this.firstAlignedWritablePatchedObject = firstAlignedWritablePatchedObject;
+        this.lastAlignedWritablePatchedObject = lastAlignedWritablePatchedObject;
+        this.firstUnalignedWritableObject = firstUnalignedWritableObject;
+        this.lastUnalignedWritableObject = lastUnalignedWritableObject;
+        this.firstUnalignedReadOnlyObject = firstUnalignedReadOnlyObject;
+        this.lastUnalignedReadOnlyObject = lastUnalignedReadOnlyObject;
         this.offsetOfFirstWritableAlignedChunk = offsetOfFirstWritableAlignedChunk;
         this.offsetOfFirstWritableUnalignedChunk = offsetOfFirstWritableUnalignedChunk;
         this.offsetOfLastWritableUnalignedChunk = offsetOfLastWritableUnalignedChunk;
         this.dynamicHubCount = dynamicHubCount;
 
-        // Compute boundaries for checks considering partitions can be empty (first == last == null)
-        Object firstReadOnlyNonHugeObject = (firstReadOnlyRegularObject != null) ? firstReadOnlyRegularObject : firstReadOnlyRelocatableObject;
-        Object lastReadOnlyNonHugeObject = (lastReadOnlyRelocatableObject != null) ? lastReadOnlyRelocatableObject : lastReadOnlyRegularObject;
-        Object firstNonHugeObject = (firstReadOnlyNonHugeObject != null) ? firstReadOnlyNonHugeObject : firstWritableRegularObject;
-        Object lastNonHugeObject = (lastWritableRegularObject != null) ? lastWritableRegularObject : lastReadOnlyNonHugeObject;
-        Object firstHugeObject = (firstWritableHugeObject != null) ? firstWritableHugeObject : firstReadOnlyHugeObject;
-        Object lastHugeObject = (lastReadOnlyHugeObject != null) ? lastReadOnlyHugeObject : lastWritableHugeObject;
-        this.firstObject = (firstNonHugeObject != null) ? firstNonHugeObject : firstHugeObject;
-        this.lastObject = (lastHugeObject != null) ? lastHugeObject : lastNonHugeObject;
+        /*
+         * Determine first and last objects. Note orderedObject is ordered based on the partition
+         * layout. Empty partitions will have (first == last == null).
+         */
+        Object[] orderedObjects = {
+                        firstAlignedReadOnlyObject,
+                        lastAlignedReadOnlyObject,
+                        firstAlignedReadOnlyRelocatableObject,
+                        lastAlignedReadOnlyRelocatableObject,
+                        firstAlignedWritableObject,
+                        lastAlignedWritableObject,
+                        firstUnalignedWritableObject,
+                        lastUnalignedWritableObject,
+                        firstUnalignedReadOnlyObject,
+                        lastUnalignedReadOnlyObject
+        };
+        for (Object cur : orderedObjects) {
+            if (cur != null) {
+                if (firstObject == null) {
+                    firstObject = cur;
+                }
+                lastObject = cur;
+            }
+        }
     }
 
     /*
@@ -127,49 +159,53 @@ public final class ImageHeapInfo {
      */
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInReadOnlyRegularPartition(Pointer ptr) {
+    public boolean isInAlignedReadOnly(Pointer ptr) {
         assert ptr.isNonNull();
-        return Word.objectToUntrackedPointer(firstReadOnlyRegularObject).belowOrEqual(ptr) && ptr.belowThan(getObjectEnd(lastReadOnlyRegularObject));
+        return Word.objectToUntrackedPointer(firstAlignedReadOnlyObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastAlignedReadOnlyObject));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInReadOnlyRelocatablePartition(Pointer ptr) {
+    public boolean isInAlignedReadOnlyRelocatable(Pointer ptr) {
         assert ptr.isNonNull();
-        return Word.objectToUntrackedPointer(firstReadOnlyRelocatableObject).belowOrEqual(ptr) && ptr.belowThan(getObjectEnd(lastReadOnlyRelocatableObject));
+        boolean result = Word.objectToUntrackedPointer(firstAlignedReadOnlyRelocatableObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastAlignedReadOnlyRelocatableObject));
+        assert !result || isInAlignedReadOnly(ptr);
+        return result;
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInWritableRegularPartition(Pointer ptr) {
+    public boolean isInAlignedWritable(Pointer ptr) {
         assert ptr.isNonNull();
-        return Word.objectToUntrackedPointer(firstWritableRegularObject).belowOrEqual(ptr) && ptr.belowThan(getObjectEnd(lastWritableRegularObject));
+        return Word.objectToUntrackedPointer(firstAlignedWritableObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastAlignedWritableObject));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInWritableHugePartition(Pointer ptr) {
+    public boolean isInAlignedWritablePatched(Pointer ptr) {
         assert ptr.isNonNull();
-        return Word.objectToUntrackedPointer(firstWritableHugeObject).belowOrEqual(ptr) && ptr.belowThan(getObjectEnd(lastWritableHugeObject));
+        boolean result = Word.objectToUntrackedPointer(firstAlignedWritablePatchedObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastAlignedWritablePatchedObject));
+        assert !result || isInAlignedWritable(ptr);
+        return result;
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInReadOnlyHugePartition(Pointer ptr) {
+    public boolean isInUnalignedWritable(Pointer ptr) {
         assert ptr.isNonNull();
-        return Word.objectToUntrackedPointer(firstReadOnlyHugeObject).belowOrEqual(ptr) && ptr.belowThan(getObjectEnd(lastReadOnlyHugeObject));
+        return Word.objectToUntrackedPointer(firstUnalignedWritableObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastUnalignedWritableObject));
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isInUnalignedReadOnly(Pointer ptr) {
+        assert ptr.isNonNull();
+        return Word.objectToUntrackedPointer(firstUnalignedReadOnlyObject).belowOrEqual(ptr) && ptr.belowThan(objEnd(lastUnalignedReadOnlyObject));
     }
 
     /**
-     * This method only returns the correct result for pointers that point to the the start of an
+     * This method only returns the correct result for pointers that point to the start of an
      * object. This is sufficient for all our current use cases. This code must be as fast as
      * possible as the GC uses it for every visited reference.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isInImageHeap(Pointer objectPointer) {
-        boolean result;
-        if (objectPointer.isNull()) {
-            result = false;
-        } else {
-            result = objectPointer.aboveOrEqual(Word.objectToUntrackedPointer(firstObject)) && objectPointer.belowOrEqual(Word.objectToUntrackedPointer(lastObject));
-        }
-        return result;
+        return objectPointer.aboveOrEqual(Word.objectToUntrackedPointer(firstObject)) && objectPointer.belowOrEqual(Word.objectToUntrackedPointer(lastObject));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -188,9 +224,9 @@ public final class ImageHeapInfo {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static Pointer getObjectEnd(Object obj) {
+    private static Pointer objEnd(Object obj) {
         if (obj == null) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         return LayoutEncoding.getImageHeapObjectEnd(obj);
     }
@@ -199,18 +235,22 @@ public final class ImageHeapInfo {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static <T extends HeapChunk.Header<T>> T asImageHeapChunk(long offsetInImageHeap) {
         if (offsetInImageHeap < 0) {
-            return (T) WordFactory.nullPointer();
+            return (T) Word.nullPointer();
         }
-        UnsignedWord offset = WordFactory.unsigned(offsetInImageHeap);
-        Pointer heapBase = (Pointer) Isolates.getHeapBase(CurrentIsolate.getIsolate());
-        return (T) heapBase.add(offset);
+        UnsignedWord offset = Word.unsigned(offsetInImageHeap);
+        return (T) KnownIntrinsics.heapBase().add(offset);
     }
 
     public void print(Log log) {
-        log.string("ReadOnly: ").zhex(Word.objectToUntrackedPointer(firstReadOnlyRegularObject)).string(" - ").zhex(getObjectEnd(lastReadOnlyRegularObject)).newline();
-        log.string("ReadOnly Relocatables: ").zhex(Word.objectToUntrackedPointer(firstReadOnlyRelocatableObject)).string(" - ").zhex(getObjectEnd(lastReadOnlyRelocatableObject)).newline();
-        log.string("Writable: ").zhex(Word.objectToUntrackedPointer(firstWritableRegularObject)).string(" - ").zhex(getObjectEnd(lastWritableRegularObject)).newline();
-        log.string("Writable Huge: ").zhex(Word.objectToUntrackedPointer(firstWritableHugeObject)).string(" - ").zhex(getObjectEnd(lastWritableHugeObject)).newline();
-        log.string("ReadOnly Huge: ").zhex(Word.objectToUntrackedPointer(firstReadOnlyHugeObject)).string(" - ").zhex(getObjectEnd(lastReadOnlyHugeObject)).newline();
+        log.string("Objects in aligned chunks").indent(true);
+        log.string("read-only: ").zhex(Word.objectToUntrackedPointer(firstAlignedReadOnlyObject)).string(" - ").zhex(objEnd(lastAlignedReadOnlyObject)).newline();
+        log.string("read-only relocatables: ").zhex(Word.objectToUntrackedPointer(firstAlignedReadOnlyRelocatableObject)).string(" - ").zhex(objEnd(lastAlignedReadOnlyRelocatableObject))
+                        .newline();
+        log.string("writable: ").zhex(Word.objectToUntrackedPointer(firstAlignedWritableObject)).string(" - ").zhex(objEnd(lastAlignedWritableObject)).newline();
+        log.string("writeable patched: ").zhex(Word.objectToUntrackedPointer(firstAlignedWritablePatchedObject)).string(" - ").zhex(objEnd(lastAlignedWritablePatchedObject)).indent(false);
+
+        log.string("Objects in unaligned chunks").indent(true);
+        log.string("writable: ").zhex(Word.objectToUntrackedPointer(firstUnalignedWritableObject)).string(" - ").zhex(objEnd(lastUnalignedWritableObject)).newline();
+        log.string("read-only: ").zhex(Word.objectToUntrackedPointer(firstUnalignedReadOnlyObject)).string(" - ").zhex(objEnd(lastUnalignedReadOnlyObject)).indent(false);
     }
 }

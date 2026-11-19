@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,6 @@ name: GraalVM Gate
 on:
   push:
     branches:
-      - 'master'
       - 'release/**'
     paths-ignore:
       - '.devcontainer/**'
@@ -58,6 +57,8 @@ on:
       - '**.md'
       - '**.jsonnet'
       - '**.libjsonnet'
+  schedule:
+  - cron: '30 0 * * 1'
   # Enable manual dispatch of the workflow
   # see https://docs.github.com/en/actions/managing-workflow-runs/manually-running-a-workflow
   workflow_dispatch:
@@ -77,7 +78,7 @@ concurrency:
 
 env:
   JAVA_HOME: ${{ github.workspace }}/jdk
-  JDT: builtin
+  TOOLS_JAVA_HOME_LOCATION: ${{ github.workspace }}/tools-jdk
   LANG: en_US.UTF-8
   MX_GIT_CACHE: refcache
   MX_PATH: ${{ github.workspace }}/mx
@@ -90,8 +91,9 @@ permissions:
 
 jobs:
   build-graalvm-linux:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     name: /${{ matrix.env.PRIMARY }} ${{ matrix.env.GATE_TAGS }} JDK${{ matrix.env.JDK_VERSION }}
-    runs-on: ubuntu-20.04
+    runs-on: ${{ matrix.os || 'ubuntu-22.04' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -99,7 +101,8 @@ jobs:
         include:
           # /compiler
           - env:
-              JDK_VERSION: "21"
+              JDK_VERSION: "latest"
+              TOOLS_JDK_VERSION: "21"
               GATE_TAGS: "style,fullbuild,test"
               PRIMARY: "compiler"
           - env:
@@ -108,24 +111,27 @@ jobs:
               PRIMARY: "compiler"
           # /espresso
           - env:
-              JDK_VERSION: "21"
+              JDK_VERSION: "latest"
+              TOOLS_JDK_VERSION: "21"
               GATE_TAGS: "style,fullbuild"
               PRIMARY: "espresso"
           # /substratevm
           - env:
-              JDK_VERSION: "21"
+              JDK_VERSION: "latest"
+              TOOLS_JDK_VERSION: "21"
               GATE_TAGS: "style,fullbuild"
               PRIMARY: "substratevm"
           - env:
               JDK_VERSION: "latest"
-              GATE_TAGS: "build,helloworld,native_unittests"
+              GATE_TAGS: "build,helloworld,native_unittests,standalone_pointsto_unittests"
               PRIMARY: "substratevm"
+              DYNAMIC_IMPORTS: "/espresso-compiler-stub"
               PIP_PACKAGES: "jsonschema==4.6.1"
-          # debuginfotest broken by JDK 24+4 [GR-55038]
-          # - env:
-          #     JDK_VERSION: "latest"
-          #     GATE_TAGS: "build,debuginfotest"
-          #     PRIMARY: "substratevm"
+          - os: ubuntu-24.04
+            env:
+              JDK_VERSION: "latest"
+              GATE_TAGS: "build,debuginfotest"
+              PRIMARY: "substratevm"
           - env:
               JDK_VERSION: "latest"
               GATE_TAGS: "hellomodule"
@@ -138,7 +144,7 @@ jobs:
           # /truffle
           - env:
               JDK_VERSION: "21"
-              GATE_TAGS: "" # Truffle does not use tags
+              GATE_TAGS: "style,fullbuild,fulltest"
               PRIMARY: "truffle"
           # /vm
           - env:
@@ -148,8 +154,6 @@ jobs:
               PRIMARY: "vm"
               DYNAMIC_IMPORTS: "/sulong,/substratevm"
               NATIVE_IMAGES: "graalvm-native-binutil,graalvm-native-clang,graalvm-native-clang-cl,graalvm-native-clang++,graalvm-native-ld,lib:llvmvm"
-              DISABLE_POLYGLOT: true
-              DISABLE_LIBPOLYGLOT: true
           - env:
               JDK_VERSION: "latest"
               GATE_TAGS: "build"
@@ -159,37 +163,37 @@ jobs:
               NATIVE_IMAGES: "lib:jvmcicompiler,native-image,lib:native-image-agent,lib:native-image-diagnostics-agent,polyglot"
               WITHOUT_VCS: true
     env:
+      JDT: builtin # Compile with ECJ (and javac) as part of gate runs tagged with 'fullbuild'
       MX_RUNS_DEBUG: ${{ contains(matrix.env.GATE_TAGS, 'debug') || matrix.env.GATE_TAGS == '' }}
       MX_RUNS_STYLE: ${{ contains(matrix.env.GATE_TAGS, 'style') || matrix.env.GATE_TAGS == '' }}
     steps:
     - name: Checkout oracle/graal
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         ref: ${{ github.ref }} # Lock ref to current branch to avoid fetching others
         fetch-depth: "${{ env.MX_RUNS_STYLE && '0' || '1' }}" # The style gate needs the full commit history for checking copyright years
     - name: Determine mx version
       run: echo "MX_VERSION=$(jq -r '.mx_version' common.json)" >> ${GITHUB_ENV}
     - name: Checkout graalvm/mx
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         repository: graalvm/mx.git
         ref: ${{ env.MX_VERSION }}
         path: ${{ env.MX_PATH }}
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
       with:
         python-version: '3.8'
-    - name: Update mx cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.mx
-        key: ${{ runner.os }}-mx-${{ hashFiles('**/suite.py') }}
-        restore-keys: ${{ runner.os }}-mx-
     - name: Fetch LabsJDK
       env: ${{ matrix.env }}
       run: |
         mkdir jdk-dl
         ${MX_PATH}/mx --java-home= fetch-jdk --jdk-id labsjdk-ce-${JDK_VERSION} --to jdk-dl --alias ${JAVA_HOME}
+    - name: Fetch Tools JDK
+      env: ${{ matrix.env }}
+      if: ${{ matrix.env.TOOLS_JDK_VERSION != '' }}
+      run: |
+        ${MX_PATH}/mx --java-home= fetch-jdk --jdk-id labsjdk-ce-${TOOLS_JDK_VERSION} --to jdk-dl --alias ${TOOLS_JAVA_HOME_LOCATION}
     - name: Update dependency cache
       if: ${{ env.MX_RUNS_DEBUG == 'true' || env.MX_RUNS_STYLE == 'true' }}
       run: sudo apt update
@@ -198,9 +202,7 @@ jobs:
       run: sudo apt install gdb
     - name: Install style dependencies
       if: ${{ env.MX_RUNS_STYLE == 'true' }}
-      run: |
-        sudo apt install python3-pip python-setuptools
-        sudo pip install $(jq -r '[.pip | to_entries[] | join("")] | join(" ")' common.json)
+      run: ${MX_PYTHON} -m pip install $(jq -r '[.pip | to_entries[] | join("")] | join(" ")' common.json)
     - name: Install additional pip packages
       if: ${{ matrix.env.PIP_PACKAGES != '' }}
       run: ${MX_PYTHON} -m pip install ${{ matrix.env.PIP_PACKAGES }}
@@ -218,34 +220,48 @@ jobs:
       run: rm -rf .git
     - name: Build GraalVM and run gate with tags
       env: ${{ matrix.env }}
-      run: ${MX_PATH}/mx --primary-suite-path ${PRIMARY} --java-home=${JAVA_HOME} gate --strict-mode ${{ matrix.env.GATE_OPTS }} --tags ${GATE_TAGS}
+      shell: bash
+      run: |
+        DYNAMIC_IMPORT_ARGS=()
+        if [ -n "${DYNAMIC_IMPORTS}" ]; then
+          DYNAMIC_IMPORT_ARGS=(--dy "${DYNAMIC_IMPORTS}")
+        fi
+        ${MX_PATH}/mx --primary-suite-path ${PRIMARY} --java-home=${JAVA_HOME} --tools-java-home=${{ matrix.env.TOOLS_JDK_VERSION != '' && env.TOOLS_JAVA_HOME_LOCATION || '' }} "${DYNAMIC_IMPORT_ARGS[@]}" gate --strict-mode ${{ matrix.env.GATE_OPTS }} --tags ${GATE_TAGS}
       if: ${{ matrix.env.GATE_TAGS != '' }}
     - name: Build GraalVM and run gate without tags
       env: ${{ matrix.env }}
-      run: ${MX_PATH}/mx --primary-suite-path ${PRIMARY} --java-home=${JAVA_HOME} gate --strict-mode ${{ matrix.env.GATE_OPTS }}
+      shell: bash
+      run: |
+        DYNAMIC_IMPORT_ARGS=()
+        if [ -n "${DYNAMIC_IMPORTS}" ]; then
+          DYNAMIC_IMPORT_ARGS=(--dy "${DYNAMIC_IMPORTS}")
+        fi
+        ${MX_PATH}/mx --primary-suite-path ${PRIMARY} --java-home=${JAVA_HOME} "${DYNAMIC_IMPORT_ARGS[@]}" gate --strict-mode ${{ matrix.env.GATE_OPTS }}
       if: ${{ matrix.env.GATE_TAGS == '' }}
   build-graalvm-windows:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     name: /substratevm on Windows
     runs-on: windows-2022
     timeout-minutes: 60
     env:
       MX_PYTHON: 'python'
+      PYTHONIOENCODING: 'utf-8'
     steps:
     - name: Checkout oracle/graal
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         ref: ${{ github.ref }} # Lock ref to current branch to avoid fetching others
     - name: Determine mx version
       shell: bash
       run: echo "MX_VERSION=$(jq -r '.mx_version' common.json)" >> ${GITHUB_ENV}
     - name: Checkout graalvm/mx
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         repository: graalvm/mx.git
         ref: ${{ env.MX_VERSION }}
         path: ${{ env.MX_PATH }}
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
       with:
         python-version: '3.8'
     - name: Fetch LabsJDK

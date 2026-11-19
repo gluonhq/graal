@@ -29,6 +29,7 @@ import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunction.Transition;
 import org.graalvm.nativeimage.c.function.CLibrary;
+import org.graalvm.nativeimage.c.struct.AllowWideningCast;
 import org.graalvm.nativeimage.c.struct.CPointerTo;
 import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.VoidPointer;
@@ -38,7 +39,7 @@ import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
 
 import com.oracle.svm.core.posix.headers.Time.timespec;
-import com.oracle.svm.core.thread.VMThreads.OSThreadHandle;
+import com.oracle.svm.guest.staging.core.thread.OSThreadHandle;
 
 // Checkstyle: stop
 
@@ -78,13 +79,11 @@ public class Pthread {
     public interface pthread_key_t extends UnsignedWord {
     }
 
-    @CPointerTo(nameOfCType = "size_t")
+    @CPointerTo(nameOfCType = "pthread_key_t")
     public interface pthread_key_tPointer extends PointerBase {
+        @AllowWideningCast
         pthread_key_t read();
     }
-
-    @CConstant
-    public static native int PTHREAD_KEYS_MAX();
 
     @CConstant
     public static native int PTHREAD_CREATE_JOINABLE();
@@ -97,9 +96,6 @@ public class Pthread {
 
     @CFunction(value = "pthread_create", transition = Transition.NO_TRANSITION)
     public static native int pthread_create_no_transition(pthread_tPointer newthread, pthread_attr_t attr, WordBase start_routine, WordBase arg);
-
-    @CFunction
-    public static native int pthread_join(pthread_t th, WordPointer thread_return);
 
     @CFunction(value = "pthread_join", transition = Transition.NO_TRANSITION)
     public static native int pthread_join_no_transition(pthread_t th, WordPointer thread_return);
@@ -188,9 +184,6 @@ public class Pthread {
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native int pthread_condattr_destroy(pthread_condattr_t attr);
 
-    @CFunction
-    public static native int pthread_kill(pthread_t thread, Signal.SignalEnum sig);
-
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native int pthread_key_create(pthread_key_tPointer key, PointerBase keyDestructor);
 
@@ -203,4 +196,8 @@ public class Pthread {
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native VoidPointer pthread_getspecific(pthread_key_t key);
 
+    public static class NoTransition {
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int pthread_exit(VoidPointer retval);
+    }
 }

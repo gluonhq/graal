@@ -24,16 +24,19 @@
  */
 package com.oracle.svm.core.code;
 
-import jdk.graal.compiler.code.CompilationResult;
-import jdk.graal.compiler.debug.DebugContext;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.c.struct.RawField;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.struct.PinnedObjectField;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.guest.staging.core.c.struct.PinnedObjectField;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.shared.Uninterruptible;
+
+import jdk.graal.compiler.code.CompilationResult;
+import jdk.graal.compiler.debug.DebugContext;
 
 /** Observes the life of one piece of runtime-compiled code. */
 public interface InstalledCodeObserver {
@@ -70,6 +73,7 @@ public interface InstalledCodeObserver {
         default void activate(InstalledCodeObserverHandle handle) {
         }
 
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
         default void release(InstalledCodeObserverHandle handle) {
         }
 
@@ -77,10 +81,6 @@ public interface InstalledCodeObserver {
         }
 
         default void attachToCurrentIsolate(InstalledCodeObserverHandle handle) {
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        default void releaseOnTearDown(InstalledCodeObserverHandle handle) {
         }
     }
 }

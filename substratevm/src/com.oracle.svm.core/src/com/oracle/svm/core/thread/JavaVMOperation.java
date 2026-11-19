@@ -24,17 +24,19 @@
  */
 package com.oracle.svm.core.thread;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.SubstrateOptions.ConcealedOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.heap.VMOperationInfo;
 import com.oracle.svm.core.jdk.SplittableRandomAccessors;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * The abstract base class for all VM operations that are allocated on the Java heap. Allocating the
@@ -49,9 +51,8 @@ import com.oracle.svm.core.util.VMError;
  * executed before it is enqueued again. Otherwise, this could result in various race conditions,
  * especially if {@linkplain ConcealedOptions#UseDedicatedVMOperationThread} is enabled.
  */
-public abstract class JavaVMOperation extends VMOperation implements VMOperationControl.JavaAllocationFreeQueue.Element<JavaVMOperation> {
+public abstract class JavaVMOperation extends VMOperation {
     protected IsolateThread queuingThread;
-    private long queuingThreadId;
     private JavaVMOperation next;
     private volatile boolean finished;
 
@@ -66,12 +67,10 @@ public abstract class JavaVMOperation extends VMOperation implements VMOperation
         VMError.guarantee(!SubstrateUtil.HOSTED, "must not be created at image build time");
     }
 
-    @Override
     public JavaVMOperation getNext() {
         return next;
     }
 
-    @Override
     public void setNext(JavaVMOperation value) {
         next = value;
     }
@@ -86,27 +85,20 @@ public abstract class JavaVMOperation extends VMOperation implements VMOperation
     }
 
     @Override
-    protected long getQueuingThreadId(NativeVMOperationData data) {
-        return queuingThreadId;
-    }
-
-    @Override
     protected boolean isFinished(NativeVMOperationData data) {
         return finished;
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     protected void markAsQueued(NativeVMOperationData data) {
         finished = false;
         queuingThread = CurrentIsolate.getCurrentThread();
-        queuingThreadId = JavaThreads.getCurrentThreadIdOrZero();
     }
 
     @Override
     protected void markAsFinished(NativeVMOperationData data) {
-        queuingThread = WordFactory.nullPointer();
-        queuingThreadId = 0;
+        queuingThread = Word.nullPointer();
         finished = true;
     }
 

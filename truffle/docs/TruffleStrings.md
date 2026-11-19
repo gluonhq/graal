@@ -69,7 +69,7 @@ Query string properties:
   Get coarse information about the string's content, without taking 16/32-bit based encodings into account.
 * [CodeRangeEquals](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/TruffleString.CodeRangeEqualsNode.html):
   Check whether a string's code range equals the given code range.
-* [isCompatibleTo](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/AbstractTruffleString.html#isCompatibleTo-com.oracle.truffle.api.strings.TruffleString.Encoding-):
+* [isCompatibleToUncached](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/AbstractTruffleString.html#isCompatibleToUncached-com.oracle.truffle.api.strings.TruffleString.Encoding-):
   Check if a string is compatible to / can be viewed in a given encoding.
 * [isManaged](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/AbstractTruffleString.html#isManaged--):
   Check if a string is not backed by a native pointer.
@@ -117,7 +117,7 @@ Conversion:
 * [CopyToNativeMemory](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/TruffleString.CopyToNativeMemoryNode.html):
   Copy a string's content into a native pointer.
 * [GetInternalNativePointer](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/TruffleString.GetInternalNativePointerNode.html):
-  Get a native string's pointer object.
+  Get a native string's pointer object, or a boxed raw pointer if no pointer object exists.
 * [ToJavaString](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/TruffleString.ToJavaStringNode.html):
   Convert a string to a `java.lang.String`.
 * [ParseInt](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/TruffleString.ParseIntNode.html):
@@ -275,8 +275,10 @@ Every `TruffleString` is encoded in a specific internal encoding, which is set d
 `TruffleString` is fully optimized for the following encodings:
 
 * `UTF-8`
-* `UTF-16`
-* `UTF-32`
+* `UTF-16LE`
+* `UTF-16BE`
+* `UTF-32LE`
+* `UTF-32BE`
 * `US-ASCII`
 * `ISO-8859-1`
 * `BYTES`
@@ -328,7 +330,7 @@ This disables re-using string objects when switching encodings, and makes encodi
 whereas operations working on two strings will still allow byte-equivalent re-interpretations.
 
 All `TruffleString` operations with more than one string parameter require the strings to be in an encoding compatible with the result encoding.
-So either the strings need to be in the same encoding, or the caller must ensure that both Strings are [compatible](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/AbstractTruffleString.html#isCompatibleTo-com.oracle.truffle.api.strings.TruffleString.Encoding-) with the resulting encoding.
+So either the strings need to be in the same encoding, or the caller must ensure that both Strings are [compatible](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/strings/AbstractTruffleString.html#isCompatibleToUncached-com.oracle.truffle.api.strings.TruffleString.Encoding-) with the resulting encoding.
 This enable callers which already know the `SwitchEncodingNodes` would be noops to just skip them for footprint reasons.
 
 ```java
@@ -351,6 +353,9 @@ abstract static class SomeNode extends Node {
     }
 }
 ```
+
+For optimal performance, the `expectedEncoding` parameter of `TruffleString` nodes should be partial-evaluation-constant whenever possible. `TruffleString` nodes don't profile this parameter, since most languages use a single constant encoding.
+
 
 ### String Properties
 

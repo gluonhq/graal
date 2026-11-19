@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,23 +25,25 @@
 package com.oracle.svm.core.code;
 
 import static com.oracle.svm.core.code.CodeInfoDecoder.FrameInfoState.NO_SUCCESSOR_INDEX_MARKER;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import java.util.Arrays;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.c.NonmovableObjectArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
 import com.oracle.svm.core.code.CodeInfoDecoder.FrameInfoState;
 import com.oracle.svm.core.code.FrameInfoQueryResult.ValueInfo;
 import com.oracle.svm.core.code.FrameInfoQueryResult.ValueType;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.core.util.NonmovableByteArrayTypeReader;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.type.CompressibleConstant;
 import jdk.graal.compiler.core.common.util.TypeConversion;
@@ -208,7 +210,7 @@ public class FrameInfoDecoder {
 
     static final HeapBasedValueInfoAllocator HeapBasedValueInfoAllocator = new HeapBasedValueInfoAllocator();
 
-    private static class CompressedFrameDecoderHelper {
+    private static final class CompressedFrameDecoderHelper {
         /**
          * Differentiates between compressed and uncompressed frame slices. Uncompressed frame
          * slices start with {@link #UNCOMPRESSED_FRAME_SLICE_MARKER}.
@@ -371,7 +373,7 @@ public class FrameInfoDecoder {
         return result;
     }
 
-    @Uninterruptible(reason = "Some allocators are interruptible.", calleeMustBe = false)
+    @Uninterruptible(reason = "Some allocators are interruptible.", mayBeInlined = true, calleeMustBe = false)
     private static FrameInfoQueryResult newFrameInfoQueryResult(FrameInfoQueryResultAllocator resultAllocator) {
         return resultAllocator.newFrameInfoQueryResult();
     }
@@ -432,10 +434,13 @@ public class FrameInfoDecoder {
             if (deoptMethodIndex < 0) {
                 /*
                  * Negative number is a reference to the target method (runtime compilations only).
+                 * The method can also be recorded for interpreter methods that do not have an AOT
+                 * deopt target so stack walking can recover the Ristretto source information from
+                 * the interpreter method.
                  */
                 cur.deoptMethod = (SharedMethod) NonmovableArrays.getObject(CodeInfoAccess.getObjectConstants(info), -1 - deoptMethodIndex);
                 cur.deoptMethodOffset = cur.deoptMethod.getImageCodeDeoptOffset();
-                assert cur.deoptMethodOffset != 0;
+                assert cur.deoptMethodOffset != 0 || cur.deoptMethod.hasInterpreterMethod();
             } else if (deoptMethodIndex > 0) {
                 /*
                  * Positive number is a directly encoded method offset (AOT compilations only, to
@@ -455,9 +460,14 @@ public class FrameInfoDecoder {
                 /* This is the first frame, i.e., the top frame that will be returned. */
                 int numVirtualObjects = readBuffer.getUVInt();
                 virtualObjects = newValueInfoArrayArray(valueInfoAllocator, numVirtualObjects);
+                /*
+                 * An allocator that discards virtual objects may reuse the storage holding the
+                 * frame's locals. Consume the virtual-object encodings without touching that storage.
+                 */
+                ValueInfoAllocator virtualObjectAllocator = virtualObjects == null ? CodeInfoDecoder.DummyValueInfoAllocator.SINGLETON : valueInfoAllocator;
                 for (int i = 0; i < numVirtualObjects; i++) {
                     int numValues = readBuffer.getUVInt();
-                    ValueInfo[] decodedValues = decodeValues(valueInfoAllocator, constantAccess, numValues, readBuffer, CodeInfoAccess.getObjectConstants(info));
+                    ValueInfo[] decodedValues = decodeValues(virtualObjectAllocator, constantAccess, numValues, readBuffer, CodeInfoAccess.getObjectConstants(info));
                     if (virtualObjects != null) {
                         virtualObjects[i] = decodedValues;
                     }
@@ -482,7 +492,7 @@ public class FrameInfoDecoder {
         return result;
     }
 
-    @Uninterruptible(reason = "Some allocators are interruptible.", calleeMustBe = false)
+    @Uninterruptible(reason = "Some allocators are interruptible.", mayBeInlined = true, calleeMustBe = false)
     private static ValueInfo[][] newValueInfoArrayArray(ValueInfoAllocator valueInfoAllocator, int numVirtualObjects) {
         return valueInfoAllocator.newValueInfoArrayArray(numVirtualObjects);
     }
@@ -505,6 +515,7 @@ public class FrameInfoDecoder {
                 valueInfo.kind = extractKind(flags);
                 valueInfo.isCompressedReference = extractIsCompressedReference(flags);
                 valueInfo.isEliminatedMonitor = extractIsEliminatedMonitor(flags);
+                valueInfo.isAutoBoxedPrimitive = extractIsAutoBoxedPrimitive(flags);
             }
             if (valueType.hasData) {
                 long valueInfoData = readBuffer.getSV();
@@ -517,17 +528,17 @@ public class FrameInfoDecoder {
         return valueInfos;
     }
 
-    @Uninterruptible(reason = "Some allocators are interruptible.", calleeMustBe = false)
+    @Uninterruptible(reason = "Some allocators are interruptible.", mayBeInlined = true, calleeMustBe = false)
     private static void decodeConstant(ValueInfoAllocator valueInfoAllocator, ConstantAccess constantAccess, NonmovableObjectArray<?> frameInfoObjectConstants, ValueInfo valueInfo) {
         valueInfoAllocator.decodeConstant(valueInfo, frameInfoObjectConstants, constantAccess);
     }
 
-    @Uninterruptible(reason = "Some allocators are interruptible.", calleeMustBe = false)
+    @Uninterruptible(reason = "Some allocators are interruptible.", mayBeInlined = true, calleeMustBe = false)
     private static ValueInfo[] newValueInfoArray(ValueInfoAllocator valueInfoAllocator, int numValues) {
         return valueInfoAllocator.newValueInfoArray(numValues);
     }
 
-    @Uninterruptible(reason = "Some allocators are interruptible.", calleeMustBe = false)
+    @Uninterruptible(reason = "Some allocators are interruptible.", mayBeInlined = true, calleeMustBe = false)
     private static ValueInfo newValueInfo(ValueInfoAllocator valueInfoAllocator) {
         return valueInfoAllocator.newValueInfo();
     }
@@ -545,7 +556,7 @@ public class FrameInfoDecoder {
         return (encodedBci & ENCODED_BCI_DURING_CALL_MASK) != 0;
     }
 
-    protected static boolean decodeRethrowException(long encodedBci) {
+    public static boolean decodeRethrowException(long encodedBci) {
         assert encodedBci >= 0 && encodedBci != FrameInfoDecoder.ENCODED_BCI_NO_CALLER : encodedBci;
         return (encodedBci & ENCODED_BCI_RETHROW_EXCEPTION_MASK) != 0;
     }
@@ -574,44 +585,56 @@ public class FrameInfoDecoder {
     protected static final int KIND_SHIFT = TYPE_SHIFT + TYPE_BITS;
     protected static final int KIND_MASK_IN_PLACE = ((1 << KIND_BITS) - 1) << KIND_SHIFT;
 
-    /**
-     * Value not used by {@link JavaKind} as a marker for eliminated monitors. The kind of a monitor
-     * is always {@link JavaKind#Object}.
-     */
-    protected static final int IS_ELIMINATED_MONITOR_KIND_VALUE = 15;
+    /* Repurpose unused {@link JavaKind} ordinal values as markers for special object values. */
+    protected static final int AUTOBOXED_PRIMITIVE_KIND_INDEX = 14;
+    protected static final int ELIMINATED_MONITOR_KIND_INDEX = 15;
 
     protected static final int IS_COMPRESSED_REFERENCE_BITS = 1;
     protected static final int IS_COMPRESSED_REFERENCE_SHIFT = KIND_SHIFT + KIND_BITS;
     protected static final int IS_COMPRESSED_REFERENCE_MASK_IN_PLACE = ((1 << IS_COMPRESSED_REFERENCE_BITS) - 1) << IS_COMPRESSED_REFERENCE_SHIFT;
 
-    protected static final JavaKind[] KIND_VALUES;
-
-    static {
-        KIND_VALUES = Arrays.copyOf(JavaKind.values(), IS_ELIMINATED_MONITOR_KIND_VALUE + 1);
-        assert KIND_VALUES[IS_ELIMINATED_MONITOR_KIND_VALUE] == null;
-        KIND_VALUES[IS_ELIMINATED_MONITOR_KIND_VALUE] = JavaKind.Object;
-    }
+    protected static final JavaKind[] KIND_VALUES = createJavaKindArray();
 
     /* Allow allocation-free access to ValueType values */
     private static final ValueType[] ValueTypeValues = ValueType.values();
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static ValueType extractType(int flags) {
         return ValueTypeValues[(flags & TYPE_MASK_IN_PLACE) >> TYPE_SHIFT];
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static JavaKind extractKind(int flags) {
-        return KIND_VALUES[(flags & KIND_MASK_IN_PLACE) >> KIND_SHIFT];
+        return KIND_VALUES[extractKindIndex(flags)];
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static boolean extractIsCompressedReference(int flags) {
         return (flags & IS_COMPRESSED_REFERENCE_MASK_IN_PLACE) != 0;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static boolean extractIsEliminatedMonitor(int flags) {
-        return ((flags & KIND_MASK_IN_PLACE) >> KIND_SHIFT) == IS_ELIMINATED_MONITOR_KIND_VALUE;
+        return extractKindIndex(flags) == ELIMINATED_MONITOR_KIND_INDEX;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean extractIsAutoBoxedPrimitive(int flags) {
+        return extractKindIndex(flags) == AUTOBOXED_PRIMITIVE_KIND_INDEX;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static int extractKindIndex(int flags) {
+        return (flags & KIND_MASK_IN_PLACE) >> KIND_SHIFT;
+    }
+
+    private static JavaKind[] createJavaKindArray() {
+        JavaKind[] result = Arrays.copyOf(JavaKind.values(), ELIMINATED_MONITOR_KIND_INDEX + 1);
+        assert result[AUTOBOXED_PRIMITIVE_KIND_INDEX] == null;
+        assert result[ELIMINATED_MONITOR_KIND_INDEX] == null;
+
+        result[AUTOBOXED_PRIMITIVE_KIND_INDEX] = JavaKind.Object;
+        result[ELIMINATED_MONITOR_KIND_INDEX] = JavaKind.Object;
+        return result;
     }
 }

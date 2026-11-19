@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,7 +28,10 @@ import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.vm.ci.code.ValueUtil.isRegister;
 import static jdk.vm.ci.code.ValueUtil.isStackSlot;
 
+import java.util.List;
+
 import jdk.graal.compiler.core.common.LIRKind;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIR;
 import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstruction;
@@ -36,7 +39,8 @@ import jdk.graal.compiler.lir.framemap.FrameMap;
 import jdk.graal.compiler.lir.framemap.ReferenceMapBuilder;
 import jdk.graal.compiler.lir.gen.LIRGenerationResult;
 import jdk.graal.compiler.lir.phases.FinalCodeAnalysisPhase;
-
+import jdk.vm.ci.code.BailoutException;
+import jdk.vm.ci.code.BytecodeFrame;
 import jdk.vm.ci.code.ReferenceMap;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.RegisterAttributes;
@@ -56,7 +60,7 @@ public final class LocationMarkerPhase extends FinalCodeAnalysisPhase {
 
     static final class Marker extends LocationMarker<RegStackValueSet> {
 
-        private final RegisterAttributes[] registerAttributes;
+        private final List<RegisterAttributes> registerAttributes;
 
         private Marker(LIR lir, FrameMap frameMap) {
             super(lir, frameMap);
@@ -92,11 +96,26 @@ public final class LocationMarkerPhase extends FinalCodeAnalysisPhase {
             if (!info.hasDebugInfo()) {
                 info.initDebugInfo();
             }
+            try {
+                ReferenceMapBuilder refMap = frameMap.newReferenceMapBuilder();
+                values.addLiveValues(refMap);
 
-            ReferenceMapBuilder refMap = frameMap.newReferenceMapBuilder();
-            values.addLiveValues(refMap);
-
-            info.debugInfo().setReferenceMap(refMap.finish(info));
+                info.debugInfo().setReferenceMap(refMap.finish(info));
+            } catch (BailoutException ex) {
+                // Do not intercept bailouts as some tests (such as ExceedMaxOopMapStackOffset)
+                // may be expecting a bailout
+                throw ex;
+            } catch (Throwable ex) {
+                BytecodeFrame frame = info.topFrame;
+                GraalError error = ex instanceof GraalError ? (GraalError) ex : new GraalError(ex);
+                String prefix = "lir frame: ";
+                while (frame != null) {
+                    error.addContext(prefix + frame.getMethod().asStackTraceElement(frame.getBCI()));
+                    frame = (BytecodeFrame) frame.getCaller();
+                    prefix = "          ";
+                }
+                throw error;
+            }
         }
 
         /**
@@ -104,7 +123,7 @@ public final class LocationMarkerPhase extends FinalCodeAnalysisPhase {
          * configuration.
          */
         private RegisterAttributes attributes(Register reg) {
-            return registerAttributes[reg.number];
+            return registerAttributes.get(reg.number);
         }
 
     }

@@ -39,38 +39,42 @@ import com.oracle.svm.graal.meta.SubstrateRuntimeConfigurationBuilder;
 import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 import com.oracle.svm.hosted.code.SharedRuntimeConfigurationBuilder;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
-import jdk.graal.compiler.nodes.spi.LoopsDataProvider;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.graal.compiler.word.WordTypes;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public class SubstrateGraalCompilerSetup {
 
     protected final SubstrateMetaAccess sMetaAccess;
 
     public SubstrateGraalCompilerSetup() {
-        if (SubstrateOptions.supportCompileInIsolates()) {
+        if (SubstrateOptions.SupportCompileInIsolates.getValue()) {
             sMetaAccess = new IsolateAwareMetaAccess();
         } else {
             sMetaAccess = new SubstrateMetaAccess();
         }
     }
 
-    public SubstrateProviders getSubstrateProviders(AnalysisMetaAccess aMetaAccess, WordTypes wordTypes) {
-        if (SubstrateOptions.supportCompileInIsolates()) {
+    public SubstrateRuntimeProviders getSubstrateProviders(AnalysisMetaAccess aMetaAccess, WordTypes wordTypes) {
+        if (SubstrateOptions.SupportCompileInIsolates.getValue()) {
             assert sMetaAccess instanceof IsolateAwareMetaAccess;
             return new IsolateAwareProviders(aMetaAccess, (IsolateAwareMetaAccess) sMetaAccess);
         } else {
-            return new SubstrateProviders(aMetaAccess, sMetaAccess, wordTypes);
+            return new SubstrateRuntimeProviders(aMetaAccess, sMetaAccess, wordTypes);
         }
     }
 
     public SharedRuntimeConfigurationBuilder createRuntimeConfigurationBuilder(OptionValues options, SVMHost hostVM, AnalysisUniverse aUniverse, UniverseMetaAccess metaAccess,
-                    Function<Providers, SubstrateBackend> backendProvider, ClassInitializationSupport classInitializationSupport, LoopsDataProvider loopsDataProvider,
-                    SubstratePlatformConfigurationProvider platformConfig, SnippetReflectionProvider snippetReflection) {
+                    Function<Providers, SubstrateBackend> backendProvider, ClassInitializationSupport classInitializationSupport, SubstratePlatformConfigurationProvider platformConfig,
+                    SnippetReflectionProvider snippetReflection) {
         return new SubstrateRuntimeConfigurationBuilder(options, hostVM, aUniverse, metaAccess, backendProvider, classInitializationSupport,
-                        loopsDataProvider, platformConfig, snippetReflection);
+                        platformConfig, snippetReflection);
     }
 }

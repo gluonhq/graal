@@ -24,33 +24,45 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import java.util.concurrent.atomic.AtomicBoolean;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.core.heap.PhysicalMemory;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.core.locks.VMMutex;
+import com.oracle.svm.core.os.CommittedMemoryProvider;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.core.thread.RecurringCallbackSupport;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
-import jdk.graal.compiler.nodes.PauseNode;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.SubstrateGCOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.PhysicalMemory;
-import com.oracle.svm.core.heap.ReferenceAccess;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.UnsignedUtils;
-import com.oracle.svm.core.util.VMError;
-
+/**
+ * Note that a lot of methods in this class are final. Subclasses may only override certain methods
+ * to avoid inconsistencies between the different heap size values.
+ */
 abstract class AbstractCollectionPolicy implements CollectionPolicy {
+    private static final VMMutex SIZES_MUTEX = new VMMutex("AbstractCollectionPolicy.sizes");
 
-    protected static final int MIN_SPACE_SIZE_IN_ALIGNED_CHUNKS = 8;
-    protected static final int MAX_TENURING_THRESHOLD = 15;
+    protected static final int MIN_SPACE_SIZE_AS_NUMBER_OF_ALIGNED_CHUNKS = 8;
 
-    @Platforms(Platform.HOSTED_ONLY.class)
-    static int getMaxSurvivorSpaces(Integer userValue) {
-        assert userValue == null || userValue >= 0 : userValue;
-        return (userValue != null) ? userValue : AbstractCollectionPolicy.MAX_TENURING_THRESHOLD;
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/hotspot/share/gc/shared/gc_globals.hpp#L572-L575") //
+    static final int MAX_TENURING_THRESHOLD = 15;
+
+    static boolean shouldCollectYoungGenSeparately(boolean defaultValue) {
+        Boolean optionValue = SerialGCOptions.CollectYoungGenerationSeparately.getValue();
+        return (optionValue != null) ? optionValue : defaultValue;
     }
 
     /*
@@ -60,38 +72,40 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
      * Don't change these values individually without carefully going over their occurrences in
      * HotSpot source code, there are dependencies between them that are not handled in our code.
      */
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/hotspot/share/gc/shared/gc_globals.hpp#L413-L415") //
     protected static final int INITIAL_SURVIVOR_RATIO = 8;
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/hotspot/share/gc/shared/gc_globals.hpp#L409-L411") //
     protected static final int MIN_SURVIVOR_RATIO = 3;
-    protected static final int DEFAULT_TIME_WEIGHT = 25; // -XX:AdaptiveTimeWeight
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/hotspot/share/gc/shared/gc_globals.hpp#L340-L342") //
+    protected static final int ADAPTIVE_TIME_WEIGHT = 25;
 
     /* Constants to compute defaults for values which can be set through existing options. */
-    protected static final UnsignedWord INITIAL_HEAP_SIZE = WordFactory.unsigned(128 * 1024 * 1024);
-    protected static final int NEW_RATIO = 2; // HotSpot: -XX:NewRatio
+    protected static final UnsignedWord INITIAL_HEAP_SIZE = Word.unsigned(128 * 1024 * 1024);
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/hotspot/share/gc/shared/gc_globals.hpp#L554-L556") //
+    protected static final int NEW_RATIO = 2;
 
-    protected final AdaptiveWeightedAverage avgYoungGenAlignedChunkFraction = new AdaptiveWeightedAverage(DEFAULT_TIME_WEIGHT);
+    protected final AdaptiveWeightedAverage avgYoungGenAlignedChunkFraction = new AdaptiveWeightedAverage(ADAPTIVE_TIME_WEIGHT);
+    protected final SizeParameters sizes = new SizeParameters();
 
     private final int initialNewRatio;
-    protected UnsignedWord survivorSize;
-    protected UnsignedWord edenSize;
-    protected UnsignedWord promoSize;
-    protected UnsignedWord oldSize;
     protected int tenuringThreshold;
-
-    protected volatile SizeParameters sizes;
-    private final AtomicBoolean sizesUpdateSpinLock = new AtomicBoolean();
 
     protected AbstractCollectionPolicy(int initialNewRatio, int initialTenuringThreshold) {
         this.initialNewRatio = initialNewRatio;
-        this.tenuringThreshold = UninterruptibleUtils.Math.clamp(initialTenuringThreshold, 1, HeapParameters.getMaxSurvivorSpaces() + 1);
+        this.tenuringThreshold = UninterruptibleUtils.Math.clamp(initialTenuringThreshold, 0, HeapParameters.getMaxSurvivorSpaces());
+    }
+
+    @Override
+    @Uninterruptible(reason = "Tear-down in progress.")
+    public void tearDown() {
+        sizes.tearDown();
     }
 
     @Override
     public boolean shouldCollectOnAllocation() {
-        if (sizes == null) {
-            return false; // updateSizeParameters() has never been called
-        }
+        guaranteeSizeParametersInitialized();
         UnsignedWord edenUsed = HeapImpl.getAccounting().getEdenUsedBytes();
-        return edenUsed.aboveOrEqual(edenSize);
+        return edenUsed.aboveOrEqual(sizes.getEdenSize());
     }
 
     @Override
@@ -122,7 +136,7 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
 
     @Fold
     static UnsignedWord minSpaceSize() {
-        return getAlignment().multiply(MIN_SPACE_SIZE_IN_ALIGNED_CHUNKS);
+        return HeapParameters.getAlignedHeapChunkSize().multiply(MIN_SPACE_SIZE_AS_NUMBER_OF_ALIGNED_CHUNKS);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -131,146 +145,114 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
     }
 
     @Override
+    @AlwaysInline("Keep the size initialization check inline in allocation slow paths.")
     public void ensureSizeParametersInitialized() {
-        if (sizes == null) {
+        if (!sizes.isInitialized()) {
             updateSizeParameters();
         }
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     protected void guaranteeSizeParametersInitialized() {
-        VMError.guarantee(sizes != null);
+        VMError.guarantee(sizes.isInitialized());
     }
 
+    /**
+     * (Re)computes and updates the {@link SizeParameters} used by this garbage collection policy to
+     * reflect the latest values derived from relevant heap size options and physical memory
+     * constraints.
+     * <p>
+     * This method is thread-safe and may be invoked concurrently by multiple threads. It is called
+     * at least once during VM startup, and is called again if the value of a relevant runtime
+     * option changes. A mutex is used to guarantee consistency of the computed parameters and
+     * prevent lost updates (note that a CAS would not be sufficient to prevent lost updates because
+     * threads could overwrite more recent values with outdated values).
+     */
     @Override
+    @NeverInline("Keep size calculations and locking out of allocation slow paths.")
     public void updateSizeParameters() {
-        SizeParameters params = computeSizeParameters(sizes);
-        SizeParameters previous = sizes;
-        if (previous != null && params.equal(previous)) {
-            return; // nothing to do
-        }
-        while (!sizesUpdateSpinLock.compareAndSet(false, true)) {
-            /*
-             * We use a primitive spin lock because at this point, the current thread might be
-             * unable to use a Java lock (e.g. no Thread object yet), and the critical section is
-             * short, so we do not want to suspend and wake up threads for it.
-             */
-            PauseNode.pause();
-        }
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
         try {
-            updateSizeParametersLocked(params, previous);
+            SIZES_MUTEX.lock();
+            try {
+                assert RecurringCallbackSupport.isCallbackUnsupportedOrTimerSuspended() : "recurring callbacks could trigger recursive locking, which isn't supported";
+
+                RawSizeParameters newValuesOnStack = StackValue.get(RawSizeParameters.class);
+                computeSizeParameters(newValuesOnStack);
+
+                sizes.update(newValuesOnStack);
+            } finally {
+                SIZES_MUTEX.unlock();
+            }
         } finally {
-            sizesUpdateSpinLock.set(false);
+            StackOverflowCheck.singleton().protectYellowZone();
         }
-        guaranteeSizeParametersInitialized(); // sanity
-    }
-
-    @Uninterruptible(reason = "Must be atomic with regard to garbage collection.")
-    private void updateSizeParametersLocked(SizeParameters params, SizeParameters previous) {
-        if (sizes != previous) {
-            // Some other thread beat us and we cannot tell if our values or their values are newer,
-            // so back off -- any newer values will be applied eventually.
-            return;
-        }
-        sizes = params;
-
-        if (previous == null || gcCount() == 0) {
-            survivorSize = params.initialSurvivorSize;
-            edenSize = params.initialEdenSize;
-            oldSize = params.initialOldSize();
-            promoSize = UnsignedUtils.min(edenSize, oldSize);
-        }
-
-        /*
-         * NOTE: heap limits can change when options are updated at runtime or once the physical
-         * memory size becomes known. This means that we start off with sizes which can cause higher
-         * GC costs initially, and when shrinking the heap, that previously computed values such as
-         * GC costs and intervals and survived/promoted objects are likely no longer representative.
-         *
-         * We assume that such changes happen very early on and values then adapt reasonably quick,
-         * but we must still ensure that computations can handle it (for example, no overflows).
-         */
-        survivorSize = UnsignedUtils.min(survivorSize, params.maxSurvivorSize());
-        edenSize = UnsignedUtils.min(edenSize, getMaximumEdenSize());
-        oldSize = UnsignedUtils.min(oldSize, params.maxOldSize());
-        promoSize = UnsignedUtils.min(promoSize, params.maxOldSize());
     }
 
     @Override
-    public UnsignedWord getInitialEdenSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.initialEdenSize;
+    public final UnsignedWord getInitialEdenSize() {
+        return sizes.getInitialEdenSize();
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public UnsignedWord getMaximumEdenSize() {
-        guaranteeSizeParametersInitialized();
-        return alignDown(sizes.maxYoungSize.subtract(survivorSize.multiply(2)));
+    public final UnsignedWord getMaximumEdenSize() {
+        return sizes.getMaxEdenSize();
     }
 
     @Override
-    public UnsignedWord getMaximumHeapSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.maxHeapSize;
+    public final UnsignedWord getMaximumHeapSize() {
+        return sizes.getMaxHeapSize();
     }
 
     @Override
-    public UnsignedWord getMaximumYoungGenerationSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.maxYoungSize;
+    public final UnsignedWord getMaximumYoungGenerationSize() {
+        return sizes.getMaxYoungSize();
     }
 
     @Override
-    public UnsignedWord getInitialSurvivorSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.initialSurvivorSize;
+    public final UnsignedWord getInitialSurvivorSize() {
+        return sizes.getInitialSurvivorSize();
     }
 
     @Override
-    public UnsignedWord getMaximumSurvivorSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.maxSurvivorSize();
+    public final UnsignedWord getMaximumSurvivorSize() {
+        return sizes.getMaxSurvivorSize();
     }
 
     @Override
-    public UnsignedWord getCurrentHeapCapacity() {
-        assert VMOperation.isGCInProgress() : "use only during GC";
-        guaranteeSizeParametersInitialized();
-        return edenSize.add(survivorSize).add(oldSize);
+    public final UnsignedWord getCurrentHeapSizeTarget() {
+        return sizes.getCurrentHeapSizeTarget();
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public UnsignedWord getSurvivorSpacesCapacity() {
-        assert VMOperation.isGCInProgress() : "use only during GC";
-        guaranteeSizeParametersInitialized();
-        return survivorSize;
+    public final UnsignedWord getEdenCapacity() {
+        return sizes.getEdenSize();
     }
 
     @Override
-    @Uninterruptible(reason = "Ensure reading a consistent value.")
-    public UnsignedWord getYoungGenerationCapacity() {
-        guaranteeSizeParametersInitialized();
-        return edenSize.add(survivorSize);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public final UnsignedWord getSurvivorSpacesCapacity() {
+        return sizes.getSurvivorSize();
     }
 
     @Override
-    public UnsignedWord getInitialOldSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.initialOldSize();
+    public final UnsignedWord getYoungGenerationCapacity() {
+        return sizes.getYoungSize();
     }
 
     @Override
-    public UnsignedWord getMaximumOldSize() {
-        guaranteeSizeParametersInitialized();
-        return sizes.maxOldSize();
+    public final UnsignedWord getInitialOldSize() {
+        return sizes.getInitialOldSize();
     }
 
     @Override
-    public UnsignedWord getOldGenerationCapacity() {
-        guaranteeSizeParametersInitialized();
-        return oldSize;
+    public final UnsignedWord getMaximumOldSize() {
+        return sizes.getMaxOldSize();
+    }
+
+    @Override
+    public final UnsignedWord getOldGenerationCapacity() {
+        return sizes.getOldSize();
     }
 
     @Override
@@ -278,25 +260,27 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
         assert VMOperation.isGCInProgress() : "use only during GC";
         guaranteeSizeParametersInitialized();
         /*
-         * Keep chunks ready for allocations in eden and for the survivor to-spaces during young
-         * collections (although we might keep too many aligned chunks when large objects in
-         * unallocated chunks are also allocated). We could alternatively return
-         * getCurrentHeapCapacity() to have chunks ready during full GCs as well.
+         * Keep chunks ready for allocations in eden as well as for copying the objects currently in
+         * survivor spaces in a future collection. We could alternatively return
+         * getCurrentHeapSizeTarget() to have chunks ready during full GCs as well.
          */
-        UnsignedWord total = edenSize.add(survivorSize);
+        UnsignedWord total = sizes.getEdenSize().add(HeapImpl.getAccounting().getSurvivorUsedBytes());
         double alignedFraction = Math.min(1, Math.max(0, avgYoungGenAlignedChunkFraction.getAverage()));
         return UnsignedUtils.fromDouble(UnsignedUtils.toDouble(total) * alignedFraction);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public int getTenuringAge() {
         assert VMOperation.isGCInProgress() : "use only during GC";
-        return tenuringThreshold;
+        assert tenuringThreshold >= 0 && tenuringThreshold <= HeapParameters.getMaxSurvivorSpaces();
+        return tenuringThreshold + 1;
     }
 
     @Override
-    public void onCollectionBegin(boolean completeCollection, long requestingNanoTime) {
+    public void onCollectionBegin(boolean completeCollection, long beginNanoTime) {
+        sizes.freeUnusedSizeParameters();
+
         // Capture the fraction of bytes in aligned chunks at the start to include all allocated
         // (also dead) objects, because we use it to reserve aligned chunks for future allocations
         UnsignedWord youngChunkBytes = GCImpl.getAccounting().getYoungChunkBytesBefore();
@@ -307,53 +291,48 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
     }
 
     @Override
-    public UnsignedWord getMinimumHeapSize() {
-        return sizes.minHeapSize;
+    public final UnsignedWord getMinimumHeapSize() {
+        return sizes.getMinHeapSize();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected abstract long gcCount();
-
-    protected SizeParameters computeSizeParameters(SizeParameters existing) {
-        UnsignedWord addressSpaceSize = ReferenceAccess.singleton().getAddressSpaceSize();
-        UnsignedWord minYoungSpaces = minSpaceSize(); // eden
-        if (HeapParameters.getMaxSurvivorSpaces() > 0) {
-            minYoungSpaces = minYoungSpaces.add(minSpaceSize().multiply(2)); // survivor from and to
-        }
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+21/src/hotspot/share/gc/shared/genArguments.cpp#L195-L310")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+21/src/hotspot/share/gc/parallel/psYoungGen.cpp#L104-L116")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+21/src/hotspot/share/gc/parallel/psYoungGen.cpp#L146-L168")
+    protected void computeSizeParameters(RawSizeParameters newParamsOnStack) {
+        UnsignedWord minYoungSpaces = getMinYoungSpacesSize();
         UnsignedWord minAllSpaces = minYoungSpaces.add(minSpaceSize()); // old
+        UnsignedWord heapSizeLimit = UnsignedUtils.max(alignDown(getHeapSizeLimit()), minAllSpaces);
 
         UnsignedWord maxHeap;
-        long optionMax = SubstrateGCOptions.MaxHeapSize.getValue();
+        long optionMax = getMaximumHeapSizeOptionValue();
         if (optionMax > 0L) {
-            maxHeap = WordFactory.unsigned(optionMax);
-        } else if (!PhysicalMemory.isInitialized()) {
-            maxHeap = addressSpaceSize;
+            maxHeap = Word.unsigned(optionMax);
         } else {
-            maxHeap = PhysicalMemory.getCachedSize().unsignedDivide(100).multiply(HeapParameters.getMaximumHeapSizePercent());
+            maxHeap = PhysicalMemory.size().unsignedDivide(100).multiply(HeapParameters.getMaximumHeapSizePercent());
         }
         UnsignedWord unadjustedMaxHeap = maxHeap;
-        maxHeap = UnsignedUtils.clamp(alignDown(maxHeap), minAllSpaces, alignDown(addressSpaceSize));
+        maxHeap = UnsignedUtils.clamp(alignDown(maxHeap), minAllSpaces, heapSizeLimit);
 
         UnsignedWord maxYoung;
-        long optionMaxYoung = SubstrateGCOptions.MaxNewSize.getValue();
+        long optionMaxYoung = getMaxNewSizeOptionValue();
         if (optionMaxYoung > 0L) {
-            maxYoung = WordFactory.unsigned(optionMaxYoung);
+            maxYoung = Word.unsigned(optionMaxYoung);
         } else if (SerialAndEpsilonGCOptions.MaximumYoungGenerationSizePercent.hasBeenSet()) {
             maxYoung = maxHeap.unsignedDivide(100).multiply(HeapParameters.getMaximumYoungGenerationSizePercent());
         } else {
             maxYoung = maxHeap.unsignedDivide(AbstractCollectionPolicy.NEW_RATIO + 1);
         }
-        maxYoung = UnsignedUtils.clamp(alignDown(maxYoung), minYoungSpaces, maxHeap.subtract(minSpaceSize()));
+        maxYoung = UnsignedUtils.clamp(alignDown(maxYoung), minYoungSpaces, getYoungSizeLimit(maxHeap));
 
         UnsignedWord maxOld = alignDown(maxHeap.subtract(maxYoung));
         maxHeap = maxYoung.add(maxOld);
-        VMError.guarantee(maxOld.aboveOrEqual(minSpaceSize()) && maxHeap.belowOrEqual(addressSpaceSize) &&
+        VMError.guarantee(maxOld.aboveOrEqual(minSpaceSize()) && maxHeap.belowOrEqual(heapSizeLimit) &&
                         (maxHeap.belowOrEqual(unadjustedMaxHeap) || unadjustedMaxHeap.belowThan(minAllSpaces)));
 
-        UnsignedWord minHeap = WordFactory.zero();
-        long optionMin = SubstrateGCOptions.MinHeapSize.getValue();
+        UnsignedWord minHeap = Word.zero();
+        long optionMin = getMinHeapSizeOptionValue();
         if (optionMin > 0L) {
-            minHeap = WordFactory.unsigned(optionMin);
+            minHeap = Word.unsigned(optionMin);
         }
         minHeap = UnsignedUtils.clamp(alignUp(minHeap), minAllSpaces, maxHeap);
 
@@ -367,97 +346,105 @@ abstract class AbstractCollectionPolicy implements CollectionPolicy {
             initialYoung = initialHeap.unsignedDivide(initialNewRatio + 1);
             initialYoung = UnsignedUtils.clamp(alignUp(initialYoung), minYoungSpaces, maxYoung);
         }
-        UnsignedWord initialSurvivor = WordFactory.zero();
+
+        UnsignedWord initialSurvivor = Word.zero();
         if (HeapParameters.getMaxSurvivorSpaces() > 0) {
             /*
              * In HotSpot, this is the reserved capacity of each of the survivor From and To spaces,
              * i.e., together they occupy 2x this size. Our chunked heap doesn't reserve memory, so
-             * we never occupy more than 1x this size for survivors except during collections.
-             * However, this is inconsistent with how we interpret the maximum size of the old
-             * generation, which we can exceed while copying during collections.
+             * we never occupy more than 1x this size for survivors except during collections. We
+             * reserve 2x regardless (see below). However, this is inconsistent with how we
+             * interpret the maximum size of CopyingOldGeneration, which we can exceed the same way
+             * while copying during collections, but reserve only 1x its size.
              */
             initialSurvivor = initialYoung.unsignedDivide(AbstractCollectionPolicy.INITIAL_SURVIVOR_RATIO);
             initialSurvivor = minSpaceSize(alignDown(initialSurvivor));
         }
+
         UnsignedWord initialEden = initialYoung.subtract(initialSurvivor.multiply(2));
         initialEden = minSpaceSize(alignDown(initialEden));
 
-        return SizeParameters.get(existing, maxHeap, maxYoung, initialHeap, initialEden, initialSurvivor, minHeap);
+        UnsignedWord maxSurvivorSize = Word.zero();
+        UnsignedWord maxEdenSize = maxYoung;
+        if (HeapParameters.getMaxSurvivorSpaces() > 0) {
+            maxSurvivorSize = maxYoung.unsignedDivide(MIN_SURVIVOR_RATIO);
+            maxSurvivorSize = minSpaceSize(alignDown(maxSurvivorSize));
+            maxEdenSize = maxYoung.subtract(minSpaceSize().multiply(2));
+        }
+
+        UnsignedWord maxOldSize = maxHeap.subtract(maxYoung);
+        UnsignedWord initialOldSize = initialHeap.subtract(initialYoung);
+
+        UnsignedWord survivorSize;
+        UnsignedWord edenSize;
+        UnsignedWord oldSize;
+        /*
+         * promoSize: memory reserved in the old generation for objects promoted from the young
+         * generation. Not used by all subclasses, but managed here for simplicity.
+         */
+        UnsignedWord promoSize;
+        if (sizes.isInitialized() && sameInitialSizes(initialEden, initialSurvivor, initialYoung, initialOldSize, initialHeap)) {
+            /* Copy and limit existing values. */
+            survivorSize = UnsignedUtils.min(sizes.getSurvivorSize(), maxSurvivorSize);
+            edenSize = UnsignedUtils.min(sizes.getEdenSize(), maxEdenSize);
+            oldSize = UnsignedUtils.min(sizes.getOldSize(), maxOldSize);
+            promoSize = UnsignedUtils.min(sizes.getPromoSize(), maxOldSize);
+        } else {
+            /* Set initial values (either during startup or when relevant option values change). */
+            survivorSize = initialSurvivor;
+            edenSize = initialEden;
+            oldSize = initialOldSize;
+            promoSize = UnsignedUtils.min(edenSize, oldSize);
+        }
+
+        RawSizeParametersOnStackAccess.initialize(newParamsOnStack,
+                        initialEden, edenSize, maxEdenSize,
+                        initialSurvivor, survivorSize, maxSurvivorSize,
+                        initialOldSize, oldSize, maxOldSize,
+                        promoSize,
+                        initialYoung, maxYoung,
+                        minHeap, initialHeap, maxHeap);
+    }
+
+    protected static UnsignedWord getMinYoungSpacesSize() {
+        UnsignedWord minYoung = minSpaceSize(); // eden
+        if (HeapParameters.getMaxSurvivorSpaces() > 0) {
+            minYoung = minYoung.add(minSpaceSize().multiply(2)); // survivor from and to
+        }
+        return minYoung;
+    }
+
+    /** The initial sizes only change when a relevant GC-specific option value is modified. */
+    private boolean sameInitialSizes(UnsignedWord initialEden, UnsignedWord initialSurvivor, UnsignedWord initialYoung, UnsignedWord initialOld, UnsignedWord initialHeap) {
+        assert sizes.isInitialized();
+        return sizes.getInitialEdenSize() == initialEden && sizes.getInitialSurvivorSize() == initialSurvivor && sizes.getInitialYoungSize() == initialYoung &&
+                        sizes.getInitialOldSize() == initialOld && sizes.getInitialHeapSize() == initialHeap;
+    }
+
+    protected UnsignedWord getHeapSizeLimit() {
+        return CommittedMemoryProvider.get().getCollectedHeapAddressSpaceSize();
+    }
+
+    protected UnsignedWord getYoungSizeLimit(UnsignedWord maxHeap) {
+        return maxHeap.subtract(minSpaceSize());
+    }
+
+    protected long getMaximumHeapSizeOptionValue() {
+        int optionIndex = IsolateArgumentParser.getOptionIndex(SubstrateGCOptions.MaxHeapSize);
+        return IsolateArgumentParser.singleton().getLongOptionValue(optionIndex);
+    }
+
+    protected static long getMaxNewSizeOptionValue() {
+        int optionIndex = IsolateArgumentParser.getOptionIndex(SubstrateGCOptions.MaxNewSize);
+        return IsolateArgumentParser.singleton().getLongOptionValue(optionIndex);
+    }
+
+    protected static long getMinHeapSizeOptionValue() {
+        int optionIndex = IsolateArgumentParser.getOptionIndex(SubstrateGCOptions.MinHeapSize);
+        return IsolateArgumentParser.singleton().getLongOptionValue(optionIndex);
     }
 
     protected UnsignedWord getInitialHeapSize() {
         return AbstractCollectionPolicy.INITIAL_HEAP_SIZE;
-    }
-
-    protected static final class SizeParameters {
-        final UnsignedWord maxHeapSize;
-        final UnsignedWord maxYoungSize;
-        final UnsignedWord initialHeapSize;
-        final UnsignedWord initialEdenSize;
-        final UnsignedWord initialSurvivorSize;
-        final UnsignedWord minHeapSize;
-
-        static SizeParameters get(SizeParameters existing, UnsignedWord maxHeap, UnsignedWord maxYoung, UnsignedWord initialHeap,
-                        UnsignedWord initialEden, UnsignedWord initialSurvivor, UnsignedWord minHeap) {
-            if (existing != null && existing.matches(maxHeap, maxYoung, initialHeap, initialEden, initialSurvivor, minHeap)) {
-                return existing;
-            }
-            return new SizeParameters(maxHeap, maxYoung, initialHeap, initialEden, initialSurvivor, minHeap);
-        }
-
-        private SizeParameters(UnsignedWord maxHeapSize, UnsignedWord maxYoungSize, UnsignedWord initialHeapSize,
-                        UnsignedWord initialEdenSize, UnsignedWord initialSurvivorSize, UnsignedWord minHeapSize) {
-            this.maxHeapSize = maxHeapSize;
-            this.maxYoungSize = maxYoungSize;
-            this.initialHeapSize = initialHeapSize;
-            this.initialEdenSize = initialEdenSize;
-            this.initialSurvivorSize = initialSurvivorSize;
-            this.minHeapSize = minHeapSize;
-
-            assert isAligned(maxHeapSize) && isAligned(maxYoungSize) && isAligned(initialHeapSize) && isAligned(initialEdenSize) && isAligned(initialSurvivorSize);
-            assert isAligned(maxSurvivorSize()) && isAligned(initialYoungSize()) && isAligned(initialOldSize()) && isAligned(maxOldSize());
-
-            assert initialHeapSize.belowOrEqual(maxHeapSize);
-            assert maxSurvivorSize().belowThan(maxYoungSize);
-            assert maxYoungSize.add(maxOldSize()).equal(maxHeapSize);
-            assert maxHeapSize.belowOrEqual(ReferenceAccess.singleton().getAddressSpaceSize());
-            assert initialEdenSize.add(initialSurvivorSize.multiply(2)).equal(initialYoungSize());
-            assert initialYoungSize().add(initialOldSize()).equal(initialHeapSize);
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        UnsignedWord maxSurvivorSize() {
-            if (HeapParameters.getMaxSurvivorSpaces() == 0) {
-                return WordFactory.zero();
-            }
-            UnsignedWord size = maxYoungSize.unsignedDivide(MIN_SURVIVOR_RATIO);
-            return minSpaceSize(alignDown(size));
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        UnsignedWord initialYoungSize() {
-            return initialEdenSize.add(initialSurvivorSize.multiply(2));
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        UnsignedWord initialOldSize() {
-            return initialHeapSize.subtract(initialYoungSize());
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        UnsignedWord maxOldSize() {
-            return maxHeapSize.subtract(maxYoungSize);
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        boolean equal(SizeParameters other) {
-            return other == this || other.matches(maxHeapSize, maxYoungSize, initialHeapSize, initialEdenSize, initialSurvivorSize, minHeapSize);
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        boolean matches(UnsignedWord maxHeap, UnsignedWord maxYoung, UnsignedWord initialHeap, UnsignedWord initialEden, UnsignedWord initialSurvivor, UnsignedWord minHeap) {
-            return maxHeapSize.equal(maxHeap) && maxYoungSize.equal(maxYoung) && initialHeapSize.equal(initialHeap) &&
-                            initialEdenSize.equal(initialEden) && initialSurvivorSize.equal(initialSurvivor) && minHeapSize.equal(minHeap);
-        }
     }
 }

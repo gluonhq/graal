@@ -34,8 +34,8 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Inject;
@@ -43,8 +43,11 @@ import com.oracle.svm.core.annotate.KeepOriginal;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.jdk.OpenJDK;
+import com.oracle.svm.guest.staging.core.heap.UnknownClass;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.graal.compiler.nodes.java.ReachabilityFenceNode;
 
@@ -117,21 +120,30 @@ public final class Target_java_lang_ref_Reference<T> {
     @Uninterruptible(reason = "The initialization of the fields must be atomic with respect to collection.")
     Target_java_lang_ref_Reference(T referent, Target_java_lang_ref_ReferenceQueue<? super T> queue) {
         this.referent = referent;
-        this.queue = (queue == null) ? Target_java_lang_ref_ReferenceQueue.NULL : queue;
+        this.queue = (queue == null) ? Target_java_lang_ref_ReferenceQueue.NULL_QUEUE : queue;
     }
 
     @KeepOriginal
     native T get();
 
     @Substitute
-    public void clear() {
-        ReferenceInternals.clear(SubstrateUtil.cast(this, Reference.class));
+    @TargetElement(onlyWith = OpenJDK.class)
+    @SuppressWarnings("unchecked")
+    private T get0() {
+        /* Use the regular referent field access so the selected GC's read barrier is applied. */
+        return (T) ReferenceInternals.getReferent(SubstrateUtil.cast(this, Reference.class));
     }
+
+    @KeepOriginal
+    native void clear();
 
     @Substitute
     private void clear0() {
-        clear();
+        ReferenceInternals.clear(SubstrateUtil.cast(this, Reference.class));
     }
+
+    @KeepOriginal
+    native void clearImpl();
 
     @KeepOriginal
     native boolean refersToImpl(T obj);

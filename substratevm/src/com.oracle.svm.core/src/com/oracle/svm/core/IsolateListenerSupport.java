@@ -31,12 +31,19 @@ import org.graalvm.nativeimage.Isolate;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class IsolateListenerSupport {
     private IsolateListener[] listeners;
 
@@ -53,7 +60,7 @@ public class IsolateListenerSupport {
         listeners[oldLength] = listener;
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static IsolateListenerSupport singleton() {
         return ImageSingletons.lookup(IsolateListenerSupport.class);
     }
@@ -86,7 +93,8 @@ public class IsolateListenerSupport {
          * isolate is still unattached when this method is called.
          */
         @Uninterruptible(reason = "Thread state not yet set up.")
-        void afterCreateIsolate(Isolate isolate);
+        default void afterCreateIsolate(@SuppressWarnings("unused") Isolate isolate) {
+        }
 
         /**
          * Implementations must not throw any exceptions. Note that this method is called on

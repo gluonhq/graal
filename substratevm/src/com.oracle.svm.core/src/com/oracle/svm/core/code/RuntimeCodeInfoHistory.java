@@ -24,7 +24,6 @@
  */
 package com.oracle.svm.core.code;
 
-import jdk.graal.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
@@ -33,17 +32,25 @@ import org.graalvm.word.UnsignedWord;
 
 import com.oracle.svm.core.Isolates;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.CodeInfoAccess.HasInstalledCode;
 import com.oracle.svm.core.collections.RingBuffer;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.thread.Safepoint;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.TimeUtils;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.shared.util.TimeUtils;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
+import jdk.graal.compiler.api.replacements.Fold;
+
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 public class RuntimeCodeInfoHistory {
     private static final RingBuffer.Consumer<CodeCacheLogEntry> PRINT_WITH_JAVA_HEAP_DATA = RuntimeCodeInfoHistory::printEntryWithJavaHeapData;
     private static final RingBuffer.Consumer<CodeCacheLogEntry> PRINT_WITHOUT_JAVA_HEAP_DATA = RuntimeCodeInfoHistory::printEntryWithoutJavaHeapData;
@@ -120,7 +127,7 @@ public class RuntimeCodeInfoHistory {
     }
 
     private static class CodeCacheLogEntry {
-        private long timestamp;
+        private long uptimeMillis;
         private String kind;
         private String codeName;
         private CodeInfo codeInfo;
@@ -141,8 +148,8 @@ public class RuntimeCodeInfoHistory {
             assert VMOperation.isInProgressAtSafepoint();
             assert Heap.getHeap().isInImageHeap(kind);
 
-            this.safepointId = Safepoint.Master.singleton().getSafepointId();
-            this.timestamp = System.currentTimeMillis();
+            this.safepointId = Safepoint.singleton().getSafepointId();
+            this.uptimeMillis = Isolates.getUptimeMillis();
             this.kind = kind;
             this.codeInfo = codeInfo;
             this.codeInfoState = codeInfoState;
@@ -162,8 +169,7 @@ public class RuntimeCodeInfoHistory {
 
         public void print(Log log, boolean allowJavaHeapAccess) {
             if (kind != null) {
-                long uptime = timestamp - Isolates.getCurrentStartTimeMillis();
-                log.rational(uptime, TimeUtils.millisPerSecond, 3).string("s - ").string(kind).spaces(1);
+                log.rational(uptimeMillis, TimeUtils.millisPerSecond, 3).string("s - ").string(kind).spaces(1);
                 String name = allowJavaHeapAccess ? codeName : null;
                 CodeInfoAccess.printCodeInfo(log, codeInfo, codeInfoState, name, codeStart, codeEnd, hasInstalledCode, installedCodeAddress, installedCodeEntryPoint);
                 log.string(", safepointId: ").unsigned(safepointId).newline();

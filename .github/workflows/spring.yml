@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, 2024, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2024, 2025, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -38,44 +38,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-name: Nightly Spring Tests
+name: Weekly Spring Tests
 
 on:
-  push:
-    paths:
-      - '.github/workflows/spring.yml'
   pull_request:
     paths:
+      - '.github/workflows/spring-template.yml'
       - '.github/workflows/spring.yml'
   schedule:
-  - cron: '0 4 * * *'
+  - cron: '0 4 * * 1'
   workflow_dispatch:
 
-env:
-  SPRING_PETCLINIC_PATH: ${{ github.workspace }}/spring-petclinic
-  SPRING_JAVA_VERSION: 21
-
-permissions:
-  contents: read # to fetch code (actions/checkout)
-
 jobs:
-  build-graalvm-and-spring:
-    name: Native Tests
-    runs-on: ubuntu-20.04
-    if: (github.event_name == 'schedule' && github.repository == 'oracle/graal') || (github.event_name != 'schedule')
-    steps:
-    - name: Checkout oracle/graal
-      uses: actions/checkout@v4
-    - name: Build GraalVM JDK
-      uses: ./.github/actions/build-graalvm
-      with:
-        java-version: ${{ env.SPRING_JAVA_VERSION }}
-    - name: Checkout spring-projects/spring-petclinic
-      uses: actions/checkout@v4
-      with:
-        repository: spring-projects/spring-petclinic
-        path: ${{ env.SPRING_PETCLINIC_PATH }}
-    - name: Run nativeTest in spring-petclinic
-      run: |
-        cd ${{ env.SPRING_PETCLINIC_PATH }}
-        ./gradlew nativeTest
+  call-template:
+    uses: './.github/workflows/spring-template.yml'

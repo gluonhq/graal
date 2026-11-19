@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,22 +30,25 @@ import java.util.Arrays;
 import java.util.EnumSet;
 
 import com.oracle.svm.core.ParsingReason;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.cpufeature.RuntimeCPUFeatureCheck;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.graal.aarch64.AArch64CPUFeatureRegionOp;
 import com.oracle.svm.graal.amd64.AMD64CPUFeatureRegionOp;
+import com.oracle.svm.shared.ReflectivelyAccessed;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 
+import jdk.graal.compiler.core.common.LIRKind;
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.lir.ConstantValue;
 import jdk.graal.compiler.lir.gen.LIRGenerator;
 import jdk.graal.compiler.nodeinfo.NodeCycles;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodeinfo.NodeSize;
-import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
@@ -53,10 +56,12 @@ import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
+import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.code.Architecture;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -65,7 +70,7 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
 
     @Override
     public void registerInvocationPlugins(Providers providers, GraphBuilderConfiguration.Plugins plugins, ParsingReason reason) {
-        InvocationPlugins.Registration r = new InvocationPlugins.Registration(plugins.getInvocationPlugins(), RuntimeCPUFeatureRegion.class, providers.getReplacements());
+        InvocationPlugins.Registration r = new InvocationPlugins.Registration(plugins.getInvocationPlugins(), RuntimeCPUFeatureRegion.class);
         r.register(new InvocationPlugin.RequiredInlineOnlyInvocationPlugin("enter", Enum.class) {
             @Override
             public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode arg0) {
@@ -93,8 +98,7 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
         r.register(new InvocationPlugin.RequiredInlineOnlyInvocationPlugin("leave", InvocationPlugin.Receiver.class) {
             @Override
             public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver) {
-                receiver.get(true);
-                b.add(new CPUFeatureRegionLeaveNode());
+                b.add(new CPUFeatureRegionLeaveNode(featuresFromRegion(receiver.get(true))));
                 return true;
             }
         });
@@ -104,16 +108,14 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
         Enum<?> firstEnum = constValueToEnum(b, first);
         Enum<?>[] restEnum = Arrays.stream(rest).map(n -> constValueToEnum(b, n)).toArray(Enum<?>[]::new);
         EnumSet<?> features = toEnumSet(firstEnum, restEnum);
-        b.add(new CPUFeatureRegionEnterNode(features));
-        b.addPush(JavaKind.Object, ConstantNode.forConstant(b.getSnippetReflection().forObject(RuntimeCPUFeatureRegion.INSTANCE), b.getMetaAccess()));
+        b.addPush(JavaKind.Object, new CPUFeatureRegionEnterNode(features, b.getSnippetReflection().forObject(RuntimeCPUFeatureRegion.INSTANCE)));
         return true;
     }
 
     private static boolean createRegionEnterSetNode(GraphBuilderContext b, ValueNode set) {
         GraalError.guarantee(set.isConstant(), "Must be a constant: %s", set);
         EnumSet<?> features = b.getSnippetReflection().asObject(EnumSet.class, set.asJavaConstant());
-        b.add(new CPUFeatureRegionEnterNode(features));
-        b.addPush(JavaKind.Object, ConstantNode.forConstant(b.getSnippetReflection().forObject(RuntimeCPUFeatureRegion.INSTANCE), b.getMetaAccess()));
+        b.addPush(JavaKind.Object, new CPUFeatureRegionEnterNode(features, b.getSnippetReflection().forObject(RuntimeCPUFeatureRegion.INSTANCE)));
         return true;
     }
 
@@ -122,9 +124,28 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
         return b.getSnippetReflection().asObject(Enum.class, node.asJavaConstant());
     }
 
+    /**
+     * The {@code enter} plugins push the {@link CPUFeatureRegionEnterNode} itself as the HIR object
+     * result of {@link RuntimeCPUFeatureRegion#enterSet(EnumSet)}. Therefore, the receiver of
+     * {@link RuntimeCPUFeatureRegion#leave()} carries the same feature set as the enter marker.
+     */
+    private static EnumSet<?> featuresFromRegion(ValueNode node) {
+        ValueNode region = GraphUtil.skipPi(node);
+        GraalError.guarantee(region instanceof CPUFeatureRegionEnterNode, "Unexpected CPU feature region receiver: %s", node);
+        return ((CPUFeatureRegionEnterNode) region).features;
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static EnumSet<?> toEnumSet(Enum first, Enum... rest) {
         return EnumSet.of(first, rest);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Enum<T>> EnumSet<T> checkedCast(EnumSet<?> features, Class<T> enumClass) {
+        if (!features.isEmpty()) {
+            GraalError.guarantee(enumClass.isInstance(features.iterator().next()), "Wrong enum set: %s vs. %s", enumClass, features);
+        }
+        return (EnumSet<T>) features;
     }
 
     // @formatter:off
@@ -138,23 +159,27 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
         public static final NodeClass<CPUFeatureRegionEnterNode> TYPE = NodeClass.create(CPUFeatureRegionEnterNode.class);
 
         private final EnumSet<?> features;
+        private final JavaConstant regionObject;
 
-        protected CPUFeatureRegionEnterNode(EnumSet<?> features) {
+        /**
+         * This node is both the fixed compiler marker for entering a CPU-feature region and the
+         * HIR object value returned by {@link RuntimeCPUFeatureRegion#enterSet(EnumSet)}. Reusing
+         * the node as the result lets the corresponding leave plugin recover the entered feature
+         * set from its receiver. The node still lowers to a concrete singleton object constant so
+         * that frame states have a valid LIR operand when the region local is live in debug info.
+         */
+        protected CPUFeatureRegionEnterNode(EnumSet<?> features, JavaConstant regionObject) {
             super(TYPE, StampFactory.objectNonNull());
             this.features = features;
-        }
-
-        @SuppressWarnings("unchecked")
-        private static <T extends Enum<T>> EnumSet<T> checkedCast(EnumSet<?> features, Class<T> enumClass) {
-            if (!features.isEmpty()) {
-                GraalError.guarantee(enumClass.isInstance(features.iterator().next()), "Wrong enum set: %s vs. %s", enumClass, features);
-            }
-            return (EnumSet<T>) features;
+            this.regionObject = regionObject;
         }
 
         @Override
         public void generate(NodeLIRBuilderTool tool) {
-            Architecture arch = ConfigurationValues.getTarget().arch;
+            LIRKind kind = tool.getLIRGeneratorTool().getLIRKind(stamp(NodeView.DEFAULT));
+            tool.setResult(this, new ConstantValue(kind, regionObject));
+
+            Architecture arch = SubstrateTarget.getArchitecture();
             if (arch instanceof AMD64) {
                 LIRGenerator generator = (LIRGenerator) tool.getLIRGeneratorTool();
                 generator.append(new AMD64CPUFeatureRegionOp.AMD64CPUFeatureRegionEnterOp(checkedCast(features, AMD64.CPUFeature.class)));
@@ -168,7 +193,7 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
     }
 
     // @formatter:off
-    @NodeInfo(nameTemplate = "CPUFeatureRegionLeave",
+    @NodeInfo(nameTemplate = "CPUFeatureRegionLeave {p#features}",
             cycles = NodeCycles.CYCLES_0,
             cyclesRationale = "no code is generated for this node",
             size = NodeSize.SIZE_0,
@@ -177,16 +202,23 @@ class RuntimeCPUFeatureRegionFeature implements InternalFeature {
     public static class CPUFeatureRegionLeaveNode extends FixedWithNextNode implements LIRLowerable {
         public static final NodeClass<CPUFeatureRegionLeaveNode> TYPE = NodeClass.create(CPUFeatureRegionLeaveNode.class);
 
-        protected CPUFeatureRegionLeaveNode() {
+        private final EnumSet<?> features;
+
+        /**
+         * Creates a leave marker for the feature set recovered from the matching enter node.
+         */
+        protected CPUFeatureRegionLeaveNode(EnumSet<?> features) {
             super(TYPE, StampFactory.forVoid());
+            this.features = features;
         }
 
         @Override
         public void generate(NodeLIRBuilderTool tool) {
-            Architecture arch = ConfigurationValues.getTarget().arch;
+            Architecture arch = SubstrateTarget.getArchitecture();
             if (arch instanceof AMD64) {
                 LIRGenerator generator = (LIRGenerator) tool.getLIRGeneratorTool();
-                generator.append(new AMD64CPUFeatureRegionOp.AMD64CPUFeatureRegionLeaveOp());
+                EnumSet<AMD64.CPUFeature> amd64Features = checkedCast(features, AMD64.CPUFeature.class);
+                generator.append(new AMD64CPUFeatureRegionOp.AMD64CPUFeatureRegionLeaveOp(amd64Features, ((AMD64) generator.target().arch).getFeatures()));
             } else if (arch instanceof AArch64) {
                 LIRGenerator generator = (LIRGenerator) tool.getLIRGeneratorTool();
                 generator.append(new AArch64CPUFeatureRegionOp.AArch64CPUFeatureRegionLeaveOp());
@@ -233,19 +265,26 @@ public final class RuntimeCPUFeatureRegion {
      * <p>
      * All arguments must be compile-time constant.
      */
-    public static native RuntimeCPUFeatureRegion enter(@ConstantNodeParameter Enum<?> arg0);
-
-    public static native RuntimeCPUFeatureRegion enterSet(@ConstantNodeParameter EnumSet<?> arg0);
+    public static native RuntimeCPUFeatureRegion enterSet(@ConstantNodeParameter EnumSet<?> features);
 
     /**
-     * @see #enter(Enum)
+     * @see #enterSet(EnumSet)
      */
+    @ReflectivelyAccessed
+    public static native RuntimeCPUFeatureRegion enter(@ConstantNodeParameter Enum<?> arg0);
+
+    /**
+     * @see #enterSet(EnumSet)
+     */
+    @ReflectivelyAccessed
     public static native <T extends Enum<T>> RuntimeCPUFeatureRegion enter(@ConstantNodeParameter Enum<T> arg0, @ConstantNodeParameter Enum<T> arg1);
 
     /**
-     * @see #enter(Enum)
+     * @see #enterSet(EnumSet)
      */
+    @ReflectivelyAccessed
     public static native <T extends Enum<T>> RuntimeCPUFeatureRegion enter(@ConstantNodeParameter Enum<T> arg0, @ConstantNodeParameter Enum<T> arg1, @ConstantNodeParameter Enum<T> arg2);
 
+    @ReflectivelyAccessed
     public native void leave();
 }

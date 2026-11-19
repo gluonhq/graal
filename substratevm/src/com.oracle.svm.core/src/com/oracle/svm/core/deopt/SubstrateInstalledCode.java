@@ -24,14 +24,14 @@
  */
 package com.oracle.svm.core.deopt;
 
-import jdk.graal.compiler.core.common.CompilationIdentifier;
-
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.RuntimeCodeCache;
+import com.oracle.svm.shared.Uninterruptible;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.vm.ci.code.InstalledCode;
+import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -93,6 +93,18 @@ public interface SubstrateInstalledCode {
      */
     void invalidate();
 
+    /**
+     * Indicates whether the code associated with this method should be subject to profiling again
+     * after invalidation.
+     */
+    void reprofile();
+
+    /**
+     * Records the reason for a deoptimization that invalidated this installed code, if this
+     * installed-code implementation exposes deoptimization counts through profiling metadata.
+     */
+    void recordDeoptimization(DeoptimizationReason reason);
+
     /** Whether the code represented by this object exists and could have live invocations. */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     boolean isAlive();
@@ -102,7 +114,7 @@ public interface SubstrateInstalledCode {
      * {@link #isValid()} returns {@code false}, {@link #isAlive()} returns {@code true}, and
      * {@link #getEntryPoint()} returns 0.
      */
-    void invalidateWithoutDeoptimization();
+    void makeNonEntrant();
 
     SubstrateSpeculationLog getSpeculationLog();
 

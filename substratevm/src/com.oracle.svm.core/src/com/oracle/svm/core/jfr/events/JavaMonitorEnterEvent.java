@@ -26,10 +26,9 @@
 
 package com.oracle.svm.core.jfr.events;
 
-import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.StackValue;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.jfr.HasJfrSupport;
 import com.oracle.svm.core.jfr.JfrEvent;
 import com.oracle.svm.core.jfr.JfrNativeEventWriter;
@@ -38,15 +37,17 @@ import com.oracle.svm.core.jfr.JfrNativeEventWriterDataAccess;
 import com.oracle.svm.core.jfr.JfrTicks;
 import com.oracle.svm.core.jfr.SubstrateJVM;
 
+import org.graalvm.word.impl.Word;
+
 public class JavaMonitorEnterEvent {
-    public static void emit(Object obj, long previousOwnerTid, long startTicks) {
+    public static void emit(Object obj, long previousOwnerTid, String previousOwnerVThreadName, long previousOwnerVThreadEpochId, long startTicks) {
         if (HasJfrSupport.get()) {
-            emit0(obj, previousOwnerTid, startTicks);
+            emit0(obj, previousOwnerTid, previousOwnerVThreadName, previousOwnerVThreadEpochId, startTicks);
         }
     }
 
     @Uninterruptible(reason = "Accesses a JFR buffer.")
-    public static void emit0(Object obj, long previousOwnerTid, long startTicks) {
+    public static void emit0(Object obj, long previousOwnerTid, String previousOwnerVThreadName, long previousOwnerVThreadEpochId, long startTicks) {
         long duration = JfrTicks.duration(startTicks);
         if (JfrEvent.JavaMonitorEnter.shouldEmit(duration)) {
             JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
@@ -56,9 +57,9 @@ public class JavaMonitorEnterEvent {
             JfrNativeEventWriter.putLong(data, startTicks);
             JfrNativeEventWriter.putLong(data, duration);
             JfrNativeEventWriter.putEventThread(data);
-            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.JavaMonitorEnter, 0));
+            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.JavaMonitorEnter));
             JfrNativeEventWriter.putClass(data, obj.getClass());
-            JfrNativeEventWriter.putLong(data, previousOwnerTid);
+            JfrNativeEventWriter.putThread(data, previousOwnerTid, previousOwnerVThreadName, previousOwnerVThreadEpochId);
             JfrNativeEventWriter.putLong(data, Word.objectToUntrackedPointer(obj).rawValue());
             JfrNativeEventWriter.endSmallEvent(data);
         }

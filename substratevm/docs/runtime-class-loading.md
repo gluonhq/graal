@@ -1,0 +1,132 @@
+# Run-Time Class Loading
+
+Run-time class loading, also called Crema, allows `ClassLoader.defineClass` to work at run time, creating new `DynamicHub`s.
+It is enabled at build time with the `-H:+RuntimeClassLoading` option.
+
+## Extra Setup
+
+While `-H:+RuntimeClassLoading` is sufficient to allow `defineClass` to work, additional setup may be needed depending on the specific use case.
+* If jar files are to be loaded with a `URLClassLoader`, register the `sun.net.www.protocol.jar.Handler` constructor in reachability metadata.
+* If JDK classes need to be loaded at run time (e.g. to allow a dynamically loaded app to access JDK classes not in the image),
+  set `-H:+AllowJRTFileSystem` at build time, and ensure the `java.home` system property points to a JDK at run time.
+  For example, pass `-Djava.home=...` when starting the native image.
+  Note that the only requirement for this directory is to contain a `lib/modules` file with the necessary classes.
+* If classes from the system (a.k.a. "App") class loader need to be loaded at run time, use `--initialize-at-run-time=jdk.internal.loader.ClassLoaders` at build time, and set the `java.class.path` system property at run time.
+
+Run-time-loaded classes can link to other run-time-loaded classes or to build-time-loaded classes.
+For build-time-loaded classes, the native image build process may have removed some methods or static fields.
+Run-time class loading cannot reload a class that was already partially included into the native image at build time.
+This will result in errors if run-time-loaded classes try to use such removed methods or static fields.
+A typical way to address this is to use `-H:Preserve=package=...` at build time to ensure all methods and fields of a package are included in the native image.
+
+### Preservation Option Argument Files
+
+You can keep preservation selections in an [argument file with option-value continuations](../../docs/reference-manual/native-image/BuildOptions.md#argument-files):
+
+```text
+# native-image: value-continuations
+
+# Library scope
+-H:Preserve=...
+    package=my.library.*
+    module=java.logging
+```
+
+Pass this file as `native-image @preserve.args ...`.
+The driver expands the section into `-H:Preserve=package=my.library.*,module=java.logging`.
+`Preserve` remains an application build choice and cannot be embedded in a library's _native-image.properties_.
+
+### Runtime Compilation Mode Options
+
+Use `-H:+GraalJITCompileAtRuntime` at build time to include Ristretto in the image for just-in-time (JIT) compilation of run-time-loaded bytecode.
+This also makes the additional run-time options described below available in the resulting image.
+
+Ristretto-enabled images recognize the HotSpot-style run-time options `-Xint`, `-Xmixed`, and
+`-Xcomp`. `-Xint` disables run-time compilation and uses the interpreter; `-Xmixed` enables
+threshold-based mixed execution; and `-Xcomp` compiles before first invocation. If more than one
+of these mode options is present, they are processed in command-line order and the last one wins.
+
+`-Xbatch` is independent of the selected mode. It makes callers wait for scheduled compilation,
+including on-stack replacement compilation.
+If run-time compilation is disabled, execution remains in the interpreter.
+Compiler bailouts normally fall back to the interpreter.
+Unexpected compiler exceptions and bailouts configured as failures through `CompilationBailoutAsFailure` follow the configured compilation-failure policy.
+
+### Compilation Failure Options
+
+In images that include the Graal runtime compiler, `-XX:+AbortVMOnCompilationFailure` sets the compiler's `CompilationFailureAction` option to `ExitVM`, overriding any earlier setting.
+`-XX:-AbortVMOnCompilationFailure` sets it to `Silent` only if the most recent `AbortVMOnCompilationFailure` flag on the same command line was positive and no explicit `CompilationFailureAction` setting followed that flag.
+Otherwise, the negative flag has no effect.
+Explicit settings of `CompilationFailureAction` through
+`-Djdk.graal.CompilationFailureAction=`, `-Dgraal.CompilationFailureAction=`, or
+`-XX:CompilationFailureAction=` take effect in command-line order.
+For example, `-XX:+AbortVMOnCompilationFailure -Dgraal.CompilationFailureAction=Diagnose -XX:-AbortVMOnCompilationFailure` leaves the action as `Diagnose`, while `-Dgraal.CompilationFailureAction=Print -XX:+AbortVMOnCompilationFailure` selects `ExitVM`.
+Images that do not include the Graal runtime compiler handle these flags according to their normal unrecognized-option policy.
+When runtime compilation is present, these options use the existing Graal compiler failure handling, including Ristretto and Truffle compilation.
+
+### Runtime VM Options
+
+`-XX:+IgnoreUnrecognizedVMOptions` discards unknown VM options, including options that precede it.
+For JNI VM creation, an incoming `JavaVMInitArgs.ignoreUnrecognized=true` also enables this policy,
+and `-XX:-IgnoreUnrecognizedVMOptions` does not disable it. Otherwise, the final `+` or `-` setting
+determines the policy. Malformed values of options parsed by Native Image still fail.
+For Java main entry points with strict runtime option handling enabled
+(`-H:+StrictRuntimeJavaOptions`), arguments after the first `--` remain application arguments.
+
+`-XX:±UnlockDiagnosticVMOptions` is supported for HotSpot command-line compatibility. Native Image
+does not currently have diagnostic warnings to unlock.
+
+## Resource URLs
+The semantics of the internal `resource:` URL depends on `ClassForNameRespectsClassLoader`:
+* `-H:-ClassForNameRespectsClassLoader`: the host part of the URL is the module name, matching the legacy resource lookup scheme.
+  For example, `resource://java.base/0!/module-info.class`.
+* `-H:+ClassForNameRespectsClassLoader`: the user info part of the URL is the module name and the host part of the URL is the resource loader key (`boot`, `platform`, `app`, or `synthetic-N`).
+  For example, `resource://java.base@boot/0!/module-info.class`.
+  The loader is the discriminator required to preserve Java class-loader resource lookup behavior.
+  This is needed for module-reader lookups that cross the `ModuleReader.find(String)` interface as a `URI`: the URI string must preserve the module identity because URL stream handler state does not survive a `URL` to `URI` to `URL` round trip.
+
+The path part of a `resource:` URL has the form `/<root-id>!/<resource-path>`.
+The root id is a dense id for the source root that provided the resource within the selected resource loader.
+For class-path resources, the source root is a class-path entry such as a jar file or an exploded classes directory.
+For example, if the application loader sees this class path:
+
+```text
+project-foo.jar
+project-bar.jar
+```
+
+then Native Image assigns dense root ids for that loader:
+
+```text
+project-foo.jar -> 0
+project-bar.jar -> 1
+```
+
+The root id is preserved when a resource URL is converted to a `URI` and then to a `Path`, so resource file-system operations continue to observe the resource as it appears in that source root.
+
+This matters for directory resources that exist in more than one source root.
+For example, if two class-path entries contain different `META-INF/micronaut/` directories, resource lookup returns one URL per directory variant, such as:
+
+```text
+resource://app/0!/META-INF/micronaut/
+resource://app/1!/META-INF/micronaut/
+```
+
+If user code converts each URL to a `Path` and walks it with `Files.walk`, the Native Image resource file system lists the selected directory variant's content.
+It does not list the merged children from all roots for every URL.
+This matches HotSpot-style resource lookup behavior where each directory resource URL represents the contents from one class-path root.
+
+## Current Limitations
+* Parallel class loading is explicitly disabled and not supported.
+* Assertion status depends on whether you build with `-H:-StrictRuntimeJavaOptions` or
+  `-H:+StrictRuntimeJavaOptions`:
+  * Build-time-initialized classes use the assertion status configured when the image is built.
+    Runtime `-ea`, `-da`, `-esa`, and `-dsa` options never change their status.
+  * Runtime-initialized image classes use the build-time `-ea`, `-da`, `-esa`, and `-dsa`
+    options when you build with `-H:-StrictRuntimeJavaOptions`.
+    When you build with `-H:+StrictRuntimeJavaOptions`, runtime `-ea`, `-da`, `-esa`, and `-dsa`
+    options control their status instead.
+  * Runtime-loaded classes use runtime assertion options.
+    The runtime assertion options are supported only when the image was built with
+    `-H:+StrictRuntimeJavaOptions`.
+* Methods or static fields removed by analysis from a class included in the image have no fallback and cause an error if run-time-loaded code uses them.

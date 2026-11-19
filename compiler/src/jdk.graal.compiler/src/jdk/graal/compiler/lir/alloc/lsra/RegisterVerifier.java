@@ -252,6 +252,9 @@ final class RegisterVerifier {
 
             // check if input operands are correct
             op.visitEachInput(useConsumer);
+            // Verify the incoming location because @UseKill must still be readable when the
+            // instruction starts.
+            op.visitEachUseKill(useConsumer);
             // invalidate all caller save registers at calls
             if (op.destroysCallerSavedRegisters()) {
                 for (Register r : allocator.getRegisterAllocationConfig().getRegisterConfig().getCallerSaveRegisters()) {
@@ -261,6 +264,9 @@ final class RegisterVerifier {
             op.visitEachAlive(useConsumer);
             // set temp operands (some operations use temp operands also as output operands, so
             // can't set them null)
+            // Process the same operands as kills so the register is no longer considered available
+            // after this instruction.
+            op.visitEachUseKill(defConsumer);
             op.visitEachTemp(defConsumer);
             // set output operands
             op.visitEachOutput(defConsumer);

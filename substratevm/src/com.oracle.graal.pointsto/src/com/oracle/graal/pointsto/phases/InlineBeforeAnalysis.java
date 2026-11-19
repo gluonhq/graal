@@ -27,12 +27,14 @@ package com.oracle.graal.pointsto.phases;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.flow.AnalysisParsedGraph;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.util.ClassUtil;
 
 import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.DebugOptions;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.printer.GraalDebugHandlersFactory;
 
 /**
@@ -59,10 +61,13 @@ public class InlineBeforeAnalysis {
 
     @SuppressWarnings("try")
     public static StructuredGraph decodeGraph(BigBang bb, AnalysisMethod method, AnalysisParsedGraph analysisParsedGraph) {
+        // The decoded graph may be re-encoded for layer persistence, but the optimization log is
+        // not consumed on that path.
+        OptionValues options = bb.getOptions().derive(DebugOptions.OptimizationLog, null);
         DebugContext.Description description = new DebugContext.Description(method, ClassUtil.getUnqualifiedName(method.getClass()) + ":" + method.getId());
-        DebugContext debug = new DebugContext.Builder(bb.getOptions(), new GraalDebugHandlersFactory(bb.getSnippetReflectionProvider())).description(description).build();
+        DebugContext debug = new DebugContext.Builder(options, new GraalDebugHandlersFactory(bb.getSnippetReflectionProvider())).description(description).build();
 
-        StructuredGraph result = new StructuredGraph.Builder(bb.getOptions(), debug, bb.getHostVM().allowAssumptions(method))
+        StructuredGraph result = new StructuredGraph.Builder(options, debug, bb.getHostVM().allowAssumptions(method))
                         .method(method)
                         .trackNodeSourcePosition(analysisParsedGraph.getEncodedGraph().trackNodeSourcePosition())
                         .recordInlinedMethods(analysisParsedGraph.getEncodedGraph().isRecordingInlinedMethods())

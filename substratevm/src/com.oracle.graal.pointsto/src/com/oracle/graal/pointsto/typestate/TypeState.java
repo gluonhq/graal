@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,13 +32,24 @@ import java.util.stream.StreamSupport;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.flow.PrimitiveComparison;
+import com.oracle.graal.pointsto.flow.TypeFlow;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 
-public abstract class TypeState {
+/**
+ * This class and its subclasses represent the sets of objects/types/primitive values propagated
+ * through {@link TypeFlow} nodes during the run of {@link PointsToAnalysis}. If the
+ * {@link TypeState} hierarchy is changed, {@link PointsToStats} might have to be updated to reflect
+ * that.
+ * 
+ * @see TypeFlow
+ * @see PointsToStats
+ */
+public abstract sealed class TypeState permits EmptyTypeState, NullTypeState, PrimitiveTypeState, SingleTypeState, MultiTypeState {
 
     /** Get the number of types. */
     public abstract int typesCount();
@@ -61,8 +72,23 @@ public abstract class TypeState {
         return StreamSupport.stream(types(bb).spliterator(), false);
     }
 
+    /**
+     * A convenience method that allows to iterate over type ids without having to look up the
+     * corresponding {@link AnalysisType} instances as in some cases, the type ids are enough to
+     * implement the given operation.
+     */
+    public abstract Iterator<Integer> typeIdsIterator();
+
     /** Returns true if this type state contains the type, otherwise it returns false. */
     public abstract boolean containsType(AnalysisType exactType);
+
+    /**
+     * A convenience method using {@code typeId} which avoids the lookup of the corresponding
+     * {@link AnalysisType} in case when it is not needed otherwise.
+     *
+     * @see #containsType(AnalysisType)
+     */
+    public abstract boolean containsType(int typeId);
 
     /* Objects accessing methods. */
 
@@ -109,12 +135,16 @@ public abstract class TypeState {
         return this == EmptyTypeState.SINGLETON;
     }
 
+    public final boolean isNotEmpty() {
+        return !isEmpty();
+    }
+
     public boolean isNull() {
         return this == NullTypeState.SINGLETON;
     }
 
     public boolean isPrimitive() {
-        return this instanceof AnyPrimitiveTypeState;
+        return false;
     }
 
     public abstract boolean canBeNull();
@@ -145,16 +175,20 @@ public abstract class TypeState {
         return NullTypeState.SINGLETON;
     }
 
-    public static TypeState defaultValueForKind(JavaKind javaKind) {
+    public static TypeState defaultValueForKind(PointsToAnalysis bb, JavaKind javaKind) {
         if (javaKind.isPrimitive()) {
-            return TypeState.forPrimitiveConstant(0);
+            return TypeState.forPrimitiveConstant(bb, 0);
         } else {
             return TypeState.forNull();
         }
     }
 
-    public static TypeState forPrimitiveConstant(long value) {
-        return PrimitiveConstantTypeState.forValue(value);
+    public static TypeState forPrimitiveConstant(PointsToAnalysis bb, long value) {
+        return PrimitiveConstantTypeState.forValue(bb, value);
+    }
+
+    public static TypeState forBoolean(PointsToAnalysis bb, boolean value) {
+        return value ? TypeState.forPrimitiveConstant(bb, 1) : TypeState.forPrimitiveConstant(bb, 0);
     }
 
     public static TypeState anyPrimitiveState() {
@@ -206,14 +240,9 @@ public abstract class TypeState {
             return s1;
         } else if (s2.isNull()) {
             return s1.forCanBeNull(bb, true);
-        } else if (s1 instanceof PrimitiveConstantTypeState c1 && s2 instanceof PrimitiveConstantTypeState c2 && c1.getValue() == c2.getValue()) {
-            return s1;
-        } else if (s1.isPrimitive()) {
-            assert s2.isPrimitive() : s2;
-            return TypeState.anyPrimitiveState();
-        } else if (s2.isPrimitive()) {
-            assert s1.isPrimitive() : s1;
-            return TypeState.anyPrimitiveState();
+        } else if (s1.isPrimitive() || s2.isPrimitive()) {
+            assert s1 instanceof PrimitiveTypeState && s2 instanceof PrimitiveTypeState : "Both type states should be primitive: " + s1 + " " + s2;
+            return ((PrimitiveTypeState) s1).forUnion((PrimitiveTypeState) s2);
         } else if (s1 instanceof SingleTypeState && s2 instanceof SingleTypeState) {
             return bb.analysisPolicy().doUnion(bb, (SingleTypeState) s1, (SingleTypeState) s2);
         } else if (s1 instanceof SingleTypeState && s2 instanceof MultiTypeState) {
@@ -268,6 +297,16 @@ public abstract class TypeState {
             return bb.analysisPolicy().doSubtraction(bb, (MultiTypeState) s1, (MultiTypeState) s2);
         }
     }
+
+    /** Returns a type state representing left filtered with respect to the comparison and right. */
+    public static TypeState filter(TypeState left, PrimitiveComparison comparison, TypeState right, boolean isUnsigned) {
+        assert left.isPrimitive() || left.isEmpty() : left;
+        assert right.isPrimitive() || right.isEmpty() : right;
+        if (left.isEmpty() || right.isEmpty()) {
+            return forEmpty();
+        }
+        return ((PrimitiveTypeState) left).filter(comparison, isUnsigned, (PrimitiveTypeState) right);
+    }
 }
 
 final class EmptyTypeState extends TypeState {
@@ -293,6 +332,11 @@ final class EmptyTypeState extends TypeState {
     }
 
     @Override
+    public Iterator<Integer> typeIdsIterator() {
+        return Collections.emptyIterator();
+    }
+
+    @Override
     protected Iterator<AnalysisObject> objectsIterator(BigBang bb) {
         return Collections.emptyIterator();
     }
@@ -304,6 +348,11 @@ final class EmptyTypeState extends TypeState {
 
     @Override
     public boolean containsType(AnalysisType exactType) {
+        return false;
+    }
+
+    @Override
+    public boolean containsType(int typeId) {
         return false;
     }
 
@@ -356,6 +405,11 @@ final class NullTypeState extends TypeState {
     }
 
     @Override
+    public Iterator<Integer> typeIdsIterator() {
+        return Collections.emptyIterator();
+    }
+
+    @Override
     protected Iterator<AnalysisObject> objectsIterator(BigBang bb) {
         return Collections.emptyIterator();
     }
@@ -367,6 +421,11 @@ final class NullTypeState extends TypeState {
 
     @Override
     public boolean containsType(AnalysisType exactType) {
+        return false;
+    }
+
+    @Override
+    public boolean containsType(int typeId) {
         return false;
     }
 

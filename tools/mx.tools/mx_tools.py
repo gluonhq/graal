@@ -1,7 +1,7 @@
 #
 # mx_tools.py - the GraalVM specific commands
 #
-# Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # This code is free software; you can redistribute it and/or modify it
@@ -26,11 +26,8 @@
 #
 
 import os
-from os.path import exists, join
+from os.path import exists
 import re
-import tempfile
-import shutil
-import glob
 
 import mx
 
@@ -43,6 +40,8 @@ import mx_benchmark
 import mx_sdk_vm
 
 import sys
+
+from mx_sdk_shaded import ShadedLibraryProject  # pylint: disable=unused-import
 
 if sys.version_info[0] < 3:
     from urlparse import urljoin
@@ -64,7 +63,7 @@ class JMHRunnerToolsBenchmarkSuite(mx_benchmark.JMHRunnerBenchmarkSuite):
         return "tools"
 
     def extraVmArgs(self):
-        return ['-XX:-UseJVMCIClassLoader'] + super(JMHRunnerToolsBenchmarkSuite, self).extraVmArgs()
+        return ['-XX:-UseJVMCIClassLoader'] + super().extraVmArgs()
 
 mx_benchmark.add_bm_suite(JMHRunnerToolsBenchmarkSuite())
 
@@ -74,6 +73,8 @@ def javadoc(args):
     if not args:
         projectNames = []
         for p in mx.projects(True, True):
+            if getattr(p, "noMavenJavadoc", False):
+                continue
             projectNames.append(p.name)
         mx.javadoc(['--unified', '--disallow-all-warnings', '--projects', ','.join(projectNames)], includeDeps=False)
     else:
@@ -81,9 +82,10 @@ def javadoc(args):
     javadocDir = os.sep.join([_suite.dir, 'javadoc'])
     index = os.sep.join([javadocDir, 'index.html'])
     if exists(index):
-        indexContent = open(index, 'r').read()
-        new_file = open(index, "w")
-        new_file.write(indexContent)
+        with open(index, encoding='utf-8') as existing_index:
+            indexContent = existing_index.read()
+        with open(index, "w", encoding='utf-8') as new_file:
+            new_file.write(indexContent)
     checkLinks(javadocDir)
 
 def checkLinks(javadocDir):
@@ -93,7 +95,8 @@ def checkLinks(javadocDir):
         for f in files:
             if f.endswith('.html'):
                 html = os.path.join(root, f)
-                content = open(html, 'r').read()
+                with open(html, encoding='utf-8') as html_file:
+                    content = html_file.read()
                 for url in href.findall(content):
                     full = urljoin(html, url)
                     sectionIndex = full.find('#')
@@ -122,9 +125,10 @@ def checkLinks(javadocDir):
             mx.warn('Referenced file ' + referencedfile + ' does not exist. Referenced from ' + sections[0][0])
             err = True
         else:
-            content = open(referencedfile, 'r').read()
+            with open(referencedfile, encoding='utf-8') as referenced:
+                content = referenced.read()
             for path, s in sections:
-                if not s is None:
+                if s is not None:
                     s = s.replace("%3C", "&lt;")
                     s = s.replace("%3E", "&gt;")
                     whereName = content.find('name="' + s + '"')
@@ -136,61 +140,10 @@ def checkLinks(javadocDir):
     if err:
         mx.abort('There are wrong references in Javadoc')
 
-def lsp_types_gen(args):
-    """generate Language Server Protocol types"""
-    generators_dir = join(_suite.dir, 'generators')
-    out = join(_suite.get_output_root(), 'lsp-types')
-    if exists(out):
-        mx.rmtree(out)
-    mx.run(['npm', 'install'], nonZeroIsFatal=True, cwd=generators_dir)
-    mx.run(['npm', 'run', 'compile'], nonZeroIsFatal=True, cwd=generators_dir)
-    repository = open(join(generators_dir, 'resources', 'LSP_REPOSITORY'), 'r').read()
-    branch = open(join(generators_dir, 'resources', 'LSP_VERSION'), 'r').read()
-    tmpdir = tempfile.mkdtemp()
-    catfile = open(join(tmpdir, 'lsp.ts'), 'w')
-    mx.run(['git', 'clone', '-b', branch, repository, 'lib'], nonZeroIsFatal=True, cwd=tmpdir)
-    spec_files = glob.glob(join(tmpdir, 'lib/types/src/*.ts'))
-    spec_files.extend(glob.glob(join(tmpdir, 'lib/jsonrpc/src/*.ts')))
-    spec_files.extend(glob.glob(join(tmpdir, 'lib/protocol/src/*.ts')))
-    for file_name in spec_files:
-        with open(file_name, 'r') as input_file:
-            shutil.copyfileobj(input_file, catfile)
-        catfile.flush()
-    pkg = open(join(generators_dir, 'resources', 'LSP_PACKAGE'), 'r').read()
-    mx.run(['node', 'out/generator.js', '--source', catfile.name, '--target', out, '--suffixNested', '--pkg', pkg, '--license', 'resources/LSP_license.txt'], nonZeroIsFatal=True, cwd=generators_dir)
-    mx.rmtree(tmpdir)
-    mx.run(['patch', '-p1', '-s', '-i', join(generators_dir, 'resources', 'LSP_patch.diff')], nonZeroIsFatal=True, cwd=out)
-    mx.log('LSP types generated to: ' + out)
-
-def dap_types_gen(args):
-    """generate Debug Adapter Protocol types"""
-    generators_dir = join(_suite.dir, 'generators')
-    out = join(_suite.get_output_root(), 'dap-types')
-    if exists(out):
-        mx.rmtree(out)
-    mx.run(['npm', 'install'], nonZeroIsFatal=True, cwd=generators_dir)
-    mx.run(['npm', 'run', 'compile'], nonZeroIsFatal=True, cwd=generators_dir)
-    repository = open(join(generators_dir, 'resources', 'DAP_REPOSITORY'), 'r').read()
-    tmpdir = tempfile.mkdtemp()
-    catfile = open(join(tmpdir, 'dap.ts'), 'wt')
-    mx.run(['git', 'clone', repository, 'lib'], nonZeroIsFatal=True, cwd=tmpdir)
-    spec_files = glob.glob(join(tmpdir, 'lib/protocol/src/*.ts'))
-    for file_name in spec_files:
-        with open(file_name, 'rt') as input_file:
-            for line in input_file:
-                catfile.write(line.replace('// type:', 'type:').replace('// command:', 'command:').replace('// event:', 'event:'))
-        catfile.flush()
-    pkg = open(join(generators_dir, 'resources', 'DAP_PACKAGE'), 'r').read()
-    mx.run(['node', 'out/generator.js', '--source', catfile.name, '--target', out, '--prefixNested', '--pkg', pkg, '--license', 'resources/DAP_license.txt'], nonZeroIsFatal=True, cwd=generators_dir)
-    mx.rmtree(tmpdir)
-    mx.run(['patch', '-p1', '-s', '-i', join(generators_dir, 'resources', 'DAP_patch.diff')], nonZeroIsFatal=True, cwd=out)
-    mx.log('DAP types generated to: ' + out)
-
-
 class ToolsUnittestConfig(mx_unittest.MxUnittestConfig):
 
     def __init__(self):
-        super(ToolsUnittestConfig, self).__init__('tools')
+        super().__init__('tools')
 
     def apply(self, config):
         vmArgs, mainClass, mainClassArgs = config
@@ -198,13 +151,25 @@ class ToolsUnittestConfig(mx_unittest.MxUnittestConfig):
         # in turn allows us to dynamically open fields/methods to reflection.
         vmArgs = vmArgs + ['--add-exports=java.base/jdk.internal.module=ALL-UNNAMED']
         vmArgs = vmArgs + ['--add-modules=ALL-MODULE-PATH']
+        # The tools unittests use internals
+        mainClassArgs.extend(['-JUnitOpenPackages', 'com.oracle.truffle.tools.chromeinspector/*=ALL-UNNAMED'])
+        mainClassArgs.extend(['-JUnitOpenPackages', 'com.oracle.truffle.tools.coverage/*=ALL-UNNAMED'])
+        mainClassArgs.extend(['-JUnitOpenPackages', 'com.oracle.truffle.tools.dap/*=ALL-UNNAMED'])
+        mainClassArgs.extend(['-JUnitOpenPackages', 'org.graalvm.tools.insight/*=ALL-UNNAMED'])
+        mainClassArgs.extend(['-JUnitOpenPackages', 'org.graalvm.tools.insight.heap/*=ALL-UNNAMED'])
+        mainClassArgs.extend(['-JUnitOpenPackages', 'org.graalvm.tools.lsp/*=ALL-UNNAMED'])
         return (vmArgs, mainClass, mainClassArgs)
 
 mx_unittest.register_unittest_config(ToolsUnittestConfig())
 
 def _tools_gate_runner(args, tasks):
     with Task('Tools Signature Tests', tasks) as t:
-        if t: sigtest(['--check', 'binary'])
+        if t:
+            jdk = mx.get_jdk(tag=mx.DEFAULT_JDK_TAG)
+            if jdk.javaCompliance == '25':
+                sigtest(['--check', 'all'])
+            else:
+                sigtest(['--check', 'binary'])
     with Task('Tools UnitTests', tasks) as t:
         if t: unittest(['--suite', 'tools', '--enable-timing', '--verbose', '--max-class-failures=25'])
 
@@ -306,6 +271,4 @@ mx_sdk_vm.register_graalvm_component(mx_sdk_vm.GraalVmTool(
 mx.update_commands(_suite, {
     'javadoc' : [javadoc, ''],
     'gate' : [mx_gate.gate, ''],
-    'lsp-types-gen' : [lsp_types_gen, ''],
-    'dap-types-gen' : [dap_types_gen, ''],
 })

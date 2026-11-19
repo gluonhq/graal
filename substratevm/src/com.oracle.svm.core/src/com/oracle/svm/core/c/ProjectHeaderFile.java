@@ -29,21 +29,23 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 @AutomaticallyRegisteredFeature
-class RegisterSVMTestingResolverFeature extends ProjectHeaderFile.RegisterFallbackResolverFeature {
+class RegisterSVMTestingResolverFeature implements InternalFeature {
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
@@ -62,19 +64,6 @@ class RegisterSVMTestingResolverFeature extends ProjectHeaderFile.RegisterFallba
 }
 
 public final class ProjectHeaderFile {
-
-    /**
-     * Base class for fall back resolvers registration. Extending this class will ensure that the
-     * {@link ProjectHeaderFile} will be added as a dependency.
-     */
-    public abstract static class RegisterFallbackResolverFeature implements InternalFeature {
-
-        @Override
-        public List<Class<? extends Feature>> getRequiredFeatures() {
-            return Collections.singletonList(ProjectHeaderFileHeaderResolversRegistryFeature.class);
-        }
-    }
-
     /**
      * Resolves the path to a C header file that is located in a Substrate VM project.
      */
@@ -88,6 +77,7 @@ public final class ProjectHeaderFile {
      * search the location(s) specified by CLibraryPath, then registered fall back locations if any.
      */
     @AutomaticallyRegisteredImageSingleton
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
     public static class HeaderResolversRegistry {
 
         /** Register additional resolvers. */
@@ -127,10 +117,12 @@ public final class ProjectHeaderFile {
             }
 
             /* If the header was not found at any of the specified locations an error is thrown. */
-            throw VMError.shouldNotReachHere("Header file " + headerFile +
-                            " not found at main search location(s): \n" + String.join("\n", mainResult.locations) +
-                            (fallbackLocations.size() > 0 ? "\n or any of the fallback locations: \n" + String.join("\n", fallbackLocations) : "") +
-                            "\n Use option -H:CLibraryPath to specify header file search locations.");
+            throw VMError.shouldNotReachHere("Header file " + headerFile + " not found at main search location(s): " +
+                            System.lineSeparator() + String.join(System.lineSeparator(), mainResult.locations) +
+                            (!fallbackLocations.isEmpty()
+                                            ? System.lineSeparator() + " or any of the fallback locations: " + System.lineSeparator() + String.join(System.lineSeparator(), fallbackLocations)
+                                            : "") +
+                            System.lineSeparator() + " Use option -H:CLibraryPath to specify header file search locations.");
         }
 
     }

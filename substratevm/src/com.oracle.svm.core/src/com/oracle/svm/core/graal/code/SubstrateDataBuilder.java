@@ -24,14 +24,13 @@
  */
 package com.oracle.svm.core.graal.code;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.nio.ByteBuffer;
 
 import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.shared.config.ObjectLayout;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 
 import jdk.graal.compiler.code.DataSection.Data;
@@ -53,7 +52,7 @@ public class SubstrateDataBuilder extends DataBuilder {
             return new ObjectData(vmConstant);
         } else if (JavaConstant.isNull(constant)) {
             if (SubstrateObjectConstant.isCompressed((JavaConstant) constant)) {
-                size = ConfigurationValues.getObjectLayout().getReferenceSize();
+                size = ObjectLayout.singleton().getReferenceSize();
             } else {
                 size = FrameAccess.uncompressedReferenceSize();
             }
@@ -70,9 +69,8 @@ public class SubstrateDataBuilder extends DataBuilder {
         private final VMConstant constant;
 
         protected ObjectData(VMConstant constant) {
-            super(ConfigurationValues.getObjectLayout().getReferenceSize(), ConfigurationValues.getObjectLayout().getReferenceSize());
-            assert ((CompressibleConstant) constant).isCompressed() == ReferenceAccess.singleton()
-                            .haveCompressedReferences() : "Constant object references in compiled code must be compressed (base-relative)";
+            super(ObjectLayout.singleton().getReferenceSize(), ObjectLayout.singleton().getReferenceSize());
+            assert ((CompressibleConstant) constant).isCompressed() : "Constant object references in compiled code must be compressed (base-relative)";
             this.constant = constant;
         }
 
@@ -102,6 +100,6 @@ public class SubstrateDataBuilder extends DataBuilder {
     public int getMaxSupportedAlignment() {
         // See RuntimeCodeInstaller.prepareCodeMemory
         // Code and data are allocated in one go
-        return SubstrateOptions.codeAlignment();
+        return SubstrateOptions.runtimeCodeAlignment();
     }
 }

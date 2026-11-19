@@ -26,14 +26,15 @@ package com.oracle.svm.core.jfr;
 
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
 import com.oracle.svm.core.jdk.UninterruptibleUtils;
 import com.oracle.svm.core.jdk.UninterruptibleUtils.CharReplacer;
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.thread.JavaThreads;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * A JFR event writer that does not allocate any objects in the Java heap. Can only be used from
@@ -94,13 +95,13 @@ public final class JfrNativeEventWriter {
 
     /**
      * See {@link #beginSmallEvent}.
-     * 
+     *
      * @return {@link JfrEventWriteStatus#Success} or {@link JfrEventWriteStatus#Failure}.
      */
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
     public static JfrEventWriteStatus endSmallEvent(JfrNativeEventWriterData data) {
         JfrEventWriteStatus status = endEvent(data, false);
-        VMError.guarantee(status != JfrEventWriteStatus.RetryLarge);
+        assert status != JfrEventWriteStatus.RetryLarge;
         return status;
     }
 
@@ -213,11 +214,11 @@ public final class JfrNativeEventWriter {
         } else if (string.isEmpty()) {
             putByte(data, JfrChunkFileWriter.StringEncoding.EMPTY_STRING.getValue());
         } else {
-            int mUTF8Length = UninterruptibleUtils.String.modifiedUTF8Length(string, false, replacer);
+            int utf8Length = UninterruptibleUtils.String.utf8Length(string, replacer);
             putByte(data, JfrChunkFileWriter.StringEncoding.UTF8_BYTE_ARRAY.getValue());
-            putInt(data, mUTF8Length);
-            if (ensureSize(data, mUTF8Length)) {
-                Pointer newPosition = UninterruptibleUtils.String.toModifiedUTF8(string, data.getCurrentPos(), data.getEndPos(), false, replacer);
+            putInt(data, utf8Length);
+            if (ensureSize(data, utf8Length)) {
+                Pointer newPosition = UninterruptibleUtils.String.toUTF8(string, data.getCurrentPos(), data.getEndPos(), replacer);
                 data.setCurrentPos(newPosition);
             }
         }
@@ -234,7 +235,7 @@ public final class JfrNativeEventWriter {
             putByte(data, JfrChunkFileWriter.StringEncoding.UTF8_BYTE_ARRAY.getValue());
             putInt(data, numBytes);
             if (ensureSize(data, numBytes)) {
-                UnmanagedMemoryUtil.copy(utf8Buffer, data.getCurrentPos(), WordFactory.unsigned(numBytes));
+                UnmanagedMemoryUtil.copy(utf8Buffer, data.getCurrentPos(), Word.unsigned(numBytes));
                 data.setCurrentPos(data.getCurrentPos().add(numBytes));
             }
         }
@@ -242,20 +243,35 @@ public final class JfrNativeEventWriter {
 
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
     public static void putEventThread(JfrNativeEventWriterData data) {
-        putThread(data, SubstrateJVM.getCurrentThreadId());
+        putThread(data, JavaThreads.getCurrentThreadOrNull());
     }
 
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
     public static void putThread(JfrNativeEventWriterData data, Thread thread) {
-        if (thread == null) {
-            putThread(data, 0L);
-        } else {
-            putThread(data, SubstrateJVM.getThreadId(thread));
-        }
+        long threadId = Target_jdk_jfr_internal_JVM.getThreadId(thread);
+        putRegisteredThreadId(data, threadId);
     }
 
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
-    public static void putThread(JfrNativeEventWriterData data, long threadId) {
+    public static void putThread(JfrNativeEventWriterData data, long threadId, String vthreadName, long vthreadEpochId) {
+        if (vthreadName != null) {
+            /*
+             * The capture site records the vthread's observed epoch. If that epoch is not current,
+             * register from the delayed id/name data now that the event is being emitted.
+             */
+            SubstrateJVM.getThreadRepo().registerVThread(threadId, vthreadName, vthreadEpochId);
+        }
+        putRegisteredThreadId(data, threadId);
+    }
+
+    /**
+     * Writes a thread id that was already registered earlier for the current epoch.
+     * <p>
+     * If possible, use {@link #putThread} instead as it ensures that the thread is
+     * registered for the current epoch before writing the id.
+     */
+    @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
+    public static void putRegisteredThreadId(JfrNativeEventWriterData data, long threadId) {
         putLong(data, threadId);
     }
 
@@ -308,7 +324,7 @@ public final class JfrNativeEventWriter {
 
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
     private static void cancel(JfrNativeEventWriterData data) {
-        data.setEndPos(WordFactory.nullPointer());
+        data.setEndPos(Word.nullPointer());
     }
 
     @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
@@ -347,13 +363,14 @@ public final class JfrNativeEventWriter {
         if (oldBuffer.getSize().belowThan(minNewSize)) {
             // Grow the buffer because it is too small.
             UnsignedWord newSize = oldBuffer.getSize();
+            assert newSize.aboveThan(0) : "JFR buffer size must be positive.";
             while (newSize.belowThan(minNewSize)) {
                 newSize = newSize.multiply(2);
             }
 
             JfrBuffer result = JfrBufferAccess.allocate(newSize, oldBuffer.getBufferType());
             if (result.isNull()) {
-                return WordFactory.nullPointer();
+                return Word.nullPointer();
             }
 
             // Copy all unflushed data (no matter if committed or uncommitted) from the old buffer
@@ -363,7 +380,7 @@ public final class JfrNativeEventWriter {
 
             JfrBufferAccess.free(oldBuffer);
 
-            assert result.getSize().aboveThan(minNewSize);
+            assert result.getSize().aboveOrEqual(minNewSize);
             return result;
         } else {
             // Reuse the existing buffer because enough data was already flushed in the meanwhile.
@@ -426,7 +443,7 @@ public final class JfrNativeEventWriter {
         return (int) (b1 + b2 + b3 + b4);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Accesses a native JFR buffer.", callerMustBe = true)
     private static void putPaddedInt(JfrNativeEventWriterData data, int v) {
         assert v <= MAX_PADDED_INT_VALUE;
         if (!ensureSize(data, Integer.BYTES)) {

@@ -36,10 +36,10 @@ public interface HostedPatcher {
      * Create relocation for the binary file.
      *
      * @param ref value instruction sequence should refer to
-     * @param relocs buffer of added relocation site information
+     * @param codeBuffer code buffer to which relocation site information is added
      * @param compStart codecache-relative starting position this method's machine code
      */
-    void relocate(Reference ref, RelocatableBuffer relocs, int compStart);
+    void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart);
 
     /**
      * Patch the code buffer.
@@ -49,4 +49,22 @@ public interface HostedPatcher {
      * @param code machine code generated for this method
      */
     void patch(int compStart, int relative, byte[] code);
+
+    /**
+     * Describes a patch encoded in one contiguous operand byte range. All positions are relative
+     * to the start of the compiled method.
+     */
+    interface ContiguousOperandPatchSite {
+        /** Start of the instruction containing the operand. */
+        int instructionPosition();
+
+        /** Start of the operand byte range. */
+        int operandPosition();
+
+        /** Size of the operand byte range. */
+        int operandSize();
+
+        /** Start of the instruction following the patched instruction. */
+        int nextInstructionPosition();
+    }
 }

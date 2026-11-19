@@ -24,18 +24,31 @@
  */
 package com.oracle.svm.core.threadlocal;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHereUnexpectedInput;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereUnexpectedInput;
 
 import java.util.function.IntSupplier;
 
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.LocationIdentity;
 import org.graalvm.word.WordBase;
 
-import com.oracle.svm.core.BuildPhaseProvider.ReadyForCompilation;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.shared.BuildPhaseProvider.ReadyForCompilation;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.graal.thread.LoadVMThreadLocalNode;
+import com.oracle.svm.core.graal.thread.StoreVMThreadLocalNode;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocal;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalBoolean;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalByte;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalBytes;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalChar;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalLong;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalObject;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalShort;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalWord;
 
 import jdk.vm.ci.meta.JavaKind;
 
@@ -46,12 +59,20 @@ import jdk.vm.ci.meta.JavaKind;
 public class VMThreadLocalInfo {
 
     @SuppressWarnings("unchecked")    //
-    public static final Class<? extends FastThreadLocal>[] THREAD_LOCAL_CLASSES = (Class<? extends FastThreadLocal>[]) new Class<?>[]{FastThreadLocalInt.class, FastThreadLocalLong.class,
-                    FastThreadLocalWord.class, FastThreadLocalObject.class};
+    public static final Class<? extends FastThreadLocal>[] THREAD_LOCAL_CLASSES = (Class<? extends FastThreadLocal>[]) new Class<?>[]{FastThreadLocalBoolean.class, FastThreadLocalByte.class,
+                    FastThreadLocalShort.class, FastThreadLocalChar.class, FastThreadLocalInt.class, FastThreadLocalLong.class, FastThreadLocalWord.class, FastThreadLocalObject.class};
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public static Class<?> getValueClass(Class<? extends FastThreadLocal> threadLocalClass) {
-        if (threadLocalClass == FastThreadLocalInt.class) {
+        if (threadLocalClass == FastThreadLocalBoolean.class) {
+            return boolean.class;
+        } else if (threadLocalClass == FastThreadLocalByte.class) {
+            return byte.class;
+        } else if (threadLocalClass == FastThreadLocalShort.class) {
+            return short.class;
+        } else if (threadLocalClass == FastThreadLocalChar.class) {
+            return char.class;
+        } else if (threadLocalClass == FastThreadLocalInt.class) {
             return int.class;
         } else if (threadLocalClass == FastThreadLocalLong.class) {
             return long.class;
@@ -74,7 +95,18 @@ public class VMThreadLocalInfo {
     public final boolean allowFloatingReads;
     public final String name;
 
+    /**
+     * Offset of this thread local variable from its holder thread {@link IsolateThread} data
+     * structure. It is a compile time constant, determined by collecting and sorting all thread
+     * locals, and used during lowering of {@link FastThreadLocal} specific operations, e.g.,
+     * {@link LoadVMThreadLocalNode}, {@link StoreVMThreadLocalNode} and others.
+     */
     @UnknownPrimitiveField(availability = ReadyForCompilation.class) public int offset;
+    /**
+     * How many bytes does this thread local need for storage. Just like the {@link #offset} this is
+     * a compile-time constant, determined by taking into account the {@link #storageKind} or via
+     * the {@link #sizeSupplier}, and it is used to lay out the thread locals in memory.
+     */
     @UnknownPrimitiveField(availability = ReadyForCompilation.class) public int sizeInBytes;
 
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -99,12 +131,20 @@ public class VMThreadLocalInfo {
             valueClass = null;
         }
 
-        if (threadLocalClass == FastThreadLocalInt.class) {
+        if (threadLocalClass == FastThreadLocalBoolean.class) {
+            storageKind = JavaKind.Boolean;
+        } else if (threadLocalClass == FastThreadLocalByte.class) {
+            storageKind = JavaKind.Byte;
+        } else if (threadLocalClass == FastThreadLocalShort.class) {
+            storageKind = JavaKind.Short;
+        } else if (threadLocalClass == FastThreadLocalChar.class) {
+            storageKind = JavaKind.Char;
+        } else if (threadLocalClass == FastThreadLocalInt.class) {
             storageKind = JavaKind.Int;
         } else if (threadLocalClass == FastThreadLocalLong.class) {
             storageKind = JavaKind.Long;
         } else if (threadLocalClass == FastThreadLocalWord.class) {
-            storageKind = ConfigurationValues.getWordKind();
+            storageKind = SubstrateTarget.getWordKind();
         } else if (threadLocalClass == FastThreadLocalObject.class) {
             storageKind = JavaKind.Object;
         } else if (threadLocalClass == FastThreadLocalBytes.class) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,44 +41,65 @@
 
 package org.graalvm.wasm.parser.validation;
 
+import java.util.ArrayList;
+import java.util.BitSet;
+
+import org.graalvm.wasm.SymbolTable;
 import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.parser.bytecode.BytecodeFixup;
 import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 
 /**
  * Represents the scope of a block structure during module validation.
  */
 public abstract class ControlFrame {
-    private final byte[] paramTypes;
-    private final byte[] resultTypes;
+    private final int[] paramTypes;
+    private final int[] resultTypes;
+    private final SymbolTable symbolTable;
 
     private final int initialStackSize;
+    private final int legacyCatchDepth;
+    private boolean unwindLegacyCatches;
     private boolean unreachable;
     private final int commonResultType;
+    protected BitSet initializedLocals;
+    private ArrayList<BytecodeFixup> delegateFixups;
 
     /**
      * @param paramTypes The parameter value types of the block structure.
      * @param resultTypes The result value types of the block structure.
+     * @param symbolTable Necessary to look up the definitions of types in {@code paramTypes} and
+     *            {@code resultTypes}
      * @param initialStackSize The size of the value stack when entering this block structure.
-     * @param unreachable If the block structure should be declared unreachable.
+     * @param initializedLocals The set of locals which are already initialized at the start of this
+     *            function
      */
-    ControlFrame(byte[] paramTypes, byte[] resultTypes, int initialStackSize, boolean unreachable) {
+    ControlFrame(int[] paramTypes, int[] resultTypes, SymbolTable symbolTable, int initialStackSize, BitSet initializedLocals, int legacyCatchDepth) {
         this.paramTypes = paramTypes;
         this.resultTypes = resultTypes;
+        this.symbolTable = symbolTable;
         this.initialStackSize = initialStackSize;
-        this.unreachable = unreachable;
-        commonResultType = WasmType.getCommonValueType(resultTypes);
+        this.legacyCatchDepth = legacyCatchDepth;
+        this.unwindLegacyCatches = false;
+        this.unreachable = false;
+        this.commonResultType = WasmType.getCommonValueType(resultTypes);
+        this.initializedLocals = (BitSet) initializedLocals.clone();
     }
 
-    protected byte[] paramTypes() {
+    protected int[] paramTypes() {
         return paramTypes;
     }
 
-    public byte[] resultTypes() {
+    public int[] resultTypes() {
         return resultTypes;
     }
 
     protected int resultTypeLength() {
         return resultTypes.length;
+    }
+
+    protected SymbolTable getSymbolTable() {
+        return symbolTable;
     }
 
     /**
@@ -91,7 +112,7 @@ public abstract class ControlFrame {
     /**
      * @return The types that must be on the value stack when branching to this frame.
      */
-    abstract byte[] labelTypes();
+    abstract int[] labelTypes();
 
     protected int labelTypeLength() {
         return labelTypes().length;
@@ -99,6 +120,10 @@ public abstract class ControlFrame {
 
     int initialStackSize() {
         return initialStackSize;
+    }
+
+    int legacyCatchDepth() {
+        return legacyCatchDepth;
     }
 
     void setUnreachable() {
@@ -113,44 +138,79 @@ public abstract class ControlFrame {
         this.unreachable = false;
     }
 
-    /**
-     * Performs checks and actions when entering an else branch.
-     * 
-     * @param state The current parser state.
-     * @param bytecode The current extra data array.
-     */
-    abstract void enterElse(ParserState state, RuntimeBytecodeGen bytecode);
+    boolean isLocalInitialized(int localIndex) {
+        return initializedLocals.get(localIndex);
+    }
+
+    void initializeLocal(int localIndex) {
+        initializedLocals.set(localIndex);
+    }
 
     /**
      * Performs checks and actions when exiting a frame.
-     * 
-     * @param bytecode The current extra data array.
      */
-    abstract void exit(RuntimeBytecodeGen bytecode);
+    abstract void exit(ParserState state, RuntimeBytecodeGen bytecode);
 
     /**
-     * Adds an unconditional branch targeting this control frame. Automatically patches the branch
-     * target as soon as it is available.
-     * 
-     * @param bytecode The bytecode of the current control frame.
+     * Registers a forward branch for fixing up and records whether it exits catches relative to
+     * this label's scope.
      */
-    abstract void addBranch(RuntimeBytecodeGen bytecode);
+    void registerForwardBranch(BytecodeFixup fixup, int sourceLegacyCatchDepth) {
+        registerBranch(sourceLegacyCatchDepth);
+        addLabelFixup(fixup);
+    }
 
     /**
-     * Adds a conditional branch targeting this control frame. Automatically patches the branch *
-     * target as soon as it is available.
-     * 
-     * @param bytecode The bytecode of the current control frame.
+     * Registers a backward branch and records whether it exits catches relative to this label's scope.
      */
-
-    abstract void addBranchIf(RuntimeBytecodeGen bytecode);
+    void registerBackwardBranch(int sourceLegacyCatchDepth) {
+        registerBranch(sourceLegacyCatchDepth);
+    }
 
     /**
-     * Adds a branch table item targeting this control frame. Automatically patches the branch *
-     * target as soon as it is available.
-     * 
-     * @param bytecode The bytecode of the current control frame.
+     * Emits a branch to this frame, deferring target patching until the label is available.
+     * Subclasses with an already emitted label can override this to use a compact encoding.
      */
+    void addBranch(RuntimeBytecodeGen bytecode, RuntimeBytecodeGen.BranchOp branchOp, RuntimeBytecodeGen.BranchHint branchHint, int sourceLegacyCatchDepth) {
+        registerForwardBranch(bytecode.addForwardBranch(branchOp, branchHint), sourceLegacyCatchDepth);
+    }
 
-    abstract void addBranchTableItem(RuntimeBytecodeGen bytecode);
+    private void registerBranch(int sourceLegacyCatchDepth) {
+        // Use the entry depth: a legacy try exits outside its own catch clause.
+        unwindLegacyCatches |= sourceLegacyCatchDepth > legacyCatchDepth;
+    }
+
+    protected int addBranchLabel(RuntimeBytecodeGen bytecode) {
+        return bytecode.addLabel(resultTypeLength(), initialStackSize(), commonResultType(), legacyCatchDepth, unwindLegacyCatches);
+    }
+
+    /**
+     * Adds a fixup that targets this control frame's label. The fixup is patched immediately when
+     * the label is already available, or deferred until the frame emits its label.
+     *
+     * @param fixup The fixup that targets this frame's label.
+     */
+    abstract void addLabelFixup(BytecodeFixup fixup);
+
+    /**
+     * Adds a fixup used by legacy {@code delegate} to target this control frame. The fixup is
+     * patched with the exception-table location where exception dispatch should continue once
+     * control is delegated to this frame.
+     *
+     * @param fixup The fixup to patch with this frame's delegate continuation location.
+     */
+    void addDelegateFixup(BytecodeFixup fixup) {
+        if (delegateFixups == null) {
+            delegateFixups = new ArrayList<>();
+        }
+        delegateFixups.add(fixup);
+    }
+
+    protected void registerDelegateContinuationFixups(ParserState state, int tableIndex) {
+        if (delegateFixups != null) {
+            for (BytecodeFixup fixup : delegateFixups) {
+                state.addExceptionTableContinuationFixup(tableIndex, fixup);
+            }
+        }
+    }
 }

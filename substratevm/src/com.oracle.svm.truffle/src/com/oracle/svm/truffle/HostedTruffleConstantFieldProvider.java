@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,11 +27,13 @@ package com.oracle.svm.truffle;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.util.GuestAnnotationAccess;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.nodes.Node.Child;
 import com.oracle.truffle.api.nodes.Node.Children;
 
 import jdk.graal.compiler.core.common.spi.ConstantFieldProvider;
+import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 @Platforms(Platform.HOSTED_ONLY.class)
@@ -61,7 +63,9 @@ public final class HostedTruffleConstantFieldProvider implements ConstantFieldPr
      */
     @Override
     public <T> T readConstantField(ResolvedJavaField field, ConstantFieldTool<T> tool) {
-        boolean hasTruffleFoldedAnnotation = field.isAnnotationPresent(CompilationFinal.class) || field.isAnnotationPresent(Child.class) || field.isAnnotationPresent(Children.class);
+        boolean hasTruffleFoldedAnnotation = GuestAnnotationAccess.isAnnotationPresent(field, CompilationFinal.class) ||
+                        GuestAnnotationAccess.isAnnotationPresent(field, Child.class) ||
+                        GuestAnnotationAccess.isAnnotationPresent(field, Children.class);
         if (hasTruffleFoldedAnnotation) {
             return null;
         }
@@ -72,5 +76,10 @@ public final class HostedTruffleConstantFieldProvider implements ConstantFieldPr
     @Override
     public boolean maybeFinal(ResolvedJavaField field) {
         return wrappedConstantFieldProvider.maybeFinal(field);
+    }
+
+    @Override
+    public boolean isTrustedFinal(CanonicalizerTool tool, ResolvedJavaField field) {
+        return wrappedConstantFieldProvider.isTrustedFinal(tool, field);
     }
 }

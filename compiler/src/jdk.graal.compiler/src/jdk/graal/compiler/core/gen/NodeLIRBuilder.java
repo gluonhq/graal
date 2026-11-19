@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -64,6 +64,7 @@ import jdk.graal.compiler.lir.FullInfopointOp;
 import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstruction;
 import jdk.graal.compiler.lir.LabelRef;
+import jdk.graal.compiler.lir.StandardOp;
 import jdk.graal.compiler.lir.StandardOp.JumpOp;
 import jdk.graal.compiler.lir.StandardOp.LabelOp;
 import jdk.graal.compiler.lir.SwitchStrategy;
@@ -94,6 +95,7 @@ import jdk.graal.compiler.nodes.LoweredCallTargetNode;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ParameterNode;
 import jdk.graal.compiler.nodes.PhiNode;
+import jdk.graal.compiler.nodes.ReadArgumentNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.ValuePhiNode;
@@ -519,6 +521,11 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
         }
     }
 
+    @Override
+    public boolean narrowsUseCastValue() {
+        return gen.getProviders().getLowerer().narrowsUseCastValue();
+    }
+
     protected void emitPrologue(StructuredGraph graph) {
         CallingConvention incomingArguments = gen.getResult().getCallingConvention();
 
@@ -558,7 +565,7 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
     @Override
     public void visitEndNode(AbstractEndNode end) {
         AbstractMergeNode merge = end.merge();
-        JumpOp jump = newJumpOp(getLIRBlock(merge));
+        JumpOp jump = new JumpOp(getLIRBlock(merge), end instanceof LoopEndNode loopEndNode && loopEndNode.loopBegin().mayEmitThreadedCode());
         jump.setPhiValues(createPhiOut(merge, end));
         append(jump);
     }
@@ -568,10 +575,6 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
      */
     @Override
     public void visitLoopEnd(LoopEndNode x) {
-    }
-
-    protected JumpOp newJumpOp(LabelRef ref) {
-        return new JumpOp(ref);
     }
 
     protected LIRKind getPhiKind(PhiNode phi) {
@@ -646,7 +649,7 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
                         callTarget.signature(), gen);
         frameMapBuilder.callsMethod(invokeCc);
 
-        Value[] parameters = visitInvokeArguments(invokeCc, callTarget.arguments());
+        Value[] parameters = visitInvokeArguments(invokeCc, callTarget.arguments(), callTarget);
 
         LabelRef exceptionEdge = null;
         if (x instanceof InvokeWithExceptionNode) {
@@ -660,6 +663,12 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
 
         if (isLegal(result)) {
             setResult(x.asNode(), gen.emitMove(result));
+        }
+
+        // Additional return values must be fetched immediately after the Invoke.
+        for (ReadArgumentNode readArgumentNode : x.asNode().usages().filter(ReadArgumentNode.class)) {
+            AllocatableValue allocatableValue = gen.getAdditionalReturnLocation(invokeCc, readArgumentNode.getIndex());
+            setResult(readArgumentNode, gen.emitMove(allocatableValue));
         }
 
         if (x instanceof InvokeWithExceptionNode) {
@@ -695,6 +704,13 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
             setResult(x.asNode(), result);
         }
 
+        // Additional return values must be fetched immediately after the foreign call.
+        for (ReadArgumentNode readArgumentNode : x.asNode().usages().filter(ReadArgumentNode.class)) {
+            CallingConvention outgoingCallingConvention = linkage.getOutgoingCallingConvention();
+            AllocatableValue allocatableValue = gen.getAdditionalReturnLocation(outgoingCallingConvention, readArgumentNode.getIndex());
+            setResult(readArgumentNode, gen.emitMove(allocatableValue));
+        }
+
         if (x instanceof WithExceptionNode) {
             gen.emitJump(getLIRBlock(((WithExceptionNode) x).next()));
         }
@@ -704,7 +720,7 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
 
     protected abstract void emitIndirectCall(IndirectCallTargetNode callTarget, Value result, Value[] parameters, Value[] temps, LIRFrameState callState);
 
-    public Value[] visitInvokeArguments(CallingConvention invokeCc, Collection<ValueNode> arguments) {
+    public Value[] visitInvokeArguments(CallingConvention invokeCc, Collection<ValueNode> arguments, @SuppressWarnings("unused") LoweredCallTargetNode callTargetNode) {
         // for each argument, load it into the correct location
         Value[] result = new Value[arguments.size()];
         int j = 0;
@@ -744,8 +760,7 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
                 LIRKind kind = gen.getLIRKind(x.value().stamp(NodeView.DEFAULT));
                 Value key = gen.emitConstant(kind, x.keyAt(0));
                 gen.emitCompareBranch(kind.getPlatformKind(), value, key, Condition.EQ, false, getLIRBlock(x.keySuccessor(0)), defaultTarget, probability);
-            } else if (x instanceof IntegerSwitchNode && x.isSorted()) {
-                IntegerSwitchNode intSwitch = (IntegerSwitchNode) x;
+            } else if (x instanceof IntegerSwitchNode intSwitch && x.isSorted()) {
                 LabelRef[] keyTargets = new LabelRef[keyCount];
                 JavaConstant[] keyConstants = new JavaConstant[keyCount];
                 double[] keyProbabilities = new double[keyCount];
@@ -756,7 +771,7 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
                     keyProbabilities[i] = intSwitch.keyProbability(i);
                     assert keyConstants[i].getJavaKind() == keyKind : Assertions.errorMessage(keyConstants, keyKind);
                 }
-                gen.emitStrategySwitch(keyConstants, keyProbabilities, keyTargets, defaultTarget, value);
+                gen.emitStrategySwitch(keyConstants, keyProbabilities, keyTargets, defaultTarget, value, intSwitch.inputMayBeOutOfRange(), intSwitch.mayEmitThreadedCode());
             } else {
                 // keyKind != JavaKind.Int || !x.isSorted()
                 LabelRef[] keyTargets = new LabelRef[keyCount];
@@ -863,5 +878,10 @@ public abstract class NodeLIRBuilder implements NodeLIRBuilderTool, LIRGeneratio
                         LIRKind.fromJavaKind(lirGenTool.target().arch, node.getStackKind()));
         lirGenTool.emitIncomingValues(new Value[]{returnRegister});
         setResult(node, lirGenTool.emitMove(returnRegister));
+    }
+
+    @Override
+    public void emitStartRecordingThreadedSwitch() {
+        append(new StandardOp.StartRecordingThreadedSwitchOp());
     }
 }

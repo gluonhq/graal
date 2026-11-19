@@ -25,9 +25,9 @@
 package com.oracle.svm.core.jfr;
 
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
+import org.graalvm.word.impl.Word;
 
 /**
  * Helper class that holds methods related to {@link JfrNativeEventWriterData}.
@@ -49,10 +49,10 @@ public final class JfrNativeEventWriterDataAccess {
             data.setCurrentPos(buffer.getCommittedPos());
             data.setEndPos(JfrBufferAccess.getDataEnd(buffer));
         } else {
-            data.setJfrBuffer(WordFactory.nullPointer());
-            data.setStartPos(WordFactory.nullPointer());
-            data.setCurrentPos(WordFactory.nullPointer());
-            data.setEndPos(WordFactory.nullPointer());
+            data.setJfrBuffer(Word.nullPointer());
+            data.setStartPos(Word.nullPointer());
+            data.setCurrentPos(Word.nullPointer());
+            data.setEndPos(Word.nullPointer());
         }
     }
 

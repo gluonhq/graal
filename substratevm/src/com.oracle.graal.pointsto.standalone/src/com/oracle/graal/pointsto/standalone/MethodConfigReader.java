@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2022, 2022, Alibaba Group Holding Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -26,29 +26,28 @@
 
 package com.oracle.graal.pointsto.standalone;
 
-import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.graal.pointsto.util.AnalysisError;
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaMethod;
-import jdk.vm.ci.meta.ResolvedJavaType;
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.debug.DebugOptions;
-import jdk.graal.compiler.debug.MethodFilter;
-
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+
+import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.util.AnalysisError;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.DebugOptions;
+import jdk.graal.compiler.debug.MethodFilter;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * This class reads the configuration file that complies to the following rules:
@@ -61,21 +60,20 @@ import java.util.stream.Collectors;
 public class MethodConfigReader {
 
     private static final String READ_ENTRY_POINTS = "ReadEntryPoints";
+    private static final int MAX_REPORTED_MISSING_ENTRY_POINTS = 20;
 
     /**
      * Read methods from the specified file. For each parsed method, execute the specified action.
      *
-     * @param file the configuration file to read.
+     * @param file the configuration file or class-path resource to read.
      * @param bigbang
-     * @param classLoader analysis classloader
+     * @param classLoaderAccess for loading classes
      * @param actionForEachMethod the action to take for each resolved method.
      */
-    public static void readMethodFromFile(String file, BigBang bigbang, ClassLoader classLoader, Consumer<AnalysisMethod> actionForEachMethod) {
+    public static void readMethodFromFile(String file, BigBang bigbang, PointsToAnalyzer.ClassLoaderAccess classLoaderAccess, Consumer<AnalysisMethod> actionForEachMethod) {
         List<String> methodNameList = new ArrayList<>();
-        Path entryFilePath = Paths.get(file);
-        File entryFile = entryFilePath.toFile();
-        try (FileInputStream fis = new FileInputStream(entryFile);
-                        BufferedReader br = new BufferedReader(new InputStreamReader(fis))) {
+        try (InputStream input = openMethodConfig(file);
+                        BufferedReader br = new BufferedReader(new InputStreamReader(input))) {
             String line;
             while ((line = br.readLine()) != null) {
                 methodNameList.add(line);
@@ -84,37 +82,79 @@ public class MethodConfigReader {
             AnalysisError.shouldNotReachHere(e);
         }
         int totalSize = methodNameList.size();
-        int num = forMethodList(bigbang.getDebug(), methodNameList, bigbang, classLoader, actionForEachMethod);
+        EntryPointReadResult readResult = forMethodList(bigbang.getDebug(), methodNameList, bigbang, classLoaderAccess, actionForEachMethod);
         StringBuilder sb = new StringBuilder();
-        sb.append("==Reading analysis entry points status==\n");
-        sb.append(num).append(" out of ").append(totalSize).append(" methods are read from ").append(file).append("\n");
-        if (num < totalSize) {
-            sb.append("To see the details about the missing methods, please append option -H:").append(DebugOptions.Log.getName()).append("=").append(READ_ENTRY_POINTS).append(":3").append("\n");
-        }
+        sb.append("==Reading analysis entry points status==").append(System.lineSeparator());
+        sb.append(readResult.resolvedMethods()).append(" out of ").append(totalSize).append(" methods are read from ").append(file).append(System.lineSeparator());
         System.out.println(sb.toString());
+        AnalysisError.guarantee(readResult.unresolvedMethods().isEmpty(),
+                        "Could not register %d analysis entry point(s) from %s.%nMissing entries:%n%s%nAppend option -H:%s=%s:3 for per-entry diagnostics.",
+                        readResult.unresolvedMethods().size(),
+                        file,
+                        formatMissingEntryPoints(readResult.unresolvedMethods()),
+                        DebugOptions.Log.getName(),
+                        READ_ENTRY_POINTS);
+    }
+
+    /**
+     * Opens an entry-points configuration either from the filesystem or, if no regular file exists
+     * at the supplied location, from the class path.
+     */
+    private static InputStream openMethodConfig(String file) throws IOException {
+        File entryFile = new File(file);
+        if (entryFile.isFile()) {
+            return new FileInputStream(entryFile);
+        }
+        InputStream resourceStream = MethodConfigReader.class.getResourceAsStream(file);
+        if (resourceStream != null) {
+            return resourceStream;
+        }
+        throw new IOException("Cannot find analysis entry points file or resource: " + file);
     }
 
     @SuppressWarnings("try")
-    public static int forMethodList(DebugContext debug, List<String> methods, BigBang bigbang, ClassLoader classLoader, Consumer<AnalysisMethod> actionForEachMethod) {
+    public static EntryPointReadResult forMethodList(DebugContext debug, List<String> methods, BigBang bigbang, PointsToAnalyzer.ClassLoaderAccess classLoaderAccess,
+                    Consumer<AnalysisMethod> actionForEachMethod) {
         AtomicInteger validMethodsNum = new AtomicInteger(0);
+        List<String> unresolvedMethods = new ArrayList<>();
         try (DebugContext.Scope s = debug.scope(READ_ENTRY_POINTS)) {
             methods.stream().forEach(method -> {
                 if (!method.isBlank()) {
                     try {
-                        workWithMethod(method, bigbang, classLoader, actionForEachMethod);
+                        workWithMethod(method, bigbang, classLoaderAccess, actionForEachMethod);
                         validMethodsNum.incrementAndGet();
                     } catch (Throwable t) {
+                        unresolvedMethods.add(method);
                         // Checkstyle: Allow raw info or warning printing - begin
-                        debug.log(DebugContext.VERBOSE_LEVEL, "Warning: Can't add method " + method + " as analysis root method. Reason: " + t.getMessage());
+                        debug.log(DebugContext.VERBOSE_LEVEL, "Warning: Can't add method %s as analysis root method. Reason: %s", method, t.getMessage());
                         // Checkstyle: Allow raw info or warning printing - end
                     }
                 }
             });
         }
-        return validMethodsNum.get();
+        return new EntryPointReadResult(validMethodsNum.get(), List.copyOf(unresolvedMethods));
     }
 
-    private static void workWithMethod(String method, BigBang bigbang, ClassLoader classLoader, Consumer<AnalysisMethod> actionForEachMethod) throws ClassNotFoundException {
+    private static String formatMissingEntryPoints(List<String> unresolvedMethods) {
+        int reportedMethods = Math.min(unresolvedMethods.size(), MAX_REPORTED_MISSING_ENTRY_POINTS);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < reportedMethods; i++) {
+            if (i > 0) {
+                sb.append(System.lineSeparator());
+            }
+            sb.append(unresolvedMethods.get(i));
+        }
+        if (unresolvedMethods.size() > reportedMethods) {
+            sb.append(System.lineSeparator()).append("... and ").append(unresolvedMethods.size() - reportedMethods).append(" more");
+        }
+        return sb.toString();
+    }
+
+    public record EntryPointReadResult(int resolvedMethods, List<String> unresolvedMethods) {
+    }
+
+    private static void workWithMethod(String method, BigBang bigbang, PointsToAnalyzer.ClassLoaderAccess classLoaderAccess, Consumer<AnalysisMethod> actionForEachMethod)
+                    throws ClassNotFoundException {
         int pos = method.indexOf('(');
         int dotAfterClassNamePos;
         if (pos == -1) {
@@ -123,15 +163,16 @@ public class MethodConfigReader {
             dotAfterClassNamePos = method.lastIndexOf('.', pos);
         }
         if (dotAfterClassNamePos == -1) {
-            AnalysisError.shouldNotReachHere("The the given method's name " + method + " doesn't contain the declaring class name.");
+            AnalysisError.shouldNotReachHere("The given method's name " + method + " doesn't contain the declaring class name.");
         }
         String className = method.substring(0, dotAfterClassNamePos);
-        Class<?> c = Class.forName(className, false, classLoader);
+        ResolvedJavaType t = classLoaderAccess.forName(className);
+        if (t == null) {
+            throw new ClassNotFoundException(className);
+        }
         // MethodFilter.parse requires ResolvedJavaMethod as input
-        MetaAccessProvider originalMetaAccess = bigbang.getUniverse().getOriginalMetaAccess();
-        List<ResolvedJavaMethod> methodCandidates = Arrays.stream(c.getDeclaredMethods()).map(m -> originalMetaAccess.lookupJavaMethod(m)).filter(m -> !m.isNative()).collect(Collectors.toList());
-        methodCandidates.addAll(Arrays.stream(c.getDeclaredConstructors()).map(m -> originalMetaAccess.lookupJavaMethod(m)).collect(Collectors.toList()));
-        ResolvedJavaType t = originalMetaAccess.lookupJavaType(c);
+        List<ResolvedJavaMethod> methodCandidates = Arrays.stream(t.getDeclaredMethods()).filter(m -> !m.isNative()).collect(Collectors.toList());
+        methodCandidates.addAll(Arrays.stream(t.getDeclaredConstructors()).toList());
         if (t.getClassInitializer() != null) {
             methodCandidates.add(t.getClassInitializer());
         }

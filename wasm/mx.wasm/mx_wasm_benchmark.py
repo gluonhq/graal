@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -49,6 +49,7 @@ import tempfile
 import zipfile
 import argparse
 
+import mx_polybench
 from mx_benchmark import JMHDistBenchmarkSuite
 from mx_benchmark import add_bm_suite
 from mx_benchmark import add_java_vm
@@ -94,8 +95,8 @@ class WasmBenchmarkVm(mx_benchmark.OutputCapturingVm):
     def name(self):
         return "wasm-benchmark"
 
-    def post_process_command_line_args(self, args):
-        return args
+    def post_process_command_line_args(self, suiteArgs):
+        return suiteArgs
 
     def parse_suite_benchmark(self, args):
         suite = next(iter([arg for arg in args if arg.endswith(SUITE_NAME_SUFFIX)]), None)
@@ -165,7 +166,7 @@ class NodeWasmBenchmarkVm(WasmBenchmarkVm):
         try:
             tmp_dir = self.extract_jar_to_tempdir(jar, suite, benchmark)
             node_cmd = os.path.join(node_dir, "node")
-            node_cmd_line = [node_cmd, "--experimental-wasm-bigint", os.path.join(tmp_dir, "bench", suite, benchmark + ".js")]
+            node_cmd_line = [node_cmd, os.path.join(tmp_dir, "bench", suite, benchmark + ".js")]
             mx.log("Running benchmark " + benchmark + " with node.")
             mx.run(node_cmd_line, cwd=tmp_dir, out=out, err=err, nonZeroIsFatal=nonZeroIsFatal)
         finally:
@@ -209,7 +210,7 @@ class WasmJMHJsonRule(mx_benchmark.JMHJsonRule):
         filename = self._prepend_working_dir(self.filename)
         if not os.path.exists(filename):
             return []
-        return super(WasmJMHJsonRule, self).parse(text)
+        return super().parse(text)
 
 
 class WasmBenchmarkSuite(JMHDistBenchmarkSuite):
@@ -295,15 +296,15 @@ class MemoryBenchmarkSuite(mx_benchmark.JavaBenchmarkSuite, mx_benchmark.Averagi
         jdk.run_java(args, out=out)
         return out.data.split()
 
-    def createCommandLineArgs(self, benchmarks, bm_suite_args):
-        benchmarks = benchmarks if benchmarks is not None else self.benchmarkList(bm_suite_args)
+    def createCommandLineArgs(self, benchmarks, bmSuiteArgs):
+        benchmarks = benchmarks if benchmarks is not None else self.benchmarkList(bmSuiteArgs)
         jdk = mx.get_jdk(mx.distribution(BENCHMARKCASES_DISTRIBUTION).javaCompliance)
-        vm_args = self.vmArgs(bm_suite_args) + mx.get_runtime_jvm_args([BENCHMARKCASES_DISTRIBUTION], jdk=jdk)
+        vm_args = self.vmArgs(bmSuiteArgs) + mx.get_runtime_jvm_args([BENCHMARKCASES_DISTRIBUTION], jdk=jdk)
         run_args = ["--warmup-iterations", str(MEMORY_WARMUP_ITERATIONS),
                     "--result-iterations", str(self.getExtraIterationCount(MEMORY_WARMUP_ITERATIONS))]
         return vm_args + [MEMORY_PROFILER_CLASS_NAME] + run_args + benchmarks
 
-    def rules(self, out, benchmarks, bm_suite_args):
+    def rules(self, output, benchmarks, bmSuiteArgs):
         return [
             # We collect all our measures as "warmup"s. `AveragingBenchmarkMixin.addAverageAcrossLatestResults` then
             # takes care of creating one final "memory" point which is the average of the last N points, where N is
@@ -321,9 +322,53 @@ class MemoryBenchmarkSuite(mx_benchmark.JavaBenchmarkSuite, mx_benchmark.Averagi
         ]
 
     def run(self, benchmarks, bmSuiteArgs):
-        results = super(MemoryBenchmarkSuite, self).run(benchmarks, bmSuiteArgs)
+        results = super().run(benchmarks, bmSuiteArgs)
         self.addAverageAcrossLatestResults(results, "memory")
         return results
 
 
 add_bm_suite(MemoryBenchmarkSuite())
+
+mx_polybench.register_polybench_language(mx_suite=_suite, language="wasm", distributions=["WASM"])
+
+
+def wasm_polybench_runner(polybench_run: mx_polybench.PolybenchRunFunction, tags) -> None:
+    extra_image_build_arguments = ["-Dnative-image.benchmark.extra-image-build-argument=" + arg for arg in [
+            '-H:+UnlockExperimentalVMOptions',
+            '-H:+VectorAPISupport',
+            '--add-modules=jdk.incubator.vector']]
+
+    def bench_jvm(args):
+        polybench_run(["--jvm"] + args + ["--vm-args", "--add-modules=jdk.incubator.vector"])
+
+    def bench_native(args, mx_benchmark_args=None):
+        if mx_benchmark_args is None:
+            mx_benchmark_args = []
+        polybench_run(["--native"] + args + extra_image_build_arguments + mx_benchmark_args)
+
+    def bench(args):
+        bench_jvm(args)
+        bench_native(args)
+
+    if "gate" in tags:
+        bench(["interpreter/*.wasm", "--experimental-options", "--engine.Compilation=false", "-w", "1", "-i", "1"])
+    if "benchmark" in tags:
+        bench(["interpreter/*.wasm", "--experimental-options", "--engine.Compilation=false"])
+        bench(["interpreter/*.wasm"])
+        bench(["simd/*.wasm"])
+        bench(["exceptions/*.wasm", "--experimental-options", "--wasm.Exceptions=true", "--wasm.LegacyExceptions=true"])
+        bench_jvm(["interpreter/*.wasm", "--metric=metaspace-memory"])
+        bench_jvm(["interpreter/*.wasm", "--metric=application-memory"])
+        bench(["interpreter/*.wasm", "--metric=allocated-bytes", "-w", "40", "-i", "10", "--experimental-options", "--engine.Compilation=false"])
+        bench(["interpreter/*.wasm", "--metric=allocated-bytes", "-w", "40", "-i", "10"])
+    if "instructions" in tags:
+        assert mx_polybench.is_enterprise()
+        fork_count_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "polybench-fork-counts.json")
+        bench_native(["interpreter/*.wasm", "--metric=instructions", "--experimental-options", "--engine.Compilation=false"],
+                     ["--mx-benchmark-args", "--fork-count-file", fork_count_file])
+
+
+mx_polybench.register_polybench_benchmark_suite(mx_suite=_suite, name="wasm", languages=["wasm"],
+                                                benchmark_distribution="WASM_POLYBENCH_BENCHMARKS",
+                                                benchmark_file_filter=".*wasm", runner=wasm_polybench_runner,
+                                                tags={"gate", "benchmark", "instructions"})

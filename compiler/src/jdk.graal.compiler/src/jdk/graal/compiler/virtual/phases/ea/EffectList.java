@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,8 +27,10 @@ package jdk.graal.compiler.virtual.phases.ea;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.function.Consumer;
 
+import jdk.graal.compiler.core.common.CancellationBailoutException;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.GraalError;
@@ -189,6 +191,9 @@ public class EffectList implements Iterable<EffectList.Effect> {
 
             @Override
             public Effect next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
                 return effects[index++];
             }
 
@@ -225,6 +230,8 @@ public class EffectList implements Iterable<EffectList.Effect> {
                 }
                 try {
                     effect.apply(graph, obsoleteNodes);
+                } catch (CancellationBailoutException e) {
+                    throw e;
                 } catch (Throwable t) {
                     throw new GraalError(t).addContext("effect", effect);
                 }

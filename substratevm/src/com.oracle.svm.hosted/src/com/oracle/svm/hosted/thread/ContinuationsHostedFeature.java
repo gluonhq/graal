@@ -29,14 +29,14 @@ import java.util.List;
 
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.thread.ContinuationInternals;
 import com.oracle.svm.core.thread.ContinuationSupport;
 import com.oracle.svm.core.thread.ContinuationsFeature;
 import com.oracle.svm.core.thread.Target_jdk_internal_vm_Continuation;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 @AutomaticallyRegisteredFeature
 public class ContinuationsHostedFeature implements InternalFeature {
@@ -47,11 +47,18 @@ public class ContinuationsHostedFeature implements InternalFeature {
     }
 
     @Override
-    public void beforeAnalysis(BeforeAnalysisAccess access) {
+    public void beforeAnalysis(BeforeAnalysisAccess a) {
         if (ContinuationSupport.isSupported()) {
             // limit the analysis optimizations performed on continuation return location
-            Method opaqueReturnMethod = ReflectionUtil.lookupMethod(ContinuationInternals.class, "enterSpecial1", Target_jdk_internal_vm_Continuation.class, boolean.class);
-            ((BeforeAnalysisAccessImpl) access).registerOpaqueMethodReturn(opaqueReturnMethod);
+            BeforeAnalysisAccessImpl access = (BeforeAnalysisAccessImpl) a;
+            Method enterSpecial1Method = ReflectionUtil.lookupMethod(ContinuationInternals.class, "enterSpecial1", Target_jdk_internal_vm_Continuation.class, boolean.class);
+            access.registerOpaqueMethodReturn(enterSpecial1Method);
+            /*
+             * The doYield1 does not return from the point of view of the analysis, but it actually
+             * does after the context is switched back.
+             */
+            Method doYield1Method = ReflectionUtil.lookupMethod(ContinuationInternals.class, "doYield1", Target_jdk_internal_vm_Continuation.class);
+            access.registerOpaqueMethodReturn(doYield1Method);
         }
     }
 }

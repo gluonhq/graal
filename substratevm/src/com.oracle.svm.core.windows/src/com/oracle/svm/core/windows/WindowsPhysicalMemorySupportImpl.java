@@ -24,23 +24,48 @@
  */
 package com.oracle.svm.core.windows;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
-import com.oracle.svm.core.heap.PhysicalMemory.PhysicalMemorySupport;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.heap.PlatformPhysicalMemorySupport;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.windows.headers.SysinfoAPI;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-@AutomaticallyRegisteredImageSingleton(PhysicalMemorySupport.class)
-class WindowsPhysicalMemorySupportImpl implements PhysicalMemorySupport {
-
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public class WindowsPhysicalMemorySupportImpl extends PlatformPhysicalMemorySupport {
     @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public UnsignedWord size() {
         SysinfoAPI.MEMORYSTATUSEX memStatusEx = UnsafeStackValue.get(SysinfoAPI.MEMORYSTATUSEX.class);
         memStatusEx.set_dwLength(SizeOf.get(SysinfoAPI.MEMORYSTATUSEX.class));
         SysinfoAPI.GlobalMemoryStatusEx(memStatusEx);
-        return WordFactory.unsigned(memStatusEx.ullTotalPhys());
+        return Word.unsigned(memStatusEx.ullTotalPhys());
+    }
+}
+
+@AutomaticallyRegisteredFeature
+class WindowsPhysicalMemorySupportFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        if (!ImageSingletons.contains(PlatformPhysicalMemorySupport.class)) {
+            ImageSingletons.add(PlatformPhysicalMemorySupport.class, new WindowsPhysicalMemorySupportImpl());
+        }
     }
 }

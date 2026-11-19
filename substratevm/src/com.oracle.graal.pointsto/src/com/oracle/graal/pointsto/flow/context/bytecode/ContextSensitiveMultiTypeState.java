@@ -24,18 +24,21 @@
  */
 package com.oracle.graal.pointsto.flow.context.bytecode;
 
+import java.lang.invoke.VarHandle;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.meta.AnalysisType;
-import com.oracle.graal.pointsto.typestate.MultiTypeState;
+import com.oracle.graal.pointsto.typestate.MultiTypeStateWithBitSet;
+import com.oracle.graal.pointsto.typestate.PointsToStats;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
-public class ContextSensitiveMultiTypeState extends MultiTypeState {
+public class ContextSensitiveMultiTypeState extends MultiTypeStateWithBitSet {
 
     /** The objects of this type state. */
     protected final AnalysisObject[] objects;
@@ -43,16 +46,16 @@ public class ContextSensitiveMultiTypeState extends MultiTypeState {
     protected int[] objectTypeIds;
 
     /** Creates a new type state using the provided types bit set and objects. */
-    public ContextSensitiveMultiTypeState(PointsToAnalysis bb, boolean canBeNull, BitSet typesBitSet, int typesCount, AnalysisObject... objects) {
-        super(bb, canBeNull, typesBitSet, typesCount);
+    public ContextSensitiveMultiTypeState(boolean canBeNull, BitSet typesBitSet, int typesCount, AnalysisObject... objects) {
+        super(canBeNull, typesBitSet, typesCount);
         this.objects = objects;
         assert objects.length > 1 : "Multi type state with single object.";
         assert checkObjects();
     }
 
     /** Create a type state with the same content and a reversed canBeNull value. */
-    protected ContextSensitiveMultiTypeState(PointsToAnalysis bb, boolean canBeNull, ContextSensitiveMultiTypeState other) {
-        super(bb, canBeNull, other);
+    protected ContextSensitiveMultiTypeState(boolean canBeNull, ContextSensitiveMultiTypeState other) {
+        super(canBeNull, other);
         this.objects = other.objects;
         this.merged = other.merged;
     }
@@ -74,6 +77,8 @@ public class ContextSensitiveMultiTypeState extends MultiTypeState {
             for (int i = 0; i < objects.length; i++) {
                 result[i] = objects[i].getTypeId();
             }
+            /* Ensure array element initializations are published before publishing the array. */
+            VarHandle.storeStoreFence();
             this.objectTypeIds = result;
         }
         return objectTypeIds;
@@ -128,7 +133,7 @@ public class ContextSensitiveMultiTypeState extends MultiTypeState {
             return this;
         } else {
             /* Just flip the canBeNull flag and copy the rest of the values from this. */
-            return new ContextSensitiveMultiTypeState(bb, resultCanBeNull, this);
+            return PointsToStats.registerTypeState(bb, new ContextSensitiveMultiTypeState(resultCanBeNull, this));
         }
     }
 
@@ -222,6 +227,9 @@ public class ContextSensitiveMultiTypeState extends MultiTypeState {
 
             @Override
             public AnalysisObject next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
                 return objects[idx++];
             }
         };

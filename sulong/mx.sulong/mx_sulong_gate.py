@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2016, 2023, Oracle and/or its affiliates.
+# Copyright (c) 2016, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -38,8 +38,6 @@ from mx_gate import Task, add_gate_runner, add_gate_argument
 import mx_sulong_suite_constituents
 import mx_sulong_unittest
 
-import mx_sdk_vm
-
 _suite = mx.suite('sulong')
 
 def _sulong_gate_unittest(title, test_suite, tasks, args, tags=None, testClasses=None, unittestArgs=None):
@@ -48,7 +46,7 @@ def _sulong_gate_unittest(title, test_suite, tasks, args, tags=None, testClasses
     f.execute(tasks)
 
 
-class TestSuiteBuildTask(object):
+class TestSuiteBuildTask:
     def __init__(self, test_suite, tags, extra_build_args=None):
         self.test_suite = test_suite
         self.tags = tags
@@ -67,7 +65,7 @@ class TestSuiteBuildTask(object):
         return isinstance(other, TestSuiteBuildTask) and self.test_suite == other.test_suite and self.extra_build_args == other.extra_build_args
 
 
-class UnittestTaskFactory(object):
+class UnittestTaskFactory:
 
     def __init__(self):
         self.build_tasks = []
@@ -95,16 +93,14 @@ class UnittestTaskFactory(object):
                 description = ''
             def _reduce_package_prefix(cls):
                 prefix = "com.oracle.truffle.llvm"
-                reduced_prefix = ".".join((x[0] for x in prefix.split(".")))
+                reduced_prefix = ".".join(x[0] for x in prefix.split("."))
                 if cls and cls.startswith(prefix):
                     return cls.replace(prefix, reduced_prefix, 1)
                 return cls
             # add a "junit" prefix if the test class does not use a full package name (no '.') to make it obvious that it is a
             # Java class
             junit_prefix = "JUnit " if not any("." in x for x in testClasses) else ""
-            return '{description}({junit_prefix}{testClasses})'.format(description=description,
-                                                                       junit_prefix=junit_prefix,
-                                                                       testClasses=', '.join((_reduce_package_prefix(cls) for cls in testClasses)))
+            return f"{description}({junit_prefix}{', '.join(_reduce_package_prefix(cls) for cls in testClasses)})"
 
         description = _sulong_gate_format_description(testClasses, description=description)
 
@@ -126,7 +122,7 @@ class UnittestTaskFactory(object):
             test_task(tasks)
 
 
-class SulongGateEnv(object):
+class SulongGateEnv:
     """"Sets a marker environment variable."""
     def __enter__(self):
         os.environ['_MX_SULONG_GATE'] = "1"
@@ -160,20 +156,21 @@ def _sulong_gate_runner(args, tasks):
     else:
         slowStandalone = standaloneMode == "jvm"
 
-    with Task('Build GraalJDK', tasks, tags=['standalone']) as t:
-        # building GraalJDK to work around a bug in the mx support code of the compiler suite
-        # `mx unittest` doesn't work if this is not built, and we want to avoid doing a full `mx build` in the standalone jobs
-        if t:
-            import mx_compiler
-            mx.command_function('build')(['--dependencies', mx_compiler._graaljdk_dist(edition='ce').name])
+    if mx.suite('compiler', fatalIfMissing=False):
+        with Task('Build GraalJDK', tasks, tags=['standalone']) as t:
+            # building GraalJDK to work around a bug in the mx support code of the compiler suite
+            # `mx unittest` doesn't work if compiler is imported and this is not built, and we want to avoid doing a full `mx build` in the standalone jobs
+            if t:
+                import mx_compiler
+                mx.command_function('build')(['--dependencies', mx_compiler._graaljdk_dist(edition='ce').name])
 
     if standaloneMode == "native":
         with Task('Build Native LLVM Standalone', tasks, tags=['standalone']) as t:
-            if t: mx.command_function('build')(['--dependencies', f'LLVM_NATIVE_STANDALONE_SVM_JAVA{mx_sdk_vm.base_jdk_version()}'])
+            if t: mx.command_function('build')(['--dependencies', 'SULONG_NATIVE_STANDALONE'])
 
     if standaloneMode == "jvm":
         with Task('Build Java LLVM Standalone', tasks, tags=['standalone']) as t:
-            if t: mx.command_function('build')(['--dependencies', f'LLVM_JAVA_STANDALONE_SVM_JAVA{mx_sdk_vm.base_jdk_version()}'])
+            if t: mx.command_function('build')(['--dependencies', 'SULONG_JVM_STANDALONE'])
 
     # Folders not containing tests: options, services, util
     _unittest('Benchmarks', 'SULONG_SHOOTOUT_TEST_SUITE', description="Language Benchmark game tests", testClasses=['ShootoutsSuite'], tags=['benchmarks', 'sulongMisc'])
@@ -185,7 +182,6 @@ def _sulong_gate_runner(args, tasks):
     _unittest('GCCParserTorture', 'SULONG_PARSER_TORTURE', description="Parser test using GCC suite", testClasses=['ParserTortureSuite'], tags=['parser'])
     _unittest('GCC_C', 'SULONG_GCC_C_TEST_SUITE', description="GCC 5.2 test suite (C tests)", testClasses=['GccCSuite'], tags=['gcc_c'])
     _unittest('GCC_CPP', 'SULONG_GCC_CPP_TEST_SUITE', description="GCC 5.2 test suite (C++ tests)", testClasses=['GccCppSuite'], tags=['gcc_cpp'])
-    _unittest('GCC_Fortran', 'SULONG_GCC_FORTRAN_TEST_SUITE', description="GCC 5.2 test suite (Fortran tests)", testClasses=['GccFortranSuite'], tags=['gcc_fortran'])
     _unittest('Sulong', 'SULONG_STANDALONE_TEST_SUITES', description="Sulong's internal tests", testClasses='SulongSuite', tags=['sulongStandalone', 'sulongBasic', 'standalone'],
               # run only a small subset of the tests on the jvm standalone, the startup overhead per test is too high for more
               extraUnittestArgs=['-Dsulongtest.testNameFilter=cpp'] if slowStandalone else [])

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,7 +32,8 @@ import static jdk.vm.ci.code.ValueUtil.isRegister;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.BitSet;
+import java.util.Iterator;
+import java.util.List;
 
 import org.graalvm.collections.Pair;
 
@@ -42,6 +43,8 @@ import jdk.graal.compiler.core.common.alloc.RegisterAllocationConfig;
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
 import jdk.graal.compiler.core.common.cfg.BlockMap;
 import jdk.graal.compiler.debug.Assertions;
+import jdk.graal.compiler.debug.CounterKey;
+import jdk.graal.compiler.debug.DebugCloseable;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.debug.Indent;
@@ -61,7 +64,6 @@ import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterArray;
 import jdk.vm.ci.code.RegisterAttributes;
 import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.code.TargetDescription;
@@ -75,10 +77,55 @@ import jdk.vm.ci.meta.Value;
  */
 public class LinearScan {
 
+    protected boolean isDetailedAsserts() {
+        return Assertions.assertionsEnabled() && detailedAsserts;
+    }
+
+    /**
+     * These timers can significantly affect the speed of linear scan so they are disabled by
+     * default.
+     */
+    static final boolean DETAILED_TIMERS = false;
+
+    static CounterKey counter(String name) {
+        if (DETAILED_TIMERS) {
+            return DebugContext.counter(name);
+        }
+        return null;
+    }
+
+    static DebugContext.CountingTimerKey countingTimer(String name) {
+        if (DETAILED_TIMERS) {
+            return DebugContext.countingTimer(name);
+        }
+        return null;
+    }
+
+    DebugCloseable start(DebugContext.CountingTimerKey key) {
+        if (key != null) {
+            return key.start(debug);
+        }
+        return null;
+    }
+
+    void increment(CounterKey key) {
+        if (key != null) {
+            key.increment(debug);
+        }
+    }
+
     public static class Options {
         // @formatter:off
         @Option(help = "Enable spill position optimization", type = OptionType.Debug)
         public static final OptionKey<Boolean> LIROptLSRAOptimizeSpillPosition = new NestedBooleanOptionKey(LIRPhase.Options.LIROptimization, true);
+        @Option(help = "Consider call clobbers when choosing spill victims and avoiding reloads on fast paths", type = OptionType.Debug)
+        public static final OptionKey<Boolean> LIROptLSRACallClobberAwareSpilling = new OptionKey<>(false);
+        @Option(help = "Maximum number of interval splits created to keep pressure spills off unrelated fast paths. Non-positive values disable this optimization.", type = OptionType.Debug)
+        public static final OptionKey<Integer> LIROptLSRAMaxFastPathRecoverySplits = new OptionKey<>(100);
+        @Option(help = "Maximum number of LIR blocks in a compilation eligible for fast-path spill recovery. Non-positive values disable this optimization.", type = OptionType.Debug)
+        public static final OptionKey<Integer> LIROptLSRAMaxBlocksForFastPathRecovery = new OptionKey<>(400);
+        @Option(help = "Use binary search if interval is longer than this limit", type = OptionType.Debug)
+        public static final OptionKey<Integer> IntervalBinarySearchLimit = new OptionKey<>(100);
         // @formatter:on
     }
 
@@ -90,7 +137,7 @@ public class LinearScan {
          * block. The bit index of an operand is its {@linkplain LinearScan#operandNumber(Value)
          * operand number}.
          */
-        public BitSet liveIn;
+        public SparseBitSet liveIn;
 
         /**
          * Bit map specifying which operands are live upon exit from this block. These are values
@@ -98,20 +145,26 @@ public class LinearScan {
          * to this block. The bit index of an operand is its
          * {@linkplain LinearScan#operandNumber(Value) operand number}.
          */
-        public BitSet liveOut;
+        public SparseBitSet liveOut;
 
         /**
          * Bit map specifying which operands are used (before being defined) in this block. That is,
          * these are the values that are live upon entry to the block. The bit index of an operand
          * is its {@linkplain LinearScan#operandNumber(Value) operand number}.
          */
-        public BitSet liveGen;
+        public SparseBitSet liveGen;
 
         /**
          * Bit map specifying which operands are defined/overwritten in this block. The bit index of
          * an operand is its {@linkplain LinearScan#operandNumber(Value) operand number}.
          */
-        public BitSet liveKill;
+        public SparseBitSet liveKill;
+
+        /**
+         * State used during {@link LinearScanLifetimeAnalysisPhase#computeGlobalLiveSets()} to
+         * create a worklist.
+         */
+        boolean dirty = true;
     }
 
     public static final int DOMINATOR_SPILL_MOVE_ID = -2;
@@ -125,8 +178,8 @@ public class LinearScan {
 
     private final LIR ir;
     private final FrameMapBuilder frameMapBuilder;
-    private final RegisterAttributes[] registerAttributes;
-    private final RegisterArray registers;
+    private final List<RegisterAttributes> registerAttributes;
+    private final List<Register> registers;
     private final RegisterAllocationConfig regAllocConfig;
     private final MoveFactory moveFactory;
 
@@ -160,14 +213,14 @@ public class LinearScan {
     private Interval[] sortedIntervals;
 
     /**
-     * Map from an instruction {@linkplain LIRInstruction#id id} to the instruction. Entries should
-     * be retrieved with {@link #instructionForId(int)} as the id is not simply an index into this
-     * array.
+     * Map from an instruction {@linkplain LIRInstruction#id() id} to the instruction. Entries
+     * should be retrieved with {@link #instructionForId(int)} as the id is not simply an index into
+     * this array.
      */
     private LIRInstruction[] opIdToInstructionMap;
 
     /**
-     * Map from an instruction {@linkplain LIRInstruction#id id} to the {@linkplain BasicBlock
+     * Map from an instruction {@linkplain LIRInstruction#id() id} to the {@linkplain BasicBlock
      * block} containing the instruction. Entries should be retrieved with {@link #blockForId(int)}
      * as the id is not simply an index into this array.
      */
@@ -187,9 +240,10 @@ public class LinearScan {
      * Sentinel interval to denote the end of an interval list.
      */
     protected final Interval intervalEndMarker;
-    public final Range rangeEndMarker;
-    public final boolean detailedAsserts;
+    private final boolean detailedAsserts;
+    private final boolean hasFastPathBlocks;
     private final LIRGenerationResult res;
+    public final int intervalBinarySearchLimit;
 
     @SuppressWarnings("this-escape")
     protected LinearScan(TargetDescription target, LIRGenerationResult res, MoveFactory spillMoveFactory, RegisterAllocationConfig regAllocConfig, int[] sortedBlocks,
@@ -208,10 +262,22 @@ public class LinearScan {
         this.numVariables = ir.numVariables();
         this.blockData = new BlockMap<>(ir.getControlFlowGraph());
         this.neverSpillConstants = neverSpillConstants;
-        this.rangeEndMarker = new Range(Integer.MAX_VALUE, Integer.MAX_VALUE, null, ir);
-        this.intervalEndMarker = new Interval(ir, Value.ILLEGAL, Interval.END_MARKER_OPERAND_NUMBER, null, rangeEndMarker);
+        this.intervalEndMarker = new Interval(Value.ILLEGAL, Interval.END_MARKER_OPERAND_NUMBER, null);
         this.intervalEndMarker.next = intervalEndMarker;
         this.detailedAsserts = Assertions.detailedAssertionsEnabled(ir.getOptions());
+        this.intervalBinarySearchLimit = Options.IntervalBinarySearchLimit.getValue(ir.getOptions());
+        boolean foundFastPathBlock = false;
+        for (int i = 0; i < blockCount(); i++) {
+            if (blockAt(i).isFastPathBlock()) {
+                foundFastPathBlock = true;
+                break;
+            }
+        }
+        this.hasFastPathBlocks = foundFastPathBlock;
+    }
+
+    boolean hasFastPathBlocks() {
+        return hasFastPathBlocks;
     }
 
     /**
@@ -222,7 +288,7 @@ public class LinearScan {
      *         describes a register
      */
     public int getVariableNumber(int operand) {
-        // check if its a variable
+        // check if it's a variable
         if (operand >= firstVariableNumber) {
             return operand - firstVariableNumber;
         }
@@ -243,14 +309,14 @@ public class LinearScan {
     }
 
     public int getFirstLirInstructionId(BasicBlock<?> block) {
-        int result = ir.getLIRforBlock(block).get(0).id();
+        int result = ir.getLIRforBlock(block).getFirst().id();
         assert NumUtil.assertNonNegativeInt(result);
         return result;
     }
 
     public int getLastLirInstructionId(BasicBlock<?> block) {
         ArrayList<LIRInstruction> instructions = ir.getLIRforBlock(block);
-        int result = instructions.get(instructions.size() - 1).id();
+        int result = instructions.getLast().id();
         assert NumUtil.assertNonNegativeInt(result);
         return result;
     }
@@ -328,7 +394,7 @@ public class LinearScan {
      * configuration.
      */
     public RegisterAttributes attributes(Register reg) {
-        return registerAttributes[reg.number];
+        return registerAttributes.get(reg.number);
     }
 
     void assignSpillSlot(Interval interval) {
@@ -368,7 +434,7 @@ public class LinearScan {
     Interval createInterval(AllocatableValue operand) {
         assert isLegal(operand);
         int operandNumber = operandNumber(operand);
-        Interval interval = new Interval(ir, operand, operandNumber, intervalEndMarker, rangeEndMarker);
+        Interval interval = new Interval(operand, operandNumber, intervalEndMarker);
         assert operandNumber < intervalsSize : operandNumber + " " + intervalsSize;
         assert intervals[operandNumber] == null;
         intervals[operandNumber] = interval;
@@ -420,7 +486,7 @@ public class LinearScan {
     }
 
     int numLoops() {
-        return ir.getControlFlowGraph().getLoops().size();
+        return ir.getControlFlowGraph().getNumberOfLoops();
     }
 
     Interval intervalFor(int operandNumber) {
@@ -461,7 +527,7 @@ public class LinearScan {
     }
 
     /**
-     * Converts an {@linkplain LIRInstruction#id instruction id} to an instruction index. All LIR
+     * Converts an {@linkplain LIRInstruction#id() instruction id} to an instruction index. All LIR
      * instructions in a method have an index one greater than their linear-scan order predecessor
      * with the first instruction having an index of 0.
      */
@@ -470,10 +536,10 @@ public class LinearScan {
     }
 
     /**
-     * Retrieves the {@link LIRInstruction} based on its {@linkplain LIRInstruction#id id}.
+     * Retrieves the {@link LIRInstruction} based on its {@linkplain LIRInstruction#id() id}.
      *
-     * @param opId an instruction {@linkplain LIRInstruction#id id}
-     * @return the instruction whose {@linkplain LIRInstruction#id} {@code == id}
+     * @param opId an instruction {@linkplain LIRInstruction#id() id}
+     * @return the instruction whose {@linkplain LIRInstruction#id()} {@code == id}
      */
     public LIRInstruction instructionForId(int opId) {
         assert isEven(opId) : "opId not even";
@@ -485,12 +551,74 @@ public class LinearScan {
     /**
      * Gets the block containing a given instruction.
      *
-     * @param opId an instruction {@linkplain LIRInstruction#id id}
+     * @param opId an instruction {@linkplain LIRInstruction#id() id}
      * @return the block containing the instruction denoted by {@code opId}
      */
     public BasicBlock<?> blockForId(int opId) {
         assert opIdToBlockMap.length > 0 && opId >= 0 && opId <= maxOpId() + 1 : "opId out of range";
         return opIdToBlockMap[opIdToIndex(opId)];
+    }
+
+    /**
+     * Iterates over all blocks whose instruction range intersects a live range of {@code interval}.
+     * The interval need not be live throughout the entire block.
+     */
+    Iterable<BasicBlock<?>> blocksForInterval(Interval interval) {
+        return () -> new Iterator<>() {
+            private final Interval.RangeIterator range = new Interval.RangeIterator(interval);
+            private BasicBlock<?> block = blockForId(range.from());
+
+            @Override
+            public BasicBlock<?> next() {
+                BasicBlock<?> currentBlock = block;
+                int nextBlockIndex = block.getLinearScanNumber() + 1;
+                if (nextBlockIndex < blockCount()) {
+                    block = blockAt(nextBlockIndex);
+                    if (range.to() <= getFirstLirInstructionId(block)) {
+                        range.next();
+                        block = range.isAtEnd() ? null : blockForId(range.from());
+                    }
+                } else {
+                    block = null;
+                }
+                return currentBlock;
+            }
+
+            @Override
+            public boolean hasNext() {
+                return block != null;
+            }
+        };
+    }
+
+    /**
+     * Returns whether {@code interval} is live at any position in a block carrying the fast-path
+     * hint. The interval need not be live throughout the entire block.
+     */
+    boolean intervalCoversFastPathBlock(Interval interval) {
+        if (!hasFastPathBlocks()) {
+            return false;
+        }
+        for (BasicBlock<?> block : blocksForInterval(interval)) {
+            if (block.isFastPathBlock()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Returns whether any interval in {@code interval}'s split family covers a fast-path block. */
+    boolean splitFamilyCoversFastPathBlock(Interval interval) {
+        Interval splitParent = interval.splitParent();
+        if (splitParent.getSplitChildren().isEmpty()) {
+            return intervalCoversFastPathBlock(splitParent);
+        }
+        for (Interval splitChild : splitParent.getSplitChildren()) {
+            if (intervalCoversFastPathBlock(splitChild)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     boolean isBlockBegin(int opId) {
@@ -500,7 +628,7 @@ public class LinearScan {
     /**
      * Determines if an {@link LIRInstruction} destroys all caller saved registers.
      *
-     * @param opId an instruction {@linkplain LIRInstruction#id id}
+     * @param opId an instruction {@linkplain LIRInstruction#id() id}
      * @return {@code true} if the instruction denoted by {@code id} destroys all caller saved
      *         registers.
      */
@@ -740,14 +868,14 @@ public class LinearScan {
 
                 sortIntervalsAfterAllocation();
 
-                if (detailedAsserts) {
+                if (isDetailedAsserts()) {
                     verify();
                 }
                 beforeSpillMoveElimination();
                 createSpillMoveEliminationPhase().apply(target, lirGenRes, context);
                 createAssignLocationsPhase().apply(target, lirGenRes, context);
 
-                if (detailedAsserts) {
+                if (isDetailedAsserts()) {
                     verifyIntervals();
                 }
             } catch (Throwable e) {
@@ -855,14 +983,14 @@ public class LinearScan {
                     throw new GraalError("");
                 }
 
-                if (i1.first().isEndMarker()) {
+                if (i1.isEmpty()) {
                     debug.log("Interval %d has no Range", i1.operandNumber);
                     debug.log(i1.logString(this));
                     throw new GraalError("");
                 }
 
-                for (Range r = i1.first(); !r.isEndMarker(); r = r.next) {
-                    if (r.from >= r.to) {
+                for (Interval.RangeIterator r = new Interval.RangeIterator(i1); !r.isAtEnd(); r.next()) {
+                    if (r.from() >= r.to()) {
                         debug.log("Interval %d has zero length range", i1.operandNumber);
                         debug.log(i1.logString(this));
                         throw new GraalError("");
@@ -906,7 +1034,7 @@ public class LinearScan {
         return sortedBlocks;
     }
 
-    public RegisterArray getRegisters() {
+    public List<Register> getRegisters() {
         return registers;
     }
 

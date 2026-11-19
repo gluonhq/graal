@@ -26,53 +26,72 @@
 
 package com.oracle.graal.pointsto.standalone.test;
 
-import org.junit.Test;
-
-import java.io.File;
-import java.io.IOException;
-import java.nio.file.Path;
-
+import static org.junit.Assume.assumeTrue;
 import static org.junit.Assert.assertTrue;
 
-public class StandaloneAnalysisReportTest {
-    // Take an arbitrary case for this test
+import java.io.File;
+import java.nio.file.Path;
+
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import com.oracle.graal.pointsto.standalone.StandaloneOptions;
+import com.oracle.graal.pointsto.standalone.test.classes.ClassEqualityCase;
+
+/**
+ * Verifies standalone analysis report emission using {@link ClassEqualityCase} as a small input.
+ */
+public class StandaloneAnalysisReportTest extends StandaloneAnalysisTest {
+    private static final String REPORTS_PATH_OPTION = "-H:" + StandaloneOptions.StandaloneAnalysisReportsPath.getName() + "=";
+
+    /*
+     * Takes an arbitrary small fixture because the report tests care about emitted files rather
+     * than about any fixture-specific reachability nuance.
+     */
     private static final Class<?> TEST_CLASS = ClassEqualityCase.class;
 
+    /**
+     * Owns report-output directories for this test class so each report scenario gets an isolated
+     * temporary root without relying on the shared harness temp-directory bookkeeping.
+     */
+    @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
+
+    /**
+     * Verifies that analyzing {@link ClassEqualityCase} with report generation enabled writes at
+     * least one call-tree report file.
+     *
+     * This checks the standalone report plumbing rather than a specific reachability fact: the
+     * analysis must honor the configured reports path, create the reports directory, and emit
+     * output into it.
+     */
     @Test
-    public void testPrintAnalysisCallTree() throws IOException {
-        PointstoAnalyzerTester tester = new PointstoAnalyzerTester(TEST_CLASS);
-        Path testTmpDir = tester.createTestTmpDir();
-        tester.setAnalysisArguments(tester.getTestClassName(),
-                        "-H:AnalysisTargetAppCP=" + tester.getTestClassJar(),
-                        "-H:ReportsPath=" + testTmpDir.toString(),
+    public void testPrintAnalysisCallTree() {
+        Path testTmpDir = temporaryFolder.getRoot().toPath();
+        runAnalysis(TEST_CLASS,
+                        REPORTS_PATH_OPTION + testTmpDir,
                         "-H:+PrintAnalysisCallTree");
-        try {
-            tester.runAnalysisAndAssert();
-            File reportDir = testTmpDir.resolve("reports").toFile();
-            assertTrue(reportDir.isDirectory());
-            File[] reportFiles = reportDir.listFiles();
-            assertTrue(reportFiles.length > 0);
-        } finally {
-            tester.deleteTestTmpDir();
-        }
+        File reportDir = testTmpDir.resolve("reports").toFile();
+        assertTrue(reportDir.isDirectory());
+        File[] reportFiles = reportDir.listFiles();
+        assertTrue(reportFiles.length > 0);
     }
 
+    /**
+     * Verifies object-tree report generation for {@link ClassEqualityCase} under the unified
+     * standalone heap model.
+     */
     @Test
-    public void testPrintAnalysisObjectTree() throws IOException {
-        PointstoAnalyzerTester tester = new PointstoAnalyzerTester(TEST_CLASS);
-        Path testTmpDir = tester.createTestTmpDir();
-        tester.setAnalysisArguments(tester.getTestClassName(),
-                        "-H:AnalysisTargetAppCP=" + tester.getTestClassJar(),
-                        "-H:ReportsPath=" + testTmpDir.toString(),
+    public void testPrintAnalysisObjectTree() {
+        assumeTrue("Object-tree reporting currently requires host VMAccess because Espresso external JVMCI cannot materialize Class objects for report formatting.",
+                        "host".equals(System.getProperty("com.oracle.graal.pointsto.standalone.vmaccess.name")));
+        Path testTmpDir = temporaryFolder.getRoot().toPath();
+        runAnalysis(TEST_CLASS,
+                        REPORTS_PATH_OPTION + testTmpDir,
                         "-H:+PrintImageObjectTree");
-        try {
-            tester.runAnalysisAndAssert();
-            File reportDir = testTmpDir.resolve("reports").toFile();
-            assertTrue(reportDir.isDirectory());
-            File[] reportFiles = reportDir.listFiles();
-            assertTrue(reportFiles.length > 0);
-        } finally {
-            tester.deleteTestTmpDir();
-        }
+        File reportDir = testTmpDir.resolve("reports").toFile();
+        assertTrue(reportDir.isDirectory());
+        File[] reportFiles = reportDir.listFiles();
+        assertTrue(reportFiles.length > 0);
     }
 }

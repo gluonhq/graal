@@ -28,30 +28,76 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.module.ModuleReader;
 import java.lang.module.ModuleReference;
+import java.lang.ref.SoftReference;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-import com.oracle.svm.core.SubstrateUtil;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
+
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
+import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 @TargetClass(value = jdk.internal.loader.BuiltinClassLoader.class)
 @SuppressWarnings({"unused", "static-method"})
 final class Target_jdk_internal_loader_BuiltinClassLoader {
 
-    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset) //
+    @Alias Target_jdk_internal_loader_URLClassPath ucp;
+
+    @Alias Map<String, ModuleReference> nameToModule;
+
+    /// This alias avoids embedding the build-time moduleToReader contents into the image heap.
+    /// Instead, each runtime image gets a fresh ConcurrentHashMap.
+    @Alias @RecomputeFieldValue(kind = Kind.Custom, declClass = NewConcurrentHashMap.class) //
     private Map<ModuleReference, ModuleReader> moduleToReader;
 
+    @Alias @RecomputeFieldValue(kind = Kind.Reset) //
+    volatile SoftReference<Map<String, List<URL>>> resourceCache;
+
+    /// Maps package names to the JDK metadata for the module that owns the package.
+    ///
+    /// `ModuleLayerFeature` transforms this static JDK field to a Native Image owned map and rebuilds
+    /// it while synthesizing the runtime boot layer. The final rebuild clears the prototype state seen
+    /// during analysis and inserts `LoadedModule` values created from the runtime built-in loader and
+    /// the selected `ModuleReference`s, so runtime boot package lookup uses the synthesized module
+    /// layer instead of the image builder's transient loader state.
+    @Alias @RecomputeFieldValue(kind = Kind.None, isFinal = false) //
+    static Map<String, Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule> packageToModule;
+
+    @Alias
+    public native ModuleReference findModule(String name);
+
+    @Alias
+    public native void loadModule(ModuleReference mref);
+
+    @Alias
+    native ModuleReader moduleReaderFor(ModuleReference mref);
+
+    @Alias
+    native boolean hasClassPath();
+
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     protected Class<?> findClass(String name) throws ClassNotFoundException {
         throw new ClassNotFoundException(name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
         Target_java_lang_ClassLoader self = SubstrateUtil.cast(this, Target_java_lang_ClassLoader.class);
         Class<?> clazz = self.findLoadedClass(name);
@@ -62,44 +108,190 @@ final class Target_jdk_internal_loader_BuiltinClassLoader {
     }
 
     @Substitute
+    @TargetElement(onlyWith = RuntimeClassLoading.NoRuntimeClassLoading.class)
+    private Class<?> findClassInModuleOrNull(@SuppressWarnings("unused") Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule loadedModule,
+                    @SuppressWarnings("unused") String cn) {
+        return null;
+    }
+
+    @Substitute
+    @TargetElement(onlyWith = RuntimeClassLoading.NoRuntimeClassLoading.class)
+    protected Class<?> defineClass(String cn, Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule loadedModule) {
+        /*
+         * Avoid dragging in logging & formatting code through
+         * JarModuleReader->JarFile->Manifest->Attributes
+         */
+        throw RuntimeClassLoading.throwNoBytecodeClasses(cn);
+    }
+
+    @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     public URL findResource(String mn, String name) {
         Module module = ModuleLayer.boot().findModule(mn).orElse(null);
         return ResourcesHelper.nameToResourceURL(module, name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     public InputStream findResourceAsStream(String mn, String name) throws IOException {
         return ResourcesHelper.nameToResourceInputStream(mn, name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     public URL findResource(String name) {
         return ResourcesHelper.nameToResourceURL(name);
     }
 
     @Substitute
-    public Enumeration<URL> findResources(String name) {
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
+    public Enumeration<URL> findResources(String name) throws IOException {
         return ResourcesHelper.nameToResourceEnumerationURLs(name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     private List<URL> findMiscResource(String name) {
         return ResourcesHelper.nameToResourceListURLs(name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.IgnoresClassLoader.class)
     private URL findResource(ModuleReference mref, String name) {
         Module module = ModuleLayer.boot().findModule(mref.descriptor().name()).orElse(null);
         return ResourcesHelper.nameToResourceURL(module, name);
     }
 
     @Substitute
+    @TargetElement(onlyWith = ClassRegistries.RespectsClassLoader.class)
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/java.base/share/classes/jdk/internal/loader/BuiltinClassLoader.java#L483-L492")
     private URL findResourceOnClassPath(String name) {
-        return ResourcesHelper.nameToResourceURL(name);
+        ClassLoader loader = SubstrateUtil.cast(this, ClassLoader.class);
+        URL url = ResourcesHelper.findEmbeddedResourceEntry(loader, name) ? ResourcesHelper.nameToResourceURL(loader, name) : null;
+        if (url != null) {
+            return url;
+        }
+        if (hasClassPath()) {
+            return ucp.findResource(name);
+        }
+        if (ResourcesHelper.isBootLoader(loader)) {
+            return null;
+        }
+        ResourcesHelper.reportMissingEmbeddedResourceMetadata(loader, name);
+        return null;
     }
 
     @Substitute
-    private Enumeration<URL> findResourcesOnClassPath(String name) {
-        return ResourcesHelper.nameToResourceEnumerationURLs(name);
+    @TargetElement(onlyWith = ClassRegistries.RespectsClassLoader.class)
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+20/src/java.base/share/classes/jdk/internal/loader/BuiltinClassLoader.java#L497-L504")
+    private Enumeration<URL> findResourcesOnClassPath(String name) throws IOException {
+        ClassLoader loader = SubstrateUtil.cast(this, ClassLoader.class);
+        List<URL> embeddedResources = ResourcesHelper.findEmbeddedResourceEntry(loader, name) ? ResourcesHelper.nameToResourceListURLs(loader, name) : List.of();
+        if (embeddedResources.isEmpty()) {
+            if (hasClassPath()) {
+                return ucp.findResources(name);
+            }
+            if (ResourcesHelper.isBootLoader(loader)) {
+                return Collections.emptyEnumeration();
+            }
+            ResourcesHelper.reportMissingEmbeddedResourceMetadata(loader, name);
+            return Collections.emptyEnumeration();
+        }
+        List<URL> resources = new ArrayList<>(embeddedResources);
+        Enumeration<URL> classPathResources = hasClassPath() ? ucp.findResources(name) : Collections.emptyEnumeration();
+        while (classPathResources.hasMoreElements()) {
+            resources.add(classPathResources.nextElement());
+        }
+        return Collections.enumeration(resources);
     }
+
+    static final class NewConcurrentHashMap implements FieldValueTransformer {
+        @Override
+        public Object transform(Object receiver, Object originalValue) {
+            return new ConcurrentHashMap<>();
+        }
+    }
+}
+
+final class BuiltinClassLoaderSubstitutionsSupport {
+    private BuiltinClassLoaderSubstitutionsSupport() {
+    }
+
+    /// Replaces the image-time module reference with its runtime patched counterpart.
+    ///
+    /// The JDK normally installs patched references while bootstrapping the module system. Native
+    /// Image synthesizes the loader maps before runtime module options are available, so the maps
+    /// and their `LoadedModule` values need to be updated once the runtime patcher is initialized.
+    static void patchModuleReference(Target_jdk_internal_loader_BuiltinClassLoader loader, ModuleReference originalReference, ModuleReference patchedReference) {
+        String moduleName = patchedReference.descriptor().name();
+        ModuleReference previousReference = loader.nameToModule.replace(moduleName, patchedReference);
+        if (previousReference != originalReference) {
+            throw VMError.shouldNotReachHere("Unexpected built-in loader module reference for " + moduleName);
+        }
+
+        Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule loadedModule;
+        Set<String> originalPackages = originalReference.descriptor().packages();
+        Set<String> patchedPackages = patchedReference.descriptor().packages();
+
+        if (originalPackages.isEmpty()) {
+            loadedModule = new Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule(loader, patchedReference);
+        } else {
+            // Updates the single LoadedModule shared by the module's existing packages.
+            String firstOriginalPackage = originalPackages.iterator().next();
+            loadedModule = Target_jdk_internal_loader_BuiltinClassLoader.packageToModule.get(firstOriginalPackage);
+            if (loadedModule.loader() != loader) {
+                throw VMError.shouldNotReachHere("Unexpected loader for loaded module " + moduleName + ": " + loader);
+            }
+            loadedModule.mref = patchedReference;
+        }
+
+        // Adds mappings for packages introduced by the patched module descriptor.
+        if (!originalPackages.equals(patchedPackages)) {
+            for (String packageName : patchedPackages) {
+                if (originalPackages.contains(packageName)) {
+                    continue;
+                }
+                Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule existing = Target_jdk_internal_loader_BuiltinClassLoader.packageToModule.putIfAbsent(packageName, loadedModule);
+                if (existing != null) {
+                    if (existing.loader() != loader || !moduleName.equals(existing.name())) {
+                        throw VMError.shouldNotReachHere("Package " + packageName + " is already mapped to module " + existing.name());
+                    }
+                    existing.mref = patchedReference;
+                }
+            }
+        }
+
+        loader.resourceCache = null;
+    }
+
+    /// Finds the boot-layer module that owns `packageName` for `loader` in the built-in loader map.
+    static Module findLoadedModule(ClassLoader loader, String packageName) {
+        Target_jdk_internal_loader_BuiltinClassLoader expectedLoader = loader == null ? Target_jdk_internal_loader_ClassLoaders.bootLoader()
+                        : SubstrateUtil.cast(loader, Target_jdk_internal_loader_BuiltinClassLoader.class);
+        Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule loadedModule = Target_jdk_internal_loader_BuiltinClassLoader.packageToModule.get(packageName);
+        if (loadedModule == null || loadedModule.loader() != expectedLoader) {
+            return null;
+        }
+        return ModuleLayer.boot().findModule(loadedModule.name()).orElse(null);
+    }
+}
+
+@TargetClass(value = jdk.internal.loader.BuiltinClassLoader.class, innerClass = "LoadedModule")
+final class Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule {
+
+    @Alias
+    Target_jdk_internal_loader_BuiltinClassLoader_LoadedModule(@SuppressWarnings("unused") Target_jdk_internal_loader_BuiltinClassLoader loader, @SuppressWarnings("unused") ModuleReference mref) {
+    }
+
+    @Alias
+    native String name();
+
+    /// Runtime `--patch-module` options replace the image-time module reference after startup.
+    @Alias @RecomputeFieldValue(isFinal = false, kind = Kind.None) ModuleReference mref;
+
+    @Alias
+    native ModuleReference mref();
+
+    @Alias
+    native Target_jdk_internal_loader_BuiltinClassLoader loader();
 }

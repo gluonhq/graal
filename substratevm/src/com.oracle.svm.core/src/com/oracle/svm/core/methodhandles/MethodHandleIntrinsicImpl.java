@@ -24,18 +24,16 @@
  */
 package com.oracle.svm.core.methodhandles;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.hub.DynamicHub;
@@ -43,6 +41,7 @@ import com.oracle.svm.core.invoke.MethodHandleIntrinsic;
 import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
 
 import jdk.vm.ci.meta.JavaKind;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * This class represents direct method handles which are not invoked through reflection for various
@@ -111,7 +110,7 @@ final class MethodHandleIntrinsicImpl implements MethodHandleIntrinsic {
 
     static Map<Variant, Map<String, Map<JavaKind, Map<Integer, MethodHandleIntrinsicImpl>>>> cache = new ConcurrentHashMap<>();
     static final String NO_SPECIES = "";
-    static final Set<String> unsafeFieldAccessMethodNames = new HashSet<>();
+    static final EconomicSet<String> unsafeFieldAccessMethodNames = EconomicSet.create();
 
     static {
         for (String op : Arrays.asList("get", "put")) {
@@ -136,10 +135,10 @@ final class MethodHandleIntrinsicImpl implements MethodHandleIntrinsic {
     }
 
     private static MethodHandleIntrinsicImpl intrinsic(Variant variant, String species, JavaKind kind, int index) {
-        return cache.computeIfAbsent(variant, (v) -> new ConcurrentHashMap<>())
-                        .computeIfAbsent(species, (s) -> new ConcurrentHashMap<>())
-                        .computeIfAbsent(kind, (t) -> new ConcurrentHashMap<>())
-                        .computeIfAbsent(index, (i) -> new MethodHandleIntrinsicImpl(variant, species, kind, index));
+        return cache.computeIfAbsent(variant, _ -> new ConcurrentHashMap<>())
+                        .computeIfAbsent(species, _ -> new ConcurrentHashMap<>())
+                        .computeIfAbsent(kind, _ -> new ConcurrentHashMap<>())
+                        .computeIfAbsent(index, _ -> new MethodHandleIntrinsicImpl(variant, species, kind, index));
     }
 
     static MethodHandleIntrinsicImpl intrinsic(Variant variant) {

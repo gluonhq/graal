@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -77,7 +77,7 @@ import com.oracle.truffle.api.profiles.IntValueProfile;
 import com.oracle.truffle.api.profiles.LongValueProfile;
 import com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest;
 
-@SuppressWarnings({"truffle-inlining", "truffle-neverdefault", "truffle-sharing", "unused"})
+@SuppressWarnings({"truffle-neverdefault", "truffle-sharing", "unused"})
 public class ProfileInliningTest extends AbstractPolyglotTest {
 
     @Test
@@ -115,6 +115,7 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
     @GenerateCached(alwaysInlineCached = true)
     @GenerateUncached
     @SuppressWarnings({"unused"})
+    @ExpectError("This node is a candidate for node object inlining.%")
     public abstract static class UsageNode extends Node {
 
         abstract Object execute(Object arg);
@@ -166,7 +167,7 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
 
         @Specialization
         static Object doLong(long arg,
-                        @Bind("this") Node node,
+                        @Bind Node node,
                         @Cached InlinedLongValueProfile p) {
             return p.profile(node, arg);
         }
@@ -191,6 +192,7 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
     @GenerateCached(alwaysInlineCached = true)
     @GenerateUncached
     @SuppressWarnings({"unused"})
+    @ExpectError("This node is a candidate for node object inlining.%")
     public abstract static class LoopConditionUsageNode extends Node {
 
         abstract Object execute(Object arg);
@@ -227,7 +229,7 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
         @ExportMessage
         @SuppressWarnings("unused")
         static Object execute(UsageExport receiver, Object[] arguments,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached InlinedBranchProfile p0,
                         @Cached InlinedConditionProfile p1,
                         @Cached InlinedCountingConditionProfile p2,
@@ -254,7 +256,8 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
 
     }
 
-    @SuppressWarnings({"unused", "truffle"})
+    @SuppressWarnings({"unused"})
+    @ExpectError("This node is a candidate for node object inlining.%")
     public abstract static class TestInlineMessage1 extends BaseNode {
 
         // even though BranchProfile needs a different type we report as inlinable
@@ -309,7 +312,7 @@ public class ProfileInliningTest extends AbstractPolyglotTest {
         }
     }
 
-    @SuppressWarnings({"unused", "truffle"})
+    @ExpectError("This node is a candidate for node object inlining.%")
     public abstract static class TestInlineMessage6 extends BaseNode {
 
         // test no warning for inlinable

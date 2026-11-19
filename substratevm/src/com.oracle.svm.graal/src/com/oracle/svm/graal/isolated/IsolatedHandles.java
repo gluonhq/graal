@@ -24,10 +24,9 @@
  */
 package com.oracle.svm.graal.isolated;
 
-import org.graalvm.nativeimage.ObjectHandle;
-
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.handles.ThreadLocalHandles;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.core.graal.isolated.IsolatedHandle;
+import com.oracle.svm.guest.staging.core.handles.ThreadLocalHandles;
 
 public final class IsolatedHandles {
     @SuppressWarnings("unchecked")
@@ -38,12 +37,4 @@ public final class IsolatedHandles {
 
     private IsolatedHandles() {
     }
-}
-
-/**
- * An object handle for isolated compilation with added static type information.
- *
- * @param <T> The type of the object referenced by the handle.
- */
-interface IsolatedHandle<T> extends ObjectHandle {
 }

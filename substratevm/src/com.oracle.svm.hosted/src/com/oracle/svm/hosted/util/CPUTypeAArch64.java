@@ -41,11 +41,12 @@ import java.util.stream.Stream;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.graal.pointsto.util.GraalAccess;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.NativeImageOptions;
-import com.oracle.svm.util.StringUtil;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.StringUtil;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.aarch64.AArch64.CPUFeature;
@@ -68,7 +69,7 @@ public enum CPUTypeAArch64 implements CPUType {
 
     private static CPUFeature[] getNativeOrEmpty() {
         CPUFeature[] empty = new CPUFeature[0];
-        if (GraalAccess.getOriginalTarget().arch instanceof AArch64 arch) {
+        if (GuestAccess.get().getTarget().arch instanceof AArch64 arch) {
             return arch.getFeatures().toArray(empty);
         } else {
             return empty;
@@ -113,15 +114,23 @@ public enum CPUTypeAArch64 implements CPUType {
         }
     }
 
-    public static String getDefaultName() {
-        return ARMV8_A.getName();
+    public static String getDefaultName(boolean printFallbackWarning) {
+        if (NATIVE.getFeatures().containsAll(ARMV8_1_A.getFeatures())) {
+            return ARMV8_1_A.getName();
+        } else {
+            if (printFallbackWarning) {
+                LogUtils.warning("The host machine does not support all features of '%s'. Falling back to '%s' for best compatibility.",
+                                ARMV8_1_A.getName(), SubstrateOptionsParser.commandArgument(NativeImageOptions.MicroArchitecture, COMPATIBILITY.getName()));
+            }
+            return COMPATIBILITY.getName();
+        }
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public static EnumSet<CPUFeature> getSelectedFeatures() {
         String value = NativeImageOptions.MicroArchitecture.getValue();
         if (value == null) {
-            value = getDefaultName();
+            value = getDefaultName(true);
         }
         return getCPUFeaturesForArch(value);
     }

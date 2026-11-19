@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,24 +32,26 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import com.oracle.svm.guest.staging.option.RuntimeOptionValues.Origin;
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.options.OptionDescriptors;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.deopt.Deoptimizer;
 import com.oracle.svm.core.deopt.SubstrateSpeculationLog;
 import com.oracle.svm.core.heap.ReferenceInternals;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.InteriorObjRefWalker;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
 import com.oracle.svm.core.stack.SubstrateStackIntrospection;
 import com.oracle.svm.truffle.TruffleSupport;
 import com.oracle.truffle.api.CompilerAsserts;
@@ -58,10 +60,7 @@ import com.oracle.truffle.api.impl.AbstractFastThreadLocal;
 import com.oracle.truffle.api.impl.ThreadLocalHandshake;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.utilities.TriState;
-import com.oracle.truffle.compiler.ConstantFieldInfo;
-import com.oracle.truffle.compiler.HostMethodInfo;
 import com.oracle.truffle.compiler.OptimizedAssumptionDependency;
-import com.oracle.truffle.compiler.PartialEvaluationMethodInfo;
 import com.oracle.truffle.compiler.TruffleCompilable;
 import com.oracle.truffle.compiler.TruffleCompiler;
 import com.oracle.truffle.runtime.AbstractCompilationTask;
@@ -81,7 +80,6 @@ import jdk.vm.ci.code.stack.StackIntrospection;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.SpeculationLog;
 
@@ -103,6 +101,7 @@ class SubstrateTruffleOptions {
          */
         return SubstrateTruffleOptions.TruffleMultiThreaded.getValue();
     }
+
 }
 
 public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
@@ -120,16 +119,15 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
     private static final int DEBUG_TEAR_DOWN_TIMEOUT = 2_000;
     private static final int PRODUCTION_TEAR_DOWN_TIMEOUT = 10_000;
 
-    private KnownMethods hostedCallMethods;
+    @Platforms(Platform.HOSTED_ONLY.class) private KnownMethods hostedCallMethods;
     private volatile BackgroundCompileQueue compileQueue;
     private volatile boolean initialized;
+    private volatile boolean compilerInitialized;
     private volatile Boolean profilingEnabled;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public SubstrateTruffleRuntime() {
         super(new SubstrateTruffleCompilationSupport(), List.of());
-        /* Ensure the factory class gets initialized. */
-        super.getLoopNodeFactory();
     }
 
     @Override
@@ -160,15 +158,19 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
     }
 
     private void initializeAtRuntime(OptimizedCallTarget callTarget) {
-        truffleCompiler.initialize(callTarget, true);
+        /*
+         * The compiler itself (option parsing, partial evaluator, Truffle tier) is initialized
+         * lazily on the first compilation, see getTruffleCompiler. Short runs never compile, and
+         * this runs when the first call target is created, on the startup path.
+         */
         if (SubstrateTruffleOptions.isMultiThreaded()) {
             compileQueue = TruffleSupport.singleton().createBackgroundCompileQueue(this);
         }
         if (callTarget.engine.traceTransferToInterpreter) {
-            Deoptimizer.Options.TraceDeoptimization.update(true);
+            Deoptimizer.Options.TraceDeoptimization.update(true, Origin.Runtime);
         }
         installDefaultListeners();
-        RuntimeSupport.getRuntimeSupport().addTearDownHook(isFirstIsolate -> teardown());
+        RuntimeSupport.getRuntimeSupport().addTearDownHook(_ -> teardownCompilerIsolate());
     }
 
     @Override
@@ -182,34 +184,16 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
         return null;
     }
 
-    @Override
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public PartialEvaluationMethodInfo getPartialEvaluationMethodInfo(ResolvedJavaMethod method) {
-        return super.getPartialEvaluationMethodInfo(method);
-    }
-
-    @Override
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public HostMethodInfo getHostMethodInfo(ResolvedJavaMethod method) {
-        return super.getHostMethodInfo(method);
-    }
-
-    @Override
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public ConstantFieldInfo getConstantFieldInfo(ResolvedJavaField field) {
-        return super.getConstantFieldInfo(field);
-    }
-
-    private void teardown() {
-        long timeout = SubstrateUtil.assertionsEnabled() ? DEBUG_TEAR_DOWN_TIMEOUT : PRODUCTION_TEAR_DOWN_TIMEOUT;
-        BackgroundCompileQueue queue = getCompileQueue();
-        if (queue != null) {
-            queue.shutdownAndAwaitTermination(timeout);
-        }
-
+    private void teardownCompilerIsolate() {
         TruffleCompiler tcp = truffleCompiler;
         if (tcp != null) {
-            ((SubstrateTruffleCompiler) tcp).teardown();
+            ((SubstrateTruffleCompiler) tcp).teardown(() -> {
+                long timeout = SubstrateUtil.assertionsEnabled() ? DEBUG_TEAR_DOWN_TIMEOUT : PRODUCTION_TEAR_DOWN_TIMEOUT;
+                BackgroundCompileQueue queue = getCompileQueue();
+                if (queue != null) {
+                    queue.shutdownAndAwaitTermination(timeout);
+                }
+            });
         }
     }
 
@@ -229,13 +213,25 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
     }
 
     public ResolvedJavaMethod[] getAnyFrameMethod() {
-        return knownMethods.anyFrameMethod;
+        return knownMethods.getAnyFrameMethods();
     }
 
+    /**
+     * Returns the compiler, initializing it first if needed. Every compilation gets the compiler
+     * through this method ({@code OptimizedTruffleRuntime.compileImpl}).
+     */
     @Override
     public SubstrateTruffleCompiler getTruffleCompiler(TruffleCompilable compilable) {
         Objects.requireNonNull(compilable, "Compilable must be non null.");
         ensureInitializedAtRuntime((OptimizedCallTarget) compilable);
+        if (!SubstrateUtil.HOSTED && !compilerInitialized) {
+            synchronized (this) {
+                if (!compilerInitialized) {
+                    truffleCompiler.initialize(compilable, true);
+                    compilerInitialized = true;
+                }
+            }
+        }
         return (SubstrateTruffleCompiler) truffleCompiler;
     }
 
@@ -266,17 +262,22 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
         if (profilingEnabled == null) {
             profilingEnabled = getEngineData(rootNode).profilingEnabled;
         }
-        OptimizedCallTarget callTarget = TruffleSupport.singleton().createOptimizedCallTarget(source, rootNode);
+        OptimizedCallTarget callTarget = new SubstrateOptimizedCallTarget(source, rootNode);
         ensureInitializedAtRuntime(callTarget);
         return callTarget;
     }
 
     @Override
     protected OptimizedCallTarget createInitializationCallTarget(EngineData engine) {
-        return TruffleSupport.singleton().createOptimizedCallTarget(engine);
+        return new SubstrateOptimizedCallTarget(engine);
     }
 
-    private void ensureInitializedAtRuntime(OptimizedCallTarget callTarget) {
+    /**
+     * Initializes process-local runtime services before a fresh or restored call target is used.
+     *
+     * @param callTarget a call target whose engine has current runtime options and logging
+     */
+    public void ensureInitializedAtRuntime(OptimizedCallTarget callTarget) {
         if (!SubstrateUtil.HOSTED && !initialized) {
             synchronized (this) {
                 if (!initialized) {
@@ -315,6 +316,11 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
 
     @Override
     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {
+        return submitForCompilation(optimizedCallTarget, lastTierCompilation, CompilationTask.SubmissionReason.EXPLICIT);
+    }
+
+    @Override
+    public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation, CompilationTask.SubmissionReason submissionReason) {
         if (SubstrateUtil.HOSTED) {
             /*
              * Truffle code can run during image generation. But for now it is the easiest to not
@@ -333,7 +339,7 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
         ensureInitializedAtRuntime(optimizedCallTarget);
 
         if (SubstrateTruffleOptions.isMultiThreaded()) {
-            return super.submitForCompilation(optimizedCallTarget, lastTierCompilation);
+            return super.submitForCompilation(optimizedCallTarget, lastTierCompilation, submissionReason);
         }
 
         try {
@@ -426,17 +432,17 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
 
     @Override
     protected int getObjectAlignment() {
-        return ConfigurationValues.getObjectLayout().getAlignment();
+        return ObjectLayout.singleton().getAlignment();
     }
 
     @Override
     protected int getArrayBaseOffset(Class<?> componentType) {
-        return ConfigurationValues.getObjectLayout().getArrayBaseOffset(JavaKind.fromJavaClass(componentType));
+        return ObjectLayoutCompilerSupport.getArrayBaseOffset(ObjectLayout.singleton(), JavaKind.fromJavaClass(componentType));
     }
 
     @Override
     protected int getArrayIndexScale(Class<?> componentType) {
-        return ConfigurationValues.getObjectLayout().getArrayIndexScale(JavaKind.fromJavaClass(componentType));
+        return ObjectLayoutCompilerSupport.getArrayIndexScale(ObjectLayout.singleton(), JavaKind.fromJavaClass(componentType));
     }
 
     @Override
@@ -463,7 +469,7 @@ public final class SubstrateTruffleRuntime extends OptimizedTruffleRuntime {
         boolean referenceInstanceClass = dh.isReferenceInstanceClass();
         int monitorOffset = dh.getMonitorOffset();
         InteriorObjRefWalker.walkInstanceReferenceOffsets(dh, (offset) -> {
-            if (offset == monitorOffset) {
+            if (monitorOffset != 0 && offset == monitorOffset) {
                 // Object monitor is not a proper field.
             } else if (referenceInstanceClass && ReferenceInternals.isAnyReferenceFieldOffset(offset)) {
                 // Reference class field offsets must not be exposed.

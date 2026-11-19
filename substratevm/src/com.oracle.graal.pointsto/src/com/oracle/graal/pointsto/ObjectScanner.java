@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,7 +29,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
-import java.util.IdentityHashMap;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -38,15 +38,19 @@ import org.graalvm.word.WordBase;
 
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
 import com.oracle.graal.pointsto.heap.HeapSnapshotVerifier;
+import com.oracle.graal.pointsto.heap.HostedValuesProvider;
 import com.oracle.graal.pointsto.heap.ImageHeapArray;
 import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
+import com.oracle.graal.pointsto.heap.TypedConstant;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.reports.ObjectTreePrinter;
 import com.oracle.graal.pointsto.reports.ReportUtils;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.CompletionExecutor;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.vm.ci.code.BytecodePosition;
@@ -55,12 +59,18 @@ import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
- * Provides functionality for scanning constant objects.
- *
+ * Provides functionality for traversing object graphs from a set of roots.
+ * For every encountered field value and array element, the scanner delegates to an
+ * {@link ObjectScanningObserver}. The observer determines the purpose and effects of a traversal;
+ * for example, {@link AnalysisObjectScanningObserver} drives analysis,
+ * {@link HeapSnapshotVerifier} verifies the image-heap snapshot, and {@link ObjectTreePrinter}
+ * produces diagnostics.
+ * <p>
  * The scanning is done in parallel. The set of visited elements is a special data structure whose
- * structure can be reused over multiple scanning iterations to save CPU resources. (For details
+ * structure can be reused over multiple scanning iterations to save CPU resources (For details, see
  * {@link ReusableSet}).
  */
 public class ObjectScanner {
@@ -109,7 +119,7 @@ public class ObjectScanner {
         }
         for (AnalysisField field : fields) {
             if (Modifier.isStatic(field.getModifiers()) && field.isRead()) {
-                execute(() -> scanRootField(field));
+                execute(() -> scanStaticFieldRoot(field));
             }
         }
 
@@ -155,9 +165,9 @@ public class ObjectScanner {
      *
      * @param field the scanned root field
      */
-    protected final void scanRootField(AnalysisField field) {
-        if (field.isInBaseLayer()) {
-            // skip base layer roots
+    protected final void scanStaticFieldRoot(AnalysisField field) {
+        if (!field.installableInLayer()) {
+            // skip fields not installable in this layer
             return;
         }
         scanField(field, null, null);
@@ -172,7 +182,7 @@ public class ObjectScanner {
     protected void scanField(AnalysisField field, JavaConstant receiver, ScanReason prevReason) {
         ScanReason reason = new FieldScan(field, receiver, prevReason);
         try {
-            if (!bb.getUniverse().getHeapScanner().isValueAvailable(field)) {
+            if (!bb.getUniverse().getHeapScanner().isValueAvailable(field, receiver)) {
                 /* The value is not available yet. */
                 return;
             }
@@ -211,6 +221,12 @@ public class ObjectScanner {
 
         } catch (UnsupportedFeatureException | AnalysisError.TypeNotFoundError ex) {
             unsupportedFeatureDuringFieldScan(bb, field, receiver, ex, reason);
+        } catch (AnalysisError analysisError) {
+            if (analysisError.getCause() instanceof UnsupportedFeatureException ex) {
+                unsupportedFeatureDuringFieldScan(bb, field, receiver, ex, reason);
+            } else {
+                throw analysisError;
+            }
         }
     }
 
@@ -264,17 +280,18 @@ public class ObjectScanner {
                 }
             }
         } else {
-            Object[] arrayObject = (Object[]) constantAsObject(bb, array);
-            for (int idx = 0; idx < arrayObject.length; idx++) {
-                Object e = arrayObject[idx];
-                if (e == null) {
+            HostedValuesProvider hostedValuesProvider = bb.getUniverse().getHostedValuesProvider();
+            int len = hostedValuesProvider.readArrayLength(array);
+            for (int idx = 0; idx < len; idx++) {
+                JavaConstant elem = hostedValuesProvider.readArrayElement(array, idx);
+                if (elem.isNull()) {
                     scanningObserver.forNullArrayElement(array, arrayType, idx, reason);
                 } else {
                     try {
-                        JavaConstant element = bb.getUniverse().getHostedValuesProvider().forObject(bb.getUniverse().replaceObject(e));
+                        JavaConstant element = bb.getUniverse().replaceConstantWithAllReplacers(elem);
                         scanArrayElement(array, arrayType, reason, idx, element);
                     } catch (UnsupportedFeatureException | AnalysisError.TypeNotFoundError ex) {
-                        unsupportedFeatureDuringConstantScan(bb, bb.getUniverse().getHostedValuesProvider().forObject(e), ex, reason);
+                        unsupportedFeatureDuringConstantScan(bb, elem, ex, reason);
                     }
                 }
             }
@@ -298,12 +315,11 @@ public class ObjectScanner {
             return;
         }
         JavaConstant unwrappedValue = maybeUnwrap(value);
-        Object valueObj = unwrappedValue instanceof ImageHeapConstant ? unwrappedValue : constantAsObject(bb, unwrappedValue);
-        if (scannedObjects.putAndAcquire(valueObj) == null) {
+        if (scannedObjects.putAndAcquire(unwrappedValue) == null) {
             try {
                 scanningObserver.forScannedConstant(unwrappedValue, reason);
             } finally {
-                scannedObjects.release(valueObj);
+                scannedObjects.release(unwrappedValue);
                 WorklistEntry worklistEntry = new WorklistEntry(unwrappedValue, reason);
                 if (executor != null) {
                     executor.execute(debug -> doScan(worklistEntry));
@@ -391,7 +407,7 @@ public class ObjectScanner {
         if (constant == null || constant.isNull()) {
             return "null";
         }
-        AnalysisType type = bb.getMetaAccess().lookupJavaType(constant);
+        ResolvedJavaType type = constant instanceof TypedConstant typedConstant ? typedConstant.getType() : bb.getMetaAccess().getWrapped().lookupJavaType(constant);
         JavaConstant hosted = constant;
         if (constant instanceof ImageHeapConstant heapConstant) {
             JavaConstant hostedObject = heapConstant.getHostedObject();
@@ -407,17 +423,31 @@ public class ObjectScanner {
             return hosted.toValueString();
         }
 
-        Object obj = constantAsObject(bb, hosted);
-        String str = type.toJavaName() + '@' + Integer.toHexString(System.identityHashCode(obj));
+        /*
+         * The scan fast path only needs reachability. Guest-backed identityHashCode/toString are
+         * used exclusively for optional diagnostics such as reports and verifier messages, so this
+         * generic GuestAccess fallback stays off the main scanning path.
+         */
+        String str = type.toJavaName() + '@' + Integer.toHexString(originalIdentityHashCode(hosted));
         if (appendToString) {
             try {
-                str += ": " + limit(obj.toString(), 80).replace(System.lineSeparator(), "");
-            } catch (Throwable e) {
+                str += ": " + limit(originalToString(hosted), 80).replace(System.lineSeparator(), "");
+            } catch (Throwable ignored) {
                 // ignore any error in creating the string representation
             }
         }
 
         return str;
+    }
+
+    private static int originalIdentityHashCode(JavaConstant constant) {
+        return GuestAccess.get().getProviders().getConstantReflection().identityHashCode(constant);
+    }
+
+    private static String originalToString(JavaConstant constant) {
+        GuestAccess access = GuestAccess.get();
+        JavaConstant stringConstant = access.invoke(access.elements.java_lang_Object_toString, constant);
+        return access.asHostString(stringConstant);
     }
 
     public static String limit(String value, int length) {
@@ -536,10 +566,7 @@ public class ObjectScanner {
     }
 
     public static class OtherReason extends ScanReason {
-        public static final ScanReason LATE_SCAN = new OtherReason("late scan, after sealing heap");
         public static final ScanReason UNKNOWN = new OtherReason("manually created constant");
-        public static final ScanReason RESCAN = new OtherReason("manually triggered rescan");
-        public static final ScanReason HUB = new OtherReason("scanning a class constant");
 
         final String reason;
 
@@ -601,8 +628,7 @@ public class ObjectScanner {
 
         public String location() {
             Object readBy = field.getReadBy();
-            if (readBy instanceof BytecodePosition) {
-                BytecodePosition position = (BytecodePosition) readBy;
+            if (readBy instanceof BytecodePosition position) {
                 return position.getMethod().asStackTraceElement(position.getBCI()).toString();
             } else if (readBy instanceof AnalysisMethod) {
                 return ((AnalysisMethod) readBy).asStackTraceElement(0).toString();
@@ -740,7 +766,7 @@ public class ObjectScanner {
 
         @Override
         public String toString(BigBang bb) {
-            return "scanning root " + asString(bb, constant) + " embedded in" + System.lineSeparator() + INDENTATION_AFTER_NEWLINE + asStackTraceElement();
+            return "scanning root constant " + asString(bb, constant) + " embedded in" + System.lineSeparator() + INDENTATION_AFTER_NEWLINE + asStackTraceElement();
         }
 
         @Override
@@ -784,12 +810,16 @@ public class ObjectScanner {
         /**
          * The storage of atomic integers. During analysis the constant count for rather large
          * programs such as the JS interpreter are 90k objects. Hence we use 64k as a good start.
+         * <p/>
+         * The specification of {@link Object#equals(Object)} and {@link Object#hashCode()}} for
+         * {@link JavaConstant} states that they are based on the identity of the wrapped object,
+         * thus we can use {@link JavaConstant} as keys here.
          */
-        private final IdentityHashMap<Object, AtomicInteger> store = new IdentityHashMap<>(65536);
+        private final HashMap<JavaConstant, AtomicInteger> store = new HashMap<>(65536);
         private int sequence = 0;
 
-        public Object putAndAcquire(Object object) {
-            IdentityHashMap<Object, AtomicInteger> map = this.store;
+        public Object putAndAcquire(JavaConstant object) {
+            Map<JavaConstant, AtomicInteger> map = this.store;
             AtomicInteger i = map.get(object);
             int seq = this.sequence;
             int inflightSequence = seq - 1;
@@ -822,14 +852,14 @@ public class ObjectScanner {
             }
         }
 
-        public void release(Object o) {
-            IdentityHashMap<Object, AtomicInteger> map = this.store;
-            AtomicInteger i = map.get(o);
+        public void release(JavaConstant object) {
+            Map<JavaConstant, AtomicInteger> map = this.store;
+            AtomicInteger i = map.get(object);
             if (i == null) {
                 // We have missed a value likely someone else has updated the map at the same time.
                 // Now synchronize
                 synchronized (map) {
-                    i = map.get(o);
+                    i = map.get(object);
                 }
             }
             i.set(sequence);

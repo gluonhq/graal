@@ -27,21 +27,26 @@ package com.oracle.svm.hosted.code;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import jdk.graal.compiler.graph.Node.NodeIntrinsic;
-import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
+import com.oracle.svm.core.CFunctionGuestValue;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.graal.code.CGlobalDataInfo;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
 import com.oracle.svm.hosted.c.CGlobalDataFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
+import jdk.graal.compiler.graph.Node.NodeIntrinsic;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class CFunctionLinkages {
     public static CFunctionLinkages singleton() {
         return ImageSingletons.lookup(CFunctionLinkages.class);
@@ -53,13 +58,17 @@ public final class CFunctionLinkages {
     }
 
     public CGlobalDataInfo addOrLookupMethod(ResolvedJavaMethod method) {
-        if (method.getAnnotation(NodeIntrinsic.class) != null || method.getAnnotation(Word.Operation.class) != null) {
+        if (GuestAnnotationAccess.isAnnotationPresent(method, NodeIntrinsic.class) || GuestAnnotationAccess.isAnnotationPresent(method, Word.Operation.class)) {
             return null;
         }
         return nameToFunction.computeIfAbsent(linkageName(method), symbolName -> {
             CGlobalData<CFunctionPointer> linkage = CGlobalDataFactory.forSymbol(symbolName);
             return CGlobalDataFeature.singleton().registerAsAccessedOrGet(linkage);
         });
+    }
+
+    public boolean isFunctionLinkage(CGlobalDataInfo dataInfo) {
+        return dataInfo.isSymbolReference() && nameToFunction.get(dataInfo.getData().symbolName) == dataInfo;
     }
 
     private static String linkageName(ResolvedJavaMethod method) {
@@ -71,7 +80,7 @@ public final class CFunctionLinkages {
     }
 
     private static String getLinkageNameFromAnnotation(ResolvedJavaMethod method) {
-        CFunction cFunctionAnnotation = method.getAnnotation(CFunction.class);
+        CFunctionGuestValue cFunctionAnnotation = CFunctionGuestValue.get(method);
         if (cFunctionAnnotation != null) {
             return cFunctionAnnotation.value();
         }

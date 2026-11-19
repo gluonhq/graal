@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) 2025, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.oracle.svm.webimage.jtt.api;
+
+import org.graalvm.webimage.api.JS;
+import org.graalvm.webimage.api.JSNumber;
+import org.graalvm.webimage.api.JSObject;
+
+public class JSObjectConversionTest {
+    public static final String[] OUTPUT = {
+                    "JavaScript<object; [object Object]>", "[object Object]", "JavaScript<object; [object Object]>", "false", "false", "false",
+                    "JavaScript<function;", "JavaScript<function;", "5", "JavaScript<number; 5>", "JavaScript<number; 12>",
+                    "12",
+                    "js value",
+                    "Field type modified!",
+                    "",
+                    "java value",
+                    "java value",
+    };
+
+    public static void main(String[] args) {
+        passingAnonymousObject();
+        functionPassingAndInvoking();
+        jsObjectInvalidFieldAccess();
+    }
+
+    private static void passingAnonymousObject() {
+        // Anonymous object creation and passing through boundaries.
+        JSObject obj = JSObject.create();
+        System.out.println(obj);
+        log(obj);
+        System.out.println(id(obj));
+        System.out.println(obj == id(obj));
+        System.out.println(obj.equals(id(obj)));
+        System.out.println(obj.equals(JSObject.create()));
+    }
+
+    @JS("console.log(x.toString());")
+    private static native void log(Object x);
+
+    @JS("return x;")
+    private static native Object id(Object x);
+
+    private static void functionPassingAndInvoking() {
+        // Function creation, passing through boundaries and invoking.
+        JSObject add = addFunction();
+        System.out.println(add.toString().substring(0, 20));
+        System.out.println(id(add).toString().substring(0, 20));
+        JSNumber sum = (JSNumber) add.invoke(JSNumber.of(2), JSNumber.of(3));
+        log(sum);
+        System.out.println(sum);
+
+        // Function call with this binding
+        JSObject thisObj = dummyJSObject(JSNumber.of(10));
+        JSObject fun = functionWithThis();
+        JSNumber res = (JSNumber) fun.call(thisObj, JSNumber.of(2));
+        System.out.println(res);
+    }
+
+    @JS("return (a, b) => a + b;")
+    private static native JSObject addFunction();
+
+    @JS("return function (a) { return a + this.size; }")
+    private static native JSObject functionWithThis();
+
+    @JS("return { size: num };")
+    private static native JSObject dummyJSObject(JSNumber num);
+
+    private static void jsObjectInvalidFieldAccess() {
+        ObjectWithFields obj = new ObjectWithFields();
+        String s = "";
+        obj.intValue = 11;
+        obj.stringValue = "value";
+        modifyFields(obj, 12, "js value");
+        System.out.println(obj.intValue);
+        System.out.println(obj.stringValue);
+        incorrectlyModifyFields(obj, 3.0);
+        try {
+            s = obj.stringValue;
+        } catch (ClassCastException e) {
+            System.out.println("Field type modified!");
+        }
+        System.out.println(s);
+        fixFields(obj, "java value");
+        System.out.println(obj.stringValue);
+        System.out.println(obj.get("stringValue"));
+    }
+
+    @JS("obj.intValue = intValue; obj.stringValue = stringValue;")
+    private static native void modifyFields(ObjectWithFields obj, Integer intValue, String stringValue);
+
+    @JS("obj.stringValue = doubleValue;")
+    private static native void incorrectlyModifyFields(ObjectWithFields obj, Double doubleValue);
+
+    @JS("obj.stringValue = stringValue;")
+    private static native void fixFields(ObjectWithFields obj, String stringValue);
+}
+
+class ObjectWithFields extends JSObject {
+    public Integer intValue;
+    public String stringValue;
+}

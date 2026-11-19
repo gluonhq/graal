@@ -6,7 +6,7 @@
   bench_base:: common.build_base + {
     # job name automatically generated: <job_prefix>-<suite>-<platform>-<jdk_name>-<os>-<arch>-<job_suffix>
     # null values are omitted from the list.
-    generated_name:: utils.hyphenize([self.job_prefix, self.suite, self.platform, self.jdk_name, self.os, self.arch, self.job_suffix]),
+    generated_name:: utils.hyphenize([self.job_prefix, self.suite, self.platform, self.jdk_name, if std.objectHasAll(self, 'machine_name') then self.machine_name else null, self.os, self.arch, self.job_suffix]),
     job_prefix:: null,
     job_suffix:: null,
     name:
@@ -34,7 +34,7 @@
   # max number of threads to use for benchmarking in general
   # the goal being to limit parallelism on very large servers which may not be respresentative of real-world scenarios
   bench_max_threads:: {
-   restrict_threads:: 36
+   restrict_threads:: if self.arch == 'amd64' then 36 else 32,
   },
 
   bench_no_thread_cap:: {
@@ -69,6 +69,16 @@
       default_numa_node:: 0,
       num_threads:: 16
     },
+    x52:: common.linux_amd64 + self._bench_machine + {
+      machine_name:: "x52",
+      capabilities+: ["tmpfs25g"],
+      numa_nodes:: [0, 1],
+      default_numa_node:: 1,
+      num_threads:: 72
+    },
+    x52_root:: self.x52 + {
+      capabilities: ["linux_root", "amd64", "tmpfs25g"]
+    },
     x82:: common.linux_amd64 + self._bench_machine + {
       machine_name:: "x82",
       capabilities+: ["tmpfs25g"],
@@ -82,14 +92,26 @@
       num_threads:: 32,
       hyperthreading:: false
     },
-    a12c:: common.linux_aarch64 + self._bench_machine + {
-      machine_name:: "a12c",
+    hr350a:: common.linux_aarch64 + self._bench_machine + {
+      machine_name:: "hr350a",
       capabilities+: ["tmpfs25g"],
-      numa_nodes:: [0, 1],
+      numa_nodes:: [0],
       default_numa_node:: 0,
-      num_threads:: 160,
+      num_threads:: 32,
       hyperthreading:: false
-    }
+    },
+    osprey:: common.linux_aarch64 + self._bench_machine + {
+      machine_name:: "osprey",
+      capabilities+: ["tmpfs25g"],
+      numa_nodes:: [0],
+      default_numa_node:: 0,
+      num_threads:: 32,
+      hyperthreading:: false
+    },
+    local contains(a_str, substr) = std.length(std.findSubstr(substr, a_str)) > 0,
+    # Useful to distribute the benchmark load between two machine types, but always stay consistent for the same benchmark suite
+    # This guarantees comparability of results, whatever the platform/context, for each suite
+    hr350a_or_osprey(suite=null):: if suite != null && std.count([contains(s, suite) for s in ["barista", "renaissance"]], true) > 0 then self.osprey else self.hr350a,
   },
 
   hwloc_cmd(cmd, num_threads, node, hyperthreading, max_threads_per_node)::

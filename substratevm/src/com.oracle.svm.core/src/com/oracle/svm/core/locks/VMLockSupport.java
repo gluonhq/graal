@@ -34,64 +34,67 @@ import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunk;
 import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.util.ImageHeapList;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.util.ImageHeapList;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
-@AutomaticallyRegisteredFeature
-final class VMLockFeature implements InternalFeature {
-    @Override
-    public void duringSetup(DuringSetupAccess access) {
-        if (!ImageSingletons.contains(VMLockSupport.class)) {
-            /* The platform uses a VMThreads implementation that does not rely on VMLockSupport. */
-            return;
-        }
-        VMLockSupport support = ImageSingletons.lookup(VMLockSupport.class);
+/**
+ * Registry and lifecycle owner for VM-level locking primitives that are reachable in an image.
+ * <p>
+ * During image build, {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects are
+ * created as hosted placeholders. Those placeholders are then replaced with runtime implementations
+ * that are backed by platform-specific state.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public class VMLockSupport {
+    /** All mutexes, so that we can initialize them at run time when the VM starts. */
+    private final List<VMMutex> mutexes = ImageHeapList.create(VMMutex.class, Comparator.comparing(VMMutex::getName));
+    /** All conditions, so that we can initialize them at run time when the VM starts. */
+    private final List<VMCondition> conditions = ImageHeapList.create(VMCondition.class, Comparator.comparing(VMCondition::getName));
+    /** All semaphores, so that we can initialize them at run time when the VM starts. */
+    private final List<VMSemaphore> semaphores = ImageHeapList.create(VMSemaphore.class, Comparator.comparing(VMSemaphore::getName));
 
-        support.mutexReplacer = new ClassInstanceReplacer<>(VMMutex.class, support.mutexes, support::replaceVMMutex);
-        support.conditionReplacer = new ClassInstanceReplacer<>(VMCondition.class, support.conditions, support::replaceVMCondition);
-        support.semaphoreReplacer = new ClassInstanceReplacer<>(VMSemaphore.class, support.semaphores, support::replaceSemaphore);
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private ClassInstanceReplacer<VMMutex, VMMutex> mutexReplacer;
 
-        access.registerObjectReplacer(support.mutexReplacer);
-        access.registerObjectReplacer(support.conditionReplacer);
-        access.registerObjectReplacer(support.semaphoreReplacer);
-    }
-}
-
-public abstract class VMLockSupport {
-
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static VMLockSupport singleton() {
         return ImageSingletons.lookup(VMLockSupport.class);
     }
 
-    /** All mutexes, so that we can initialize them at run time when the VM starts. */
-    protected final List<VMMutex> mutexes = ImageHeapList.create(VMMutex.class, Comparator.comparing(VMMutex::getName));
-    /** All conditions, so that we can initialize them at run time when the VM starts. */
-    protected final List<VMCondition> conditions = ImageHeapList.create(VMCondition.class, Comparator.comparing(VMCondition::getName));
-    /** All semaphores, so that we can initialize them at run time when the VM starts. */
-    protected final List<VMSemaphore> semaphores = ImageHeapList.create(VMSemaphore.class, Comparator.comparing(VMSemaphore::getName));
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void registerObjectReplacers(InternalFeature.DuringSetupAccess access) {
+        mutexReplacer = new ClassInstanceReplacer<>(VMMutex.class, mutexes, this::replaceVMMutex);
 
-    @Platforms(Platform.HOSTED_ONLY.class) //
-    protected ClassInstanceReplacer<VMMutex, VMMutex> mutexReplacer;
-    @Platforms(Platform.HOSTED_ONLY.class) //
-    protected ClassInstanceReplacer<VMCondition, VMCondition> conditionReplacer;
-    @Platforms(Platform.HOSTED_ONLY.class) //
-    protected ClassInstanceReplacer<VMSemaphore, VMSemaphore> semaphoreReplacer;
+        access.registerObjectReplacer(mutexReplacer);
+        access.registerObjectReplacer(new ClassInstanceReplacer<>(VMCondition.class, conditions, this::replaceVMCondition));
+        access.registerObjectReplacer(new ClassInstanceReplacer<>(VMSemaphore.class, semaphores, this::replaceSemaphore));
+    }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    protected abstract VMMutex replaceVMMutex(VMMutex source);
+    private VMMutex replaceVMMutex(VMMutex source) {
+        return new RuntimeVMMutex(source.getName());
+    }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    protected abstract VMCondition replaceVMCondition(VMCondition source);
+    private VMCondition replaceVMCondition(VMCondition source) {
+        return new RuntimeVMCondition((RuntimeVMMutex) mutexReplacer.apply(source.getMutex()), source.getName());
+    }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    protected abstract VMSemaphore replaceSemaphore(VMSemaphore source);
+    private VMSemaphore replaceSemaphore(VMSemaphore source) {
+        return new RuntimeVMSemaphore(source.getName());
+    }
 
     /**
      * Initializes all {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects.
@@ -121,27 +124,21 @@ public abstract class VMLockSupport {
 
     /**
      * Destroys all {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects.
-     *
-     * @return {@code true} if the destruction was successful, {@code false} if an error occurred.
      */
     @Uninterruptible(reason = "The isolate teardown is in progress.")
-    public final boolean destroy() {
+    public final void destroy() {
         for (int i = 0; i < semaphores.size(); i++) {
-            if (semaphores.get(i).destroy() != 0) {
-                return false;
-            }
+            int code = semaphores.get(i).destroy();
+            VMError.guarantee(code == 0, "VMSemaphore.destroy() failed.");
         }
         for (int i = 0; i < conditions.size(); i++) {
-            if (conditions.get(i).destroy() != 0) {
-                return false;
-            }
+            int code = conditions.get(i).destroy();
+            VMError.guarantee(code == 0, "VMCondition.destroy() failed.");
         }
         for (int i = 0; i < mutexes.size(); i++) {
-            if (mutexes.get(i).destroy() != 0) {
-                return false;
-            }
+            int code = mutexes.get(i).destroy();
+            VMError.guarantee(code == 0, "VMMutex.destroy() failed.");
         }
-        return true;
     }
 
     public static class DumpVMMutexes extends DiagnosticThunk {
@@ -155,30 +152,22 @@ public abstract class VMLockSupport {
         public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
             log.string("VM mutexes:").indent(true);
 
-            VMLockSupport support = null;
-            if (ImageSingletons.contains(VMLockSupport.class)) {
-                support = ImageSingletons.lookup(VMLockSupport.class);
-            }
-
-            if (support == null || support.mutexes == null) {
-                log.string("No mutex information is available.").newline();
-            } else {
-                for (int i = 0; i < support.mutexes.size(); i++) {
-                    VMMutex mutex = support.mutexes.get(i);
-                    IsolateThread owner = mutex.owner;
-                    log.string("mutex \"").string(mutex.getName()).string("\" ");
-                    if (owner.isNull()) {
-                        log.string("is unlocked.");
+            VMLockSupport support = VMLockSupport.singleton();
+            for (int i = 0; i < support.mutexes.size(); i++) {
+                VMMutex mutex = support.mutexes.get(i);
+                IsolateThread owner = mutex.owner;
+                log.string("mutex \"").string(mutex.getName()).string("\" ");
+                if (owner.isNull()) {
+                    log.string("is unlocked.");
+                } else {
+                    log.string("is locked by ");
+                    if (owner.equal(VMMutex.UNSPECIFIED_OWNER)) {
+                        log.string("an unspecified thread.");
                     } else {
-                        log.string("is locked by ");
-                        if (owner.equal(VMMutex.UNSPECIFIED_OWNER)) {
-                            log.string("an unspecified thread.");
-                        } else {
-                            log.string("thread ").zhex(owner);
-                        }
+                        log.string("thread ").zhex(owner);
                     }
-                    log.newline();
                 }
+                log.newline();
             }
 
             log.indent(false);

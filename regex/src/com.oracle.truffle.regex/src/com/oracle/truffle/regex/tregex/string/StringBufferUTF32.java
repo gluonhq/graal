@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,22 +40,27 @@
  */
 package com.oracle.truffle.regex.tregex.string;
 
+import com.oracle.truffle.api.strings.TruffleString;
 import com.oracle.truffle.regex.tregex.buffer.IntArrayBuffer;
-import com.oracle.truffle.regex.tregex.string.Encodings.Encoding;
 
 public final class StringBufferUTF32 extends IntArrayBuffer implements AbstractStringBuffer {
 
-    public StringBufferUTF32() {
-        this(16);
+    private final Encoding encoding;
+
+    public StringBufferUTF32(int capacity, Encoding encoding) {
+        super(capacity);
+        assert encoding.isUTF32();
+        this.encoding = encoding;
     }
 
-    public StringBufferUTF32(int capacity) {
-        super(capacity);
+    public StringBufferUTF32(StringBufferUTF32 copy) {
+        super(copy);
+        this.encoding = copy.encoding;
     }
 
     @Override
     public Encoding getEncoding() {
-        return Encodings.UTF_32;
+        return encoding;
     }
 
     @Override
@@ -73,8 +78,46 @@ public final class StringBufferUTF32 extends IntArrayBuffer implements AbstractS
         add(c1 ^ c2);
     }
 
+    private byte[] toByteSwappedByteArray() {
+        byte[] bytes = new byte[length() << 2];
+        for (int i = 0; i < length(); i++) {
+            int c = get(i);
+            bytes[i << 2] = (byte) (c >> 24);
+            bytes[(i << 2) + 1] = (byte) (c >> 16);
+            bytes[(i << 2) + 2] = (byte) (c >> 8);
+            bytes[(i << 2) + 3] = (byte) c;
+        }
+        return bytes;
+    }
+
     @Override
-    public StringUTF32 materialize() {
-        return new StringUTF32(toArray());
+    public AbstractStringBuffer copy() {
+        return new StringBufferUTF32(this);
+    }
+
+    @Override
+    public long prefixHash(int maxLength) {
+        int prefixLength = Math.min(length(), maxLength);
+        long hash = prefixLength;
+        for (int i = 0; i < prefixLength; i++) {
+            hash = Long.rotateLeft(hash, 5) ^ buf[i];
+        }
+        return hash;
+    }
+
+    @Override
+    public TruffleString asTString() {
+        if (encoding == Encoding.UTF_32BE) {
+            return TruffleString.fromByteArrayUncached(toByteSwappedByteArray(), encoding.getTStringEncoding(), false);
+        }
+        return TruffleString.fromIntArrayUTF32Uncached(toArray());
+    }
+
+    @Override
+    public TruffleString.WithMask asTStringMask(TruffleString pattern) {
+        if (encoding == Encoding.UTF_32BE) {
+            return TruffleString.WithMask.createUncached(pattern, toByteSwappedByteArray(), encoding.getTStringEncoding());
+        }
+        return TruffleString.WithMask.createUTF32Uncached(pattern, toArray());
     }
 }

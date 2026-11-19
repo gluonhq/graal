@@ -27,11 +27,16 @@ package com.oracle.svm.truffle;
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.ImageSingletons;
 
-import com.oracle.svm.core.util.ImageHeapMap;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 import com.oracle.truffle.api.nodes.NodeClass;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 class NodeClassSupport {
-    final EconomicMap<Class<?>, NodeClass> nodeClasses = ImageHeapMap.create();
+    final EconomicMap<Class<?>, NodeClass> nodeClasses = ImageHeapMap.create("nodeClasses");
 
     static NodeClassSupport singleton() {
         return ImageSingletons.lookup(NodeClassSupport.class);

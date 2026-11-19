@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -55,6 +55,20 @@ public class StandardOp {
     public interface BlockEndOp {
     }
 
+    /** Marks the end of a block after an instruction that cannot return. */
+    @Opcode("DEAD_END")
+    public static final class DeadEndOp extends LIRInstruction implements BlockEndOp {
+        public static final LIRInstructionClass<DeadEndOp> TYPE = LIRInstructionClass.create(DeadEndOp.class);
+
+        public DeadEndOp() {
+            super(TYPE);
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb) {
+        }
+    }
+
     public interface NullCheck {
         Value getCheckedValue();
 
@@ -63,6 +77,13 @@ public class StandardOp {
 
     public interface ImplicitNullCheck {
         boolean makeNullCheckFor(Value value, LIRFrameState nullCheckState, int implicitNullCheckLimit);
+    }
+
+    /**
+     * LIR operation that can record call debug information at its return PC. Such operations must not
+     * force a pending delayed post-call NOP before the call is emitted.
+     */
+    public interface CallOp {
     }
 
     public interface LabelHoldingOp {
@@ -158,6 +179,7 @@ public class StandardOp {
             if (alignment != 0) {
                 crb.asm.align(alignment);
             }
+            crb.maybeEmitDelayedPostCallNopBeforeLabel(label);
             crb.asm.bind(label);
             crb.asm.maybeEmitIndirectTargetMarker(crb, label);
         }
@@ -184,19 +206,32 @@ public class StandardOp {
         @Alive({OperandFlag.REG, OperandFlag.STACK, OperandFlag.CONST, OperandFlag.OUTGOING}) private Value[] outgoingValues;
 
         private final LabelRef destination;
+        private final boolean isThreadedJump;
 
         public JumpOp(LabelRef destination) {
-            this(TYPE, destination);
+            this(TYPE, destination, false);
         }
 
-        protected JumpOp(LIRInstructionClass<? extends JumpOp> c, LabelRef destination) {
+        public JumpOp(LabelRef destination, boolean isThreadedJump) {
+            this(TYPE, destination, isThreadedJump);
+        }
+
+        protected JumpOp(LIRInstructionClass<? extends JumpOp> c, LabelRef destination, boolean isThreadedJump) {
             super(c);
             this.destination = destination;
             this.outgoingValues = Value.NO_VALUES;
+            this.isThreadedJump = isThreadedJump;
         }
 
         @Override
         public void emitCode(CompilationResultBuilder crb) {
+            if (isThreadedJump) {
+                if (destination.label().isBound()) {
+                    if (crb.asm.replayCodeSnippetAt(crb, destination.label().position())) {
+                        return;
+                    }
+                }
+            }
             if (!crb.isSuccessorEdge(destination)) {
                 crb.asm.jmp(destination.label());
             }
@@ -289,6 +324,14 @@ public class StandardOp {
             return op.isLoadConstantOp();
         }
 
+        /**
+         * Determine whether this constant load is safe to rematerialize directly to a stack slot.
+         * Some constant load operations have special semantics or implementations that only allow
+         * rematerialization to a register. Such operations must implement this method to return
+         * {@code false}. Simple constant loads that can be implemented using a move-immediate
+         * instruction to a stack slot, or similar, should return {@code true}.
+         */
+        boolean canRematerializeToStack();
     }
 
     /**
@@ -377,6 +420,24 @@ public class StandardOp {
     }
 
     /**
+     * Defines a fixed register without changing its contents.
+     */
+    public static final class ArbitraryValueOp extends LIRInstruction {
+        public static final LIRInstructionClass<ArbitraryValueOp> TYPE = LIRInstructionClass.create(ArbitraryValueOp.class);
+
+        @Def({OperandFlag.REG}) private AllocatableValue result;
+
+        public ArbitraryValueOp(AllocatableValue result) {
+            super(TYPE);
+            this.result = result;
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb) {
+        }
+    }
+
+    /**
      * A LIR operation that does nothing. If the operation records its position, it can be
      * subsequently {@linkplain #replace(LIR, LIRInstruction) replaced}.
      */
@@ -452,6 +513,22 @@ public class StandardOp {
         }
     }
 
+    public static final class NewScratchRegisterOp extends LIRInstruction {
+        public static final LIRInstructionClass<NewScratchRegisterOp> TYPE = LIRInstructionClass.create(NewScratchRegisterOp.class);
+
+        @Def(OperandFlag.REG) private Value value;
+
+        public NewScratchRegisterOp(Value value) {
+            super(TYPE);
+            this.value = value;
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb) {
+            // do nothing, just define a value
+        }
+    }
+
     @Opcode("SPILLREGISTERS")
     public static final class SpillRegistersOp extends LIRInstruction {
         public static final LIRInstructionClass<SpillRegistersOp> TYPE = LIRInstructionClass.create(SpillRegistersOp.class);
@@ -471,4 +548,16 @@ public class StandardOp {
         }
     }
 
+    public static final class StartRecordingThreadedSwitchOp extends LIRInstruction {
+        public static final LIRInstructionClass<StartRecordingThreadedSwitchOp> TYPE = LIRInstructionClass.create(StartRecordingThreadedSwitchOp.class);
+
+        public StartRecordingThreadedSwitchOp() {
+            super(TYPE);
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb) {
+            crb.asm.startRecordingCodeSnippet(crb);
+        }
+    }
 }

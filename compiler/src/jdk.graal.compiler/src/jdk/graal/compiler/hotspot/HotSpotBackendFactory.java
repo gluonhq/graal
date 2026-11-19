@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,18 +24,15 @@
  */
 package jdk.graal.compiler.hotspot;
 
+import static jdk.graal.compiler.core.common.NativeImageSupport.inRuntimeCode;
 import static jdk.vm.ci.common.InitTimer.timer;
-import static jdk.vm.ci.services.Services.IS_BUILDING_NATIVE_IMAGE;
-import static jdk.vm.ci.services.Services.IS_IN_NATIVE_IMAGE;
 
 import jdk.graal.compiler.bytecode.BytecodeProvider;
+import jdk.graal.compiler.core.ArchitectureSpecific;
 import jdk.graal.compiler.core.common.spi.ConstantFieldProvider;
 import jdk.graal.compiler.debug.Assertions;
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.graph.Node;
-import jdk.graal.compiler.hotspot.meta.HotSpotGraalConstantFieldProvider;
+import jdk.graal.compiler.hotspot.meta.HotSpotConstantFieldProvider;
 import jdk.graal.compiler.hotspot.meta.HotSpotHostForeignCallsProvider;
-import jdk.graal.compiler.hotspot.meta.HotSpotIdentityHashCodeProvider;
 import jdk.graal.compiler.hotspot.meta.HotSpotLoweringProvider;
 import jdk.graal.compiler.hotspot.meta.HotSpotMetaAccessExtensionProvider;
 import jdk.graal.compiler.hotspot.meta.HotSpotPlatformConfigurationProvider;
@@ -47,43 +44,70 @@ import jdk.graal.compiler.hotspot.meta.HotSpotSuitesProvider;
 import jdk.graal.compiler.hotspot.nodes.HotSpotCompressionNode;
 import jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil;
 import jdk.graal.compiler.hotspot.word.HotSpotWordTypes;
-import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.extended.ArrayRangeWrite;
 import jdk.graal.compiler.nodes.gc.BarrierSet;
 import jdk.graal.compiler.nodes.gc.CardTableBarrierSet;
 import jdk.graal.compiler.nodes.gc.G1BarrierSet;
 import jdk.graal.compiler.nodes.gc.NoBarrierSet;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
-import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
 import jdk.graal.compiler.nodes.loop.LoopsDataProviderImpl;
-import jdk.graal.compiler.nodes.memory.FixedAccessNode;
-import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
 import jdk.graal.compiler.nodes.spi.LoopsDataProvider;
 import jdk.graal.compiler.nodes.spi.Replacements;
 import jdk.graal.compiler.nodes.type.NarrowOopStamp;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.tiers.CompilerConfiguration;
 import jdk.graal.compiler.replacements.classfile.ClassfileBytecodeProvider;
-import jdk.vm.ci.code.Architecture;
+import jdk.graal.compiler.serviceprovider.LibGraalService;
 import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.code.TargetDescription;
 import jdk.vm.ci.common.InitTimer;
 import jdk.vm.ci.hotspot.HotSpotCodeCacheProvider;
 import jdk.vm.ci.hotspot.HotSpotConstantReflectionProvider;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Value;
 import jdk.vm.ci.runtime.JVMCIBackend;
 
-public abstract class HotSpotBackendFactory {
+@LibGraalService
+public abstract class HotSpotBackendFactory implements ArchitectureSpecific {
+    /**
+     * Creates a meta access provider based on a JVMCI backend.
+     *
+     * @param jvmci the JVMCI backend
+     * @return a meta access provider
+     */
+    protected MetaAccessProvider createMetaAccessProvider(JVMCIBackend jvmci) {
+        return new HotSpotSnippetMetaAccessProvider(jvmci.getMetaAccess());
+    }
 
-    protected HotSpotGraalConstantFieldProvider createConstantFieldProvider(GraalHotSpotVMConfig config, MetaAccessProvider metaAccess) {
-        return new HotSpotGraalConstantFieldProvider(config, metaAccess);
+    /**
+     * Creates a constant reflection provider based on a JVMCI backend.
+     *
+     * @param jvmci the JVMCI backend
+     * @return a constant reflection provider
+     */
+    protected HotSpotConstantReflectionProvider createConstantReflectionProvider(JVMCIBackend jvmci) {
+        return (HotSpotConstantReflectionProvider) jvmci.getConstantReflection();
+    }
+
+    /**
+     * Creates a code cache provider based on a JVMCI backend.
+     *
+     * @param jvmci the JVMCI backend
+     * @return a code cache provider.
+     */
+    protected HotSpotCodeCacheProvider createCodeCacheProvider(JVMCIBackend jvmci) {
+        return (HotSpotCodeCacheProvider) jvmci.getCodeCache();
+    }
+
+    protected ConstantFieldProvider createConstantFieldProvider(GraalHotSpotVMConfig config, MetaAccessProvider metaAccess) {
+        return new HotSpotConstantFieldProvider(config, metaAccess);
     }
 
     protected HotSpotWordTypes createWordTypes(MetaAccessProvider metaAccess, TargetDescription target) {
@@ -98,8 +122,8 @@ public abstract class HotSpotBackendFactory {
         return new HotSpotPlatformConfigurationProvider(config, barrierSet);
     }
 
-    protected HotSpotMetaAccessExtensionProvider createMetaAccessExtensionProvider() {
-        return new HotSpotMetaAccessExtensionProvider();
+    protected HotSpotMetaAccessExtensionProvider createMetaAccessExtensionProvider(ConstantReflectionProvider constantReflection, GraalHotSpotVMConfig config) {
+        return new HotSpotMetaAccessExtensionProvider(constantReflection, config);
     }
 
     protected HotSpotReplacementsImpl createReplacements(TargetDescription target, HotSpotProviders p, BytecodeProvider bytecodeProvider) {
@@ -107,7 +131,7 @@ public abstract class HotSpotBackendFactory {
     }
 
     protected ClassfileBytecodeProvider createBytecodeProvider(MetaAccessProvider metaAccess, HotSpotSnippetReflectionProvider snippetReflection) {
-        return new ClassfileBytecodeProvider(metaAccess, snippetReflection);
+        return inRuntimeCode() ? null : new ClassfileBytecodeProvider(metaAccess, snippetReflection);
     }
 
     protected HotSpotSnippetReflectionProvider createSnippetReflection(HotSpotGraalRuntimeProvider runtime, HotSpotConstantReflectionProvider constantReflection, HotSpotWordTypes wordTypes) {
@@ -121,14 +145,23 @@ public abstract class HotSpotBackendFactory {
      */
     public abstract String getName();
 
-    /**
-     * Gets the class describing the architecture the backend created by this factory is associated
-     * with.
-     */
-    public abstract Class<? extends Architecture> getArchitecture();
-
     protected LoopsDataProvider createLoopsDataProvider() {
         return new LoopsDataProviderImpl();
+    }
+
+    /**
+     * Hook method called after all JVMCI providers have been created (meta access, code cache,
+     * constant reflection).
+     */
+    protected void afterJVMCIProvidersCreated() {
+    }
+
+    /**
+     * Filters target CPU features based on HotSpot flags. JVMCI does not apply every instruction
+     * selection flag to its target description.
+     */
+    @SuppressWarnings("unused")
+    protected void filterTargetFeatures(GraalHotSpotVMConfig config, TargetDescription target) {
     }
 
     @SuppressWarnings("try")
@@ -138,15 +171,16 @@ public abstract class HotSpotBackendFactory {
         OptionValues options = graalRuntime.getOptions();
         JVMCIBackend jvmci = jvmciRuntime.getHostJVMCIBackend();
         GraalHotSpotVMConfig config = graalRuntime.getVMConfig();
-        if (IS_BUILDING_NATIVE_IMAGE || IS_IN_NATIVE_IMAGE) {
-            SnippetSignature.initPrimitiveKindCache(jvmci.getMetaAccess());
-        }
-        HotSpotCodeCacheProvider codeCache = (HotSpotCodeCacheProvider) jvmci.getCodeCache();
+        MetaAccessProvider metaAccess = createMetaAccessProvider(jvmci);
+        HotSpotCodeCacheProvider codeCache = createCodeCacheProvider(jvmci);
+        HotSpotConstantReflectionProvider constantReflection = createConstantReflectionProvider(jvmci);
+        afterJVMCIProvidersCreated();
         TargetDescription target = codeCache.getTarget();
-        MetaAccessProvider metaAccess = new HotSpotSnippetMetaAccessProvider(jvmci.getMetaAccess());
-        HotSpotConstantReflectionProvider constantReflection = (HotSpotConstantReflectionProvider) jvmci.getConstantReflection();
-        ConstantFieldProvider constantFieldProvider = new HotSpotGraalConstantFieldProvider(config, metaAccess);
+        filterTargetFeatures(config, target);
+        SnippetSignature.initPrimitiveKindCache(metaAccess);
+        ConstantFieldProvider constantFieldProvider = createConstantFieldProvider(config, metaAccess);
         HotSpotProviders providers;
+        HotSpotReplacementsImpl replacements;
         try (InitTimer t = timer("create providers")) {
             HotSpotRegistersProvider registers;
             try (InitTimer rt = timer("create HotSpotRegisters provider")) {
@@ -171,7 +205,7 @@ public abstract class HotSpotBackendFactory {
             }
             HotSpotMetaAccessExtensionProvider metaAccessExtensionProvider;
             try (InitTimer rt = timer("create MetaAccessExtensionProvider")) {
-                metaAccessExtensionProvider = createMetaAccessExtensionProvider();
+                metaAccessExtensionProvider = createMetaAccessExtensionProvider(constantReflection, config);
             }
             HotSpotStampProvider stampProvider;
             try (InitTimer rt = timer("create stamp provider")) {
@@ -194,17 +228,16 @@ public abstract class HotSpotBackendFactory {
             try (InitTimer rt = timer("create Bytecode provider")) {
                 bytecodeProvider = createBytecodeProvider(metaAccess, snippetReflection);
             }
-            IdentityHashCodeProvider identityHashCodeProvider;
-            try (InitTimer rt = timer("create IdentityHashCode provider")) {
-                identityHashCodeProvider = createIdentityHashCodeProvider();
-            }
             providers = new HotSpotProviders(metaAccess, codeCache, constantReflection, constantFieldProvider, foreignCalls, lowerer, null, null, registers,
-                            snippetReflection, wordTypes, stampProvider, platformConfigurationProvider, metaAccessExtensionProvider, loopsDataProvider, config, identityHashCodeProvider);
-            HotSpotReplacementsImpl replacements;
+                            snippetReflection, wordTypes, stampProvider, platformConfigurationProvider, metaAccessExtensionProvider, loopsDataProvider, config,
+                            graalRuntime.getReplayCompilationSupport());
+
             try (InitTimer rt = timer("create Replacements provider")) {
                 replacements = createReplacements(target, providers, bytecodeProvider);
                 providers = replacements.getProviders();
-                replacements.maybeInitializeEncoder();
+                if (!LibGraalSupport.inLibGraalRuntime()) {
+                    replacements.maybeInitializeEncoder();
+                }
             }
             GraphBuilderConfiguration.Plugins plugins;
             try (InitTimer rt = timer("create GraphBuilderPhase plugins")) {
@@ -213,7 +246,7 @@ public abstract class HotSpotBackendFactory {
                 replacements.setGraphBuilderPlugins(plugins);
             }
             try (InitTimer rt = timer("create Suites provider")) {
-                HotSpotSuitesProvider suites = createSuites(config, graalRuntime, compilerConfiguration, plugins, registers, replacements, options);
+                HotSpotSuitesProvider suites = createSuites(config, graalRuntime, compilerConfiguration, plugins, registers, options);
                 providers.setSuites(suites);
             }
             Replacements replacements2 = replacements.getProviders().getReplacements();
@@ -226,10 +259,6 @@ public abstract class HotSpotBackendFactory {
         }
     }
 
-    protected IdentityHashCodeProvider createIdentityHashCodeProvider() {
-        return new HotSpotIdentityHashCodeProvider();
-    }
-
     protected abstract HotSpotBackend createBackend(GraalHotSpotVMConfig config, HotSpotGraalRuntimeProvider graalRuntime, HotSpotProviders providers);
 
     protected abstract Value[] createNativeABICallerSaveRegisters(GraalHotSpotVMConfig config, RegisterConfig registerConfig);
@@ -239,8 +268,7 @@ public abstract class HotSpotBackendFactory {
                     HotSpotSnippetReflectionProvider snippetReflection, HotSpotReplacementsImpl replacements, HotSpotWordTypes wordTypes, OptionValues options, BarrierSet barrierSet);
 
     protected abstract HotSpotSuitesProvider createSuites(GraalHotSpotVMConfig config, HotSpotGraalRuntimeProvider runtime, CompilerConfiguration compilerConfiguration,
-                    GraphBuilderConfiguration.Plugins plugins,
-                    HotSpotRegistersProvider registers, HotSpotReplacementsImpl replacements, OptionValues options);
+                    Plugins plugins, HotSpotRegistersProvider registers, OptionValues options);
 
     protected abstract HotSpotRegistersProvider createRegisters();
 
@@ -251,91 +279,37 @@ public abstract class HotSpotBackendFactory {
     protected abstract HotSpotHostForeignCallsProvider createForeignCalls(HotSpotJVMCIRuntime jvmciRuntime, HotSpotGraalRuntimeProvider graalRuntime, MetaAccessProvider metaAccess,
                     HotSpotCodeCacheProvider codeCache, HotSpotWordTypes wordTypes, Value[] nativeABICallerSaveRegisters);
 
-    private BarrierSet createBarrierSet(GraalHotSpotVMConfig config, MetaAccessProvider metaAccess) {
+    private static BarrierSet createBarrierSet(GraalHotSpotVMConfig config, MetaAccessProvider metaAccess) {
         boolean useDeferredInitBarriers = config.useDeferredInitBarriers;
         ResolvedJavaType objectArrayType = metaAccess.lookupJavaType(Object[].class);
         ResolvedJavaField referentField = HotSpotReplacementsUtil.referentField(metaAccess);
-        if (config.gc == HotSpotGraalRuntime.HotSpotGC.X) {
-            return new HotSpotXBarrierSet(referentField);
-        } else if (config.gc == HotSpotGraalRuntime.HotSpotGC.Z) {
+        if (config.gc == HotSpotGraalRuntime.HotSpotGC.Z) {
             return new HotSpotZBarrierSet(objectArrayType, referentField);
+        } else if (config.gc == HotSpotGraalRuntime.HotSpotGC.Shenandoah) {
+            return new HotSpotShenandoahBarrierSet(objectArrayType, referentField, config);
         } else if (config.gc == HotSpotGraalRuntime.HotSpotGC.Epsilon) {
             return new NoBarrierSet();
         } else if (config.useG1GC()) {
-            return new G1BarrierSet(objectArrayType, referentField) {
-                @Override
-                protected boolean writeRequiresPostBarrier(FixedAccessNode node, ValueNode writtenValue) {
-                    if (!super.writeRequiresPostBarrier(node, writtenValue)) {
-                        return false;
-                    }
-                    return !useDeferredInitBarriers || !isWriteToNewObject(node);
-                }
-
-                @Override
-                protected boolean arrayRangeWriteRequiresPostBarrier(ArrayRangeWrite write) {
-                    if (!super.arrayRangeWriteRequiresPostBarrier(write)) {
-                        return false;
-                    }
-                    return !useDeferredInitBarriers || !isWriteToNewObject(write.asFixedWithNextNode(), write.getAddress().getBase());
-                }
-
-                @Override
-                protected ValueNode maybeUncompressExpectedValue(ValueNode value) {
-                    if (value != null && (value.stamp(NodeView.DEFAULT) instanceof NarrowOopStamp)) {
-                        return HotSpotCompressionNode.uncompress(value.graph(), value, config.getOopEncoding());
-                    }
-                    return value;
-                }
-            };
+            return new HotSpotG1BarrierSet(objectArrayType, referentField, useDeferredInitBarriers, config);
         } else {
-            return new CardTableBarrierSet(objectArrayType) {
-                @Override
-                protected boolean writeRequiresBarrier(FixedAccessNode node, ValueNode writtenValue) {
-                    if (!super.writeRequiresBarrier(node, writtenValue)) {
-                        return false;
-                    }
-                    return !useDeferredInitBarriers || !isWriteToNewObject(node);
-                }
-
-                @Override
-                protected boolean arrayRangeWriteRequiresBarrier(ArrayRangeWrite write) {
-                    if (!super.arrayRangeWriteRequiresBarrier(write)) {
-                        return false;
-                    }
-                    return !useDeferredInitBarriers || !isWriteToNewObject(write.asFixedWithNextNode(), write.getAddress().getBase());
-                }
-            };
+            return new CardTableBarrierSet(objectArrayType, useDeferredInitBarriers);
         }
     }
 
-    /**
-     * For initializing writes, the last allocation executed by the JVM is guaranteed to be
-     * automatically card marked so it's safe to skip the card mark in the emitted code.
-     */
-    protected boolean isWriteToNewObject(FixedAccessNode node) {
-        if (!node.getLocationIdentity().isInit()) {
-            return false;
-        }
-        // This is only allowed for the last allocation in sequence
-        return isWriteToNewObject(node, node.getAddress().getBase());
-    }
+    private static class HotSpotG1BarrierSet extends G1BarrierSet {
+        private final GraalHotSpotVMConfig config;
 
-    protected boolean isWriteToNewObject(FixedWithNextNode node, ValueNode base) {
-        if (base instanceof AbstractNewObjectNode) {
-            Node pred = node.predecessor();
-            while (pred != null) {
-                if (pred == base) {
-                    node.getDebug().log(DebugContext.INFO_LEVEL, "Deferred barrier for %s with base %s", node, base);
-                    return true;
-                }
-                if (pred instanceof AbstractNewObjectNode) {
-                    node.getDebug().log(DebugContext.INFO_LEVEL, "Disallowed deferred barrier for %s because %s was last allocation instead of %s", node, pred, base);
-                    return false;
-                }
-                pred = pred.predecessor();
+        HotSpotG1BarrierSet(ResolvedJavaType objectArrayType, ResolvedJavaField referentField, boolean useDeferredInitBarriers, GraalHotSpotVMConfig config) {
+            super(objectArrayType, referentField, useDeferredInitBarriers);
+            this.config = config;
+        }
+
+        @Override
+        protected ValueNode maybeUncompressExpectedValue(ValueNode value) {
+            if (value != null && (value.stamp(NodeView.DEFAULT) instanceof NarrowOopStamp)) {
+                return HotSpotCompressionNode.uncompress(value.graph(), value, config.getOopEncoding());
             }
+            return value;
         }
-        node.getDebug().log(DebugContext.INFO_LEVEL, "Unable to find allocation for deferred barrier for %s with base %s", node, base);
-        return false;
     }
 }

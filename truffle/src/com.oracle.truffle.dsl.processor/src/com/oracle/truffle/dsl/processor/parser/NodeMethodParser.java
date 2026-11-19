@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -77,7 +77,7 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
     }
 
     protected ParameterSpec createReturnParameterSpec() {
-        ParameterSpec returnValue = new ParameterSpec("returnValue", getPossibleReturnTypes());
+        ParameterSpec returnValue = new ParameterSpec("returnValue#", getPossibleReturnTypes());
         returnValue.setExecution(getNode().getThisExecution());
         return returnValue;
     }
@@ -125,7 +125,7 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
     }
 
     protected void addDefaultFrame(MethodSpec methodSpec) {
-        if (getNode().supportsFrame()) {
+        if (getNode().isBindFrame() && getNode().supportsFrame()) {
             methodSpec.addOptional(new ParameterSpec("frame", getNode().getFrameType()));
         }
     }

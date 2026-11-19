@@ -24,7 +24,15 @@
  */
 
 @Platforms(Platform.HOSTED_ONLY.class)
+@GenerateAnnotationWrapper({
+                CEntryPoint.class,
+                CEntryPointOptions.class,
+})
 package com.oracle.svm.hosted.code;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+
+import com.oracle.svm.common.annotation.GenerateAnnotationWrapper;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;

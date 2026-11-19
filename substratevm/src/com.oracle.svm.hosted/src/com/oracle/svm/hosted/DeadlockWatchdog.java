@@ -29,29 +29,49 @@ import java.lang.management.LockInfo;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MonitorInfo;
 import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.util.Date;
 import java.util.concurrent.TimeUnit;
 
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
-import com.oracle.svm.core.util.ExitStatus;
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.util.ExitStatus;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class DeadlockWatchdog implements Closeable {
 
+    private static final int NUM_INTERVALS_UNTIL_TIMEOUT = 10;
+
     private final int watchdogInterval;
+    private final long watchdogCheckIntervalNanos;
     private final boolean watchdogExitOnTimeout;
     private final Thread thread;
 
-    private volatile long nextDeadline;
+    /*
+     * This intentionally coalesces activity notifications. Once an observer cycle has seen
+     * activity, further notifications do not need to publish anything until the observer clears
+     * the flag again. The watchdog only uses the flag as a liveness indication for the current
+     * sampling interval and does not try to reconstruct when the activity happened.
+     */
+    private volatile boolean activityObserved;
     private volatile boolean stopped;
     private volatile boolean enabled;
 
     DeadlockWatchdog(int watchdogInterval, boolean watchdogExitOnTimeout) {
+        this(watchdogInterval, watchdogExitOnTimeout, true);
+    }
+
+    DeadlockWatchdog(int watchdogInterval, boolean watchdogExitOnTimeout, boolean startThread) {
         this.watchdogInterval = watchdogInterval;
+        this.watchdogCheckIntervalNanos = TimeUnit.MINUTES.toNanos(watchdogInterval) / NUM_INTERVALS_UNTIL_TIMEOUT;
         this.watchdogExitOnTimeout = watchdogExitOnTimeout;
         enabled = true;
-        if (this.watchdogInterval > 0) {
+        if (this.watchdogInterval > 0 && startThread) {
             thread = new Thread(this::watchdogThread);
             thread.setDaemon(true);
             thread.start();
@@ -65,7 +85,9 @@ public class DeadlockWatchdog implements Closeable {
     }
 
     public void recordActivity() {
-        nextDeadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(watchdogInterval);
+        if (watchdogInterval > 0 && !activityObserved) {
+            activityObserved = true;
+        }
     }
 
     @Override
@@ -77,41 +99,64 @@ public class DeadlockWatchdog implements Closeable {
     }
 
     void watchdogThread() {
-        recordActivity();
+        long nextCheck = System.nanoTime() + watchdogCheckIntervalNanos;
+        long intervalsWithoutActivity = 0;
 
         while (!stopped) {
-            long now = System.currentTimeMillis();
-            if (enabled && now >= nextDeadline) {
-                reportFailureState();
-                if (!watchdogExitOnTimeout) {
-                    recordActivity();
+            long now = System.nanoTime();
+            if (!enabled) {
+                intervalsWithoutActivity = 0;
+                nextCheck = now + watchdogCheckIntervalNanos;
+            } else if (now >= nextCheck) {
+                if (consumeActivity()) {
+                    intervalsWithoutActivity = 0;
+                } else {
+                    intervalsWithoutActivity++;
+                }
+                nextCheck = now + watchdogCheckIntervalNanos;
+
+                if (intervalsWithoutActivity >= NUM_INTERVALS_UNTIL_TIMEOUT) {
+                    reportFailureState();
+                    if (!watchdogExitOnTimeout) {
+                        intervalsWithoutActivity = 0;
+                        nextCheck = System.nanoTime() + watchdogCheckIntervalNanos;
+                    }
                 }
             }
 
             try {
-                Thread.sleep(Math.max(Math.min(nextDeadline - now, TimeUnit.SECONDS.toMillis(1)), 1));
+                Thread.sleep(Math.max(Math.min(TimeUnit.NANOSECONDS.toMillis(nextCheck - now), TimeUnit.SECONDS.toMillis(1)), 1));
             } catch (InterruptedException e) {
                 /* Nothing to do, when close() was called then we will exit the loop. */
             }
         }
     }
 
+    boolean consumeActivity() {
+        if (!activityObserved) {
+            return false;
+        }
+        activityObserved = false;
+        return true;
+    }
+
     public void reportFailureState() {
-        System.err.println();
-        System.err.println("=== Image generator watchdog detected no activity. This can be a sign of a deadlock during image building. Dumping all stack traces. Current time: " + new Date());
+        System.out.println();
+        System.out.println("=== Image generator watchdog detected no activity. This can be a sign of a deadlock during image building. Dumping all stack traces. Current time: " + new Date());
         threadDump();
         Runtime runtime = Runtime.getRuntime();
         final long heapSizeUnit = 1024 * 1024;
         long usedHeapSize = runtime.totalMemory() / heapSizeUnit;
         long freeHeapSize = runtime.freeMemory() / heapSizeUnit;
         long maximumHeapSize = runtime.maxMemory() / heapSizeUnit;
-        System.err.printf("=== Memory statistics (in MB):%n=== Used heap size: %d%n=== Free heap size: %d%n=== Maximum heap size: %d%n", usedHeapSize, freeHeapSize, maximumHeapSize);
-        System.err.flush();
+        System.out.printf("=== Memory statistics (in MB):%n=== Used heap size: %d%n=== Free heap size: %d%n=== Maximum heap size: %d%n", usedHeapSize, freeHeapSize, maximumHeapSize);
+        System.out.flush();
 
         if (watchdogExitOnTimeout) {
-            System.err.println("=== Image generator watchdog is aborting image generation. To configure the watchdog, use the options " +
+            System.out.println("=== Image generator watchdog is aborting image generation. To configure the watchdog, use the options " +
                             SubstrateOptionsParser.commandArgument(SubstrateOptions.DeadlockWatchdogInterval, Integer.toString(watchdogInterval), null) + " and " +
                             SubstrateOptionsParser.commandArgument(SubstrateOptions.DeadlockWatchdogExitOnTimeout, "+", null));
+            System.out.flush();
             /*
              * Since there is a likely deadlock somewhere, there is no less intrusive way to abort
              * other than a hard exit of the image builder VM.
@@ -131,11 +176,14 @@ public class DeadlockWatchdog implements Closeable {
     }
 
     private static void threadDump() {
-        for (ThreadInfo ti : ManagementFactory.getThreadMXBean().dumpAllThreads(true, true)) {
+        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+        boolean lockedMonitors = threadMXBean.isObjectMonitorUsageSupported();
+        boolean lockedSynchronizers = threadMXBean.isSynchronizerUsageSupported();
+        for (ThreadInfo ti : threadMXBean.dumpAllThreads(lockedMonitors, lockedSynchronizers)) {
             printThreadInfo(ti);
             printLockInfo(ti.getLockedSynchronizers());
         }
-        System.err.println();
+        System.out.println();
     }
 
     private static void printThreadInfo(ThreadInfo ti) {
@@ -149,33 +197,33 @@ public class DeadlockWatchdog implements Closeable {
         if (ti.isInNative()) {
             sb.append(" (running in native)");
         }
-        System.err.println(sb.toString());
+        System.out.println(sb.toString());
 
         if (ti.getLockOwnerName() != null) {
-            System.err.println("      owned by " + ti.getLockOwnerName() + " Id=" + ti.getLockOwnerId());
+            System.out.println("      owned by " + ti.getLockOwnerName() + " Id=" + ti.getLockOwnerId());
         }
 
         StackTraceElement[] stacktrace = ti.getStackTrace();
         MonitorInfo[] monitors = ti.getLockedMonitors();
         for (int i = 0; i < stacktrace.length; i++) {
             StackTraceElement ste = stacktrace[i];
-            System.err.println("    at " + ste.toString());
+            System.out.println("    at " + ste.toString());
             for (MonitorInfo mi : monitors) {
                 if (mi.getLockedStackDepth() == i) {
-                    System.err.println("      - locked " + mi);
+                    System.out.println("      - locked " + mi);
                 }
             }
         }
-        System.err.println();
+        System.out.println();
     }
 
     private static void printLockInfo(LockInfo[] locks) {
         if (locks.length > 0) {
-            System.err.println("    Locked synchronizers: count = " + locks.length);
+            System.out.println("    Locked synchronizers: count = " + locks.length);
             for (LockInfo li : locks) {
-                System.err.println("      - " + li);
+                System.out.println("      - " + li);
             }
-            System.err.println();
+            System.out.println();
         }
     }
 }

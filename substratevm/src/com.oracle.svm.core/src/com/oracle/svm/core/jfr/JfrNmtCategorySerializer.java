@@ -29,22 +29,25 @@ package com.oracle.svm.core.jfr;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.nmt.NmtCategory;
 
 public class JfrNmtCategorySerializer implements JfrSerializer {
+    private final NmtCategory[] nmtCategories;
+
     @Platforms(Platform.HOSTED_ONLY.class)
     public JfrNmtCategorySerializer() {
+        nmtCategories = NmtCategory.values();
     }
 
     @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
     public void write(JfrChunkWriter writer) {
         writer.writeCompressedLong(JfrType.NMTType.getId());
-
-        NmtCategory[] nmtCategories = NmtCategory.values();
         writer.writeCompressedLong(nmtCategories.length);
-        for (NmtCategory nmtCategory : nmtCategories) {
-            writer.writeCompressedInt(nmtCategory.ordinal());
-            writer.writeString(nmtCategory.getName());
+        for (int i = 0; i < nmtCategories.length; i++) {
+            writer.writeCompressedInt(nmtCategories[i].ordinal());
+            writer.writeString(nmtCategories[i].getName());
         }
     }
 }

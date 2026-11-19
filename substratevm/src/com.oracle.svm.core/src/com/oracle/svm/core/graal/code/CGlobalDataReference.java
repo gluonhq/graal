@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,14 +24,20 @@
  */
 package com.oracle.svm.core.graal.code;
 
+import java.util.Objects;
+
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
 import jdk.vm.ci.code.site.Reference;
 
-public final class CGlobalDataReference extends Reference {
+@Platforms(Platform.HOSTED_ONLY.class)
+public abstract sealed class CGlobalDataReference extends Reference permits CGlobalDataDirectReference, CGlobalDataIndirectReference {
 
     private final CGlobalDataInfo dataInfo;
 
-    public CGlobalDataReference(CGlobalDataInfo dataInfo) {
-        this.dataInfo = dataInfo;
+    protected CGlobalDataReference(CGlobalDataInfo dataInfo) {
+        this.dataInfo = Objects.requireNonNull(dataInfo);
     }
 
     public CGlobalDataInfo getDataInfo() {
@@ -39,12 +45,19 @@ public final class CGlobalDataReference extends Reference {
     }
 
     @Override
-    public int hashCode() {
-        return System.identityHashCode(dataInfo);
+    public final boolean equals(Object o) {
+        if (o == this) {
+            return true;
+        }
+        if (o == null || o.getClass() != getClass()) {
+            return false;
+        }
+        CGlobalDataReference that = (CGlobalDataReference) o;
+        return dataInfo.equals(that.dataInfo);
     }
 
     @Override
-    public boolean equals(Object obj) {
-        return (obj == this) || ((obj instanceof CGlobalDataReference) && dataInfo == ((CGlobalDataReference) obj).dataInfo);
+    public final int hashCode() {
+        return dataInfo.hashCode();
     }
 }

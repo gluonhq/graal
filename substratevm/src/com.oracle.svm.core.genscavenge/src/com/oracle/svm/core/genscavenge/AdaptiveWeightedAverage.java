@@ -24,9 +24,13 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * A weighted average maintains a running, weighted average of some floating-point value.
@@ -36,23 +40,10 @@ import com.oracle.svm.core.util.UnsignedUtils;
  *
  * This serves as our best estimate of a future unknown.
  */
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25-ga/src/hotspot/share/gc/shared/gcUtil.hpp")
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25-ga/src/hotspot/share/gc/shared/gcUtil.cpp")
 class AdaptiveWeightedAverage {
     static final int OLD_THRESHOLD = 100;
-
-    /** @see #computeEffectiveHistoryLengthForWeight */
-    static double computeWeightForEffectiveHistoryLength(double length) {
-        assert length > 0;
-        return 100.0 * (1.0 - Math.pow(Math.E, -1.0 / length));
-    }
-
-    /**
-     * Computes the effective history length for the given weight, which is the number of data
-     * points after which the former history is discounted to 1/e, i.e., its time constant.
-     */
-    static double computeEffectiveHistoryLengthForWeight(double weight) {
-        assert weight > 0 && weight <= 100;
-        return -1.0 / Math.log(1.0 - weight / 100.0);
-    }
 
     private final double weight;
 
@@ -73,6 +64,10 @@ class AdaptiveWeightedAverage {
 
     public double getAverage() {
         return average;
+    }
+
+    public long getCount() {
+        return sampleCount;
     }
 
     public void sample(double value) {
@@ -101,7 +96,8 @@ class AdaptiveWeightedAverage {
         return expAvg(avg, sample, adaptiveWeight);
     }
 
-    private static double expAvg(double avg, double sample, double adaptiveWeight) {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static double expAvg(double avg, double sample, double adaptiveWeight) {
         assert adaptiveWeight > 0 && adaptiveWeight <= 100 : "weight must be a percentage";
         return (100.0 - adaptiveWeight) * avg / 100.0 + adaptiveWeight * sample / 100.0;
     }
@@ -147,9 +143,5 @@ class AdaptivePaddedAverage extends AdaptiveWeightedAverage {
 
     public double getPaddedAverage() {
         return paddedAverage;
-    }
-
-    public double getDeviation() {
-        return deviation;
     }
 }

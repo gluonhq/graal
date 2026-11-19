@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -55,16 +55,23 @@ public final class ImageInfo {
     }
 
     /**
+     * Holds a name that is a prefix for all native-image properties.
+     *
+     * @since 25.0
+     */
+    public static final String PROPERTY_NATIVE_IMAGE_PREFIX = "org.graalvm.nativeimage.";
+
+    /**
      * Holds the string that is the name of the system property providing information about the
      * context in which code is currently executing. If the property returns the string given by
      * {@link #PROPERTY_IMAGE_CODE_VALUE_BUILDTIME} the code is executing in the context of image
      * building (e.g. in a static initializer of a class that will be contained in the image). If
      * the property returns the string given by {@link #PROPERTY_IMAGE_CODE_VALUE_RUNTIME} the code
-     * is executing at image runtime. Otherwise the property is not set.
+     * is executing at image runtime. Otherwise, the property is not set.
      *
      * @since 19.0
      */
-    public static final String PROPERTY_IMAGE_CODE_KEY = "org.graalvm.nativeimage.imagecode";
+    public static final String PROPERTY_IMAGE_CODE_KEY = PROPERTY_NATIVE_IMAGE_PREFIX + "imagecode";
 
     /**
      * Holds the string that will be returned by the system property for
@@ -91,7 +98,7 @@ public final class ImageInfo {
      *
      * @since 19.0
      */
-    public static final String PROPERTY_IMAGE_KIND_KEY = "org.graalvm.nativeimage.kind";
+    public static final String PROPERTY_IMAGE_KIND_KEY = PROPERTY_NATIVE_IMAGE_PREFIX + "kind";
 
     /**
      * Holds the string that will be returned by the system property for
@@ -118,6 +125,7 @@ public final class ImageInfo {
      * @since 19.0
      */
     public static boolean inImageCode() {
+        // A plugin in SubstrateGraphBuilderPlugins constant-folds this method to return true.
         return inImageBuildtimeCode() || inImageRuntimeCode();
     }
 
@@ -129,8 +137,11 @@ public final class ImageInfo {
      * @since 19.0
      */
     public static boolean inImageRuntimeCode() {
-        return PROPERTY_IMAGE_CODE_VALUE_RUNTIME.equals(System.getProperty(PROPERTY_IMAGE_CODE_KEY));
+        // A plugin in SubstrateGraphBuilderPlugins constant-folds this method to return true.
+        return false;
     }
+
+    private static final boolean BUILDTIME = PROPERTY_IMAGE_CODE_VALUE_BUILDTIME.equals(System.getProperty(PROPERTY_IMAGE_CODE_KEY));
 
     /**
      * Returns true if (at the time of the call) code is executing in the context of image building
@@ -139,7 +150,8 @@ public final class ImageInfo {
      * @since 19.0
      */
     public static boolean inImageBuildtimeCode() {
-        return PROPERTY_IMAGE_CODE_VALUE_BUILDTIME.equals(System.getProperty(PROPERTY_IMAGE_CODE_KEY));
+        // A plugin in SubstrateGraphBuilderPlugins constant-folds this method to return false.
+        return BUILDTIME;
     }
 
     /**
@@ -149,7 +161,7 @@ public final class ImageInfo {
      */
     public static boolean isExecutable() {
         ensureKindAvailable();
-        return PROPERTY_IMAGE_KIND_VALUE_EXECUTABLE.equals(System.getProperty(PROPERTY_IMAGE_KIND_KEY));
+        return PROPERTY_IMAGE_KIND_VALUE_EXECUTABLE.equals(ImageKindHolder.IMAGE_KIND);
     }
 
     /**
@@ -159,13 +171,21 @@ public final class ImageInfo {
      */
     public static boolean isSharedLibrary() {
         ensureKindAvailable();
-        return PROPERTY_IMAGE_KIND_VALUE_SHARED_LIBRARY.equals(System.getProperty(PROPERTY_IMAGE_KIND_KEY));
+        return PROPERTY_IMAGE_KIND_VALUE_SHARED_LIBRARY.equals(ImageKindHolder.IMAGE_KIND);
     }
 
     private static void ensureKindAvailable() {
-        if (inImageCode() && System.getProperty(PROPERTY_IMAGE_KIND_KEY) == null) {
+        if (inImageCode() && ImageKindHolder.IMAGE_KIND == null) {
             throw new UnsupportedOperationException(
                             "The kind of image that is built (executable or shared library) is not available yet because the relevant command line option has not been parsed yet.");
         }
+    }
+
+    /// This class is needed so [#IMAGE_KIND] does not get initialized before the
+    /// [#PROPERTY_IMAGE_KIND_KEY] property is set.
+    /// [ImageInfo] is initialized very early in the build process before the
+    /// [#PROPERTY_IMAGE_KIND_KEY] property is set by the image builder.
+    private static final class ImageKindHolder {
+        static final String IMAGE_KIND = System.getProperty(PROPERTY_IMAGE_KIND_KEY);
     }
 }

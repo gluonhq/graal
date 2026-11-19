@@ -30,7 +30,6 @@ import org.junit.After;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -39,42 +38,56 @@ import org.junit.Test;
  */
 public class InspectorAddressTest {
 
-    private Context context;
+    private ByteArrayOutputStream outOutput;
     private ByteArrayOutputStream errorOutput;
 
     @Before
     public void setUp() {
+        outOutput = new ByteArrayOutputStream();
         errorOutput = new ByteArrayOutputStream();
     }
 
     @After
     public void tearDown() {
-        if (context != null) {
-            context.close();
-            context = null;
-        }
+        outOutput.reset();
         errorOutput.reset();
     }
 
     @Test
     public void testHostPortDefault() {
-        context = Context.newBuilder().option("inspect", "").err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
+        try (Context context = Context.newBuilder().option("inspect", "").out(outOutput).build()) {
+            assert context != null;
+        }
+        String[] wsAddress = parseWSAddress(outOutput.toString());
         assertAddress("127.0.0.1", "9229", "?", wsAddress);
     }
 
     @Test
-    public void testHost() {
-        Assume.assumeTrue(System.getProperty("os.name").contains("Linux")); // Extra IPs are used
-        context = Context.newBuilder().option("inspect", "127.0.0.2").err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
-        assertAddress("127.0.0.2", "9229", "?", wsAddress);
+    public void testHostPortEnabled() {
+        try (Context context = Context.newBuilder().option("inspect", "true").out(outOutput).build()) {
+            assert context != null;
+        }
+        String[] wsAddress = parseWSAddress(outOutput.toString());
+        assertAddress("127.0.0.1", "9229", "?", wsAddress);
+    }
+
+    @Test
+    public void testPortDisabled() {
+        try (Context context = Context.newBuilder().option("inspect", "false").out(outOutput).err(errorOutput).build()) {
+            assert context != null;
+        }
+        String out = outOutput.toString();
+        assertTrue(out, out.isEmpty());
+        String err = errorOutput.toString();
+        assertTrue(err, err.isEmpty());
     }
 
     @Test
     public void testPort() {
-        context = Context.newBuilder().option("inspect", "2992").err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
+        try (Context context = Context.newBuilder().option("inspect", "2992").out(outOutput).build()) {
+            assert context != null;
+        }
+        String[] wsAddress = parseWSAddress(outOutput.toString());
         assertAddress("127.0.0.1", "2992", "?", wsAddress);
     }
 
@@ -91,8 +104,8 @@ public class InspectorAddressTest {
     }
 
     private void assertBadPort(int p) {
-        try {
-            Context.newBuilder().option("inspect", Integer.toString(p)).err(errorOutput).build();
+        try (Context context = Context.newBuilder().option("inspect", Integer.toString(p)).err(errorOutput).build()) {
+            assert context != null;
             fail();
         } catch (IllegalArgumentException ex) {
             assertTrue(ex.getMessage(), ex.getMessage().contains("Invalid port number: " + p + "."));
@@ -100,25 +113,31 @@ public class InspectorAddressTest {
     }
 
     @Test
-    public void testHostPort() {
-        Assume.assumeTrue(System.getProperty("os.name").contains("Linux")); // Extra IPs are used
-        context = Context.newBuilder().option("inspect", "127.0.0.2:2992").err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
-        assertAddress("127.0.0.2", "2992", "?", wsAddress);
+    public void testHostPortNotSupported() {
+        try (Context context = Context.newBuilder().option("inspect", "127.0.0.2:2992").err(errorOutput).build()) {
+            assert context != null;
+            fail();
+        } catch (IllegalArgumentException ex) {
+            assertTrue(ex.getMessage(), ex.getMessage().contains("Port is not a number"));
+        }
     }
 
     @Test
     public void testPort0() {
-        context = Context.newBuilder().option("inspect", "0").err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
+        try (Context context = Context.newBuilder().option("inspect", "0").out(outOutput).build()) {
+            assert context != null;
+        }
+        String[] wsAddress = parseWSAddress(outOutput.toString());
         assertAddress("127.0.0.1", "?", "?", wsAddress);
     }
 
     @Test
     public void testPath() {
         final String testPath = "testPath-" + SecureInspectorPathGenerator.getToken();
-        context = Context.newBuilder().option("inspect.Path", testPath).err(errorOutput).build();
-        String[] wsAddress = parseWSAddress(errorOutput.toString());
+        try (Context context = Context.newBuilder().option("inspect.Path", testPath).out(outOutput).build()) {
+            assert context != null;
+        }
+        String[] wsAddress = parseWSAddress(outOutput.toString());
         assertAddress("127.0.0.1", "9229", "/" + testPath, wsAddress);
     }
 

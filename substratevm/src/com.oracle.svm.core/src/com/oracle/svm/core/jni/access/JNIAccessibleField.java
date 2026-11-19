@@ -31,39 +31,45 @@ import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.BuildPhaseProvider.ReadyForCompilation;
+import com.oracle.svm.shared.BuildPhaseProvider.ReadyForCompilation;
 import com.oracle.svm.core.StaticFieldsSupport;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jni.headers.JNIFieldId;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.meta.JavaKind;
 
 /**
  * Information on a field that can be looked up and accessed via JNI.
  */
-public final class JNIAccessibleField extends JNIAccessibleMember {
-    /* 10000000...0 */
-    private static final UnsignedWord ID_STATIC_FLAG = WordFactory.unsigned(-1L).unsignedShiftRight(1).add(1);
+public final class JNIAccessibleField extends JNIAccessibleMember implements PreservableJNIElement {
     /* 01000000...0 */
-    private static final UnsignedWord ID_OBJECT_FLAG = ID_STATIC_FLAG.unsignedShiftRight(1);
+    private static final UnsignedWord ID_STATIC_FLAG = Word.unsigned(-1L).unsignedShiftRight(2).add(1);
     /* 00100000...0 */
-    private static final UnsignedWord ID_NEGATIVE_FLAG = ID_OBJECT_FLAG.unsignedShiftRight(1);
-    /* 00111111...1 */
-    private static final UnsignedWord ID_OFFSET_MASK = ID_NEGATIVE_FLAG.subtract(1);
+    private static final UnsignedWord ID_PRESERVED_FLAG = ID_STATIC_FLAG.unsignedShiftRight(1);
+    /* 00010000...0 */
+    private static final UnsignedWord ID_NEGATIVE_FLAG = ID_PRESERVED_FLAG.unsignedShiftRight(1);
+    /* 00001000...0 */
+    private static final UnsignedWord ID_LAYER_NUMBER_MASK = ID_NEGATIVE_FLAG.unsignedShiftRight(1);
+    private static final int ID_LAYER_NUMBER_SHIFT = Long.numberOfTrailingZeros(ID_LAYER_NUMBER_MASK.rawValue());
+    /* 00000111...1 */
+    private static final UnsignedWord ID_OFFSET_MASK = ID_LAYER_NUMBER_MASK.subtract(1);
 
     public static JNIAccessibleField negativeFieldQuery(JNIAccessibleClass jniClass) {
-        return new JNIAccessibleField(jniClass, null, 0);
+        return new JNIAccessibleField(jniClass, null, 0, false);
     }
 
     /**
      * For instance fields, the offset of the field in an object of the
      * {@linkplain JNIAccessibleMember#getDeclaringClass() declaring class}. For static fields,
      * depending on the field's type, the offset of the field in either
-     * {@link StaticFieldsSupport#getStaticPrimitiveFields()} or
-     * {@link StaticFieldsSupport#getStaticObjectFields()}.
+     * {@link StaticFieldsSupport#getStaticPrimitiveFieldsAtRuntime} or
+     * {@link StaticFieldsSupport#getStaticObjectFieldsAtRuntime}.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static WordBase getOffsetFromId(JNIFieldId id) {
@@ -72,31 +78,55 @@ public final class JNIAccessibleField extends JNIAccessibleMember {
         return result;
     }
 
-    @Platforms(HOSTED_ONLY.class) private final UnsignedWord flags;
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static Object getStaticObjectFieldsAtRuntime(JNIFieldId fieldId) {
+        int layerNumber = getLayerNumberFromId((UnsignedWord) fieldId);
+        return StaticFieldsSupport.getStaticObjectFieldsAtRuntime(layerNumber);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static Object getStaticPrimitiveFieldsAtRuntime(JNIFieldId fieldId) {
+        int layerNumber = getLayerNumberFromId((UnsignedWord) fieldId);
+        return StaticFieldsSupport.getStaticPrimitiveFieldsAtRuntime(layerNumber);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private static int getLayerNumberFromId(UnsignedWord id) {
+        if (ImageLayerBuildingSupport.buildingImageLayer()) {
+            return (int) id.and(ID_LAYER_NUMBER_MASK).unsignedShiftRight(ID_LAYER_NUMBER_SHIFT).rawValue();
+        } else {
+            return MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
+        }
+    }
+
+    @Platforms(HOSTED_ONLY.class) private UnsignedWord flags;
 
     /**
      * Represents the {@link JNIFieldId} of the field.
      *
      * From left (MSB) to right (LSB):
      * <ul>
+     * <li>1 unused bit, so regular field ids are never negative</li>
      * <li>1 bit for a flag indicating whether the field is static</li>
-     * <li>1 bit for a flag indicating whether the field is an object reference</li>
+     * <li>1 bit for a flag indicating whether the field is preserved</li>
      * <li>1 bit for a flag indicating whether the field is a negative query</li>
-     * <li>Remaining 61 bits for (unsigned) offset in the object</li>
+     * <li>1 bit for an unsigned integer indicating the layer number</li>
+     * <li>Remaining 59 bits for (unsigned) offset in the object</li>
      * </ul>
      */
     @UnknownPrimitiveField(availability = ReadyForCompilation.class)//
-    private UnsignedWord id = WordFactory.zero();
+    private UnsignedWord id = Word.zero();
 
     @Platforms(HOSTED_ONLY.class)
-    public JNIAccessibleField(JNIAccessibleClass declaringClass, JavaKind kind, int modifiers) {
+    public JNIAccessibleField(JNIAccessibleClass declaringClass, JavaKind kind, int modifiers, boolean preserved) {
         super(declaringClass);
 
-        UnsignedWord bits = Modifier.isStatic(modifiers) ? ID_STATIC_FLAG : WordFactory.zero();
+        UnsignedWord bits = Modifier.isStatic(modifiers) ? ID_STATIC_FLAG : Word.zero();
         if (kind == null) {
             bits = bits.or(ID_NEGATIVE_FLAG);
-        } else if (kind.isObject()) {
-            bits = bits.or(ID_OBJECT_FLAG);
+        }
+        if (preserved) {
+            bits = bits.or(ID_PRESERVED_FLAG);
         }
         this.flags = bits;
     }
@@ -121,11 +151,27 @@ public final class JNIAccessibleField extends JNIAccessibleMember {
     }
 
     @Platforms(HOSTED_ONLY.class)
-    public void finishBeforeCompilation(int offset, EconomicSet<Class<?>> hidingSubclasses) {
+    public void finishBeforeCompilation(int offset, int layerNumber, EconomicSet<Class<?>> hidingSubclasses) {
         assert id.equal(0);
         assert isNegativeHosted() || ID_OFFSET_MASK.and(offset).equal(offset) : "Offset is too large to be encoded in the JNIAccessibleField ID";
 
         id = isNegativeHosted() ? flags : flags.or(offset);
+        if (layerNumber == 1 || layerNumber == 0) {
+            id = id.or(Word.unsigned(layerNumber).shiftLeft(ID_LAYER_NUMBER_SHIFT));
+            VMError.guarantee(getLayerNumberFromId(id) == layerNumber);
+        } else {
+            assert layerNumber == MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
+        }
         setHidingSubclasses(hidingSubclasses);
+    }
+
+    @Override
+    public boolean isPreserved() {
+        return id.and(ID_PRESERVED_FLAG).notEqual(0);
+    }
+
+    @Override
+    public void setNotPreserved() {
+        flags = flags.and(ID_PRESERVED_FLAG.not());
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,11 +41,12 @@
 
 package org.graalvm.wasm.parser.validation;
 
-import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.BitSet;
 
-import org.graalvm.wasm.collection.IntArrayList;
 import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
+import org.graalvm.wasm.parser.bytecode.BytecodeFixup;
 import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 
 /**
@@ -53,61 +54,64 @@ import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
  */
 class IfFrame extends ControlFrame {
 
-    private final IntArrayList branchTargets;
-    private int falseJumpLocation;
+    private final ArrayList<BytecodeFixup> labelFixups;
+    private final ControlFrame parentFrame;
+    private BytecodeFixup falseJumpLocation;
     private boolean elseBranch;
 
-    IfFrame(byte[] paramTypes, byte[] resultTypes, int initialStackSize, boolean unreachable, int falseJumpLocation) {
-        super(paramTypes, resultTypes, initialStackSize, unreachable);
-        branchTargets = new IntArrayList();
+    IfFrame(int[] paramTypes, int[] resultTypes, int initialStackSize, ControlFrame parentFrame, BytecodeFixup falseJumpLocation) {
+        super(paramTypes, resultTypes, parentFrame.getSymbolTable(), initialStackSize, (BitSet) parentFrame.initializedLocals.clone(), parentFrame.legacyCatchDepth());
+        this.labelFixups = new ArrayList<>();
+        this.parentFrame = parentFrame;
         this.falseJumpLocation = falseJumpLocation;
         this.elseBranch = false;
     }
 
     @Override
-    byte[] labelTypes() {
+    int[] labelTypes() {
         return resultTypes();
     }
 
-    @Override
     void enterElse(ParserState state, RuntimeBytecodeGen bytecode) {
-        final int location = bytecode.addBranchLocation();
-        bytecode.patchLocation(falseJumpLocation, bytecode.location());
+        initializedLocals = (BitSet) parentFrame.initializedLocals.clone();
+        final BytecodeFixup location = bytecode.addForwardBranch(RuntimeBytecodeGen.BranchOp.BR);
+        falseJumpLocation.patch(bytecode.location());
         falseJumpLocation = location;
         elseBranch = true;
-        state.checkStackAfterFrameExit(this, resultTypes());
+        state.checkStackAfterFrameExit(this);
         // Since else is a separate block the unreachable state has to be reset.
         resetUnreachable();
     }
 
     @Override
-    void exit(RuntimeBytecodeGen bytecode) {
-        if (!elseBranch && !Arrays.equals(paramTypes(), resultTypes())) {
-            throw WasmException.create(Failure.TYPE_MISMATCH, "Expected else branch. If with incompatible param and result types requires else branch.");
-        }
-        if (branchTargets.size() == 0) {
-            bytecode.patchLocation(falseJumpLocation, bytecode.location());
-        } else {
-            final int location = bytecode.addLabel(resultTypeLength(), initialStackSize(), commonResultType());
-            bytecode.patchLocation(falseJumpLocation, location);
-            for (int branchLocation : branchTargets.toArray()) {
-                bytecode.patchLocation(branchLocation, location);
+    void exit(ParserState state, RuntimeBytecodeGen bytecode) {
+        if (!elseBranch) {
+            if (resultTypes().length != paramTypes().length) {
+                throw WasmException.create(Failure.TYPE_MISMATCH, "Expected else branch. If with incompatible param and result types requires else branch.");
+            }
+            if (!isUnreachable()) {
+                for (int i = 0; i < resultTypes().length; i++) {
+                    if (!getSymbolTable().matchesType(resultTypes()[i], paramTypes()[i])) {
+                        throw WasmException.create(Failure.TYPE_MISMATCH, "Expected else branch. If with incompatible param and result types requires else branch.");
+                    }
+                }
             }
         }
+        // The jump over the else branch also needs a label, even without explicit branches.
+        if (labelFixups.isEmpty() && !elseBranch) {
+            falseJumpLocation.patch(bytecode.location());
+        } else {
+            final int location = addBranchLabel(bytecode);
+            falseJumpLocation.patch(location);
+            for (BytecodeFixup labelFixup : labelFixups) {
+                labelFixup.patch(location);
+            }
+        }
+        registerDelegateContinuationFixups(state, -1);
     }
 
     @Override
-    void addBranch(RuntimeBytecodeGen bytecode) {
-        branchTargets.add(bytecode.addBranchLocation());
-    }
-
-    @Override
-    void addBranchIf(RuntimeBytecodeGen bytecode) {
-        branchTargets.add(bytecode.addBranchIfLocation());
-    }
-
-    @Override
-    void addBranchTableItem(RuntimeBytecodeGen bytecode) {
-        branchTargets.add(bytecode.addBranchTableItemLocation());
+    void addLabelFixup(BytecodeFixup fixup) {
+        labelFixups.add(fixup);
     }
 }

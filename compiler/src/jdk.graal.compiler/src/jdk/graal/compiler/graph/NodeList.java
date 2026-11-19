@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.RandomAccess;
 import java.util.stream.Stream;
 
@@ -332,16 +333,6 @@ public abstract class NodeList<T extends Node> extends AbstractList<T> implement
         return oldValue;
     }
 
-    boolean replaceFirst(Node node, Node other) {
-        for (int i = 0; i < size; i++) {
-            if (nodes[i] == node) {
-                nodes[i] = other;
-                return true;
-            }
-        }
-        return false;
-    }
-
     @Override
     public Iterator<T> iterator() {
         return new NodeListIterator<>(this, 0);
@@ -491,7 +482,9 @@ public abstract class NodeList<T extends Node> extends AbstractList<T> implement
         @SuppressWarnings("unchecked")
         @Override
         public R next() {
-            assert expectedModCount == list.modCount : Assertions.errorMessageContext("expectedModCount", expectedModCount, "list.modCount", list.modCount);
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
             return (R) list.nodes[index++];
         }
 

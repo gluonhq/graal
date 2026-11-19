@@ -24,37 +24,57 @@
  */
 package com.oracle.svm.core.jdk;
 
-import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 
-import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.shared.util.VMError;
 
 @TargetClass(java.util.concurrent.CompletableFuture.class)
 final class Target_java_util_concurrent_CompletableFuture {
     // Checkstyle: stop
-    @Alias @InjectAccessors(CompletableFutureUseCommonPoolAccessor.class) //
-    private static boolean USE_COMMON_POOL;
-
     @Alias @InjectAccessors(CompletableFutureAsyncPoolAccessor.class) //
-    private static Executor ASYNC_POOL;
+    private static ForkJoinPool ASYNC_POOL;
     // Checkstyle: resume
 }
 
-class CompletableFutureUseCommonPoolAccessor {
-    static boolean get() {
-        return CompletableFutureFieldHolder.USE_COMMON_POOL;
+@TargetClass(className = "java.util.concurrent.DelayScheduler")
+final class Target_java_util_concurrent_DelayScheduler {
+    @Alias @InjectAccessors(DelaySchedulerNanoTimeOffsetAccessor.class) //
+    private static long nanoTimeOffset;
+}
+
+class DelaySchedulerNanoTimeOffsetAccessor {
+    static long get() {
+        return DelaySchedulerNanoTimeOffsetHolder.NANO_TIME_OFFSET;
+    }
+}
+
+/**
+ * Holder for {@link DelaySchedulerNanoTimeOffsetHolder#NANO_TIME_OFFSET}. Initialized at runtime
+ * via {@link CompletableFutureFeature}.
+ */
+class DelaySchedulerNanoTimeOffsetHolder {
+
+    public static final long NANO_TIME_OFFSET;
+
+    static {
+        if (SubstrateUtil.HOSTED) {
+            throw VMError.shouldNotReachHere(DelaySchedulerNanoTimeOffsetHolder.class.getName() + " must only be initialized at runtime");
+        }
+        NANO_TIME_OFFSET = Math.min(System.nanoTime(), 0L) + Long.MIN_VALUE;
     }
 }
 
 class CompletableFutureAsyncPoolAccessor {
-    static Executor get() {
+    static ForkJoinPool get() {
         return CompletableFutureFieldHolder.ASYNC_POOL;
     }
 }
@@ -62,21 +82,15 @@ class CompletableFutureAsyncPoolAccessor {
 /* Note that this class is initialized at run time. */
 class CompletableFutureFieldHolder {
     /* The following is copied from CompletableFuture. */
-
-    static final boolean USE_COMMON_POOL = ForkJoinPool.getCommonPoolParallelism() > 1;
-
-    static final Executor ASYNC_POOL = USE_COMMON_POOL ? ForkJoinPool.commonPool()
-                    : SubstrateUtil.cast(new Target_java_util_concurrent_CompletableFuture_ThreadPerTaskExecutor(), Executor.class);
-}
-
-@TargetClass(value = java.util.concurrent.CompletableFuture.class, innerClass = "ThreadPerTaskExecutor")
-final class Target_java_util_concurrent_CompletableFuture_ThreadPerTaskExecutor {
+    static final ForkJoinPool ASYNC_POOL = Target_java_util_concurrent_ForkJoinPool.asyncCommonPool();
 }
 
 @AutomaticallyRegisteredFeature
 class CompletableFutureFeature implements InternalFeature {
     @Override
     public void duringSetup(DuringSetupAccess access) {
-        RuntimeClassInitialization.initializeAtRunTime(CompletableFutureFieldHolder.class);
+        JVMCIRuntimeClassInitializationSupport rci = JVMCIRuntimeClassInitializationSupport.singleton();
+        rci.initializeAtRunTime(GuestAccess.get().lookupType(CompletableFutureFieldHolder.class));
+        rci.initializeAtRunTime(GuestAccess.get().lookupType(DelaySchedulerNanoTimeOffsetHolder.class));
     }
 }

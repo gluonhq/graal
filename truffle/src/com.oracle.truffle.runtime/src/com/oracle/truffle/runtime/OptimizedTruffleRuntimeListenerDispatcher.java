@@ -115,8 +115,13 @@ final class OptimizedTruffleRuntimeListenerDispatcher extends CopyOnWriteArrayLi
     }
 
     @Override
-    public void onCompilationDeoptimized(OptimizedCallTarget target, Frame frame) {
-        invokeListeners((l) -> l.onCompilationDeoptimized(target, frame));
+    public void onCompilationDeoptimized(OptimizedCallTarget target, Frame frame, String reason) {
+        invokeListeners((l) -> l.onCompilationDeoptimized(target, frame, reason));
+    }
+
+    @Override
+    public void onProfileReset(OptimizedCallTarget target) {
+        invokeListeners((l) -> l.onProfileReset(target));
     }
 
     @Override
@@ -169,21 +174,6 @@ final class OptimizedTruffleRuntimeListenerDispatcher extends CopyOnWriteArrayLi
     @Override
     public void onSuccess(TruffleCompilable compilable, TruffleCompilationTask task, GraphInfo graph, CompilationResultInfo result, int tier) {
         onCompilationSuccess((OptimizedCallTarget) compilable, (AbstractCompilationTask) task, graph, result);
-    }
-
-    /**
-     * On GraalVM, the {@link TruffleCompilerListener} interface is loaded from the JDK's jimage
-     * rather than from a Maven dependency. The {@code TruffleCompilerListener} loaded from the LTS
-     * GraalVM-23.1.3 JDK does not delegate the {@code onFailure} method to the newer version, so we
-     * need to handle the delegation here.
-     * <p>
-     * GR-54187: Remove in graalvm-25.1
-     * </p>
-     */
-    @Override
-    @SuppressWarnings("deprecation")
-    public void onFailure(TruffleCompilable compilable, String reason, boolean bailout, boolean permanentBailout, int tier) {
-        onCompilationFailed((OptimizedCallTarget) compilable, reason, bailout, permanentBailout, tier, null);
     }
 
     @Override

@@ -24,7 +24,7 @@
  */
 package jdk.graal.compiler.nodes.calc;
 
-import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_2;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_4;
 
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable.BinaryOp;
@@ -46,7 +46,10 @@ import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.PrimitiveConstant;
 import jdk.vm.ci.meta.Value;
 
-@NodeInfo(shortName = "*", cycles = CYCLES_2)
+/**
+ * Multiplication node.
+ */
+@NodeInfo(shortName = "*", cycles = CYCLES_4, cyclesRationale = "The node cycle estimate is taken from Agner Fog's instruction tables (https://www.agner.org/optimize/instruction_tables.pdf).")
 public class MulNode extends BinaryArithmeticNode<Mul> implements NarrowableArithmeticNode, Canonicalizable.BinaryCommutative<ValueNode> {
 
     public static final NodeClass<MulNode> TYPE = NodeClass.create(MulNode.class);
@@ -161,17 +164,20 @@ public class MulNode extends BinaryArithmeticNode<Mul> implements NarrowableArit
                     long lowerBitValue = i - highestBitValue;
                     assert highestBitValue > 0 && lowerBitValue > 0 : Assertions.errorMessageContext("stamp", stamp, "forX", forX, "i", i, "highestBitVal", highestBitValue, "lowerBitVal",
                                     lowerBitValue);
+                    // The lower bit cannot be one because that case is handled by i - 1 above.
+                    assert lowerBitValue > 1 : Assertions.errorMessageContext("stamp", stamp, "forX", forX, "i", i, "lowerBitVal", lowerBitValue);
                     ValueNode left = new LeftShiftNode(forX, ConstantNode.forInt(CodeUtil.log2(highestBitValue)));
-                    ValueNode right = lowerBitValue == 1 ? forX : new LeftShiftNode(forX, ConstantNode.forInt(CodeUtil.log2(lowerBitValue)));
+                    ValueNode right = new LeftShiftNode(forX, ConstantNode.forInt(CodeUtil.log2(lowerBitValue)));
                     return AddNode.create(left, right, view);
                 } else {
                     // e.g., 0b1111_1100
                     int shiftToRoundUpToPowerOf2 = CodeUtil.log2(highestBitValue) + 1;
-                    long subValue = (1 << shiftToRoundUpToPowerOf2) - i;
+                    long subValue = (1L << shiftToRoundUpToPowerOf2) - i;
                     if (CodeUtil.isPowerOf2(subValue) && shiftToRoundUpToPowerOf2 < ((IntegerStamp) stamp).getBits()) {
-                        assert CodeUtil.log2(subValue) >= 1 : subValue;
                         ValueNode left = new LeftShiftNode(forX, ConstantNode.forInt(shiftToRoundUpToPowerOf2));
-                        ValueNode right = new LeftShiftNode(forX, ConstantNode.forInt(CodeUtil.log2(subValue)));
+                        // For Long.MAX_VALUE, i + 1 overflows, so this valid subtraction by one is
+                        // not handled by the preceding i + 1 check.
+                        ValueNode right = subValue == 1 ? forX : new LeftShiftNode(forX, ConstantNode.forInt(CodeUtil.log2(subValue)));
                         return SubNode.create(left, right, view);
                     }
                 }

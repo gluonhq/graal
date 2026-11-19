@@ -1,5 +1,14 @@
 blank_issues_enabled: false
 contact_links:
   - name: Need help or have a question?
+    url: https://github.com/oracle/graal/discussions
+    about: Use GitHub Discussions for questions, design discussion, and general community support.
+  - name: Join the GraalVM Slack
     url: https://www.graalvm.org/slack-invitation/
-    about: Join the GraalVM Slack channel.
+    about: Connect with the GraalVM community in Slack.
+  - name: Read the contribution guide
+    url: https://github.com/oracle/graal/blob/master/CONTRIBUTING.md
+    about: Review issue reporting, pull request expectations, and AI-assisted contribution guidance.
+  - name: Report a security vulnerability
+    url: https://github.com/oracle/graal/security/policy
+    about: Do not open a public GitHub issue for security vulnerabilities.

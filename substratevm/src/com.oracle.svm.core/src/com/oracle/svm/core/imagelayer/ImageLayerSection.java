@@ -25,24 +25,34 @@
 package com.oracle.svm.core.imagelayer;
 
 import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.layeredimagesingleton.LayeredImageSingleton;
+import com.oracle.svm.guest.staging.c.CGlobalData;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
-public abstract class ImageLayerSection implements LayeredImageSingleton {
+/**
+ * With layered images, this is a section that each layer has and that is present at runtime. It
+ * contains the addresses of various important locations and information about values to patch at
+ * runtime. See {@code ImageLayerSectionFeature} for details.
+ */
+public abstract class ImageLayerSection {
 
     protected final CGlobalData<Pointer> initialSectionStart;
     protected final CGlobalData<WordPointer> cachedImageFDs;
     protected final CGlobalData<WordPointer> cachedImageHeapOffsets;
+    protected final CGlobalData<WordPointer> cachedImageHeapRelocations;
+    protected final CGlobalData<CCharPointer> nextLayerSectionSymbolName;
 
-    protected ImageLayerSection(CGlobalData<Pointer> initialSectionStart, CGlobalData<WordPointer> cachedImageFDs, CGlobalData<WordPointer> cachedImageHeapOffsets) {
+    protected ImageLayerSection(CGlobalData<Pointer> initialSectionStart, CGlobalData<WordPointer> cachedImageFDs, CGlobalData<WordPointer> cachedImageHeapOffsets,
+                    CGlobalData<WordPointer> cachedImageHeapRelocations, CGlobalData<CCharPointer> nextLayerSectionSymbolName) {
         this.initialSectionStart = initialSectionStart;
         this.cachedImageFDs = cachedImageFDs;
         this.cachedImageHeapOffsets = cachedImageHeapOffsets;
+        this.cachedImageHeapRelocations = cachedImageHeapRelocations;
+        this.nextLayerSectionSymbolName = nextLayerSectionSymbolName;
     }
 
     public enum SectionEntries {
@@ -50,10 +60,15 @@ public abstract class ImageLayerSection implements LayeredImageSingleton {
         HEAP_END,
         HEAP_RELOCATABLE_BEGIN,
         HEAP_RELOCATABLE_END,
-        HEAP_ANY_RELOCATABLE_POINTER,
         HEAP_WRITEABLE_BEGIN,
         HEAP_WRITEABLE_END,
-        NEXT_SECTION
+        HEAP_WRITEABLE_PATCHED_BEGIN,
+        HEAP_WRITEABLE_PATCHED_END,
+        CODE_START,
+        NEXT_SECTION,
+        FIXUP_TABLE,
+        VARIABLY_SIZED_DATA,
+        FIRST_SINGLETON,
     }
 
     private static ImageLayerSection singleton() {
@@ -78,6 +93,16 @@ public abstract class ImageLayerSection implements LayeredImageSingleton {
     @Fold
     public static CGlobalData<WordPointer> getCachedImageHeapOffsets() {
         return singleton().cachedImageHeapOffsets;
+    }
+
+    @Fold
+    public static CGlobalData<WordPointer> getCachedImageHeapRelocations() {
+        return singleton().cachedImageHeapRelocations;
+    }
+
+    @Fold
+    public static CGlobalData<CCharPointer> getNextLayerSectionSymbolName() {
+        return singleton().nextLayerSectionSymbolName;
     }
 
     protected abstract int getEntryOffsetInternal(SectionEntries entry);

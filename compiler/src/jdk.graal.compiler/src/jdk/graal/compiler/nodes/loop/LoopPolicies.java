@@ -27,6 +27,7 @@ package jdk.graal.compiler.nodes.loop;
 import java.util.List;
 
 import jdk.graal.compiler.nodes.ControlSplitNode;
+import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
@@ -48,6 +49,9 @@ public interface LoopPolicies {
     boolean shouldFullUnroll(Loop loop);
 
     boolean shouldPartiallyUnroll(Loop loop, CoreProviders providers);
+
+    /// Determines whether the loop should be inverted around the given control split.
+    boolean shouldInvert(Loop loop, IfNode controlSplit, CoreProviders providers);
 
     boolean shouldTryUnswitch(Loop loop);
 
@@ -74,7 +78,7 @@ public interface LoopPolicies {
         private final boolean isTrivial;
 
         private UnswitchingDecision(List<ControlSplitNode> controlSplits, boolean isTrivial) {
-            assert !isTrivial || controlSplits != null : "An unswitching desision cannot be trivial but have not control split node";
+            assert !isTrivial || controlSplits != null : "An unswitching decision cannot be trivial but have not control split node";
 
             this.controlSplits = controlSplits;
             this.isTrivial = isTrivial;

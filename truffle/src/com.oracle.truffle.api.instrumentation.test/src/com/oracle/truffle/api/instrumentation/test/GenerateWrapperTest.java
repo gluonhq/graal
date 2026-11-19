@@ -237,6 +237,18 @@ public class GenerateWrapperTest extends AbstractPolyglotTest {
         assertResumeExecutionEvent(node, testFrame, 42, resumeExec);
     }
 
+    @Test
+    public void testResumeInExecuteExecution() {
+        setupEnv();
+        ResumeInExecuteNode node = new ResumeInExecuteNode();
+        VirtualFrame testFrame = Truffle.getRuntime().createVirtualFrame(new Object[0], new FrameDescriptor());
+        Supplier<ResumeInExecuteNode> resumeNode = adoptNode(node);
+        Runnable resumeExec = () -> {
+            resumeNode.get().execute(testFrame);
+        };
+        assertResumeExecutionEvent(node, testFrame, 42, resumeExec);
+    }
+
     private void assertUnwindInEnter(Node node, VirtualFrame expectedFrame, Object unwindValue, Supplier<Object> r) {
         List<String> events = new ArrayList<>();
         EventBinding<?> binding = instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.ANY, new ExecutionEventListener() {
@@ -1011,7 +1023,7 @@ public class GenerateWrapperTest extends AbstractPolyglotTest {
 
     @ExpectError("Class must not be private to generate a wrapper.")
     @GenerateWrapper
-    private static class ErrorNode2 extends Node implements InstrumentableNode {
+    private static final class ErrorNode2 extends Node implements InstrumentableNode {
 
         public WrapperNode createWrapper(ProbeNode probe) {
             return null;
@@ -1099,7 +1111,7 @@ public class GenerateWrapperTest extends AbstractPolyglotTest {
         assertEquals(1, foobarInvocations.get());
     }
 
-    @ExpectError("No suiteable constructor found for wrapper factory generation. At least one default or copy constructor must be visible.")
+    @ExpectError("No suitable constructor found for wrapper factory generation. At least one default or copy constructor must be visible.")
     @GenerateWrapper
     @SuppressWarnings("unused")
     public abstract static class ErrorNode6 extends Node implements InstrumentableNode {
@@ -1228,6 +1240,24 @@ public class GenerateWrapperTest extends AbstractPolyglotTest {
         @Override
         public WrapperNode createWrapper(ProbeNode probeNode) {
             return new YieldNodeWrapper(this, probeNode);
+        }
+
+        public boolean isInstrumentable() {
+            return true;
+        }
+    }
+
+    @GenerateWrapper(yieldExceptions = YieldException.class, resumeMethodPrefix = "execute")
+    @SuppressWarnings("unused")
+    public static class ResumeInExecuteNode extends Node implements InstrumentableNode {
+
+        public Object execute(VirtualFrame frame) {
+            return 42;
+        }
+
+        @Override
+        public WrapperNode createWrapper(ProbeNode probeNode) {
+            return new ResumeInExecuteNodeWrapper(this, probeNode);
         }
 
         public boolean isInstrumentable() {

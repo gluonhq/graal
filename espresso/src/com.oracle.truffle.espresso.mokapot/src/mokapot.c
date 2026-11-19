@@ -27,11 +27,13 @@
 #endif
 
 #include "mokapot.h"
+#include "probe_option_type.h"
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 
 OS_THREAD_LOCAL MokapotEnv* tls_moka_env = NULL;
@@ -44,11 +46,11 @@ JNIEXPORT void JNICALL mokapotAttachThread(MokapotEnv* moka_env) {
   tls_moka_env = moka_env;
 }
 
-JNIEXPORT OS_DL_HANDLE JNICALL mokapotGetRTLD_DEFAULT() {
+JNIEXPORT OS_DL_HANDLE JNICALL mokapotGetRTLD_DEFAULT(void) {
     return os_get_RTLD_DEFAULT();
 }
 
-JNIEXPORT OS_DL_HANDLE JNICALL mokapotGetProcessHandle() {
+JNIEXPORT OS_DL_HANDLE JNICALL mokapotGetProcessHandle(void) {
     return os_get_ProcessHandle();
 }
 
@@ -78,9 +80,8 @@ JNIEXPORT void mokapotCaptureState(int32_t* addr, jint mask) {
 
 
 JNIEXPORT MokapotEnv* JNICALL initializeMokapotContext(JNIEnv* env, void* (*fetch_by_name)(const char *, void*)) {
-
   MokapotEnv *moka_env = (MokapotEnv *) malloc(sizeof(*moka_env));
- 
+
   struct MokapotNativeInterface_ *functions = (struct MokapotNativeInterface_*) malloc(sizeof(*functions));
   struct JNIInvokeInterface_ *java_vm_functions = (struct JNIInvokeInterface_*) malloc(sizeof(*java_vm_functions));
 
@@ -95,12 +96,14 @@ JNIEXPORT MokapotEnv* JNICALL initializeMokapotContext(JNIEnv* env, void* (*fetc
   java_vm_functions->reserved2 = NULL;
 
   // Store the MokapotEnv* in the JNIEnv*.
+  // This is read in nespresso's GetJavaVM
   struct JNINativeInterface_* tmp = (struct JNINativeInterface_*) *env;
   tmp->reserved1 = (void*) moka_env;
 
   #define INIT__(name) \
       functions->name = fetch_by_name(#name, (void*)&name);
   VM_METHOD_LIST(INIT__)
+  PD_VM_METHOD_LIST(INIT__)
   #undef INIT_
 
   // Persist Moka env in TLS.
@@ -116,7 +119,7 @@ JNIEXPORT MokapotEnv* JNICALL initializeMokapotContext(JNIEnv* env, void* (*fetc
   return moka_env;
 }
 
-MokapotEnv* getEnv() {
+MokapotEnv* getEnv(void) {
   // thread local Moka or JNI Env?
   return tls_moka_env;
 }
@@ -187,6 +190,10 @@ JNIEXPORT jobject JNICALL JVM_Clone(JNIEnv *env, jobject obj) {
 JNIEXPORT jstring JNICALL JVM_InternString(JNIEnv *env, jstring str) {
   IMPLEMENTED(JVM_InternString);
   return (*getEnv())->JVM_InternString(env, str);
+}
+
+JNIEXPORT jboolean JNICALL JVM_AOTEndRecording(JNIEnv *env) {
+  return JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL JVM_CurrentTimeMillis(JNIEnv *env, jclass ignored) {
@@ -388,8 +395,12 @@ JNIEXPORT void JNICALL JVM_Yield(JNIEnv *env, jclass threadClass) {
 
 JNIEXPORT void JNICALL JVM_Sleep(JNIEnv *env, jclass threadClass, jlong millis) {
   UNIMPLEMENTED(JVM_Sleep);
+}
 
 
+JNIEXPORT void JNICALL
+JVM_SleepNanos(JNIEnv *env, jclass threadClass, jlong nanos) {
+  IMPLEMENTED(JVM_SleepNanos);
 }
 
 JNIEXPORT jobject JNICALL JVM_CurrentCarrierThread(JNIEnv *env, jclass threadClass) {
@@ -550,7 +561,7 @@ JNIEXPORT jobject JNICALL JVM_GetArrayElement(JNIEnv *env, jobject arr, jint ind
 
 JNIEXPORT jvalue JNICALL JVM_GetPrimitiveArrayElement(JNIEnv *env, jobject arr, jint index, jint wCode) {
   jvalue result = {0};
-  UNIMPLEMENTED(JVM_GetPrimitiveArrayElement);  
+  UNIMPLEMENTED(JVM_GetPrimitiveArrayElement);
   return result;
 }
 
@@ -875,7 +886,8 @@ JNIEXPORT void JNICALL JVM_ReportFinalizationComplete(JNIEnv *env, jobject final
 }
 
 JNIEXPORT jboolean JNICALL JVM_IsFinalizationEnabled(JNIEnv *env) {
-  return JNI_TRUE;
+  IMPLEMENTED(JVM_IsFinalizationEnabled);
+  return (*getEnv())->JVM_IsFinalizationEnabled(env);
 }
 
 JNIEXPORT jint JNICALL JVM_DTraceGetVersion(JNIEnv *env) {
@@ -952,7 +964,6 @@ JNIEXPORT jint JNICALL JVM_GetMethodIxByteCodeLength(JNIEnv *env, jclass cb, jin
 JNIEXPORT void JNICALL JVM_GetMethodIxExceptionTableEntry(JNIEnv *env, jclass cb, jint method_index, jint entry_index,
                                         JVM_ExceptionTableEntryType *entry) {
   UNIMPLEMENTED(JVM_GetMethodIxExceptionTableEntry);
-
 }
 
 JNIEXPORT jint JNICALL JVM_GetMethodIxExceptionTableLength(JNIEnv *env, jclass cb, int index) {
@@ -1062,11 +1073,11 @@ JNIEXPORT jboolean JNICALL JVM_IsSameClassPackage(JNIEnv *env, jclass class1, jc
 
 JNIEXPORT jint JNICALL JVM_GetLastErrorString(char *buf, int len) {
   NATIVE(JVM_GetLastErrorString);
-  return os_lasterror(buf, len);
+  return (jint) os_lasterror(buf, len);
 }
 
 JNIEXPORT char* JNICALL JVM_NativePath(char *pathname) {
-  NATIVE(JVM_NativePath);  
+  NATIVE(JVM_NativePath);
   return os_native_path(pathname);
 }
 
@@ -1203,7 +1214,7 @@ JNIEXPORT jint JNICALL JVM_SendTo(jint fd, char *buf, int len, int flags, struct
 
 JNIEXPORT jint JNICALL JVM_SocketAvailable(jint fd, jint *result) {
   NATIVE(JVM_SocketAvailable);
-  return os_socket_available(fd, result);  
+  return os_socket_available(fd, result);
 }
 
 JNIEXPORT jint JNICALL JVM_GetSockName(jint fd, struct sockaddr *him, int *len) {
@@ -1236,7 +1247,7 @@ JNIEXPORT int JNICALL JVM_GetHostName(char *name, int namelen) {
   return os_get_host_name(name, namelen);
 }
 
-static JNIEnv* getGuestJNI() {
+static JNIEnv* getGuestJNI(void) {
   JNIEnv *jniEnv = NULL;
   JavaVM *vm = (*getEnv())->vm;
   (*vm)->GetEnv(vm, (void **) &jniEnv, JNI_VERSION_1_6);
@@ -1404,9 +1415,16 @@ JNIEXPORT jboolean JNICALL JVM_AreNestMates(JNIEnv *env, jclass current, jclass 
   return (*getEnv())->JVM_AreNestMates(env, current, member);
 }
 
-JNIEXPORT void JNICALL JVM_BeforeHalt() {
+JNIEXPORT void JNICALL JVM_BeforeHalt(void) {
   IMPLEMENTED(JVM_BeforeHalt);
-  return (*getEnv())->JVM_BeforeHalt();
+  (*getEnv())->JVM_BeforeHalt();
+}
+
+
+JNIEXPORT void JNICALL
+JVM_ExpandStackFrameInfo(JNIEnv *env, jobject obj) {
+  IMPLEMENTED(JVM_ExpandStackFrameInfo);
+  (*getEnv())->JVM_ExpandStackFrameInfo(env, obj);
 }
 
 JNIEXPORT jobject JNICALL JVM_CallStackWalk(JNIEnv *env, jobject stackStream, jlong mode,
@@ -1432,8 +1450,8 @@ JNIEXPORT jobjectArray JNICALL JVM_ConstantPoolGetNameAndTypeRefInfoAt(JNIEnv *e
 }
 
 JNIEXPORT jbyte JNICALL JVM_ConstantPoolGetTagAt(JNIEnv *env, jobject unused, jobject jcpool, jint index) {
-  UNIMPLEMENTED(JVM_ConstantPoolGetTagAt);
-  return 0;
+  IMPLEMENTED(JVM_ConstantPoolGetTagAt);
+  return (*getEnv())->JVM_ConstantPoolGetTagAt(env, unused, jcpool, index);
 }
 
 JNIEXPORT void JNICALL JVM_DefineModule(JNIEnv *env, jobject module, jboolean is_open, jstring version,
@@ -1479,7 +1497,7 @@ JNIEXPORT jboolean JNICALL JVM_IsPreviewEnabled(void) {
 }
 
 JNIEXPORT jboolean JNICALL JVM_IsContinuationsSupported(void) {
-  // TODO: actually support them.
+  // TODO: GR-54288 Currently virtual threads are just platform threads in Espresso
   IMPLEMENTED(JVM_IsContinuationsSupported);
   return JNI_FALSE;
 }
@@ -1538,6 +1556,12 @@ JNIEXPORT jboolean JNICALL JVM_IsUseContainerSupport(void) {
   return JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+JVM_IsContainerized(void) {
+  UNIMPLEMENTED(JVM_IsContainerized);
+  return JNI_FALSE;
+}
+
 JNIEXPORT jobjectArray JNICALL JVM_GetRecordComponents(JNIEnv *env, jclass ofClass) {
     IMPLEMENTED(JVM_GetRecordComponents);
     return (*getEnv())->JVM_GetRecordComponents(env, ofClass);
@@ -1550,7 +1574,15 @@ JNIEXPORT void JNICALL JVM_RegisterLambdaProxyClassForArchiving(JNIEnv* env, jcl
                                          jobject implMethodMember,
                                          jobject instantiatedMethodType,
                                          jclass lambdaProxyClass) {
-  UNIMPLEMENTED(JVM_RegisterLambdaProxyClassForArchiving);
+  IMPLEMENTED(JVM_RegisterLambdaProxyClassForArchiving);
+  (*getEnv())->JVM_RegisterLambdaProxyClassForArchiving(env,
+          caller,
+          invokedName,
+          invokedType,
+          methodType,
+          implMethodMember,
+          instantiatedMethodType,
+          lambdaProxyClass);
   return;
 }
 
@@ -1560,8 +1592,14 @@ JNIEXPORT jclass JNICALL JVM_LookupLambdaProxyClassFromArchive(JNIEnv* env, jcla
                                       jobject methodType,
                                       jobject implMethodMember,
                                       jobject instantiatedMethodType) {
-  UNIMPLEMENTED(JVM_LookupLambdaProxyClassFromArchive);
-  return NULL;
+  IMPLEMENTED(JVM_LookupLambdaProxyClassFromArchive);
+  return (*getEnv())->JVM_LookupLambdaProxyClassFromArchive(env,
+          caller,
+          invokedName,
+          invokedType,
+          methodType,
+          implMethodMember,
+          instantiatedMethodType);
 }
 
 JNIEXPORT jboolean JNICALL JVM_IsCDSDumpingEnabled(JNIEnv* env) {
@@ -1579,6 +1617,16 @@ JNIEXPORT jboolean JNICALL JVM_IsDumpingClassList(JNIEnv* env) {
   return (*getEnv())->JVM_IsDumpingClassList(env);
 }
 
+JNIEXPORT jint JNICALL JVM_GetCDSConfigStatus(void) {
+  IMPLEMENTED(JVM_GetCDSConfigStatus);
+  return (*getEnv())->JVM_GetCDSConfigStatus();
+}
+
+JNIEXPORT jboolean JNICALL JVM_NeedsClassInitBarrierForCDS(JNIEnv* env, jclass cls) {
+  UNIMPLEMENTED(JVM_NeedsClassInitBarrierForCDS);
+  return 0;
+}
+
 JNIEXPORT jstring JNICALL JVM_GetExtendedNPEMessage(JNIEnv *env, jthrowable throwable) {
   IMPLEMENTED(JVM_GetExtendedNPEMessage);
   return (*getEnv())->JVM_GetExtendedNPEMessage(env, throwable);
@@ -1589,7 +1637,7 @@ JNIEXPORT jobjectArray JNICALL JVM_GetProperties(JNIEnv *env) {
   return (*getEnv())->JVM_GetProperties(env);
 }
 
-JNIEXPORT jlong JNICALL JVM_GetRandomSeedForDumping() {
+JNIEXPORT jlong JNICALL JVM_GetRandomSeedForDumping(void) {
   IMPLEMENTED(JVM_GetRandomSeedForDumping);
   return (*getEnv())->JVM_GetRandomSeedForDumping();
 }
@@ -1620,6 +1668,11 @@ JNIEXPORT jboolean JNICALL JVM_PhantomReferenceRefersTo(JNIEnv *env, jobject ref
   return (*getEnv())->JVM_PhantomReferenceRefersTo(env, ref, o);
 }
 
+JNIEXPORT jobject JNICALL JVM_ReferenceGet(JNIEnv *env, jobject ref) {
+    UNIMPLEMENTED(JVM_ReferenceGet);
+    return NULL;
+}
+
 JNIEXPORT jboolean JNICALL JVM_ReferenceRefersTo(JNIEnv *env, jobject ref, jobject o) {
   IMPLEMENTED(JVM_ReferenceRefersTo);
   return (*getEnv())->JVM_ReferenceRefersTo(env, ref, o);
@@ -1648,34 +1701,44 @@ JNIEXPORT void JNICALL JVM_DumpDynamicArchive(JNIEnv *env, jstring archiveName) 
   UNIMPLEMENTED(JVM_DumpDynamicArchive);
 }
 
-JNIEXPORT void JNICALL JVM_VirtualThreadMountBegin(JNIEnv* env, jobject vthread, jboolean first_mount) {
-  UNIMPLEMENTED(JVM_VirtualThreadUnmountBegin);
-}
-
-JNIEXPORT void JNICALL JVM_VirtualThreadMountEnd(JNIEnv* env, jobject vthread, jboolean first_mount) {
-  UNIMPLEMENTED(JVM_VirtualThreadUnmountEnd);
-}
-
-JNIEXPORT void JNICALL JVM_VirtualThreadUnmountBegin(JNIEnv* env, jobject vthread, jboolean last_unmount) {
-  UNIMPLEMENTED(JVM_VirtualThreadUnmountBegin);
-}
-
-JNIEXPORT void JNICALL JVM_VirtualThreadUnmountEnd(JNIEnv* env, jobject vthread, jboolean last_unmount) {
-  UNIMPLEMENTED(JVM_VirtualThreadUnmountEnd);
-}
-
 JNIEXPORT void JNICALL JVM_VirtualThreadHideFrames(JNIEnv* env, jobject vthread, jboolean hide) {
   UNIMPLEMENTED(JVM_VirtualThreadHideFrames);
 }
 
+JNIEXPORT void JNICALL
+JVM_VirtualThreadDisableSuspend(JNIEnv* env, jclass clazz, jboolean enter) {
+  UNIMPLEMENTED(JVM_VirtualThreadDisableSuspend);
+}
+
+JNIEXPORT void JNICALL
+JVM_VirtualThreadPinnedEvent(JNIEnv* env, jclass clazz, jstring op) {
+  UNIMPLEMENTED(JVM_VirtualThreadPinnedEvent);
+}
+
+JNIEXPORT jobject JNICALL
+JVM_TakeVirtualThreadListToUnblock(JNIEnv* env, jclass ignored) {
+  UNIMPLEMENTED(JVM_TakeVirtualThreadListToUnblock);
+  return NULL;
+}
+
 JNIEXPORT jint JNICALL JVM_GetClassFileVersion(JNIEnv *env, jclass current) {
-  UNIMPLEMENTED(JVM_GetClassFileVersion);
-  return 0;
+  IMPLEMENTED(JVM_GetClassFileVersion);
+  return (*getEnv())->JVM_GetClassFileVersion(env, current);
 }
 
 JNIEXPORT jboolean JNICALL JVM_IsForeignLinkerSupported(void) {
   IMPLEMENTED(JVM_IsForeignLinkerSupported);
   return (*getEnv())->JVM_IsForeignLinkerSupported();
+}
+
+JNIEXPORT jboolean JNICALL
+JVM_IsStaticallyLinked(void) {
+  IMPLEMENTED(JVM_IsStaticallyLinked);
+#ifdef ESPRESSO_NFI_STATIC
+  return JNI_TRUE;
+#else
+  return JNI_FALSE;
+#endif
 }
 
 JNIEXPORT void JNICALL JVM_VirtualThreadStart(JNIEnv* env, jobject vthread) {
@@ -1697,6 +1760,11 @@ JNIEXPORT void JNICALL JVM_VirtualThreadUnmount(JNIEnv* env, jobject vthread, jb
 JNIEXPORT jboolean JNICALL JVM_PrintWarningAtDynamicAgentLoad(void) {
   UNIMPLEMENTED(JVM_PrintWarningAtDynamicAgentLoad);
   return JNI_FALSE;
+}
+
+JNIEXPORT jobject JNICALL JVM_CreateThreadSnapshot(JNIEnv* env, jobject thread) {
+  IMPLEMENTED(JVM_CreateThreadSnapshot);
+  return (*getEnv())->JVM_CreateThreadSnapshot(env, thread);
 }
 
 
@@ -1999,12 +2067,145 @@ jint AttachCurrentThreadAsDaemon(JavaVM *vm, void **penv, void *args) {
     return AttachCurrentThread_helper(vm, penv, args, (*espressoJavaVM)->AttachCurrentThreadAsDaemon);
 }
 
+static int option_starts_with(const char *start, const JavaVMOption *option) {
+    return strncmp(start, option->optionString, strlen(start)) == 0;
+}
+
+static jboolean multiply_by_1k(unsigned long long int *n) {
+    if (*n <= ULLONG_MAX / 1024) {
+        *n *= 1024;
+        return JNI_TRUE;
+    } else {
+        return JNI_FALSE;
+    }
+}
+
+static unsigned long long int parse_long_size(const char *str) {
+    size_t len = strlen(str);
+    if (len == 0 || !isdigit(str[0])) {
+        return 0;
+    }
+    unsigned long long int result;
+    char *end;
+    const char *start = str;
+    errno = 0;
+    if (len > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        // hex
+        start = str + 2;
+        result = strtoull(start, &end, 16);
+    } else {
+        // dec
+        result = strtoull(start, &end, 10);
+    }
+    if (errno != 0 || start == end) {
+        return 0;
+    }
+    switch (*end) {
+        case 't':
+        case 'T':
+            if (multiply_by_1k(&result) != JNI_TRUE) {
+                return 0;
+            }
+        case 'g':
+        case 'G':
+            if (multiply_by_1k(&result) != JNI_TRUE) {
+                return 0;
+            }
+        case 'm':
+        case 'M':
+            if (multiply_by_1k(&result) != JNI_TRUE) {
+                return 0;
+            }
+        case 'k':
+        case 'K':
+            if (multiply_by_1k(&result) != JNI_TRUE) {
+                return 0;
+            }
+            end += 1;
+            break;
+    }
+    if (*end != '\0') {
+        return 0;
+    }
+    return result;
+}
+
+static char *maybe_adjust_max_heap_size(char *option_str, size_t size_offset, jboolean auto_adjust_heap_size) {
+    if (auto_adjust_heap_size != JNI_TRUE) {
+        return option_str;
+    }
+    unsigned long long int sz = parse_long_size(option_str + size_offset);
+    if (sz != 0 && sz < 128ULL * 1024 * 1024) {
+        printf("Adjusting max heap size of %llu to -Xmx128m", sz);
+        return "-Xmx128m";
+    } else {
+        return option_str;
+    }
+}
+
+static jint process_isolate_args(JavaVMInitArgs *initArgs, int *isolate_argc, char ***isolate_argv, int *n_ignored_indices, int **ignored_indices) {
+    // Pull out arguments that need to be handled by isolate creation in SVM and can't be set correctly later
+    // Mark those as ignored so that Espresso_CreateJavaVM knows not to act on them
+    // but still uses them to compose the jvm args as seen by management APIs
+
+    jboolean auto_adjust_heap_size = JNI_TRUE;
+    for (int i = 0; i < initArgs->nOptions; i++) {
+        const JavaVMOption *option = initArgs->options + i;
+        char *optionString = NULL;
+        if (option_starts_with("-XX:", option)) {
+            if (option->optionString[4] == '-' || option->optionString[4] == '+') {
+                if (strcmp("AutomaticReferenceHandling", option->optionString + 5) == 0) {
+                    fprintf(stderr, "Unsupported option: AutomaticReferenceHandling" OS_NEWLINE_STR);
+                    return JNI_ERR;
+                } else if (strcmp("AutoAdjustHeapSize", option->optionString + 5) == 0) {
+                    auto_adjust_heap_size = option->optionString[4] == '+' ? JNI_TRUE : JNI_FALSE;
+                } else if (probe_option_type(option->optionString + 5) == OPTION_BOOLEAN) {
+                    optionString = option->optionString;
+                } else {
+                    continue;
+                }
+            } else if (option_starts_with("-XX:MaxHeapSize=", option)) {
+                optionString = maybe_adjust_max_heap_size(option->optionString, strlen("-XX:MaxHeapSize="), auto_adjust_heap_size);
+            } else if (probe_option_type(option->optionString + 4) == OPTION_STRING) {
+                optionString = option->optionString;
+            } else {
+                continue;
+            }
+        } else if (option_starts_with("-Xms", option) || option_starts_with("-Xmn", option)) {
+            optionString = option->optionString;
+        } else if (option_starts_with("-Xmx", option)) {
+            optionString = maybe_adjust_max_heap_size(option->optionString, strlen("-Xmx"), auto_adjust_heap_size);
+        } else {
+            continue;
+        }
+        if (*ignored_indices == NULL) {
+            *ignored_indices = malloc(sizeof(int) * initArgs->nOptions);
+            if (*ignored_indices == NULL) {
+                return JNI_ENOMEM;
+            }
+        }
+        (*ignored_indices)[(*n_ignored_indices)++] = i;
+        if (optionString != NULL) {
+            if (*isolate_argv == NULL) {
+                *isolate_argv = malloc(sizeof(char *) * initArgs->nOptions);
+                if (*isolate_argv == NULL) {
+                    return JNI_ENOMEM;
+                }
+                // initial argument that is usually the executable name is ignored
+                (*isolate_argv)[(*isolate_argc)++] = NULL;
+            }
+            (*isolate_argv)[(*isolate_argc)++] = optionString;
+        }
+    }
+    return JNI_OK;
+}
+
 _JNI_IMPORT_OR_EXPORT_ jint JNICALL JNI_CreateJavaVM(JavaVM **vm_ptr, void **penv, void *args) {
     JavaVMInitArgs *initArgs = args;
     int lib_javavm_type = LIB_JAVAVM_PLAIN;
     jboolean is_sun_standard_launcher = JNI_FALSE;
     for (int i = 0; i < initArgs->nOptions; i++) {
-        const JavaVMOption* option = initArgs->options + i;
+        const JavaVMOption *option = initArgs->options + i;
         if (strcmp("--polyglot", option->optionString) == 0) {
             lib_javavm_type = LIB_JAVAVM_POLYGLOT;
         } else if (strcmp("-Dsun.java.launcher=SUN_STANDARD", option->optionString) == 0) {
@@ -2017,16 +2218,35 @@ _JNI_IMPORT_OR_EXPORT_ jint JNICALL JNI_CreateJavaVM(JavaVM **vm_ptr, void **pen
     }
     graal_isolate_t *isolate;
     graal_isolatethread_t *thread;
-    graal_create_isolate_params_t params;
-    params.version = 0;
-    params.reserved_address_space_size = 0;
+    graal_create_isolate_params_t params = {0};
+
+    int isolate_argc = 0;
+    char **isolate_argv = NULL;
+    int n_ignored_indices = 0;
+    int *ignored_indices = NULL;
+    int ret = process_isolate_args(initArgs, &isolate_argc, &isolate_argv, &n_ignored_indices, &ignored_indices);
+    if (ret != JNI_OK) {
+        if (isolate_argv != NULL) free(isolate_argv);
+        if (ignored_indices != NULL) free(ignored_indices);
+        return ret;
+    }
+
+    params.version = 4;
+    char ignore_unrecognized_args = initArgs->ignoreUnrecognized == JNI_TRUE ? 1 : 0;
+    params.argc = isolate_argc;
+    params.argv = isolate_argv;
+    params.ignore_unrecognized_args = ignore_unrecognized_args;
 
     if (libjavavm->create_isolate(&params, &isolate, &thread) != 0) {
+        if (isolate_argv != NULL) free(isolate_argv);
+        if (ignored_indices != NULL) free(ignored_indices);
         return JNI_ERR;
     }
     struct JavaVM_ *espressoJavaVM;
     struct JNIEnv_ *espressoJNIEnv;
-    int ret = libjavavm->Espresso_CreateJavaVM(thread, &espressoJavaVM, &espressoJNIEnv, initArgs);
+    ret = libjavavm->Espresso_CreateJavaVM(thread, &espressoJavaVM, &espressoJNIEnv, initArgs, ignored_indices, n_ignored_indices);
+    if (isolate_argv != NULL) free(isolate_argv);
+    if (ignored_indices != NULL) free(ignored_indices);
     if (ret != JNI_OK) {
         libjavavm->detach_all_threads_and_tear_down_isolate(thread);
         return ret;
@@ -2162,7 +2382,7 @@ JNIEXPORT int JNICALL jio_vsnprintf(char *str, size_t count, const char *fmt, va
 JNIEXPORT int JNICALL jio_snprintf(char *str, size_t count, const char *fmt, ...) {
   int len;
   va_list args;
-  NATIVE(jio_snprintf);  
+  NATIVE(jio_snprintf);
   va_start(args, fmt);
   len = jio_vsnprintf(str, count, fmt, args);
   va_end(args);
@@ -2172,7 +2392,7 @@ JNIEXPORT int JNICALL jio_snprintf(char *str, size_t count, const char *fmt, ...
 JNIEXPORT int JNICALL jio_fprintf(FILE *file, const char *fmt, ...) {
   int len;
   va_list args;
-  NATIVE(jio_fprintf);  
+  NATIVE(jio_fprintf);
   va_start(args, fmt);
   len = jio_vfprintf(file, fmt, args);
   va_end(args);

@@ -2,9 +2,101 @@
 
 This changelog summarizes newly introduced optimizations and other compiler related changes.
 
+## GraalVM 25.5 (Internal Version 25.5.5)
+* (GR-79881, GR-79883): Added aggressive partial loop unrolling and simulation-based loop peeling to the community
+  compiler. Aggressive partial unrolling is enabled by default and can be disabled with
+  `-Djdk.graal.AggressivePartialUnroll=false`. The original simple partial unrolling remains
+  available, and all partial unrolling is controlled by the master `-Djdk.graal.PartialUnroll=false` option.
+* (GR-79595): Added `RangeCheckEliminationPhase`, which rewrites eligible 64-bit range checks to
+  equivalent 32-bit forms after counted strip mining. The optimization is enabled by default and
+  can be disabled with `-Djdk.graal.RangeCheckElimination=false`.
+* (GR-79593): Added `BreakChainedPhisPhase`, which splits chained loop phi values in the low tier to
+  improve register allocation. The optimization is enabled by default and can be disabled with
+  `-Djdk.graal.BreakChainedPhis=false`.
+* (GR-79589): Added partial redundancy elimination scheduling to the community compiler. The
+  optimization is enabled by default and can be disabled with
+  `-Djdk.graal.PartialRedundancyScheduling=false`.
+* (GR-79594): Added a write sinking optimization that moves eligible field and constant-offset
+  array writes out of loops. The optimization is enabled by default and can be disabled with
+  `-Djdk.graal.OptWriteSinking=false`.
+* (GR-79588): Added a deduplication optimization that can reduce generated code size by sharing
+  equivalent statements and expressions from converging control-flow branches. The optimization is
+  enabled by default and can be disabled with `-Djdk.graal.OptDeDuplication=false`.
+* (GR-79526): Extended lock elimination to coarsen locks across simple control flow and eliminate
+  nested locking of the same object.
+* (GR-79587): Added `GuardRangeGroupingPhase`, which removes redundant integer range guards by
+  retaining the tightest lower and upper bounds for guards with the same anchor. The optimization is
+  enabled by default and can be disabled with `-Djdk.graal.OptGuardRangeGrouping=false`.
+* (GR-79585): Added an optimization that replaces eligible loop-carried memory reads with value
+  phis, allowing invariant reads to move out of the loop. The optimization is enabled by default
+  and can be disabled with `-Djdk.graal.OptimizeLoopAccesses=false`.
+* (GR-79597): Added early checkcast expansion to expose null and type checks as control flow for
+  subsequent optimizations. It is enabled by default and can be disabled with
+  `-Djdk.graal.EarlyExpandCheckCast=false`.
+* (GR-79590): Added speculative store checks, which can remove array store checks by speculating
+  that an array's declared type is exact. The optimization is enabled by default and can be
+  disabled with `-Djdk.graal.SpeculativeStoreCheck=false`.
+* (GR-79031): Added strip mining for counted and non-counted loops, loop inversion, loop rotation,
+  and exact arithmetic optimization. Strip mining bounds long-running loop bodies to reduce
+  safepoint overhead, loop inversion transforms while loops into guarded do-while loops to improve
+  instruction pipelining, and loop rotation transforms selected non-counted loops into counted loops
+  by duplicating loop-body code. Exact arithmetic optimization replaces exact additions with
+  normal additions while preserving overflow behavior through loop-limit deoptimization. These
+  optimizations are enabled by default and can be controlled with their corresponding options,
+  including `-Djdk.graal.LoopRotation=false` and `-Djdk.graal.OptExactArithmetic=false`.
+
+## GraalVM 25.4 (Internal Version 25.4.4.1.1)
+* (GR-79029): Add `PullThroughPhiPhase` and `DuplicationPhase` to the community compiler configuration.
+  The optimizations are enabled by default and can be disabled with `-Djdk.graal.OptPullThroughPhi=false` and
+  `-Djdk.graal.OptDuplication=false`, respectively.
+* (GR-78871): Extended read elimination to handle indexed array accesses with nonconstant indices, reads from newly
+  allocated arrays whose elements contain default values, and array clone operations. Read elimination can now also
+  run after reads are fixed in the low tier.
+* (GR-78795): Extended `OptimizeDivPhase` with magic-number optimizations for unsigned integer division
+  and remainder operations by constant values.
+
+## GraalVM 25.3 (Internal Version 25.3.4.1)
+* (GR-77137) Add new priority inlining algorithm that does extensive analysis of the call graph when making
+  inlining decisions (see `PriorityInliningPhase` for details). It is now the default inliner. To use the old
+  inliner now requires setting the `UsePriorityInlining` option to false (e.g. `-Djdk.graal.UsePriorityInlining=false`).
+  Also added `MethodDuplicationPhase`, which duplicates selected control-flow paths within a method to expose further
+  optimization opportunities.
+* (GR-28213): Added the loop vectorization optimization for certain loops doing arithmetic over arrays. The computation
+  is transformed into a SIMD (single instruction, multiple data) form that uses the target CPU's vector instructions to
+  compute multiple values in parallel. In JIT-compiled code this can improve performance of suitable loops by a factor
+  proportional to the length of the CPU's vector registers. This optimization is enabled by default and can be disabled
+  with `-Djdk.graal.VectorizeLoops=false`.
+
+## GraalVM 25.1 (Internal Version 25.1.3)
+* (GR-69280): Allow use of the `graal.` prefix for Graal compiler options without issuing a warning.
+* (GR-58163): Added support for recording and replaying JIT compilations. The `-Djdk.graal.RecordForReplay=*` option
+  serializes all compilations matching the pattern to JSON files, which contain the results of JVMCI calls. The
+  recorded compilations can be replayed with the `mx replaycomp` command. Truffle compilations are currently not
+  supported. See `docs/ReplayCompilation.md` for details.
+* (GR-71053): Added new distool utility which can disassemble HexCodeFile in .cfg files and MachCode sections
+    in HotSpot hs\_err\_pid files. E.g. `mx distool https://ci.server.com/jobs/1234/hs_err_pid5677.log`.
+* (GR-73792): Added optional constant blinding for untrusted code. Enable with `-Djdk.graal.BlindConstants=true`.
+
+## GraalVM 25 (Internal Version 25.0.0)
+* (GR-60088): This PR adds the `org.graalvm.nativeimage.libgraal` SDK module. With this module, all logic for building
+  libgraal has been moved into the compiler suite in a new `jdk.graal.compiler.libgraal` module
+  which has no dependency on Native Image internals. This
+  is required for Galahad CE where libgraal must be buildable from the Graal compiler sources in the OpenJDK
+  while using Native Image as an external tool.
+* (GR-59869) Implemented initial optimization of Java Vector API (JEP 338) operations.
+  Load, store, basic arithmetic, reduce, compare, and blend operations are transformed to efficient machine instructions where possible.
+  Coverage of more operations is planned for the future.
+  This optimization is experimental.
+  It is enabled by default and can be disabled by setting the `OptimizeVectorAPI` option to `false`.
+  Vector API operations are supported both on JIT and when building native images.
+  Native image builds must use the `--add-modules jdk.incubator.vector` and `-H:+VectorAPISupport` options to enable optimization.
+
 ## GraalVM for JDK 24 (Internal Version 24.2.0)
+* (GR-57209): The default number of JVMCI threads is now the same as the number of C2 threads (`-XX:JVMCINativeLibraryThreadFraction=0.66`).
+  This benefits the program warmup but could increase the maximum RSS.
+  Setting `-XX:JVMCINativeLibraryThreadFraction` to a smaller value will result in smaller maximum RSS but potentially longer warmup. (See [JDK-8337493](https://bugs.openjdk.org/browse/JDK-8337493)).
 * (GR-54476): Issue a deprecation warning on first use of a legacy `graal.` prefix (see GR-49960 below).
-  The warning is planned to be replaced by an error in GraalVM for JDK 25.
+  The warning is planned to be replaced by an error in GraalVM 25.
 
 ## GraalVM for JDK 23 (Internal Version 24.1.0)
 * (GR-50352): Added `-Djdk.graal.PrintPropertiesAll` to make `-XX:+JVMCIPrintProperties` show all Graal options.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,8 @@
  */
 package org.graalvm.wasm;
 
+import org.graalvm.wasm.types.DefinedType;
+
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
@@ -49,9 +51,12 @@ public final class WasmFunction {
     private final int index;
     private final ImportDescriptor importDescriptor;
     private final int typeIndex;
-    @CompilationFinal private int typeEquivalenceClass;
+    private final DefinedType definedType;
     @CompilationFinal private String debugName;
     @CompilationFinal private CallTarget callTarget;
+    /** Interop call adapter for argument and return value validation and conversion. */
+    @CompilationFinal private volatile CallTarget interopCallAdapter;
+    @CompilationFinal private boolean returnCalls;
 
     /**
      * Represents a WebAssembly function.
@@ -61,7 +66,7 @@ public final class WasmFunction {
         this.index = index;
         this.importDescriptor = importDescriptor;
         this.typeIndex = typeIndex;
-        this.typeEquivalenceClass = -1;
+        this.definedType = symbolTable.closedTypeAt(typeIndex);
     }
 
     public String moduleName() {
@@ -72,20 +77,24 @@ public final class WasmFunction {
         return symbolTable.functionTypeParamCount(typeIndex);
     }
 
-    public byte paramTypeAt(int argumentIndex) {
+    public int paramTypeAt(int argumentIndex) {
         return symbolTable.functionTypeParamTypeAt(typeIndex, argumentIndex);
+    }
+
+    public int[] paramTypes() {
+        return symbolTable.functionTypeParamTypesAsArray(typeIndex);
     }
 
     public int resultCount() {
         return symbolTable.functionTypeResultCount(typeIndex);
     }
 
-    public byte resultTypeAt(int returnIndex) {
+    public int resultTypeAt(int returnIndex) {
         return symbolTable.functionTypeResultTypeAt(typeIndex, returnIndex);
     }
 
-    void setTypeEquivalenceClass(int typeEquivalenceClass) {
-        this.typeEquivalenceClass = typeEquivalenceClass;
+    public int[] resultTypes() {
+        return symbolTable.functionTypeResultTypesAsArray(typeIndex);
     }
 
     @Override
@@ -96,7 +105,7 @@ public final class WasmFunction {
     @TruffleBoundary
     public String name() {
         if (importDescriptor != null) {
-            return importDescriptor.memberName;
+            return importDescriptor.memberName();
         }
         String exportedName = symbolTable.exportedFunctionName(index);
         if (exportedName != null) {
@@ -121,23 +130,27 @@ public final class WasmFunction {
     }
 
     public String importedModuleName() {
-        return isImported() ? importDescriptor.moduleName : null;
+        return isImported() ? importDescriptor.moduleName() : null;
     }
 
     public String importedFunctionName() {
-        return isImported() ? importDescriptor.memberName : null;
+        return isImported() ? importDescriptor.memberName() : null;
+    }
+
+    public String exportedFunctionName() {
+        return symbolTable.exportedFunctionName(index);
+    }
+
+    public boolean isExported() {
+        return exportedFunctionName() != null;
     }
 
     public int typeIndex() {
         return typeIndex;
     }
 
-    public SymbolTable.FunctionType type() {
-        return symbolTable.typeAt(typeIndex());
-    }
-
-    public int typeEquivalenceClass() {
-        return typeEquivalenceClass;
+    public DefinedType type() {
+        return definedType;
     }
 
     public int index() {
@@ -152,5 +165,33 @@ public final class WasmFunction {
         assert !isImported() : this;
         assert this.callTarget == null : this;
         this.callTarget = callTarget;
+    }
+
+    void setImportedFunctionCallTarget(CallTarget callTarget) {
+        assert isImported() : this;
+        this.callTarget = callTarget;
+    }
+
+    public void reportReturnCall() {
+        returnCalls = true;
+    }
+
+    public boolean containsReturnCalls() {
+        return returnCalls;
+    }
+
+    public CallTarget getInteropCallAdapter() {
+        return interopCallAdapter;
+    }
+
+    @TruffleBoundary
+    public CallTarget getOrCreateInteropCallAdapter(WasmLanguage language) {
+        CallTarget callAdapter = this.interopCallAdapter;
+        if (callAdapter == null) {
+            // Benign initialization race: The call target will be the same each time.
+            callAdapter = language.interopCallAdapterFor(type());
+            this.interopCallAdapter = callAdapter;
+        }
+        return callAdapter;
     }
 }

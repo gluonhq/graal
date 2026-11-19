@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,40 +24,54 @@
  */
 package com.oracle.svm.core.code;
 
-import static com.oracle.svm.core.option.RuntimeOptionKey.RuntimeOptionKeyFlag.RelevantForCompilationIsolates;
-import static com.oracle.svm.core.snippets.KnownIntrinsics.readCallerStackPointer;
+import static com.oracle.svm.core.deopt.Deoptimizer.Options.LazyDeoptimization;
+import static com.oracle.svm.core.os.RawFileOperationSupport.FileAccessMode.WRITE;
+import static com.oracle.svm.core.os.RawFileOperationSupport.FileCreationMode.CREATE_OR_REPLACE;
+import static com.oracle.svm.guest.staging.core.graal.KnownIntrinsics.readCallerStackPointer;
+import static com.oracle.svm.guest.staging.option.RuntimeOptionKey.RuntimeOptionKeyFlag.RelevantForCompilationIsolates;
+import static com.oracle.svm.guest.staging.option.RuntimeOptionValidators.NOT_ENABLED_ON_AARCH64;
 
-import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
+import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
 import com.oracle.svm.core.deopt.DeoptimizedFrame;
 import com.oracle.svm.core.deopt.Deoptimizer;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.nmt.NmtCategory;
-import com.oracle.svm.core.option.RuntimeOptionKey;
+import com.oracle.svm.core.os.RawFileOperationSupport;
 import com.oracle.svm.core.stack.JavaStackWalker;
 import com.oracle.svm.core.stack.StackFrameVisitor;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
 import com.oracle.svm.core.util.Counter;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
 import jdk.graal.compiler.options.Option;
-import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class RuntimeCodeCache {
 
     public static class Options {
@@ -65,14 +79,7 @@ public class RuntimeCodeCache {
         public static final RuntimeOptionKey<Boolean> TraceCodeCache = new RuntimeOptionKey<>(false);
 
         @Option(help = "Allocate code cache with write access, allowing inlining of objects", type = OptionType.Expert)//
-        public static final RuntimeOptionKey<Boolean> WriteableCodeCache = new RuntimeOptionKey<>(false, RelevantForCompilationIsolates) {
-            @Override
-            protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
-                if (newValue && !SubstrateUtil.HOSTED && Platform.includedIn(Platform.AARCH64.class)) {
-                    throw new IllegalArgumentException("Enabling " + getName() + " is not supported on this platform.");
-                }
-            }
-        };
+        public static final RuntimeOptionKey<Boolean> WriteableCodeCache = new RuntimeOptionKey<>(false, null, NOT_ENABLED_ON_AARCH64, RelevantForCompilationIsolates);
     }
 
     private final Counter.Group counters = new Counter.Group(CodeInfoTable.Options.CodeCacheCounters, "RuntimeCodeInfo");
@@ -90,7 +97,7 @@ public class RuntimeCodeCache {
     public RuntimeCodeCache() {
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Tear-down in progress.")
     public final void tearDown() {
         NonmovableArrays.releaseUnmanagedArray(codeInfos);
         codeInfos = NonmovableArrays.nullArray();
@@ -108,12 +115,12 @@ public class RuntimeCodeCache {
      * ensures that we see one consistent snapshot of the array, without the possibility for a
      * concurrent modification.
      */
-    @Uninterruptible(reason = "codeInfos is accessed without holding a lock, so must not be interrupted by a safepoint that can add/remove code", callerMustBe = true)
+    @Uninterruptible(reason = "Prevent concurrent modifications.", callerMustBe = true)
     protected UntetheredCodeInfo lookupCodeInfo(CodePointer ip) {
         lookupMethodCount.inc();
         assert verifyTable();
         if (numCodeInfos == 0) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         int idx = binarySearch(codeInfos, 0, numCodeInfos, ip);
@@ -126,21 +133,21 @@ public class RuntimeCodeCache {
         if (insertionPoint == 0) {
             /* ip is below the first method, so no hit. */
             assert ((UnsignedWord) ip).belowThan((UnsignedWord) UntetheredCodeInfoAccess.getCodeStart(NonmovableArrays.getWord(codeInfos, 0)));
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         UntetheredCodeInfo info = NonmovableArrays.getWord(codeInfos, insertionPoint - 1);
         assert ((UnsignedWord) ip).aboveThan((UnsignedWord) UntetheredCodeInfoAccess.getCodeStart(info));
         if (((UnsignedWord) ip).subtract((UnsignedWord) UntetheredCodeInfoAccess.getCodeStart(info)).aboveOrEqual(UntetheredCodeInfoAccess.getCodeSize(info))) {
             /* ip is not within the range of a method. */
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         return info;
     }
 
     /* Copied and adapted from Arrays.binarySearch. */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Prevent concurrent modifications.")
     private static int binarySearch(NonmovableArray<UntetheredCodeInfo> a, int fromIndex, int toIndex, CodePointer key) {
         int low = fromIndex;
         int high = toIndex - 1;
@@ -160,11 +167,52 @@ public class RuntimeCodeCache {
         return -(low + 1);  // key not found.
     }
 
+    private static RawFileOperationSupport getFileSupport() {
+        return RawFileOperationSupport.bigEndian();
+    }
+
+    private static void dumpMethod(CodeInfo info) {
+        String tmpDirPath = getFileSupport().getTempDirectory();
+        String prefix = System.nanoTime() + "_";
+        String methodName = SubstrateUtil.sanitizeForFileName(CodeInfoAccess.getName(info));
+        String suffix = "_" + CodeInfoAccess.getTier(info) + ".bin";
+
+        // Check that the file name size does not exceed the 255 chars
+        int maxMethodNameSize = 255 - prefix.length() - suffix.length();
+        if (methodName.length() > maxMethodNameSize) {
+            methodName = methodName.substring(maxMethodNameSize);
+        }
+
+        String filePath = tmpDirPath + "/" + prefix + methodName + suffix;
+
+        RawFileOperationSupport.RawFileDescriptor fd = getFileSupport().create(filePath, CREATE_OR_REPLACE, WRITE);
+        if (!getFileSupport().isValid(fd)) {
+            Log.log().string("Failed to dump runtime compiled code: '").string(filePath).string("' could not be created.").newline();
+            return;
+        }
+
+        try {
+            CCharPointer codeStart = (CCharPointer) CodeInfoAccess.getCodeStart(info);
+
+            UnsignedWord codeSize = CodeInfoAccess.getCodeSize(info);
+            if (!RawFileOperationSupport.bigEndian().write(fd, (Pointer) codeStart, codeSize)) {
+                Log.log().string("Dumping method to ").string(filePath).string(" failed").newline();
+            }
+        } finally {
+            getFileSupport().close(fd);
+        }
+    }
+
     public void addMethod(CodeInfo info) {
         assert VMOperation.isInProgressAtSafepoint() : "invalid state";
         InstalledCodeObserverSupport.activateObservers(RuntimeCodeInfoAccess.getCodeObserverHandles(info));
+
         addMethod0(info);
         RuntimeCodeInfoHistory.singleton().logAdd(info);
+
+        if (SubstrateOptions.hasDumpRuntimeCompiledMethodsSupport()) {
+            dumpMethod(info);
+        }
     }
 
     @Uninterruptible(reason = "Modifying code tables that are used by the GC")
@@ -209,16 +257,22 @@ public class RuntimeCodeCache {
          * Deoptimize all invocations that are on the stack. This performs a stack walk, so all
          * metadata must be intact (even though the method was already marked as non-invokable).
          */
-        Deoptimizer.deoptimizeInRange(CodeInfoAccess.getCodeStart(info), CodeInfoAccess.getCodeEnd(info), false);
+        Deoptimizer.deoptimizeInRange(CodeInfoAccess.getCodeStart(info), CodeInfoAccess.getCodeEnd(info), false, CurrentIsolate.getCurrentThread());
 
-        finishInvalidation(info);
+        boolean removeNow = !LazyDeoptimization.getValue();
+        continueInvalidation(info, removeNow);
     }
 
     protected void invalidateNonStackMethod(CodeInfo info) {
         assert VMOperation.isGCInProgress() : "may only be called by the GC";
         prepareInvalidation(info);
         assert codeNotOnStackVerifier.verify(info);
-        finishInvalidation(info);
+
+        /*
+         * This method is called by the GC, so we must call continueInvalidation with removeNow
+         * being true, so that code is actually removed from the code cache.
+         */
+        continueInvalidation(info, true);
     }
 
     private void prepareInvalidation(CodeInfo info) {
@@ -237,31 +291,43 @@ public class RuntimeCodeCache {
         }
     }
 
-    private void finishInvalidation(CodeInfo info) {
-        InstalledCodeObserverSupport.removeObservers(RuntimeCodeInfoAccess.getCodeObserverHandles(info));
-        finishInvalidation0(info);
-        RuntimeCodeInfoHistory.singleton().logInvalidate(info);
+    private void continueInvalidation(CodeInfo info, boolean removeNow) {
+        if (removeNow) {
+            /* If removeNow, then the CodeInfo is immediately removed from the code cache. */
+            InstalledCodeObserverSupport.removeObservers(RuntimeCodeInfoAccess.getCodeObserverHandles(info));
+            removeFromCodeCache(info);
+            RuntimeCodeInfoHistory.singleton().logInvalidate(info);
+        } else {
+            /*
+             * Otherwise, we leave the CodeInfo to be collected by GC after no stack activations are
+             * remaining by marking it as non-entrant. Note that the corresponding InstalledCode
+             * object is fully invalidated at that point (this is a major difference to normal
+             * non-entrant code, where the InstalledCode object remains valid).
+             */
+            if (CodeInfoAccess.getState(info) < CodeInfo.STATE_NON_ENTRANT) {
+                CodeInfoAccess.setState(info, CodeInfo.STATE_NON_ENTRANT);
+                RuntimeCodeInfoHistory.singleton().logInvalidate(info);
+            }
+        }
     }
 
+    /**
+     * Remove info entry from our table. This should only be called when the CodeInfo is no longer
+     * on the stack and cannot be invoked anymore
+     */
     @Uninterruptible(reason = "Modifying code tables that are used by the GC")
-    private void finishInvalidation0(CodeInfo info) {
-        /*
-         * Now it is guaranteed that the InstalledCode is not on the stack and cannot be invoked
-         * anymore, so we can free the code and all metadata.
-         */
-
-        /* Remove info entry from our table. */
+    private void removeFromCodeCache(CodeInfo info) {
         int idx = binarySearch(codeInfos, 0, numCodeInfos, CodeInfoAccess.getCodeStart(info));
         assert idx >= 0 : "info must be in table";
         NonmovableArrays.arraycopy(codeInfos, idx + 1, codeInfos, idx, numCodeInfos - (idx + 1));
         numCodeInfos--;
-        NonmovableArrays.setWord(codeInfos, numCodeInfos, WordFactory.nullPointer());
+        NonmovableArrays.setWord(codeInfos, numCodeInfos, Word.nullPointer());
 
-        RuntimeCodeInfoAccess.markAsInvalidated(info);
+        RuntimeCodeInfoAccess.markAsRemovedFromCodeCache(info);
         assert verifyTable();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Prevent concurrent modifications.")
     private boolean verifyTable() {
         if (codeInfos.isNull()) {
             assert numCodeInfos == 0 : "a1";
@@ -326,6 +392,6 @@ public class RuntimeCodeCache {
          * continue, else false.
          */
         @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while visiting code.")
-        boolean visitCode(CodeInfo codeInfo);
+        void visitCode(CodeInfo codeInfo);
     }
 }

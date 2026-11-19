@@ -54,14 +54,15 @@ import com.oracle.truffle.nfi.NativeSource.ParsedLibrary;
 import com.oracle.truffle.nfi.NativeSource.ParsedSignature;
 import com.oracle.truffle.nfi.backend.spi.NFIState;
 
-@TruffleLanguage.Registration(id = "nfi", name = "TruffleNFI", version = "0.1", characterMimeTypes = NFILanguage.MIME_TYPE, internal = true, contextPolicy = ContextPolicy.SHARED)
+@TruffleLanguage.Registration(id = NFILanguage.ID, name = "TruffleNFI", version = "0.1", characterMimeTypes = NFILanguage.MIME_TYPE, internal = true, contextPolicy = ContextPolicy.SHARED)
 public class NFILanguage extends TruffleLanguage<NFIContext> {
 
+    static final String ID = "nfi";
     public static final String MIME_TYPE = "application/x-native";
 
     private final Assumption singleContextAssumption = Truffle.getRuntime().createAssumption("NFI single context");
 
-    final ContextThreadLocal<NFIState> nfiState = locals.createContextThreadLocal((ctx, thread) -> new NFIState());
+    final ContextThreadLocal<NFIState> nfiState = locals.createContextThreadLocal((ctx, thread) -> new NFIState(thread));
 
     protected void setPendingException(Throwable pendingException) {
         TruffleStackTrace.fillIn(pendingException);
@@ -119,8 +120,7 @@ public class NFILanguage extends TruffleLanguage<NFIContext> {
         Content c = source.getContent();
         assert c != null;
         RootNode root;
-        if (c instanceof ParsedLibrary) {
-            ParsedLibrary lib = (ParsedLibrary) c;
+        if (c instanceof ParsedLibrary lib) {
             root = new NFIRootNode(this, lib, backendId);
         } else {
             ParsedSignature sig = (ParsedSignature) c;
@@ -132,6 +132,12 @@ public class NFILanguage extends TruffleLanguage<NFIContext> {
     @Override
     protected boolean isThreadAccessAllowed(Thread thread, boolean singleThreaded) {
         return true;
+    }
+
+    @Override
+    protected void disposeThread(NFIContext context, Thread thread) {
+        NFIState state = nfiState.get(thread);
+        state.dispose();
     }
 
     private static final LanguageReference<NFILanguage> REFERENCE = LanguageReference.create(NFILanguage.class);

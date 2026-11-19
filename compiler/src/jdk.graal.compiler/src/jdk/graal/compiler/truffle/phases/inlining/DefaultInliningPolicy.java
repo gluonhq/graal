@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -90,8 +90,17 @@ final class DefaultInliningPolicy implements InliningPolicy {
         if (node.getState() == CallNode.State.Expanded) {
             data.callDiff = -1 * node.getRootRelativeFrequency();
             for (CallNode child : node.getChildren()) {
-                if (child.getState() != CallNode.State.Indirect && child.getState() != CallNode.State.Removed && child.getState() != CallNode.State.BailedOut) {
-                    data.callDiff += data(child).callDiff;
+                switch (child.getState()) {
+                    case Indirect:
+                    case Removed:
+                    case BailedOut:
+                        // nothing to do
+                        break;
+                    case Cutoff:
+                    case Inlined:
+                    case Expanded:
+                        data.callDiff += data(child).callDiff;
+                        break;
                 }
             }
             if (data.callDiff > 0) {
@@ -166,6 +175,7 @@ final class DefaultInliningPolicy implements InliningPolicy {
                 child.expand();
             }
         }
+        callNode.updateChildFrequencies();
     }
 
     @Override

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,42 +24,70 @@
  */
 package jdk.graal.compiler.hotspot.test;
 
-import static jdk.graal.compiler.hotspot.HotSpotBackend.SHA2_IMPL_COMPRESS_MB;
-import static jdk.graal.compiler.hotspot.HotSpotBackend.SHA3_IMPL_COMPRESS_MB;
-import static jdk.graal.compiler.hotspot.HotSpotBackend.SHA5_IMPL_COMPRESS_MB;
-import static jdk.graal.compiler.hotspot.HotSpotBackend.SHA_IMPL_COMPRESS_MB;
-
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
+import java.security.SecureRandom;
+import java.security.Signature;
+import java.util.Arrays;
+import java.util.Random;
 
 import javax.crypto.Cipher;
+import javax.crypto.KEM;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 
-import jdk.graal.compiler.core.test.GraalCompilerTest;
-import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor;
-import jdk.graal.compiler.nodes.StructuredGraph;
-import jdk.graal.compiler.nodes.extended.ForeignCallNode;
-import jdk.graal.compiler.replacements.SnippetSubstitutionNode;
-import jdk.graal.compiler.replacements.nodes.AESNode;
-import jdk.graal.compiler.replacements.nodes.CipherBlockChainingAESNode;
-import jdk.graal.compiler.replacements.nodes.CounterModeAESNode;
-import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA1Node;
-import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA256Node;
-import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA3Node;
-import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA512Node;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.internal.AssumptionViolatedException;
 
+import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
+import jdk.graal.compiler.core.test.GraalCompilerTest;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.extended.ForeignCallNode;
+import jdk.graal.compiler.replacements.SnippetSubstitutionNode;
+import jdk.graal.compiler.replacements.nodes.AESNode;
+import jdk.graal.compiler.replacements.nodes.CipherBlockChainingAESNode;
+import jdk.graal.compiler.replacements.nodes.ChaCha20Node;
+import jdk.graal.compiler.replacements.nodes.CounterModeAESNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode;
+import jdk.graal.compiler.replacements.nodes.DoubleKeccakNode;
+import jdk.graal.compiler.replacements.nodes.ElectronicCodeBookAESNode;
+import jdk.graal.compiler.replacements.nodes.GaloisCounterModeAESNode;
+import jdk.graal.compiler.replacements.nodes.Poly1305ProcessBlocksNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumAlmostInverseNttNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumAlmostNttNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumDecomposePolyNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumMontMulByConstantNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumNttMultNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.Kyber12To16Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberAddPoly2Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberAddPoly3Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberBarrettReduceNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberInverseNttNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberNttMultNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberNttNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.MD5MultiBlockNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.MD5Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA1MultiBlockNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA1Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA256MultiBlockNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA256Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA3MultiBlockNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA3Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA512MultiBlockNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA512Node;
 import jdk.vm.ci.code.BailoutException;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -164,7 +192,7 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testEletronicCodeBookEncrypt() throws Exception {
-        Assume.assumeTrue("ElectronicCodeBook encrypt not supported", runtime().getVMConfig().electronicCodeBookEncrypt != 0L);
+        Assume.assumeTrue("ElectronicCodeBook encrypt not supported", ElectronicCodeBookAESNode.isSupported(getArchitecture()));
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBEncrypt", "AES", 128, "AES/ECB/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBEncrypt", "AES", 192, "AES/ECB/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBEncrypt", "AES", 256, "AES/ECB/NoPadding");
@@ -177,7 +205,7 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testEletronicCodeBookDecrypt() throws Exception {
-        Assume.assumeTrue("ElectronicCodeBook decrypt not supported", runtime().getVMConfig().electronicCodeBookDecrypt != 0L);
+        Assume.assumeTrue("ElectronicCodeBook decrypt not supported", ElectronicCodeBookAESNode.isSupported(getArchitecture()));
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBDecrypt", "AES", 128, "AES/ECB/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBDecrypt", "AES", 192, "AES/ECB/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ElectronicCodeBook", "implECBDecrypt", "AES", 256, "AES/ECB/NoPadding");
@@ -190,7 +218,7 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testGaloisCounterModeCrypt() throws Exception {
-        Assume.assumeTrue("GaloisCounterMode not supported", runtime().getVMConfig().galoisCounterModeCrypt != 0L);
+        Assume.assumeTrue("GaloisCounterMode not supported", GaloisCounterModeAESNode.isSupported(getArchitecture()));
         testEncryptDecrypt("com.sun.crypto.provider.GaloisCounterMode", "implGCMCrypt0", "AES", 128, "AES/GCM/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.GaloisCounterMode", "implGCMCrypt0", "AES", 128, "AES/GCM/PKCS5Padding");
         testEncryptDecrypt("com.sun.crypto.provider.GaloisCounterMode", "implGCMCrypt0", "DESede", 168, "DESede/GCM/NoPadding");
@@ -199,7 +227,7 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testPoly1305() throws Exception {
-        Assume.assumeTrue("Poly1305 not supported", runtime().getVMConfig().poly1305ProcessBlocks != 0L);
+        Assume.assumeTrue("Poly1305 not supported", Poly1305ProcessBlocksNode.isSupported(getTarget().arch));
         testEncryptDecrypt(getResolvedJavaMethod("com.sun.crypto.provider.Poly1305", "processMultipleBlocks", byte[].class, int.class, int.class, long[].class, long[].class),
                         "ChaCha20", 256, "ChaCha20-Poly1305/None/NoPadding");
         testEncryptDecrypt(getResolvedJavaMethod("com.sun.crypto.provider.Poly1305", "processMultipleBlocks", byte[].class, int.class, int.class, long[].class, long[].class),
@@ -212,11 +240,50 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testChaCha20() throws Exception {
-        Assume.assumeTrue("ChaCha20 not support", runtime().getVMConfig().chacha20Block != 0L);
+        Assume.assumeTrue("ChaCha20 not support", ChaCha20Node.isSupported(getArchitecture()));
         testEncryptDecrypt("com.sun.crypto.provider.ChaCha20Cipher", "implChaCha20Block", "ChaCha20", 256, "ChaCha20-Poly1305/None/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ChaCha20Cipher", "implChaCha20Block", "ChaCha20", 256, "ChaCha20-Poly1305/ECB/NoPadding");
         testEncryptDecrypt("com.sun.crypto.provider.ChaCha20Cipher", "implChaCha20Block", "ChaCha20", 256, "ChaCha20-Poly1305/None/PKCS5Padding");
         testEncryptDecrypt("com.sun.crypto.provider.ChaCha20Cipher", "implChaCha20Block", "ChaCha20", 256, "ChaCha20-Poly1305/ECB/PKCS5Padding");
+    }
+
+    @Test
+    public void testChaCha20OwnershipAndDirectImplBlock() throws Exception {
+        Assume.assumeTrue("ChaCha20 not support", ChaCha20Node.isSupported(getArchitecture()));
+
+        ResolvedJavaMethod intrinsicMethod = getResolvedJavaMethod("com.sun.crypto.provider.ChaCha20Cipher", "implChaCha20Block", int[].class, byte[].class);
+
+        InstalledCode intrinsic = compileAndInstallSubstitution(intrinsicMethod);
+        Assert.assertTrue("missing intrinsic", intrinsic != null);
+        try {
+            int[] state = initialChaCha20State();
+            byte[] actualKeystream = new byte[1024];
+            int actualLength = (int) executeVarargsSafe(intrinsic, state, actualKeystream);
+
+            Assert.assertTrue("unexpected ChaCha20 output length", actualLength == 128 || actualLength == 256 || actualLength == 1024);
+            Assert.assertFalse("keystream should not be all zero", isAllZero(actualKeystream, actualLength));
+            Assert.assertArrayEquals("intrinsic must not mutate initState", initialChaCha20State(), state);
+        } finally {
+            intrinsic.invalidate();
+        }
+    }
+
+    private static int[] initialChaCha20State() {
+        return new int[]{
+                        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+                        0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c,
+                        0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c,
+                        1, 0x09000000, 0x4a000000, 0,
+        };
+    }
+
+    private static boolean isAllZero(byte[] data, int length) {
+        for (int i = 0; i < length; i++) {
+            if (data[i] != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     AlgorithmParameters algorithmParameters;
@@ -277,70 +344,74 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
 
     @Test
     public void testDigestBaseSHA() throws Exception {
-        Assume.assumeTrue("SHA1 not supported", runtime().getVMConfig().sha1ImplCompressMultiBlock != 0L);
-        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-1", SHA_IMPL_COMPRESS_MB);
+        Assume.assumeTrue("SHA1 not supported", SHA1Node.isSupported(getArchitecture()));
+        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-1", SHA1MultiBlockNode.class, SHA1MultiBlockNode.STUB);
     }
 
     @Test
     public void testDigestBaseSHA2() throws Exception {
-        Assume.assumeTrue("SHA256 not supported", runtime().getVMConfig().sha256ImplCompressMultiBlock != 0L);
-        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-256", SHA2_IMPL_COMPRESS_MB);
+        Assume.assumeTrue("SHA256 not supported", SHA256Node.isSupported(getArchitecture()));
+        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-256", SHA256MultiBlockNode.class, SHA256MultiBlockNode.STUB);
     }
 
     @Test
     public void testDigestBaseSHA5() throws Exception {
-        Assume.assumeTrue("SHA512 not supported", runtime().getVMConfig().sha512ImplCompressMultiBlock != 0L);
-        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-512", SHA5_IMPL_COMPRESS_MB);
+        Assume.assumeTrue("SHA512 not supported", SHA512Node.isSupported(getArchitecture()));
+        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA-512", SHA512MultiBlockNode.class, SHA512MultiBlockNode.STUB);
     }
 
     @Test
     public void testDigestBaseSHA3() throws Exception {
-        Assume.assumeTrue("SHA3 not supported", runtime().getVMConfig().sha3ImplCompressMultiBlock != 0L);
-        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA3-512", SHA3_IMPL_COMPRESS_MB);
+        Assume.assumeTrue("SHA3 not supported", SHA3Node.isSupported(getArchitecture()));
+        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "SHA3-512", SHA3MultiBlockNode.class, SHA3MultiBlockNode.STUB);
+    }
+
+    @Test
+    public void testDigestBaseMD5() throws Exception {
+        Assume.assumeTrue("MD5 not supported", MD5Node.isSupported(getArchitecture()));
+        testDigestBase("sun.security.provider.DigestBase", "implCompressMultiBlock", "MD5", MD5MultiBlockNode.class, MD5MultiBlockNode.STUB);
     }
 
     @Before
     public void clearExceptionCall() {
-        expectedCall = null;
+        expectedNode = null;
     }
 
-    HotSpotForeignCallDescriptor expectedCall;
+    Class<? extends Node> expectedNode;
 
     @Override
     protected void checkLowTierGraph(StructuredGraph graph) {
-        if (expectedCall != null) {
-            for (ForeignCallNode node : graph.getNodes().filter(ForeignCallNode.class)) {
-                if (node.getDescriptor() == expectedCall) {
-                    return;
-                }
-            }
-            assertTrue("expected call to " + expectedCall, false);
+        if (expectedNode != null && graph.getNodes().filter(expectedNode).isEmpty()) {
+            assertTrue("expected node " + expectedNode.getSimpleName(), false);
         }
     }
 
-    private void testDigestBase(String className, String methodName, String algorithm, HotSpotForeignCallDescriptor call) throws Exception {
+    private void testDigestBase(String className, String methodName, String algorithm, Class<? extends Node> expectedNodeClass, ForeignCallDescriptor stubDescriptor) throws Exception {
         Class<?> klass = Class.forName(className);
-        expectedCall = call;
+        expectedNode = expectedNodeClass;
         MessageDigest digest = MessageDigest.getInstance(algorithm);
         byte[] expected = digest.digest(input.clone());
         ResolvedJavaMethod method = getResolvedJavaMethod(klass, methodName);
 
         try {
-            testDigestBase(digest, expected, method);
+            testDigestBase(digest, expected, method, stubDescriptor);
         } catch (BailoutException e) {
             // The plugin may cause loading which invalidates assumptions in the graph so retry it
             // once. This normally only occurs when running individual tests.
             if (e.getMessage().contains("Code installation failed: dependencies failed")) {
-                testDigestBase(digest, expected, method);
+                testDigestBase(digest, expected, method, stubDescriptor);
             } else {
                 throw e;
             }
+        } finally {
+            expectedNode = null;
         }
     }
 
-    private void testDigestBase(MessageDigest digest, byte[] expected, ResolvedJavaMethod method) {
+    private void testDigestBase(MessageDigest digest, byte[] expected, ResolvedJavaMethod method, ForeignCallDescriptor stubDescriptor) {
         StructuredGraph graph = parseForCompile(method);
         assertTrue(graph.getNodes().filter(SnippetSubstitutionNode.class).isNotEmpty());
+        getProviders().getForeignCalls().lookupForeignCall(stubDescriptor);
         InstalledCode intrinsic = getCode(method, graph, false, true, GraalCompilerTest.getInitialOptions());
         try {
             Assert.assertNotNull("missing intrinsic", intrinsic);
@@ -369,10 +440,11 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
     @Test
     public void testSha1() {
         Assume.assumeTrue("SHA1 not supported", SHA1Node.isSupported(getArchitecture()));
+        assertMessageDigestAlgorithmExists("SHA-1");
         testWithInstalledIntrinsic("sun.security.provider.SHA", "implCompress0", "testDigest", "SHA-1", getData());
     }
 
-    void testWithInstalledIntrinsic(String className, String methodName, String testSnippetName, String algorithm, byte[] data) {
+    void assertMessageDigestAlgorithmExists(String algorithm) {
         // Ensure the algorithm exists
         try {
             MessageDigest.getInstance(algorithm, "SUN");
@@ -381,7 +453,9 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
         } catch (NoSuchProviderException e) {
             throw new RuntimeException(e);
         }
+    }
 
+    void testWithInstalledIntrinsic(String className, String methodName, String testSnippetName, Object... args) {
         Class<?> c;
         try {
             c = Class.forName(className);
@@ -391,14 +465,18 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
             Assume.assumeTrue(className + " is not available", false);
             return;
         }
+        testWithInstalledIntrinsic(getMetaAccess().lookupJavaMethod(getMethod(c, methodName)), testSnippetName, args);
+    }
+
+    void testWithInstalledIntrinsic(ResolvedJavaMethod intrinsicMethod, String testSnippetName, Object... args) {
         InstalledCode code = null;
         try {
             ResolvedJavaMethod method = getResolvedJavaMethod(testSnippetName);
             Object receiver = method.isStatic() ? null : this;
-            GraalCompilerTest.Result expect = executeExpected(method, receiver, algorithm, data);
-            code = compileAndInstallSubstitution(c, methodName);
-            assertTrue("Failed to install " + methodName, code != null);
-            testAgainstExpected(method, expect, receiver, algorithm, data);
+            GraalCompilerTest.Result expect = executeExpected(method, receiver, args);
+            code = compileAndInstallSubstitution(intrinsicMethod);
+            assertTrue("Failed to install " + intrinsicMethod.getName(), code != null);
+            testAgainstExpected(method, expect, receiver, args);
         } catch (AssumptionViolatedException e) {
             // Suppress so that subsequent calls to this method within the
             // same Junit @Test annotated method can proceed.
@@ -408,26 +486,250 @@ public class HotSpotCryptoSubstitutionTest extends HotSpotGraalCompilerTest {
         }
     }
 
+    void testWithInstalledIntrinsicAndExpectedNode(String className, String methodName, Class<? extends Node> expectedNodeClass, String testSnippetName, Object... args) {
+        Class<?> c;
+        try {
+            c = Class.forName(className);
+        } catch (ClassNotFoundException e) {
+            Assume.assumeTrue(className + " is not available", false);
+            return;
+        }
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, methodName)), expectedNodeClass, testSnippetName, args);
+    }
+
+    void testWithInstalledIntrinsicAndExpectedNode(ResolvedJavaMethod intrinsicMethod, Class<? extends Node> expectedNodeClass, String testSnippetName, Object... args) {
+        InstalledCode code = null;
+        try {
+            ResolvedJavaMethod method = getResolvedJavaMethod(testSnippetName);
+            Object receiver = method.isStatic() ? null : this;
+            GraalCompilerTest.Result expect = executeExpected(method, receiver, args);
+            expectedNode = expectedNodeClass;
+            code = compileAndInstallSubstitution(intrinsicMethod);
+            assertTrue("Failed to install " + intrinsicMethod.getName(), code != null);
+            expectedNode = null;
+            testAgainstExpected(method, expect, receiver, args);
+        } catch (AssumptionViolatedException e) {
+            // Suppress so that subsequent calls to this method within the
+            // same Junit @Test annotated method can proceed.
+        } finally {
+            expectedNode = null;
+            if (code != null) {
+                code.invalidate();
+            }
+        }
+    }
+
     @Test
     public void testSha256() {
         Assume.assumeTrue("SHA256 not supported", SHA256Node.isSupported(getArchitecture()));
+        assertMessageDigestAlgorithmExists("SHA-256");
         testWithInstalledIntrinsic("sun.security.provider.SHA2", "implCompress0", "testDigest", "SHA-256", getData());
     }
 
     @Test
     public void testSha512() {
         Assume.assumeTrue("SHA512 not supported", SHA512Node.isSupported(getArchitecture()));
+        assertMessageDigestAlgorithmExists("SHA-512");
         testWithInstalledIntrinsic("sun.security.provider.SHA5", "implCompress0", "testDigest", "SHA-512", getData());
     }
 
     @Test
     public void testSha3() {
         Assume.assumeTrue("SHA3 not supported", SHA3Node.isSupported(getArchitecture()));
+        assertMessageDigestAlgorithmExists("SHA3-512");
         testWithInstalledIntrinsic("sun.security.provider.SHA3", "implCompress0", "testDigest", "SHA3-512", getData());
     }
 
     @Test
     public void testMD5() {
+        assertMessageDigestAlgorithmExists("MD5");
         testWithInstalledIntrinsic("sun.security.provider.MD5", "implCompress0", "testDigest", "MD5", getData());
+    }
+
+    static class SeededSecureRandom extends SecureRandom {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Random rnd;
+
+        SeededSecureRandom() {
+            rnd = GraalCompilerTest.getRandomInstance();
+        }
+
+        @Override
+        public void nextBytes(byte[] bytes) {
+            rnd.nextBytes(bytes);
+        }
+
+        @Override
+        public byte[] generateSeed(int numBytes) {
+            var out = new byte[numBytes];
+            rnd.nextBytes(out);
+            return out;
+        }
+    }
+
+    KeyPair generateKeyPair(String algorithm) throws NoSuchAlgorithmException {
+        var g = KeyPairGenerator.getInstance(algorithm);
+        var size = switch (g.getAlgorithm()) {
+            case "RSA", "RSASSA-PSS", "DSA", "DiffieHellman" -> 1024;
+            case "EC" -> 256;
+            case "EdDSA", "Ed25519", "XDH", "X25519" -> 255;
+            case "Ed448", "X448" -> 448;
+            case "ML-KEM", "ML-KEM-768", "ML-KEM-512", "ML-KEM-1024",
+                            "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87" ->
+                -1;
+            default -> throw new UnsupportedOperationException(algorithm);
+        };
+        g.initialize(size, new SeededSecureRandom());
+        return g.generateKeyPair();
+    }
+
+    public byte[] testSignVer(String algorithm) throws GeneralSecurityException {
+        var kp = generateKeyPair(algorithm);
+        var sig = Signature.getInstance(algorithm, "SUN");
+        sig.initSign(kp.getPrivate(), new SeededSecureRandom());
+        sig.update(input.clone());
+        byte[] result = sig.sign();
+
+        sig.initVerify(kp.getPublic());
+        boolean verifyResult = sig.verify(result);
+
+        byte[] newResult = Arrays.copyOf(result, result.length + 1);
+        newResult[result.length] = (byte) (verifyResult ? 1 : 0);
+        return newResult;
+    }
+
+    @Test
+    public void testMLDSASigVer() {
+        Assume.assumeTrue("ML_DSA not supported", DoubleKeccakNode.isSupported(getArchitecture()));
+        Assume.assumeTrue("ML_DSA not supported", DilithiumNode.isSupported(getArchitecture()));
+        assertMLDSAGraalNodeInstallations();
+        // ML-DSA-44
+        testWithInstalledIntrinsic("sun.security.provider.SHA3Parallel", "doubleKeccak", "testSignVer", "ML-DSA-44");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostNtt", "testSignVer", "ML-DSA-44");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostInverseNtt", "testSignVer", "ML-DSA-44");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumNttMult", "testSignVer", "ML-DSA-44");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumMontMulByConstant", "testSignVer", "ML-DSA-44");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumDecomposePoly", "testSignVer", "ML-DSA-44");
+        // ML-DSA-65
+        testWithInstalledIntrinsic("sun.security.provider.SHA3Parallel", "doubleKeccak", "testSignVer", "ML-DSA-65");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostNtt", "testSignVer", "ML-DSA-65");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostInverseNtt", "testSignVer", "ML-DSA-65");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumNttMult", "testSignVer", "ML-DSA-65");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumMontMulByConstant", "testSignVer", "ML-DSA-65");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumDecomposePoly", "testSignVer", "ML-DSA-65");
+        // ML-DSA-87
+        testWithInstalledIntrinsic("sun.security.provider.SHA3Parallel", "doubleKeccak", "testSignVer", "ML-DSA-87");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostNtt", "testSignVer", "ML-DSA-87");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumAlmostInverseNtt", "testSignVer", "ML-DSA-87");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumNttMult", "testSignVer", "ML-DSA-87");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumMontMulByConstant", "testSignVer", "ML-DSA-87");
+        testWithInstalledIntrinsic("sun.security.provider.ML_DSA", "implDilithiumDecomposePoly", "testSignVer", "ML-DSA-87");
+    }
+
+    private void assertMLDSAGraalNodeInstallations() {
+        try {
+            assertNodeInstalledWithoutForeignCall("sun.security.provider.SHA3Parallel", "doubleKeccak", DoubleKeccakNode.class, long[].class, long[].class);
+            assertNodeInstalledWithoutForeignCall("implDilithiumAlmostNtt", DilithiumAlmostNttNode.class, int[].class, int[].class);
+            assertNodeInstalledWithoutForeignCall("implDilithiumAlmostInverseNtt", DilithiumAlmostInverseNttNode.class, int[].class, int[].class);
+            assertNodeInstalledWithoutForeignCall("implDilithiumNttMult", DilithiumNttMultNode.class, int[].class, int[].class, int[].class);
+            assertNodeInstalledWithoutForeignCall("implDilithiumMontMulByConstant", DilithiumMontMulByConstantNode.class, int[].class, int.class);
+            assertNodeInstalledWithoutForeignCall("implDilithiumDecomposePoly", DilithiumDecomposePolyNode.class,
+                            int[].class, int[].class, int[].class, int.class, int.class);
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private void assertNodeInstalledWithoutForeignCall(String methodName, Class<? extends Node> expectedNodeClass, Class<?>... parameterTypes) throws ClassNotFoundException {
+        assertNodeInstalledWithoutForeignCall("sun.security.provider.ML_DSA", methodName, expectedNodeClass, parameterTypes);
+    }
+
+    private void assertNodeInstalledWithoutForeignCall(String className, String methodName, Class<? extends Node> expectedNodeClass, Class<?>... parameterTypes) throws ClassNotFoundException {
+        ResolvedJavaMethod method = getResolvedJavaMethod(className, methodName, parameterTypes);
+        var compilationId = runtime().getHostBackend().getCompilationIdentifier(method);
+        StructuredGraph graph = getIntrinsicGraph(method, compilationId, getDebugContext(getInitialOptions()), StructuredGraph.AllowAssumptions.YES, null);
+        assertTrue("missing intrinsic graph for " + methodName, graph != null);
+        boolean hasExpectedNode = graph.getNodes().filter(expectedNodeClass).isNotEmpty();
+        if (!hasExpectedNode) {
+            StringBuilder nodeKinds = new StringBuilder();
+            for (Node node : graph.getNodes()) {
+                if (!nodeKinds.isEmpty()) {
+                    nodeKinds.append(", ");
+                }
+                nodeKinds.append(node.getClass().getSimpleName());
+            }
+            throw new AssertionError("expected intrinsic node " + expectedNodeClass.getSimpleName() + " for " + methodName + "; nodes=" + nodeKinds);
+        }
+        for (ForeignCallNode node : graph.getNodes().filter(ForeignCallNode.class)) {
+            throw new AssertionError("unexpected ForeignCallNode path for " + methodName + ": " + node.getDescriptor());
+        }
+    }
+
+    public boolean testMLKEMEncapsulateDecapsulate(String algorithm) throws GeneralSecurityException {
+        var kp = generateKeyPair(algorithm);
+        var senderKem = KEM.getInstance(algorithm);
+
+        var encapsulator = senderKem.newEncapsulator(kp.getPublic(), new SeededSecureRandom());
+        var enc = encapsulator.encapsulate();
+        SecretKey key = enc.key();
+
+        var receiverKem = KEM.getInstance(algorithm);
+        byte[] ciphertext = enc.encapsulation();
+        var decapsulator = receiverKem.newDecapsulator(kp.getPrivate());
+        SecretKey decapsulatedKey = decapsulator.decapsulate(ciphertext);
+
+        return key.equals(decapsulatedKey);
+    }
+
+    @Test
+    public void testMLKEM() {
+        Assume.assumeTrue("ML_KEM not supported", KyberNode.isSupported(getArchitecture()));
+
+        Class<?> c;
+        try {
+            c = Class.forName("com.sun.crypto.provider.ML_KEM");
+        } catch (ClassNotFoundException e) {
+            Assume.assumeTrue("com.sun.crypto.provider.ML_KEM is not available", false);
+            return;
+        }
+
+        // ML-KEM-512
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNtt", KyberNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberInverseNtt", KyberInverseNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNttMult", KyberNttMultNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class)), KyberAddPoly2Node.class,
+                        "testMLKEMEncapsulateDecapsulate", "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class, short[].class)),
+                        KyberAddPoly3Node.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyber12To16", Kyber12To16Node.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-512");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberBarrettReduce", KyberBarrettReduceNode.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-512");
+        // ML-KEM-768
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNtt", KyberNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberInverseNtt", KyberInverseNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNttMult", KyberNttMultNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class)), KyberAddPoly2Node.class,
+                        "testMLKEMEncapsulateDecapsulate", "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class, short[].class)),
+                        KyberAddPoly3Node.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyber12To16", Kyber12To16Node.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-768");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberBarrettReduce", KyberBarrettReduceNode.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-768");
+        // ML-KEM-1024
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNtt", KyberNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberInverseNtt", KyberInverseNttNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberNttMult", KyberNttMultNode.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class)), KyberAddPoly2Node.class,
+                        "testMLKEMEncapsulateDecapsulate", "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode(getMetaAccess().lookupJavaMethod(getMethod(c, "implKyberAddPoly", short[].class, short[].class, short[].class, short[].class)),
+                        KyberAddPoly3Node.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyber12To16", Kyber12To16Node.class, "testMLKEMEncapsulateDecapsulate", "ML-KEM-1024");
+        testWithInstalledIntrinsicAndExpectedNode("com.sun.crypto.provider.ML_KEM", "implKyberBarrettReduce", KyberBarrettReduceNode.class, "testMLKEMEncapsulateDecapsulate",
+                        "ML-KEM-1024");
     }
 }

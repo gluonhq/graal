@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,56 +41,65 @@
 
 package org.graalvm.wasm.parser.ir;
 
-import java.util.List;
-
 /**
  * Represents information about the code section of a wasm function.
  */
-public class CodeEntry {
+public final class CodeEntry {
     private final int functionIndex;
     private final int maxStackSize;
-    private final byte[] localTypes;
-    private final byte[] resultTypes;
-    private List<CallNode> callNodes;
+    private final int maxLegacyCatchDepth;
+    private final int[] localTypes;
+    private final int[] resultTypes;
+    // Ordinary CALL targets, including imports, in instruction order.
+    private final int[] callFunctionIndices;
+    // CALL_INDIRECT and CALL_REF sites; imported CALLs are classified during instantiation.
+    private final int indirectCallCount;
     private final int bytecodeStartOffset;
     private final int bytecodeEndOffset;
+    private final boolean usesMemoryZero;
+    private final int exceptionTableOffset;
 
-    public CodeEntry(int functionIndex, int maxStackSize, byte[] localTypes, byte[] resultTypes, List<CallNode> callNodes, int startOffset, int endOffset) {
+    public CodeEntry(int functionIndex, int maxStackSize, int maxLegacyCatchDepth, int[] localTypes, int[] resultTypes, int[] callFunctionIndices, int indirectCallCount,
+                    int startOffset, int endOffset, boolean usesMemoryZero, int exceptionTableOffset) {
         this.functionIndex = functionIndex;
         this.maxStackSize = maxStackSize;
+        this.maxLegacyCatchDepth = maxLegacyCatchDepth;
         this.localTypes = localTypes;
         this.resultTypes = resultTypes;
-        this.callNodes = callNodes;
+        this.callFunctionIndices = callFunctionIndices;
+        this.indirectCallCount = indirectCallCount;
         this.bytecodeStartOffset = startOffset;
         this.bytecodeEndOffset = endOffset;
+        this.usesMemoryZero = usesMemoryZero;
+        this.exceptionTableOffset = exceptionTableOffset;
     }
 
     public int maxStackSize() {
         return maxStackSize;
     }
 
+    public int maxLegacyCatchDepth() {
+        return maxLegacyCatchDepth;
+    }
+
     public int functionIndex() {
         return functionIndex;
     }
 
-    public byte[] localTypes() {
+    public int[] localTypes() {
         return localTypes;
     }
 
-    public byte[] resultTypes() {
+    public int[] resultTypes() {
         return resultTypes;
     }
 
-    public List<CallNode> callNodes() {
-        return callNodes;
+    public int[] callFunctionIndices() {
+        return callFunctionIndices;
     }
 
-    public boolean hasCallNodes() {
-        return callNodes != null;
-    }
-
-    public void setCallNodes(List<CallNode> callNodes) {
-        this.callNodes = callNodes;
+    public int indirectCallCount() {
+        return indirectCallCount;
     }
 
     public int bytecodeStartOffset() {
@@ -99,5 +108,13 @@ public class CodeEntry {
 
     public int bytecodeEndOffset() {
         return bytecodeEndOffset;
+    }
+
+    public boolean usesMemoryZero() {
+        return usesMemoryZero;
+    }
+
+    public int exceptionTableOffset() {
+        return exceptionTableOffset;
     }
 }

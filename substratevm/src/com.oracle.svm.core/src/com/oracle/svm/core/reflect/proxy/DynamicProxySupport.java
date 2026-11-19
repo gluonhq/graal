@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,32 +27,47 @@ package com.oracle.svm.core.reflect.proxy;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.util.Arrays;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import org.graalvm.collections.EconomicMap;
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
-import org.graalvm.nativeimage.hosted.RuntimeReflection;
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
+import org.graalvm.nativeimage.impl.RuntimeReflectionSupport;
+import org.graalvm.nativeimage.impl.TypeReachabilityCondition;
 
 import com.oracle.svm.core.configure.ConditionalRuntimeValue;
-import com.oracle.svm.core.configure.RuntimeConditionSet;
+import com.oracle.svm.guest.staging.configure.RuntimeDynamicAccessMetadata;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.PredefinedClassesSupport;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jdk.proxy.DynamicProxyRegistry;
+import com.oracle.svm.core.metadata.MetadataTracer;
 import com.oracle.svm.core.reflect.MissingReflectionRegistrationUtils;
-import com.oracle.svm.core.util.ImageHeapMap;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ClassUtil;
-import com.oracle.svm.util.LogUtils;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.debug.GraalError;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 public class DynamicProxySupport implements DynamicProxyRegistry {
 
     public static final Pattern PROXY_CLASS_NAME_PATTERN = Pattern.compile(".*\\$Proxy[0-9]+");
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    public static DynamicProxySupport singleton() {
+        return (DynamicProxySupport) ImageSingletons.lookup(DynamicProxyRegistry.class);
+    }
 
     static final class ProxyCacheKey {
 
@@ -73,7 +88,17 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
 
         @Override
         public int hashCode() {
-            return Arrays.hashCode(interfaces);
+            if (ImageLayerBuildingSupport.buildingImageLayer()) {
+                /*
+                 * The hash code cannot be computed using the interfaces' hash code in Layered Image
+                 * because the hash code of classes cannot be injected in the application layer.
+                 * This causes the internal structure of the proxyCache to be unusable in the
+                 * application layer.
+                 */
+                return Arrays.hashCode(Arrays.stream(interfaces).map(Class::getName).toArray());
+            } else {
+                return Arrays.hashCode(interfaces);
+            }
         }
 
         @Override
@@ -82,31 +107,43 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
         }
     }
 
-    private final EconomicMap<ProxyCacheKey, ConditionalRuntimeValue<Object>> proxyCache = ImageHeapMap.create();
+    private final EconomicMap<ProxyCacheKey, Object> proxyCache = ImageHeapMap.create("proxyCache");
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private final EconomicMap<Class<?>, ClassLoader> proxyClassClassloaders = EconomicMap.create();
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private final Function<Class<?>, ClassLoader> loaderAccessor;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public DynamicProxySupport() {
+    public DynamicProxySupport(Function<Class<?>, ClassLoader> loaderAccessor) {
+        this.loaderAccessor = loaderAccessor;
     }
 
     @Override
     @Platforms(Platform.HOSTED_ONLY.class)
-    public synchronized void addProxyClass(ConfigurationCondition condition, Class<?>... interfaces) {
-        VMError.guarantee(condition.isRuntimeChecked(), "The condition used must be a runtime condition.");
+    public synchronized void addProxyClass(AccessCondition condition, boolean preserved, Class<?>... interfaces) {
+        VMError.guarantee(condition instanceof TypeReachabilityCondition && ((TypeReachabilityCondition) condition).isRuntimeChecked(), "The condition used must be a runtime condition.");
         /*
          * Make a defensive copy of the interfaces array to protect against the caller modifying the
          * array.
          */
         Class<?>[] intfs = interfaces.clone();
         ProxyCacheKey key = new ProxyCacheKey(intfs);
-
-        if (!proxyCache.containsKey(key)) {
-            proxyCache.put(key, new ConditionalRuntimeValue<>(RuntimeConditionSet.emptySet(), createProxyClass(intfs)));
+        Object conditionalValue = proxyCache.get(key);
+        if (conditionalValue == null) {
+            conditionalValue = ConditionalRuntimeValue.create(RuntimeDynamicAccessMetadata.createHosted(condition, preserved), createProxyClass(intfs, preserved));
+        } else {
+            RuntimeDynamicAccessMetadata currentMetadata = ConditionalRuntimeValue.getDynamicAccessMetadata(conditionalValue);
+            RuntimeDynamicAccessMetadata newMetadata = RuntimeDynamicAccessMetadata.addCondition(currentMetadata, condition, true)
+                            .withPreserved(preserved || currentMetadata.isPreserved());
+            conditionalValue = ConditionalRuntimeValue.create(newMetadata, ConditionalRuntimeValue.getValueUnconditionally(conditionalValue));
         }
-        proxyCache.get(key).getConditions().addCondition(condition);
+        proxyCache.put(key, conditionalValue);
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    private static Object createProxyClass(Class<?>[] interfaces) {
+    private Object createProxyClass(Class<?>[] interfaces, boolean preserved) {
         try {
             Class<?> clazz = createProxyClassFromImplementedInterfaces(interfaces);
 
@@ -119,7 +156,7 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
                  * runtime class loader hierarchy.
                  */
                 PredefinedClassesSupport.registerClass(clazz);
-                RuntimeClassInitialization.initializeAtRunTime(clazz);
+                JVMCIRuntimeClassInitializationSupport.singleton().initializeAtRunTime(GuestAccess.get().lookupType(clazz));
             }
 
             /*
@@ -129,20 +166,56 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
              * InvocationHandler)`, is registered for reflection so that dynamic proxy instances can
              * be allocated at run time.
              */
-            RuntimeReflection.register(ReflectionUtil.lookupConstructor(clazz, InvocationHandler.class));
+            RuntimeReflectionSupport reflectionSupport = ImageSingletons.lookup(RuntimeReflectionSupport.class);
+            reflectionSupport.register(AccessCondition.unconditional(), preserved, ReflectionUtil.lookupConstructor(clazz, InvocationHandler.class));
 
             /*
              * The proxy class reflectively looks up the methods of the interfaces it implements to
              * pass a Method object to InvocationHandler.
              */
             for (Class<?> intf : interfaces) {
-                RuntimeReflection.register(intf.getMethods());
+                reflectionSupport.register(AccessCondition.unconditional(), preserved, intf.getMethods());
             }
+
+            /*
+             * When the dynamic hubs for proxy classes are generated we have to make sure they get
+             * the correct runtime classloader. Remember which classloader is need for DynamicHub.
+             * See getProxyClassClassloader below.
+             */
+            ClassLoader proxyRuntimeLoader = getCommonClassLoaderOrFail(null, loaderAccessor, interfaces);
+            /* We only add entries for proxy classes where we need to adjust the loader value */
+            if (proxyRuntimeLoader != clazz.getClassLoader()) {
+                synchronized (proxyClassClassloaders) {
+                    proxyClassClassloaders.put(clazz, proxyRuntimeLoader);
+                }
+            }
+
             return clazz;
         } catch (Throwable t) {
-            LogUtils.warning("Could not create a proxy class from list of interfaces: %s. Reason: %s", Arrays.toString(interfaces), t.getMessage());
             return t;
         }
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public ClassLoader getProxyClassClassloader(Class<?> clazz, Function<Class<?>, ClassLoader> defaultSupplier) {
+        /*
+         * Using synchronized on proxyClassClassloaders, since it is very rare that it gets written
+         * to in createProxyClass.
+         */
+        synchronized (proxyClassClassloaders) {
+            if (proxyClassClassloaders.containsKey(clazz)) {
+                /*
+                 * If this is a proxy class we generated with createProxyClass, make sure it gets
+                 * the correct runtime-classloader (based on what runtime-classloader the interfaces
+                 * have that it was created for). Note that `null` is a valid classloader as well.
+                 */
+                return proxyClassClassloaders.get(clazz);
+            }
+        }
+        if (Proxy.isProxyClass(clazz)) {
+            return getCommonClassLoaderOrFail(null, defaultSupplier, clazz.getInterfaces());
+        }
+        return defaultSupplier.apply(clazz);
     }
 
     @Override
@@ -155,13 +228,13 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
     @Platforms(Platform.HOSTED_ONLY.class)
     @SuppressWarnings("deprecation")
     private static Class<?> createProxyClassFromImplementedInterfaces(Class<?>[] interfaces) {
-        return Proxy.getProxyClass(getCommonClassLoaderOrFail(null, interfaces), interfaces);
+        return Proxy.getProxyClass(getCommonClassLoaderOrFail(null, Class::getClassLoader, interfaces), interfaces);
     }
 
-    private static ClassLoader getCommonClassLoaderOrFail(ClassLoader loader, Class<?>... intfs) {
+    private static ClassLoader getCommonClassLoaderOrFail(ClassLoader loader, Function<Class<?>, ClassLoader> loaderAccessor, Class<?>... intfs) {
         ClassLoader commonLoader = null;
         for (Class<?> intf : intfs) {
-            ClassLoader intfLoader = intf.getClassLoader();
+            ClassLoader intfLoader = loaderAccessor.apply(intf);
             if (ClassUtil.isSameOrParentLoader(commonLoader, intfLoader)) {
                 commonLoader = intfLoader;
             } else if (!ClassUtil.isSameOrParentLoader(intfLoader, commonLoader)) {
@@ -172,17 +245,24 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
     }
 
     @Override
-    public Class<?> getProxyClass(ClassLoader loader, Class<?>... interfaces) {
+    public Class<?> getProxyClass(ClassLoader loader, boolean nullIfMissing, Class<?>... interfaces) {
         ProxyCacheKey key = new ProxyCacheKey(interfaces);
-        ConditionalRuntimeValue<Object> clazzOrError = proxyCache.get(key);
+        Object clazzOrError = proxyCache.get(key);
+        if (MetadataTracer.enabled() && MetadataTracer.shouldTraceMetadata(clazzOrError == null ? null : ConditionalRuntimeValue.getDynamicAccessMetadata(clazzOrError))) {
+            MetadataTracer.singleton().traceProxyType(interfaces);
+        }
 
-        if (clazzOrError == null || !clazzOrError.getConditions().satisfied()) {
-            throw MissingReflectionRegistrationUtils.errorForProxy(interfaces);
+        if (clazzOrError == null || !ConditionalRuntimeValue.isSatisfied(clazzOrError)) {
+            if (nullIfMissing) {
+                return null;
+            }
+            throw MissingReflectionRegistrationUtils.reportProxyAccess(interfaces);
         }
-        if (clazzOrError.getValue() instanceof Throwable) {
-            throw new GraalError((Throwable) clazzOrError.getValue());
+        Object value = ConditionalRuntimeValue.getValue(clazzOrError);
+        if (value instanceof Throwable) {
+            throw new GraalError((Throwable) value);
         }
-        Class<?> clazz = (Class<?>) clazzOrError.getValue();
+        Class<?> clazz = (Class<?>) value;
         if (!DynamicHub.fromClass(clazz).isLoaded()) {
             /*
              * NOTE: we might race with another thread in loading this proxy class.
@@ -192,7 +272,7 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
              * common. This prevents that later we would be unable to return the proxy class if we
              * are passed a parent loader of the initially specified loader.
              */
-            ClassLoader commonLoader = getCommonClassLoaderOrFail(loader, interfaces);
+            ClassLoader commonLoader = getCommonClassLoaderOrFail(loader, Class::getClassLoader, interfaces);
             if (!ClassUtil.isSameOrParentLoader(commonLoader, loader)) {
                 throw incompatibleClassLoaders(loader, interfaces);
             }
@@ -204,6 +284,11 @@ public class DynamicProxySupport implements DynamicProxyRegistry {
             throw incompatibleClassLoaders(loader, interfaces);
         }
         return clazz;
+    }
+
+    public boolean isProxyPreserved(Class<?>... interfaces) {
+        ProxyCacheKey key = new ProxyCacheKey(interfaces);
+        return ConditionalRuntimeValue.isPreserved(proxyCache.get(key));
     }
 
     private static RuntimeException incompatibleClassLoaders(ClassLoader provided, Class<?>[] interfaces) {

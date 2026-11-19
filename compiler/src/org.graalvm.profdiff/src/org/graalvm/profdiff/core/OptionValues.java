@@ -129,6 +129,17 @@ public class OptionValues {
     }
 
     /**
+     * Returns option values with the updated fragment-creation setting.
+     *
+     * @param newCreateFragments whether to create {@link CompilationFragment compilation fragments}
+     * @return option values with the updated fragment-creation setting
+     */
+    public OptionValues withCreateFragments(boolean newCreateFragments) {
+        return new OptionValues(hotCompilationUnitPolicy, optimizationContextTreeEnabled, diffCompilations, bciLongForm, sortInliningTree, sortUnorderedPhases,
+                        removeVeryDetailedPhases, pruneIdentities, newCreateFragments, alwaysPrintInlinerReasoning);
+    }
+
+    /**
      * Returns a builder for {@link OptionValues}.
      */
     public static Builder builder() {

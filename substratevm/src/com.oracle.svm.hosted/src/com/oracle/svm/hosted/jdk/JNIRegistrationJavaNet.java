@@ -28,15 +28,15 @@ import java.net.Proxy;
 import java.net.SocketAddress;
 
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.RuntimeJNIAccess;
-import org.graalvm.nativeimage.hosted.RuntimeReflection;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.JNIRegistrationUtil;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.DuringAnalysisAccessImpl;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeJNIAccess;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeReflection;
 
 /**
  * Registration of classes, methods, and fields accessed via JNI by C code of the JDK.
@@ -50,7 +50,14 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
     public void duringSetup(DuringSetupAccess a) {
         /* jdk.net.ExtendedSocketOptions is only available if the jdk.net module is loaded. */
         this.hasPlatformSocketOptions = a.findClassByName("jdk.net.ExtendedSocketOptions$PlatformSocketOptions") != null;
-        initializeAtRunTime(a, "java.net.DatagramPacket", "java.net.InetAddress", "java.net.NetworkInterface",
+        initializeAtRunTime(a, "java.net.DatagramPacket", "java.net.NetworkInterface",
+                        /*
+                         * InetAddress would be enough ("initialized-at-runtime" is propagated to
+                         * subclasses) but for documentation purposes we mention all subclasses
+                         * anyway (each subclass has its own static constructor that calls native
+                         * code).
+                         */
+                        "java.net.InetAddress", "java.net.Inet4Address", "java.net.Inet6Address",
                         /* Stores a default SSLContext in a static field. */
                         "javax.net.ssl.SSLContext");
 
@@ -60,6 +67,9 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
         if (isDarwin()) {
             /* Caches the default interface. */
             initializeAtRunTime(a, "java.net.DefaultInterface");
+        }
+        if (isWindows()) {
+            initializeAtRunTime(a, "sun.net.dns.ResolverConfigurationImpl");
         }
     }
 
@@ -85,8 +95,14 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
                         method(a, "java.net.Inet4AddressImpl", "lookupAllHostAddr", String.class),
                         method(a, "java.net.Inet6AddressImpl", "lookupAllHostAddr", String.class, int.class));
 
+        /*
+         * NetworkInterface.init uses JNI FindClass to look up java/net/NetworkInterface while
+         * initializing that same runtime-initialized class. Register the JNI metadata when the
+         * class is reachable so this lookup does not depend on reachability of the native
+         * initializer itself.
+         */
         a.registerReachabilityHandler(JNIRegistrationJavaNet::registerNetworkInterfaceInit,
-                        method(a, "java.net.NetworkInterface", "init"));
+                        type(a, "java.net.NetworkInterface"));
 
         if (this.hasPlatformSocketOptions) {
             /* Support for the libextnet. */
@@ -94,7 +110,13 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
                             method(a, "jdk.net.ExtendedSocketOptions$PlatformSocketOptions", "create"));
         }
 
-        a.registerReachabilityHandler(JNIRegistrationJavaNet::registerDefaultProxySelectorInit, method(a, "sun.net.spi.DefaultProxySelector", "init"));
+        a.registerReachabilityHandler(JNIRegistrationJavaNet::registerDefaultProxySelectorInit,
+                        method(a, "sun.net.spi.DefaultProxySelector", "init"));
+
+        if (isWindows()) {
+            a.registerReachabilityHandler(JNIRegistrationJavaNet::registerResolverConfigurationImplInit0,
+                            method(a, "sun.net.dns.ResolverConfigurationImpl", "init0"));
+        }
     }
 
     static void registerInitInetAddressIDs(DuringAnalysisAccess a) {
@@ -103,16 +125,19 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
         }
 
         /* Java_java_net_InetAddress_init */
-        RuntimeJNIAccess.register(fields(a, "java.net.InetAddress", "holder"));
-        RuntimeJNIAccess.register(fields(a, "java.net.InetAddress$InetAddressHolder", "address", "family", "hostName", "originalHostName"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.InetAddress", "holder"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.InetAddress$InetAddressHolder", "address", "family", "hostName", "originalHostName"));
 
         /* Java_java_net_Inet4Address_init */
-        RuntimeJNIAccess.register(constructor(a, "java.net.Inet4Address"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.net.Inet4Address"));
 
         /* Java_java_net_Inet6Address_init */
-        RuntimeJNIAccess.register(constructor(a, "java.net.Inet6Address"));
-        RuntimeJNIAccess.register(fields(a, "java.net.Inet6Address", "holder6"));
-        RuntimeJNIAccess.register(fields(a, "java.net.Inet6Address$Inet6AddressHolder", "ipaddress", "scope_id", "scope_id_set", "scope_ifname"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.net.Inet6Address"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.Inet6Address", "holder6"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.Inet6Address$Inet6AddressHolder", "ipaddress", "scope_id", "scope_id_set", "scope_ifname"));
+
+        /* Used by getEnhancedExceptionsAllowed() in net_util.c (JDK-8348986) */
+        JVMCIRuntimeJNIAccess.register(fields(a, "jdk.internal.util.Exceptions", "enhancedNonSocketExceptionText"));
     }
 
     private static void registerNetworkInterfaceInit(DuringAnalysisAccess a) {
@@ -120,14 +145,14 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
             return; /* Already registered. */
         }
 
-        RuntimeJNIAccess.register(constructor(a, "java.net.NetworkInterface"));
-        RuntimeJNIAccess.register(fields(a, "java.net.NetworkInterface", "name", "displayName", "index", "addrs", "bindings", "childs"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.net.NetworkInterface"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.NetworkInterface", "name", "displayName", "index", "addrs", "bindings", "childs"));
         if (isPosix()) {
-            RuntimeJNIAccess.register(fields(a, "java.net.NetworkInterface", "virtual", "parent"));
+            JVMCIRuntimeJNIAccess.register(fields(a, "java.net.NetworkInterface", "virtual", "parent"));
         }
 
-        RuntimeJNIAccess.register(constructor(a, "java.net.InterfaceAddress"));
-        RuntimeJNIAccess.register(fields(a, "java.net.InterfaceAddress", "address", "broadcast", "maskLength"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.net.InterfaceAddress"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.InterfaceAddress", "address", "broadcast", "maskLength"));
 
         registerInitInetAddressIDs(a);
     }
@@ -142,21 +167,25 @@ class JNIRegistrationJavaNet extends JNIRegistrationUtil implements InternalFeat
             VMError.guarantee(isWindows(), "Unexpected platform");
             implClassName = "jdk.net.WindowsSocketOptions";
         }
-        RuntimeReflection.register(clazz(a, implClassName));
-        RuntimeReflection.register(constructor(a, implClassName));
+        JVMCIRuntimeReflection.register(type(a, implClassName));
+        JVMCIRuntimeReflection.register(constructor(a, implClassName));
     }
 
     private static void registerDefaultProxySelectorInit(DuringAnalysisAccess a) {
         if (isWindows()) {
             DuringAnalysisAccessImpl access = (DuringAnalysisAccessImpl) a;
-            access.getNativeLibraries().addDynamicNonJniLibrary("winhttp");
+            access.getNativeLibraries().addDynamicLibrary("winhttp");
         }
 
-        RuntimeJNIAccess.register(constructor(a, "java.net.Proxy", Proxy.Type.class, SocketAddress.class));
-        RuntimeJNIAccess.register(fields(a, "java.net.Proxy", "NO_PROXY"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.net.Proxy", Proxy.Type.class, SocketAddress.class));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.Proxy", "NO_PROXY"));
 
-        RuntimeJNIAccess.register(fields(a, "java.net.Proxy$Type", "HTTP", "SOCKS"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.net.Proxy$Type", "HTTP", "SOCKS"));
 
-        RuntimeJNIAccess.register(method(a, "java.net.InetSocketAddress", "createUnresolved", String.class, int.class));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.net.InetSocketAddress", "createUnresolved", String.class, int.class));
+    }
+
+    private static void registerResolverConfigurationImplInit0(DuringAnalysisAccess a) {
+        JVMCIRuntimeJNIAccess.register(fields(a, "sun.net.dns.ResolverConfigurationImpl", "os_searchlist", "os_nameservers"));
     }
 }

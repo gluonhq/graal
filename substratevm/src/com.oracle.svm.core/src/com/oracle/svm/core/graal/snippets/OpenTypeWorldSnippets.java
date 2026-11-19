@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,26 +26,51 @@ package com.oracle.svm.core.graal.snippets;
 
 import static com.oracle.svm.core.graal.snippets.SubstrateIntrinsics.loadHub;
 import static com.oracle.svm.core.graal.snippets.SubstrateIntrinsics.loadHubOrNull;
+import static jdk.graal.compiler.core.common.GraalOptions.TypeCheckMaxHints;
+import static jdk.graal.compiler.core.common.GraalOptions.TypeCheckMinProfileHitProbability;
+import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.LIKELY_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.NOT_FREQUENT_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.unknownProbability;
 
+import java.nio.ByteOrder;
 import java.util.Map;
 
 import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.word.impl.ObjectAccess;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.config.ObjectLayout;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.core.graal.meta.SubstrateForeignCallsProvider;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.meta.SharedType;
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
+import com.oracle.svm.core.snippets.SnippetRuntime;
+import com.oracle.svm.core.snippets.SnippetRuntime.SubstrateForeignCallDescriptor;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
 
+import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.api.replacements.Snippet;
+import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
+import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.core.common.type.TypeReference;
 import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.graph.Node.ConstantNodeParameter;
+import jdk.graal.compiler.graph.Node.NodeIntrinsic;
 import jdk.graal.compiler.nodes.NamedLocationIdentity;
 import jdk.graal.compiler.nodes.PiNode;
 import jdk.graal.compiler.nodes.SnippetAnchorNode;
+import jdk.graal.compiler.nodes.TypeCheckHints;
 import jdk.graal.compiler.nodes.calc.FloatingNode;
+import jdk.graal.compiler.nodes.extended.BranchProbabilityNode;
+import jdk.graal.compiler.nodes.extended.ForeignCallNode;
 import jdk.graal.compiler.nodes.extended.GuardingNode;
 import jdk.graal.compiler.nodes.java.ClassIsAssignableFromNode;
 import jdk.graal.compiler.nodes.java.InstanceOfDynamicNode;
@@ -54,15 +79,27 @@ import jdk.graal.compiler.nodes.spi.LoweringTool;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.graal.compiler.replacements.InstanceOfSnippetsTemplates;
+import jdk.graal.compiler.replacements.ReplacementsUtil;
 import jdk.graal.compiler.replacements.SnippetTemplate;
 import jdk.graal.compiler.replacements.Snippets;
-import jdk.graal.compiler.word.ObjectAccess;
+import jdk.graal.compiler.replacements.nodes.ExplodeLoopNode;
+import jdk.vm.ci.meta.Assumptions;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaTypeProfile;
 
 /**
  * GR-51603 Once this snippet logic reaches a steady-state merge with {@link TypeSnippets}.
  */
-public final class OpenTypeWorldSnippets extends SubstrateTemplates implements Snippets {
+public class OpenTypeWorldSnippets extends SubstrateTemplates implements Snippets {
+    private static final SubstrateForeignCallDescriptor OUTLINED_ITERATIVE_INTERFACE_TYPE_CHECK = SnippetRuntime.findForeignCall(
+                    OpenTypeWorldSnippets.class, "outlinedIterativeInterfaceTypeCheck", NO_SIDE_EFFECT);
+
+    public static void registerForeignCalls(SubstrateForeignCallsProvider foreignCalls) {
+        foreignCalls.register(OUTLINED_ITERATIVE_INTERFACE_TYPE_CHECK);
+    }
+
+    @NodeIntrinsic(ForeignCallNode.class)
+    private static native boolean callOutlinedIterativeInterfaceTypeCheck(@ConstantNodeParameter ForeignCallDescriptor descriptor, int interfaceID, Object checkedHub);
 
     @Snippet
     protected static SubstrateIntrinsics.Any typeEqualitySnippet(
@@ -91,14 +128,22 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         }
     }
 
+    /**
+     * Performs a subtype-aware check for a non-exact target type, using any exact-hub profile hints
+     * before the generic open-world check.
+     */
     @Snippet
     protected static SubstrateIntrinsics.Any instanceOfSnippet(
+                    @Snippet.VarargsParameter DynamicHub[] hints,
+                    @Snippet.VarargsParameter boolean[] hintIsPositive,
                     Object object,
                     SubstrateIntrinsics.Any trueValue,
                     SubstrateIntrinsics.Any falseValue,
                     @Snippet.ConstantParameter boolean allowsNull,
                     @Snippet.ConstantParameter int typeID,
-                    @Snippet.ConstantParameter int typeIDDepth) {
+                    @Snippet.ConstantParameter int typeIDDepth,
+                    @Snippet.ConstantParameter boolean useInterfaceHashing,
+                    @Snippet.ConstantParameter int interfaceID) {
         if (probability(NOT_FREQUENT_PROBABILITY, object == null)) {
             if (allowsNull) {
                 return trueValue;
@@ -108,10 +153,17 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         GuardingNode guard = SnippetAnchorNode.anchor();
         Object nonNullObject = PiNode.piCastNonNull(object, guard);
         DynamicHub nonNullHub = loadHub(nonNullObject);
+        ExplodeLoopNode.explodeLoop();
+        for (int i = 0; i < hints.length; i++) {
+            boolean positive = hintIsPositive[i];
+            if (probability(LIKELY_PROBABILITY, nonNullHub == hints[i])) {
+                return unknownProbability(positive) ? trueValue : falseValue;
+            }
+        }
         if (typeIDDepth >= 0) {
             return classTypeCheck(typeID, typeIDDepth, nonNullHub, trueValue, falseValue);
         } else {
-            return interfaceTypeCheck(typeID, nonNullHub, trueValue, falseValue);
+            return interfaceTypeCheckHelper(interfaceID, nonNullHub, trueValue, falseValue, useInterfaceHashing);
         }
     }
 
@@ -121,7 +173,8 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
                     Object object,
                     SubstrateIntrinsics.Any trueValue,
                     SubstrateIntrinsics.Any falseValue,
-                    @Snippet.ConstantParameter boolean allowsNull) {
+                    @Snippet.ConstantParameter boolean allowsNull,
+                    @Snippet.ConstantParameter boolean useInterfaceHashing) {
         if (probability(NOT_FREQUENT_PROBABILITY, object == null)) {
             if (allowsNull) {
                 return trueValue;
@@ -132,11 +185,12 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         Object nonNullObject = PiNode.piCastNonNull(object, guard);
         DynamicHub nonNullHub = loadHub(nonNullObject);
         int typeIDDepth = type.getTypeIDDepth();
-        int typeIDToMatch = type.getTypeID();
         if (unknownProbability(typeIDDepth >= 0)) {
+            int typeIDToMatch = type.getTypeID();
             return classTypeCheck(typeIDToMatch, typeIDDepth, nonNullHub, trueValue, falseValue);
         } else {
-            return interfaceTypeCheck(typeIDToMatch, nonNullHub, trueValue, falseValue);
+            int interfaceIDToMatch = type.getInterfaceID();
+            return interfaceTypeCheckHelper(interfaceIDToMatch, nonNullHub, trueValue, falseValue, useInterfaceHashing);
         }
     }
 
@@ -145,18 +199,21 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
                     @Snippet.NonNullParameter DynamicHub type,
                     @Snippet.NonNullParameter DynamicHub checkedHub,
                     SubstrateIntrinsics.Any trueValue,
-                    SubstrateIntrinsics.Any falseValue) {
-        int typeID = type.getTypeID();
+                    SubstrateIntrinsics.Any falseValue,
+                    @Snippet.ConstantParameter boolean useInterfaceHashing,
+                    @Snippet.ConstantParameter boolean outlineSecondary) {
         int typeIDDepth = type.getTypeIDDepth();
         if (unknownProbability(typeIDDepth >= 0)) {
+            int typeID = type.getTypeID();
             return classTypeCheck(typeID, typeIDDepth, checkedHub, trueValue, falseValue);
         } else {
-            return interfaceTypeCheck(typeID, checkedHub, trueValue, falseValue);
+            int interfaceID = type.getInterfaceID();
+            return interfaceTypeCheckHelper(interfaceID, checkedHub, trueValue, falseValue, useInterfaceHashing, outlineSecondary);
         }
     }
 
     @DuplicatedInNativeCode
-    private static SubstrateIntrinsics.Any classTypeCheck(
+    protected static SubstrateIntrinsics.Any classTypeCheck(
                     int typeID,
                     int typeIDDepth,
                     DynamicHub checkedHub,
@@ -168,7 +225,7 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         }
         int[] checkedTypeIds = checkedHub.getOpenTypeWorldTypeCheckSlots();
         // int checkedClassId = checkedTypeIds[typeIDDepth];
-        int offset = (int) ImageSingletons.lookup(ObjectLayout.class).getArrayElementOffset(JavaKind.Int, typeIDDepth);
+        int offset = (int) ObjectLayoutCompilerSupport.getArrayElementOffset(ImageSingletons.lookup(ObjectLayout.class), JavaKind.Int, typeIDDepth);
         // GR-51603 can make a floating read
         int checkedClassId = ObjectAccess.readInt(checkedTypeIds, offset, NamedLocationIdentity.FINAL_LOCATION);
         if (checkedClassId == typeID) {
@@ -178,31 +235,102 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         return falseValue;
     }
 
+    /**
+     * Dispatches to either the iterative interface type check or the hashing based interface type
+     * check. This depends on whether {@link SubstrateOptions#useInterfaceHashing()} is enabled and
+     * whether the checked interfaceID is <= {@link SubstrateOptions#InterfaceHashingMaxId}.
+     */
     @DuplicatedInNativeCode
-    private static SubstrateIntrinsics.Any interfaceTypeCheck(
-                    int typeID,
+    protected static SubstrateIntrinsics.Any interfaceTypeCheckHelper(
+                    int interfaceID,
                     DynamicHub checkedHub,
                     SubstrateIntrinsics.Any trueValue,
-                    SubstrateIntrinsics.Any falseValue) {
+                    SubstrateIntrinsics.Any falseValue,
+                    boolean useInterfaceHashing) {
+        return interfaceTypeCheckHelper(interfaceID, checkedHub, trueValue, falseValue, useInterfaceHashing, false);
+    }
+
+    protected static SubstrateIntrinsics.Any interfaceTypeCheckHelper(
+                    int interfaceID,
+                    DynamicHub checkedHub,
+                    SubstrateIntrinsics.Any trueValue,
+                    SubstrateIntrinsics.Any falseValue,
+                    boolean useInterfaceHashing,
+                    boolean outlineIterativeTypeCheck) {
+        if (useInterfaceHashing && probability(BranchProbabilityNode.FAST_PATH_PROBABILITY, interfaceID <= SubstrateOptions.interfaceHashingMaxId())) {
+            return hashedInterfaceTypeCheck(interfaceID, checkedHub, trueValue, falseValue);
+        }
+        if (outlineIterativeTypeCheck) {
+            return callOutlinedIterativeInterfaceTypeCheck(OUTLINED_ITERATIVE_INTERFACE_TYPE_CHECK, interfaceID, checkedHub) ? trueValue : falseValue;
+        } else {
+            return iterativeInterfaceTypeCheck(interfaceID, checkedHub) ? trueValue : falseValue;
+        }
+    }
+
+    @DuplicatedInNativeCode
+    protected static boolean iterativeInterfaceTypeCheck(int interfaceID, DynamicHub checkedHub) {
         int numClassTypes = checkedHub.getNumClassTypes();
-        int numInterfaceTypes = checkedHub.getNumInterfaceTypes();
+        int numInterfaceTypes = checkedHub.getNumIterableInterfaceTypes();
         int[] checkedTypeIds = checkedHub.getOpenTypeWorldTypeCheckSlots();
         for (int i = 0; i < numInterfaceTypes * 2; i += 2) {
             // int checkedInterfaceId = checkedTypeIds[numClassTypes + i];
-            int offset = (int) ImageSingletons.lookup(ObjectLayout.class).getArrayElementOffset(JavaKind.Int, numClassTypes + i);
+            int offset = (int) ObjectLayoutCompilerSupport.getArrayElementOffset(ImageSingletons.lookup(ObjectLayout.class), JavaKind.Int, numClassTypes + i);
             // GR-51603 can make a floating read
             int checkedInterfaceId = ObjectAccess.readInt(checkedTypeIds, offset, NamedLocationIdentity.FINAL_LOCATION);
-            if (checkedInterfaceId == typeID) {
-                return trueValue;
+            if (checkedInterfaceId == interfaceID) {
+                return true;
             }
         }
-
-        return falseValue;
+        return false;
     }
 
-    @SuppressWarnings("unused")
-    public static void registerLowerings(OptionValues options, Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
-        new OpenTypeWorldSnippets(options, providers, lowerings);
+    @Uninterruptible(reason = "Only calls accessors that read immutable type-check metadata.", calleeMustBe = false)
+    @SubstrateForeignCallTarget(stubCallingConvention = false, fullyUninterruptible = true)
+    private static boolean outlinedIterativeInterfaceTypeCheck(int interfaceID, Object checkedHub) {
+        return iterativeInterfaceTypeCheck(interfaceID, GraalDirectives.uncheckedCast(checkedHub, DynamicHub.class));
+    }
+
+    /**
+     * If {@link SubstrateOptions#useInterfaceHashing()} is enabled, interfaceIDs and itable
+     * starting offsets are stored in a hash table (see TypeCheckBuilder for a general
+     * documentation). This snippet does a hash table lookup and returns true if the provided
+     * interfaceID matches the interfaceID in the hash table, false otherwise. See
+     * {@link DynamicHubUtils#hash(int, int)} for the image-wide choice between shift-and-mask and
+     * PEXT hashing.
+     */
+    @DuplicatedInNativeCode
+    protected static SubstrateIntrinsics.Any hashedInterfaceTypeCheck(
+                    int interfaceID,
+                    DynamicHub checkedHub,
+                    SubstrateIntrinsics.Any trueValue,
+                    SubstrateIntrinsics.Any falseValue) {
+        ReplacementsUtil.dynamicAssert(interfaceID > 0 && interfaceID <= DynamicHubUtils.MAX_HASHED_INTERFACE_ID, "Interface ID must be in the supported hashing range.");
+
+        int hashParam = checkedHub.getOpenTypeWorldInterfaceHashParam();
+        long[] hashTable = checkedHub.getOpenTypeWorldInterfaceHashTable();
+
+        int hash = DynamicHubUtils.hash(interfaceID, hashParam);
+        long offset = ObjectLayoutCompilerSupport.getArrayElementOffset(ImageSingletons.lookup(ObjectLayout.class), JavaKind.Long, hash) + interfaceIdWordOffset();
+        // Keep the long-entry stride, but read only the low 32-bit ID used by this check.
+        int storedInterfaceID = ObjectAccess.readInt(hashTable, Word.signed(offset), NamedLocationIdentity.FINAL_LOCATION);
+
+        if (storedInterfaceID == interfaceID) {
+            return trueValue;
+        } else {
+            return falseValue;
+        }
+    }
+
+    /** Byte offset of the low 32-bit interface ID within a long hash-table entry. */
+    @Fold
+    static int interfaceIdWordOffset() {
+        return SubstrateTarget.getArchitecture().getByteOrder() == ByteOrder.LITTLE_ENDIAN ? 0 : Integer.BYTES;
+    }
+
+    public void registerLowerings(Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings, Providers providers) {
+        lowerings.put(InstanceOfNode.class, new InstanceOfLowering(options, providers));
+        lowerings.put(InstanceOfDynamicNode.class, new InstanceOfDynamicLowering(options, providers));
+        lowerings.put(ClassIsAssignableFromNode.class, new ClassIsAssignableFromLowering(options, providers));
     }
 
     final SnippetTemplate.SnippetInfo instanceOf;
@@ -210,17 +338,14 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
     final SnippetTemplate.SnippetInfo typeEquality;
     final SnippetTemplate.SnippetInfo assignableTypeCheck;
 
-    private OpenTypeWorldSnippets(OptionValues options, Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
+    @SuppressWarnings("this-escape")
+    protected OpenTypeWorldSnippets(OptionValues options, Providers providers) {
         super(options, providers);
 
         this.instanceOf = snippet(providers, OpenTypeWorldSnippets.class, "instanceOfSnippet");
         this.instanceOfDynamic = snippet(providers, OpenTypeWorldSnippets.class, "instanceOfDynamicSnippet");
         this.typeEquality = snippet(providers, OpenTypeWorldSnippets.class, "typeEqualitySnippet");
         this.assignableTypeCheck = snippet(providers, OpenTypeWorldSnippets.class, "classIsAssignableFromSnippet");
-
-        lowerings.put(InstanceOfNode.class, new InstanceOfLowering(options, providers));
-        lowerings.put(InstanceOfDynamicNode.class, new InstanceOfDynamicLowering(options, providers));
-        lowerings.put(ClassIsAssignableFromNode.class, new ClassIsAssignableFromLowering(options, providers));
     }
 
     protected class InstanceOfLowering extends InstanceOfSnippetsTemplates implements NodeLoweringProvider<FloatingNode> {
@@ -242,29 +367,72 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
             InstanceOfNode node = (InstanceOfNode) replacer.instanceOf;
             TypeReference typeReference = node.type();
             SharedType type = (SharedType) typeReference.getType();
-            DynamicHub hub = type.getHub();
+            DynamicHub hub = DynamicHubUtils.getHub(type);
 
+            SnippetTemplate.Arguments args;
             if (typeReference.isExact()) {
-                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(typeEquality, node.graph().getGuardsStage(), tool.getLoweringStage());
+                args = new SnippetTemplate.Arguments(typeEquality, node.graph(), tool.getLoweringStage());
                 args.add("object", node.getValue());
                 args.add("trueValue", replacer.trueValue);
                 args.add("falseValue", replacer.falseValue);
-                args.addConst("allowsNull", node.allowsNull());
+                args.add("allowsNull", node.allowsNull());
                 args.add("exactType", hub);
-                return args;
-
             } else {
-                assert type.getSingleImplementor() == null : "Canonicalization of InstanceOfNode produces exact type for single implementor";
-                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(instanceOf, node.graph().getGuardsStage(), tool.getLoweringStage());
-                args.add("object", node.getValue());
-                args.add("trueValue", replacer.trueValue);
-                args.add("falseValue", replacer.falseValue);
-                args.addConst("allowsNull", node.allowsNull());
-                args.addConst("typeID", hub.getTypeID());
-                args.addConst("typeIDDepth", hub.getTypeIDDepth());
-                return args;
+                args = makeArgumentsForInexactType(replacer, tool, node, hub);
             }
+            return args;
         }
+
+        /// Builds a general type check. A sole runtime implementor does not imply an exact type when
+        /// hierarchy assumptions are unavailable.
+        protected SnippetTemplate.Arguments makeArgumentsForInexactType(InstanceOfUsageReplacer replacer, LoweringTool tool, InstanceOfNode node, DynamicHub hub) {
+            SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(instanceOf, node.graph(), tool.getLoweringStage());
+            TypeSnippets.Hints hints = createHints(node);
+            args.addVarargs("hints", DynamicHub.class, StampFactory.forKind(JavaKind.Object), hints.hubs());
+            args.addVarargs("hintIsPositive", boolean.class, StampFactory.forKind(JavaKind.Boolean), hints.isPositive());
+            args.add("object", node.getValue());
+            args.add("trueValue", replacer.trueValue);
+            args.add("falseValue", replacer.falseValue);
+            args.add("allowsNull", node.allowsNull());
+            args.add("typeID", hub.getTypeID());
+            args.add("typeIDDepth", hub.getTypeIDDepth());
+            args.add("useInterfaceHashing", SubstrateOptions.useInterfaceHashing());
+            args.add("interfaceID", hub.getInterfaceID());
+            return args;
+        }
+
+        /** Creates exact-hub hints for a type check, or an empty set if no profile is available. */
+        private TypeSnippets.Hints createHints(InstanceOfNode node) {
+            if (node.profile() == null) {
+                return new TypeSnippets.Hints(new DynamicHub[0], new boolean[0]);
+            }
+            JavaTypeProfile profile = node.profile();
+            OptionValues optionValues = node.getOptions();
+            Assumptions assumptions = node.graph().getAssumptions();
+            int maxHints = getTypeCheckMaxHints(node.getCheckedStamp().type().isInterface(), optionValues);
+            TypeCheckHints hintInfo = new TypeCheckHints(node.type(), profile, assumptions, getTypeCheckMinProfileHitProbability(optionValues), maxHints);
+            return TypeSnippets.createHints(hintInfo, false);
+        }
+    }
+
+    /** Returns the minimum useful profile hit probability for open-world type checks. */
+    public static double getTypeCheckMinProfileHitProbability(OptionValues options) {
+        /* Same default as on HotSpot. */
+        return TypeCheckMinProfileHitProbability.getValue(options);
+    }
+
+    /** Returns the maximum number of exact-hub hints for an open-world type check. */
+    public static int getTypeCheckMaxHints(boolean isInterface, OptionValues options) {
+        if (!TypeCheckMaxHints.hasBeenSet(options)) {
+            /*
+             * Benchmarks have shown that it is better to use the generic type check if more than
+             * two hub checks need to be performed. For interface checks, this number increases to
+             * three.
+             */
+            return isInterface ? 3 : 2;
+        }
+        /* Same default as on HotSpot. */
+        return TypeCheckMaxHints.getValue(options);
     }
 
     protected class InstanceOfDynamicLowering extends InstanceOfSnippetsTemplates implements NodeLoweringProvider<FloatingNode> {
@@ -286,21 +454,22 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
             InstanceOfDynamicNode node = (InstanceOfDynamicNode) replacer.instanceOf;
 
             if (node.isExact()) {
-                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(typeEquality, node.graph().getGuardsStage(), tool.getLoweringStage());
+                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(typeEquality, node.graph(), tool.getLoweringStage());
                 args.add("object", node.getObject());
                 args.add("trueValue", replacer.trueValue);
                 args.add("falseValue", replacer.falseValue);
-                args.addConst("allowsNull", node.allowsNull());
+                args.add("allowsNull", node.allowsNull());
                 args.add("exactType", node.getMirrorOrHub());
                 return args;
 
             } else {
-                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(instanceOfDynamic, node.graph().getGuardsStage(), tool.getLoweringStage());
+                SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(instanceOfDynamic, node.graph(), tool.getLoweringStage());
                 args.add("type", node.getMirrorOrHub());
                 args.add("object", node.getObject());
                 args.add("trueValue", replacer.trueValue);
                 args.add("falseValue", replacer.falseValue);
-                args.addConst("allowsNull", node.allowsNull());
+                args.add("allowsNull", node.allowsNull());
+                args.add("useInterfaceHashing", SubstrateOptions.useInterfaceHashing());
                 return args;
             }
         }
@@ -324,11 +493,13 @@ public final class OpenTypeWorldSnippets extends SubstrateTemplates implements S
         protected SnippetTemplate.Arguments makeArguments(InstanceOfUsageReplacer replacer, LoweringTool tool) {
             ClassIsAssignableFromNode node = (ClassIsAssignableFromNode) replacer.instanceOf;
 
-            SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(assignableTypeCheck, node.graph().getGuardsStage(), tool.getLoweringStage());
+            SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(assignableTypeCheck, node.graph(), tool.getLoweringStage());
             args.add("type", node.getThisClass());
             args.add("checkedHub", node.getOtherClass());
             args.add("trueValue", replacer.trueValue);
             args.add("falseValue", replacer.falseValue);
+            args.add("useInterfaceHashing", SubstrateOptions.useInterfaceHashing());
+            args.add("outlineSecondary", node.shouldOutlineSecondaryTypeCheck());
             return args;
         }
     }

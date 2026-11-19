@@ -25,7 +25,7 @@
 package com.oracle.svm.jvmtiagentbase;
 
 import static com.oracle.svm.core.jni.JNIObjectHandles.nullHandle;
-import static com.oracle.svm.core.util.VMError.guarantee;
+import static com.oracle.svm.shared.util.VMError.guarantee;
 import static org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
 import static org.graalvm.word.WordFactory.nullPointer;
 
@@ -38,7 +38,6 @@ import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.WordPointer;
 
-import com.oracle.svm.core.SubstrateUtil;
 import com.oracle.svm.core.jni.headers.JNIEnvironment;
 import com.oracle.svm.core.jni.headers.JNIErrors;
 import com.oracle.svm.core.jni.headers.JNIFieldId;
@@ -46,11 +45,12 @@ import com.oracle.svm.core.jni.headers.JNIMethodId;
 import com.oracle.svm.core.jni.headers.JNINativeInterface;
 import com.oracle.svm.core.jni.headers.JNIObjectHandle;
 import com.oracle.svm.core.jni.headers.JNIValue;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEnv;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiError;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiFrameInfo;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiInterface;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * A utility class that contains helper methods for JNI/JVMTI that agents can use.
@@ -211,8 +211,11 @@ public final class Support {
     public static String getClassNameOr(JNIEnvironment env, JNIObjectHandle clazz, String forNullHandle, String forNullNameOrException) {
         if (clazz.notEqual(nullHandle())) {
             JNIObjectHandle clazzName = callObjectMethod(env, clazz, JvmtiAgentBase.singleton().handles().javaLangClassGetName);
+            if (clearException(env)) {
+                return forNullNameOrException;
+            }
             String result = Support.fromJniString(env, clazzName);
-            if (result == null || clearException(env)) {
+            if (result == null) {
                 result = forNullNameOrException;
             }
             return result;
@@ -299,8 +302,18 @@ public final class Support {
      * words, instead using the known layout of the jvalue union.
      */
 
+    public static void callVoidMethod(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method) {
+        jniFunctions().getCallVoidMethodA().invoke(env, obj, method, nullPointer());
+    }
+
     public static JNIObjectHandle callObjectMethod(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method) {
         return jniFunctions().getCallObjectMethodA().invoke(env, obj, method, nullPointer());
+    }
+
+    public static JNIObjectHandle callObjectMethodI(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method, int i0) {
+        JNIValue args = StackValue.get(1, JNIValue.class);
+        args.setInt(i0);
+        return jniFunctions().getCallObjectMethodA().invoke(env, obj, method, args);
     }
 
     public static JNIObjectHandle callObjectMethodL(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method, JNIObjectHandle l0) {
@@ -390,6 +403,10 @@ public final class Support {
         return jniFunctions().getCallBooleanMethodA().invoke(env, obj, method, args);
     }
 
+    public static long callLongMethod(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method) {
+        return jniFunctions().getCallLongMethodA().invoke(env, obj, method, nullPointer());
+    }
+
     public static long callLongMethodL(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method, JNIObjectHandle l0) {
         JNIValue args = StackValue.get(1, JNIValue.class);
         args.addressOf(0).setObject(l0);
@@ -401,6 +418,10 @@ public final class Support {
         args.addressOf(0).setObject(l0);
         args.addressOf(1).setObject(l1);
         return jniFunctions().getCallLongMethodA().invoke(env, obj, method, args);
+    }
+
+    public static int callIntMethod(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method) {
+        return jniFunctions().getCallIntMethodA().invoke(env, obj, method, nullPointer());
     }
 
     public static int callIntMethodL(JNIEnvironment env, JNIObjectHandle obj, JNIMethodId method, JNIObjectHandle l0) {

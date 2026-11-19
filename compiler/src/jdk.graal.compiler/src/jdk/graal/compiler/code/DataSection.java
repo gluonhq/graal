@@ -27,13 +27,22 @@ package jdk.graal.compiler.code;
 import static jdk.vm.ci.meta.MetaUtil.identityHashCodeString;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.Equivalence;
+
 import jdk.graal.compiler.code.DataSection.Data;
+import jdk.graal.compiler.code.DataSection.EmittedItems.ConstantPatch;
+import jdk.graal.compiler.code.DataSection.EmittedItems.EmittedItem;
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
@@ -67,6 +76,9 @@ public final class DataSection implements Iterable<Data> {
         private int alignment;
         private final int size;
 
+        /// Prevents changes to the alignment after the owning section computes its layout.
+        private boolean alignmentFrozen;
+
         private DataSectionReference ref;
 
         protected Data(int alignment, int size) {
@@ -81,13 +93,17 @@ public final class DataSection implements Iterable<Data> {
 
         /**
          * Updates the alignment of the current data segment. This does not guarantee that the
-         * underlying runtime actually supports this alignment.
+         * underlying runtime actually supports this alignment. The alignment cannot be changed
+         * after the owning data section is closed.
          *
          * @param newAlignment The new alignment
          */
         public void updateAlignment(int newAlignment) {
             if (newAlignment == alignment) {
                 return;
+            }
+            if (alignmentFrozen) {
+                throw new IllegalStateException("Cannot update alignment after the data section is closed");
             }
             alignment = lcm(alignment, newAlignment);
         }
@@ -98,6 +114,15 @@ public final class DataSection implements Iterable<Data> {
 
         public int getSize() {
             return size;
+        }
+
+        /**
+         * Returns the reference assigned when this data is inserted into a {@link DataSection}, or
+         * {@code null} if it has not been inserted. The reference offset is assigned when the
+         * owning data section is closed.
+         */
+        public DataSectionReference getReference() {
+            return ref;
         }
 
         @Override
@@ -293,31 +318,18 @@ public final class DataSection implements Iterable<Data> {
         checkOpen();
         closed = true;
 
-        // simple heuristic: put items with larger alignment requirement first
-        dataItems.sort((a, b) -> {
-            // Workaround JVMCI bug with nmethod entry barriers on aarch64 by forcing mutable data
-            // items at the beginning of the data section.
-            if (a.isMutable() != b.isMutable()) {
-                return Boolean.compare(b.isMutable(), a.isMutable());
-            }
-            return a.alignment - b.alignment;
-        });
+        sortDataItems(dataItems);
 
         int position = 0;
         int alignment = 1;
         for (Data d : dataItems) {
+            d.alignmentFrozen = true;
             int itemAlignment = Math.max(minDataAlignment, d.alignment);
 
             alignment = lcm(alignment, itemAlignment);
-            position = align(position, itemAlignment);
-            if (Options.ForceAdversarialLayout.getValue(option)) {
-                if (position % (itemAlignment * 2) == 0) {
-                    position = position + itemAlignment;
-                    assert position % itemAlignment == 0 : Assertions.errorMessage(position, itemAlignment);
-                }
-            }
-            d.ref.setOffset(position);
-            position += d.size;
+            int itemOffset = alignedItemOffset(option, position, itemAlignment);
+            d.ref.setOffset(itemOffset);
+            position = itemOffset + d.size;
         }
 
         sectionAlignment = alignment;
@@ -383,9 +395,101 @@ public final class DataSection implements Iterable<Data> {
         buffer.position(start + sectionSize);
     }
 
+    /**
+     * Non-mutating view of emitted data-section items keyed by their
+     * {@link DataSectionReference}. Callers use it to inspect the computed layout offset, emitted
+     * bytes, alignment, and nested constant patches for selected items while preserving the normal
+     * image-build ownership of the {@link DataSection}.
+     */
+    public static final class EmittedItems {
+        public record ConstantPatch(int position, VMConstant constant) {
+        }
+
+        public record EmittedItem(int offset, int size, int alignment, byte[] bytes, List<ConstantPatch> constantPatches) {
+            public int constantPatchCount() {
+                return constantPatches.size();
+            }
+        }
+
+        private final EconomicMap<DataSectionReference, EmittedItem> itemsByReference;
+
+        private EmittedItems(EconomicMap<DataSectionReference, EmittedItem> itemsByReference) {
+            this.itemsByReference = itemsByReference;
+        }
+
+        public EmittedItem getItem(DataSectionReference reference) {
+            EmittedItem item = itemsByReference.get(reference);
+            if (item == null) {
+                throw new IllegalArgumentException("Unknown data section reference: " + reference);
+            }
+            return item;
+        }
+    }
+
+    /**
+     * Builds a per-item emitted view using the same item ordering and offset rules as
+     * {@link #close(OptionValues, int)}, without mutating this instance.
+     * <p>
+     * The supplied byte order must match the final data-section emission target. The returned view
+     * is intentionally item-scoped rather than a complete section snapshot.
+     */
+    public EmittedItems buildEmittedItems(OptionValues option, int minDataAlignment, ByteOrder byteOrder) {
+        ArrayList<Data> items = new ArrayList<>(dataItems);
+        sortDataItems(items);
+
+        EconomicMap<DataSectionReference, EmittedItem> itemsByReference = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
+        int position = 0;
+        for (Data data : items) {
+            int itemAlignment = Math.max(minDataAlignment, data.alignment);
+            int itemOffset = alignedItemOffset(option, position, itemAlignment);
+
+            byte[] itemBytes = new byte[data.getSize()];
+            List<ConstantPatch> itemConstantPatches = new ArrayList<>();
+            ByteBuffer itemBuffer = ByteBuffer.wrap(itemBytes).order(byteOrder);
+            data.emit(itemBuffer, (patchPosition, constant) -> itemConstantPatches.add(new ConstantPatch(patchPosition, constant)));
+
+            itemsByReference.put(data.ref, new EmittedItem(itemOffset, data.getSize(), itemAlignment, itemBytes, itemConstantPatches));
+
+            position = itemOffset + data.size;
+        }
+        return new EmittedItems(itemsByReference);
+    }
+
+    /**
+     * Applies the same item ordering used by {@link #close(OptionValues, int)} and
+     * {@link #buildEmittedItems(OptionValues, int, ByteOrder)} so non-mutating item emission
+     * observes the layout that closing the section would compute.
+     */
+    private static void sortDataItems(List<Data> items) {
+        // Workaround JVMCI bug with nmethod entry barriers on aarch64 by forcing mutable data items
+        // at the beginning of the data section. Within that partition, use the existing simple
+        // heuristic that puts smaller alignments first.
+        items.sort((a, b) -> {
+            if (a.isMutable() != b.isMutable()) {
+                return Boolean.compare(b.isMutable(), a.isMutable());
+            }
+            return a.alignment - b.alignment;
+        });
+    }
+
+    /**
+     * Computes the next data-item offset, including the optional adversarial-layout displacement
+     * used to expose loads that require stronger alignment than the emitted item provides.
+     */
+    private static int alignedItemOffset(OptionValues option, int position, int itemAlignment) {
+        int alignedPosition = align(position, itemAlignment);
+        if (Options.ForceAdversarialLayout.getValue(option)) {
+            if (alignedPosition % (itemAlignment * 2) == 0) {
+                alignedPosition += itemAlignment;
+                assert alignedPosition % itemAlignment == 0 : Assertions.errorMessage(alignedPosition, itemAlignment);
+            }
+        }
+        return alignedPosition;
+    }
+
     @Override
     public Iterator<Data> iterator() {
-        return dataItems.iterator();
+        return Collections.unmodifiableList(dataItems).iterator();
     }
 
     public static int lcm(int x, int y) {
@@ -404,11 +508,15 @@ public final class DataSection implements Iterable<Data> {
         }
 
         int gcd = a;
-        return x * y / gcd;
+        // Divide first so that only an unrepresentable LCM overflows. For example,
+        // lcm(32768, 65536) is 65536, but multiplying the inputs first overflows an int.
+        return Math.multiplyExact(x / gcd, y);
     }
 
-    private static int align(int position, int alignment) {
-        return ((position + alignment - 1) / alignment) * alignment;
+    public static int align(int position, int alignment) {
+        // Widen the rounding arithmetic and reject an unrepresentable final offset. For example,
+        // rounding 2147483646 up to a multiple of 3 preserves it, but adding 3 - 1 overflows an int.
+        return Math.toIntExact(NumUtil.roundUp((long) position, alignment));
     }
 
     private void checkClosed() {
@@ -429,4 +537,5 @@ public final class DataSection implements Iterable<Data> {
         this.sectionAlignment = 0;
         this.sectionSize = 0;
     }
+
 }

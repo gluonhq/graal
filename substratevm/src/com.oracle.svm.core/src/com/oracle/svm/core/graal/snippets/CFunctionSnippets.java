@@ -27,14 +27,14 @@ package com.oracle.svm.core.graal.snippets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.nodes.VerificationMarkerNode;
@@ -46,18 +46,24 @@ import com.oracle.svm.core.nodes.CFunctionPrologueNode;
 import com.oracle.svm.core.nodes.CPrologueData;
 import com.oracle.svm.core.stack.JavaFrameAnchor;
 import com.oracle.svm.core.stack.JavaFrameAnchors;
-import com.oracle.svm.core.thread.Safepoint;
+import com.oracle.svm.core.thread.ThreadStatusTransition;
 import com.oracle.svm.core.thread.VMThreads.StatusSupport;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.api.replacements.Snippet.ConstantParameter;
+import jdk.graal.compiler.core.common.type.Stamp;
+import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.InvokeNode;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.extended.MembarNode;
 import jdk.graal.compiler.nodes.spi.LoweringTool;
 import jdk.graal.compiler.options.OptionValues;
@@ -67,6 +73,8 @@ import jdk.graal.compiler.replacements.SnippetTemplate;
 import jdk.graal.compiler.replacements.SnippetTemplate.Arguments;
 import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
 import jdk.graal.compiler.replacements.Snippets;
+import jdk.graal.compiler.replacements.nodes.LateLoweredNode;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
  * Snippets for calling from Java to C. This is the inverse of {@link CEntryPointSnippets}.
@@ -104,7 +112,7 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
     @Snippet
     private static CPrologueData prologueSnippet(@ConstantParameter int newThreadStatus) {
         /* Push a JavaFrameAnchor to the thread-local linked list. */
-        JavaFrameAnchor anchor = (JavaFrameAnchor) LoweredStackValueNode.loweredStackValue(SizeOf.get(JavaFrameAnchor.class), FrameAccess.wordSize(), frameAnchorIdentity);
+        JavaFrameAnchor anchor = (JavaFrameAnchor) LoweredStackValueNode.loweredStackValue(SizeOf.get(JavaFrameAnchor.class), SubstrateTarget.getWordSize(), frameAnchorIdentity);
         JavaFrameAnchors.pushFrameAnchor(anchor);
 
         /*
@@ -120,9 +128,9 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
     @Snippet
     private static void epilogueSnippet(@ConstantParameter int oldThreadStatus) {
         if (oldThreadStatus == StatusSupport.STATUS_IN_NATIVE) {
-            Safepoint.transitionNativeToJava(true);
+            ThreadStatusTransition.fromNativeToJava(true);
         } else if (oldThreadStatus == StatusSupport.STATUS_IN_VM) {
-            Safepoint.transitionVMToJava(true);
+            ThreadStatusTransition.fromVMToJava(true);
         } else {
             ReplacementsUtil.staticAssert(false, "Unexpected thread status");
         }
@@ -138,8 +146,8 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
     CFunctionSnippets(OptionValues options, Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
         super(options, providers);
 
-        this.prologue = snippet(providers, CFunctionSnippets.class, "prologueSnippet");
-        this.epilogue = snippet(providers, CFunctionSnippets.class, "epilogueSnippet");
+        this.prologue = snippet(providers, CFunctionSnippets.class, "prologueSnippet", Snippet.SnippetType.TRANSPLANTED_SNIPPET);
+        this.epilogue = snippet(providers, CFunctionSnippets.class, "epilogueSnippet", Snippet.SnippetType.TRANSPLANTED_SNIPPET);
 
         lowerings.put(CFunctionPrologueNode.class, new CFunctionPrologueLowering());
         lowerings.put(CFunctionEpilogueNode.class, new CFunctionEpilogueLowering());
@@ -162,14 +170,27 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
              */
             node.graph().addBeforeFixed(node, node.graph().add(new VerificationMarkerNode(node.getMarker())));
 
-            int newThreadStatus = node.getNewThreadStatus();
-            assert StatusSupport.isValidStatus(newThreadStatus);
-
-            Arguments args = new Arguments(prologue, node.graph().getGuardsStage(), tool.getLoweringStage());
-            args.addConst("newThreadStatus", newThreadStatus);
-            SnippetTemplate template = template(tool, node, args);
-            template.setMayRemoveLocation(true);
-            template.instantiate(tool.getMetaAccess(), node, SnippetTemplate.DEFAULT_REPLACER, args);
+            ResolvedJavaMethod target = prologue.getMethod();
+            Stamp returnStamp = SubstrateTarget.getWordStamp();
+            StructuredGraph graph = node.graph();
+            final Supplier<SnippetTemplate> templateSupplier = new Supplier<>() {
+                @Override
+                public SnippetTemplate get() {
+                    int newThreadStatus = node.getNewThreadStatus();
+                    assert StatusSupport.isValidStatus(newThreadStatus);
+                    Arguments args = new Arguments(prologue, node.graph(), tool.getLoweringStage());
+                    args.add("newThreadStatus", newThreadStatus);
+                    SnippetTemplate template = template(tool, node, args);
+                    return template;
+                }
+            };
+            LateLoweredNode lateInvoke = graph.add(new LateLoweredNode(target, returnStamp, new ValueNode[]{ConstantNode.forInt(node.getNewThreadStatus(), graph)}, templateSupplier));
+            lateInvoke.setStateBefore(node.stateBefore());
+            lateInvoke.setStateAfter(node.stateAfter());
+            node.graph().replaceFixedWithFixed(node, lateInvoke);
+            // we do not want the backend to spill or rematerialize any constants in the basic
+            // blocks inlined via these snippets
+            lateInvoke.setAfterInlineeBasicBlockAction(x -> x.setCanUseBlockAsSpillTarget(false));
         }
     }
 
@@ -180,14 +201,27 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
                 return;
             }
             node.graph().addAfterFixed(node, node.graph().add(new VerificationMarkerNode(node.getMarker())));
-
-            int oldThreadStatus = node.getOldThreadStatus();
-            assert StatusSupport.isValidStatus(oldThreadStatus);
-            Arguments args = new Arguments(epilogue, node.graph().getGuardsStage(), tool.getLoweringStage());
-            args.addConst("oldThreadStatus", oldThreadStatus);
-            SnippetTemplate template = template(tool, node, args);
-            template.setMayRemoveLocation(true);
-            template.instantiate(tool.getMetaAccess(), node, SnippetTemplate.DEFAULT_REPLACER, args);
+            ResolvedJavaMethod target = epilogue.getMethod();
+            Stamp returnStamp = StampFactory.forKind(target.getSignature().getReturnKind());
+            StructuredGraph graph = node.graph();
+            Supplier<SnippetTemplate> templateSupplier = new Supplier<>() {
+                @Override
+                public SnippetTemplate get() {
+                    int oldThreadStatus = node.getOldThreadStatus();
+                    assert StatusSupport.isValidStatus(oldThreadStatus);
+                    Arguments args = new Arguments(epilogue, node.graph(), tool.getLoweringStage());
+                    args.add("oldThreadStatus", oldThreadStatus);
+                    SnippetTemplate template = template(tool, node, args);
+                    return template;
+                }
+            };
+            LateLoweredNode lateInvoke = graph.add(new LateLoweredNode(target, returnStamp, new ValueNode[]{ConstantNode.forInt(node.getOldThreadStatus(), graph)}, templateSupplier));
+            lateInvoke.setStateBefore(node.stateBefore());
+            lateInvoke.setStateAfter(node.stateAfter());
+            node.graph().replaceFixedWithFixed(node, lateInvoke);
+            // we do not want the backend to spill or rematerialize any constants in the basic
+            // blocks inlined via these snippets
+            lateInvoke.setAfterInlineeBasicBlockAction(x -> x.setCanUseBlockAsSpillTarget(false));
         }
     }
 
@@ -242,14 +276,20 @@ public final class CFunctionSnippets extends SubstrateTemplates implements Snipp
     }
 }
 
+/**
+ * {@link CFunctionSnippets} may only be used for code that cannot be deoptimized. Otherwise,
+ * deoptimization could destroy stack allocated {@link JavaFrameAnchor} structs when rewriting the
+ * stack.
+ */
 @AutomaticallyRegisteredFeature
 @Platforms(InternalPlatform.NATIVE_ONLY.class)
 class CFunctionSnippetsFeature implements InternalFeature {
-
     @Override
     @SuppressWarnings("unused")
     public void registerLowerings(RuntimeConfiguration runtimeConfig, OptionValues options, Providers providers,
                     Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings, boolean hosted) {
-        new CFunctionSnippets(options, providers, lowerings);
+        if (hosted) {
+            new CFunctionSnippets(options, providers, lowerings);
+        }
     }
 }

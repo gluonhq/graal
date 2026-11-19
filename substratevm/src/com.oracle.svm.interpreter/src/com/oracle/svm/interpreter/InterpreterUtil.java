@@ -1,0 +1,197 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.interpreter;
+
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.interpreter.metadata.Bytecodes;
+import com.oracle.svm.interpreter.metadata.MetadataUtil;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.directives.GraalDirectives;
+
+public class InterpreterUtil {
+    private static final boolean assertionsEnabled;
+    static {
+        boolean status = false;
+        assert (status = true) == true;
+        assertionsEnabled = status;
+    }
+
+    /** Alternative to {@link VMError#guarantee(boolean)} that keeps the failure path outlined. */
+    public static void guarantee(boolean condition) {
+        if (GraalDirectives.injectBranchProbability(GraalDirectives.SLOWPATH_PROBABILITY, !condition)) {
+            throw shouldNotReachHereAtRuntime();
+        }
+    }
+
+    /**
+     * Alternative to {@link VMError#guarantee(boolean, String, Object)} that avoids
+     * {@link String#format(String, Object...)} .
+     */
+    public static void guarantee(boolean condition, String simpleFormat, Object arg1) {
+        if (GraalDirectives.injectBranchProbability(GraalDirectives.SLOWPATH_PROBABILITY, !condition)) {
+            throw shouldNotReachHere(simpleFormat, arg1);
+        }
+    }
+
+    /**
+     * Alternative to {@link VMError#guarantee(boolean, String, Object, Object)} that avoids
+     * {@link String#format(String, Object...)} .
+     */
+    public static void guarantee(boolean condition, String simpleFormat, Object arg1, Object arg2) {
+        if (GraalDirectives.injectBranchProbability(GraalDirectives.SLOWPATH_PROBABILITY, !condition)) {
+            throw shouldNotReachHere(simpleFormat, arg1, arg2);
+        }
+    }
+
+    /**
+     * Alternative to {@link VMError#guarantee(boolean, String, Object, Object, Object)} that avoids
+     * {@link String#format(String, Object...)} .
+     */
+    public static void guarantee(boolean condition, String simpleFormat, Object arg1, Object arg2, Object arg3) {
+        if (GraalDirectives.injectBranchProbability(GraalDirectives.SLOWPATH_PROBABILITY, !condition)) {
+            throw shouldNotReachHere(simpleFormat, arg1, arg2, arg3);
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static void assertion(boolean condition, String message) {
+        if (assertionsEnabled && !condition) {
+            throw VMError.shouldNotReachHere(message);
+        }
+    }
+
+    @NeverInline("Keep guarantee failure formatting out of bytecode-handler stubs")
+    public static RuntimeException shouldNotReachHereAtRuntime() {
+        throw VMError.shouldNotReachHereAtRuntime();
+    }
+
+    @NeverInline("Keep guarantee failure formatting out of bytecode-handler stubs")
+    public static RuntimeException shouldNotReachHere(String simpleFormat, Object arg1) {
+        throw VMError.shouldNotReachHere(MetadataUtil.fmt(simpleFormat, arg1));
+    }
+
+    @NeverInline("Keep guarantee failure formatting out of bytecode-handler stubs")
+    public static RuntimeException shouldNotReachHere(String simpleFormat, Object arg1, Object arg2) {
+        throw VMError.shouldNotReachHere(MetadataUtil.fmt(simpleFormat, arg1, arg2));
+    }
+
+    @NeverInline("Keep guarantee failure formatting out of bytecode-handler stubs")
+    public static RuntimeException shouldNotReachHere(String simpleFormat, Object arg1, Object arg2, Object arg3) {
+        throw VMError.shouldNotReachHere(MetadataUtil.fmt(simpleFormat, arg1, arg2, arg3));
+    }
+
+    @NeverInline("Keep invalid opcode diagnostics out of the bytecode-handler stubs")
+    public static RuntimeException invalidOpcode(int opcode) {
+        throw VMError.shouldNotReachHere(Bytecodes.nameOf(opcode));
+    }
+
+    /**
+     * Build time logging.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static void log(String msg) {
+        if (InterpreterOptions.InterpreterBuildTimeLogging.getValue()) {
+            System.out.println(msg);
+        }
+    }
+
+    /**
+     * Build time logging.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static void log(String simpleFormat, Object arg1) {
+        if (InterpreterOptions.InterpreterBuildTimeLogging.getValue()) {
+            System.out.println(MetadataUtil.fmt(simpleFormat, arg1));
+        }
+    }
+
+    /**
+     * Build time logging.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static void log(String simpleFormat, Object arg1, Object arg2) {
+        if (InterpreterOptions.InterpreterBuildTimeLogging.getValue()) {
+            System.out.println(MetadataUtil.fmt(simpleFormat, arg1, arg2));
+        }
+    }
+
+    /**
+     * Build time logging.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static void log(String simpleFormat, Object arg1, Object arg2, Object arg3) {
+        if (InterpreterOptions.InterpreterBuildTimeLogging.getValue()) {
+            System.out.println(MetadataUtil.fmt(simpleFormat, arg1, arg2, arg3));
+        }
+    }
+
+    /**
+     * Build time logging.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static void log(Throwable t) {
+        if (InterpreterOptions.InterpreterBuildTimeLogging.getValue()) {
+            t.printStackTrace(System.out);
+        }
+    }
+
+    /**
+     * Appends current interpreter log indent, then returns the interpreter log.
+     */
+    public static Log traceInterpreter() {
+        if (InterpreterOptions.InterpreterTraceSupport.getValue()) {
+            if (InterpreterOptions.InterpreterTrace.getValue()) {
+                return forceTraceInterpreter();
+            }
+        }
+        return Log.noopLog();
+    }
+
+    /** Appends the current interpreter log indent without checking whether tracing is enabled. */
+    @NeverInline("Keep trace formatting out of bytecode-handler stubs")
+    public static Log forceTraceInterpreter() {
+        return Log.log().string(" ".repeat(Interpreter.logIndent.get()));
+    }
+
+    /**
+     * Appends given message to the Interpreter log, then returns it.
+     */
+    public static Log traceInterpreter(String msg) {
+        if (InterpreterOptions.InterpreterTraceSupport.getValue()) {
+            if (InterpreterOptions.InterpreterTrace.getValue()) {
+                return Log.log().string(msg);
+            }
+        }
+        return Log.noopLog();
+    }
+}

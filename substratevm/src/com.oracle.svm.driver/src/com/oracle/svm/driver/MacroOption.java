@@ -31,7 +31,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -42,9 +41,12 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import com.oracle.svm.core.option.OptionUtils;
+import org.graalvm.collections.EconomicSet;
+
+import com.oracle.svm.core.util.ArchiveSupport;
 import com.oracle.svm.driver.NativeImage.BuildConfiguration;
 import com.oracle.svm.driver.metainf.NativeImageMetaInfWalker;
+import com.oracle.svm.shared.option.OptionUtils;
 
 final class MacroOption {
 
@@ -88,7 +90,7 @@ final class MacroOption {
             } else {
                 sb.append(message);
             }
-            Consumer<String> lineOut = s -> sb.append("\n" + s);
+            Consumer<String> lineOut = s -> sb.append(System.lineSeparator()).append(s);
             registry.showOptions(forKind, context == null, lineOut);
             return sb.toString();
         }
@@ -245,7 +247,7 @@ final class MacroOption {
             return supported.get(kindPart).get(optionName);
         }
 
-        boolean enableOption(BuildConfiguration config, String optionString, HashSet<MacroOption> addedCheck, MacroOption context, Consumer<EnabledOption> enabler) {
+        boolean enableOption(BuildConfiguration config, String optionString, EconomicSet<MacroOption> addedCheck, MacroOption context, Consumer<EnabledOption> enabler) {
             String specString;
             if (context == null) {
                 if (optionString.startsWith(OptionUtils.MacroOptionKind.macroOptionPrefix)) {
@@ -308,7 +310,7 @@ final class MacroOption {
             return true;
         }
 
-        private void enableResolved(BuildConfiguration config, MacroOption option, String optionArg, HashSet<MacroOption> addedCheck, MacroOption context, Consumer<EnabledOption> enabler) {
+        private void enableResolved(BuildConfiguration config, MacroOption option, String optionArg, EconomicSet<MacroOption> addedCheck, MacroOption context, Consumer<EnabledOption> enabler) {
             if (addedCheck.contains(option)) {
                 return;
             }
@@ -382,7 +384,7 @@ final class MacroOption {
         this.kind = OptionUtils.MacroOptionKind.fromSubdir(optionDirectory.getParent().getFileName().toString());
         this.optionName = optionDirectory.getFileName().toString();
         this.optionDirectory = optionDirectory;
-        this.properties = NativeImage.loadProperties(optionDirectory.resolve(NativeImageMetaInfWalker.nativeImagePropertiesFilename));
+        this.properties = ArchiveSupport.loadProperties(optionDirectory.resolve(NativeImageMetaInfWalker.nativeImagePropertiesFilename));
     }
 
     @Override

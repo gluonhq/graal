@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2016, 2023, Oracle and/or its affiliates.
+# Copyright (c) 2016, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -54,13 +54,13 @@ _sulong_test_configs = {}
 
 def register_sulong_test_config(cfg):
     name = cfg.name
-    assert not name in _sulong_test_configs, 'duplicate sulong test config'
+    assert name not in _sulong_test_configs, 'duplicate sulong test config'
     _sulong_test_configs[name] = cfg
 
 
 class NativeSulongTestConfig(SulongTestConfig):
     def __init__(self, name):
-        super(NativeSulongTestConfig, self).__init__(name=name,
+        super().__init__(name=name,
                                                      sulongHome="SULONG_HOME",
                                                      configRoot=os.path.join(_suite.dir, "tests", "configs"),
                                                      runtimeDeps=["SULONG_NATIVE"],
@@ -93,6 +93,15 @@ class SulongUnittestConfigBase(mx_unittest.MxUnittestConfig):
         vmArgs += [f'-Dsulongtest.path.{d.name}={d.get_output()}' for d in _get_test_distributions(cfg.nativeTestDistFrom)]
         vmArgs += [f'-Dsulongtest.configRoot={cfg.configRoot}']
         vmArgs += [f'-Dsulongtest.config={cfg.name}']
+        if '-p' in vmArgs or '--module-path' in vmArgs:
+            # ALL-UNNAMED for native methods in
+            # com.oracle.truffle.llvm.tests.pipe.CaptureNativeOutput
+            native_access_target_module = 'org.graalvm.truffle,ALL-UNNAMED'
+        else:
+            native_access_target_module = 'ALL-UNNAMED'
+        vmArgs += [f'--enable-native-access={native_access_target_module}']
+        # GR-59703: Migrate sun.misc.* usages.
+        mx_truffle.enable_sun_misc_unsafe(vmArgs)
         if mx.get_opts().use_llvm_standalone is not None:
             vmArgs += [f'-Dsulongtest.testAOTImage={mx_sulong.get_lli_path()}']
         else:
@@ -108,6 +117,8 @@ class SulongUnittestConfigBase(mx_unittest.MxUnittestConfig):
         cfg = SulongUnittestConfigBase.sulongConfig
         deps.add(mx.distribution(cfg.testConfigDep))
         if mx.get_opts().use_llvm_standalone is None:
+            if mx.suite('compiler', fatalIfMissing=False) is not None:
+                deps.add(mx.distribution('truffle:TRUFFLE_RUNTIME'))
             for d in cfg.runtimeDeps:
                 deps.add(mx.distribution(d))
             if SulongUnittestConfigBase.useResources:
@@ -117,10 +128,10 @@ class SulongUnittestConfigBase(mx_unittest.MxUnittestConfig):
 # unittest config for Sulong tests that depend only on the embedders API
 class SulongUnittestConfig(SulongUnittestConfigBase):
     def __init__(self):
-        super(SulongUnittestConfig, self).__init__(name="sulong")
+        super().__init__(name="sulong")
 
     def apply(self, config, **kwArgs):
-        (vmArgs, mainClass, mainClassArgs) = super(SulongUnittestConfig, self).apply(config, **kwArgs)
+        (vmArgs, mainClass, mainClassArgs) = super().apply(config, **kwArgs)
         newVmArgs = []
         i = 0
         while i < len(vmArgs):
@@ -136,16 +147,18 @@ class SulongUnittestConfig(SulongUnittestConfigBase):
         if mx.get_opts().use_llvm_standalone is None:
             # add back the embedders API if we're not testing a standalone
             newVmArgs.append("--add-modules=org.graalvm.polyglot")
+            if "sdk:NATIVEBRIDGE" in SulongUnittestConfigBase.sulongConfig.runtimeDeps:
+                newVmArgs.append("--add-modules=org.graalvm.nativebridge")
 
         return (newVmArgs, mainClass, mainClassArgs)
 
 # unittest config for Sulong tests that depend on sulong internals
 class SulongInternalUnittestConfig(SulongUnittestConfigBase):
     def __init__(self):
-        super(SulongInternalUnittestConfig, self).__init__(name="sulong-internal")
+        super().__init__(name="sulong-internal")
 
     def apply(self, config, **kwArgs):
-        (vmArgs, mainClass, mainClassArgs) = super(SulongInternalUnittestConfig, self).apply(config, **kwArgs)
+        (vmArgs, mainClass, mainClassArgs) = super().apply(config, **kwArgs)
         mainClassArgs.extend(['-JUnitOpenPackages', 'org.graalvm.truffle/com.oracle.truffle.api.impl=ALL-UNNAMED'])  # for TruffleRunner
         mainClassArgs.extend(['-JUnitOpenPackages', 'org.graalvm.llvm_community/*=ALL-UNNAMED'])  # for Sulong internals
         return (vmArgs, mainClass, mainClassArgs)
@@ -159,7 +172,7 @@ class SelectSulongConfigAction(argparse.Action):
     def __init__(self, **kwargs):
         kwargs['required'] = False
         SulongUnittestConfigBase.sulongConfig = _sulong_test_configs["Native"]
-        super(SelectSulongConfigAction, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
         if values in _sulong_test_configs:
@@ -172,7 +185,7 @@ class SulongResourceConfigAction(argparse.Action):
         kwargs['required'] = False
         kwargs['nargs'] = 0
         SulongUnittestConfigBase.useResources = False
-        super(SulongResourceConfigAction, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
         SulongUnittestConfigBase.useResources = True
@@ -190,7 +203,7 @@ def get_vm_args_for_native():
 class _LLVMNFITestConfig(mx_truffle.NFITestConfig):
 
     def __init__(self):
-        super(_LLVMNFITestConfig, self).__init__('llvm', ['SULONG_NFI', 'SULONG_NATIVE'])
+        super().__init__('llvm', ['SULONG_NFI', 'SULONG_NATIVE'])
 
     def vm_args(self):
         testPath = mx.distribution('SULONG_NFI_TESTS').output

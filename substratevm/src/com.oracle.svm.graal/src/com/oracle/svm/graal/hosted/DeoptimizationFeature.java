@@ -28,9 +28,6 @@ import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
 
-import jdk.graal.compiler.graph.Node;
-import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.phases.util.Providers;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.Feature;
@@ -50,37 +47,51 @@ import com.oracle.svm.core.graal.meta.SubstrateForeignCallsProvider;
 import com.oracle.svm.core.graal.snippets.DeoptTestSnippets;
 import com.oracle.svm.core.graal.snippets.DeoptTester;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
-import com.oracle.svm.core.meta.MethodPointer;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.meta.MethodRefSupport;
 import com.oracle.svm.core.util.CounterFeature;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.CompilationAccessImpl;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ReflectionUtil;
+
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.util.Providers;
 
 /**
  * Feature to allow deoptimization in a generated native image.
  */
 @Platforms(InternalPlatform.NATIVE_ONLY.class)
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class DeoptimizationFeature implements InternalFeature {
 
-    private static final Method deoptStubMethod;
-
-    static {
-        try {
-            deoptStubMethod = Deoptimizer.class.getMethod("deoptStub", Pointer.class, UnsignedWord.class, UnsignedWord.class);
-        } catch (NoSuchMethodException ex) {
-            throw VMError.shouldNotReachHere(ex);
-        }
-    }
+    private static final Method eagerDeoptStubMethod = ReflectionUtil.lookupMethod(Deoptimizer.class, "eagerDeoptStub", Pointer.class, UnsignedWord.class, UnsignedWord.class);
+    private static final Method lazyDeoptStubPrimitiveReturnMethod = ReflectionUtil.lookupMethod(Deoptimizer.class, "lazyDeoptStubPrimitiveReturn", Pointer.class, UnsignedWord.class,
+                    UnsignedWord.class);
+    private static final Method lazyDeoptStubObjectReturnMethod = ReflectionUtil.lookupMethod(Deoptimizer.class, "lazyDeoptStubObjectReturn", Pointer.class, UnsignedWord.class, UnsignedWord.class);
 
     @Override
     public List<Class<? extends Feature>> getRequiredFeatures() {
         return List.of(DeoptimizationCanaryFeature.class, CounterFeature.class);
     }
 
+    /**
+     * Registers the runtime deoptimization entry point as a hosted root for a feature that resumes
+     * execution through deoptimization at run time.
+     */
+    public static void registerDeoptimizeRuntimeAsRoot(BeforeAnalysisAccessImpl access, Class<?> registeredIn) {
+        access.registerAsRoot((AnalysisMethod) DeoptimizationRuntime.DEOPTIMIZE.findMethod(access.getMetaAccess()), true, "Deoptimization, registered in " + registeredIn);
+    }
+
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(DeoptimizationSupport.class, new DeoptimizationSupport());
+        if (ImageLayerBuildingSupport.firstImageBuild()) {
+            ImageSingletons.add(DeoptimizationSupport.class, new DeoptimizationSupport());
+        }
         /* Counters for deoptimization. */
         ImageSingletons.add(DeoptimizationCounters.class, new DeoptimizationCounters());
     }
@@ -93,13 +104,13 @@ public final class DeoptimizationFeature implements InternalFeature {
          * The deoptimization stub is never called directly. It is patched in as the new return
          * address during deoptimization.
          */
-        access.registerAsRoot(deoptStubMethod, true, "Deoptimization stub, registered in " + DeoptimizationFeature.class);
+        access.registerAsRoot(eagerDeoptStubMethod, true, "Eager deoptimization stub, registered in " + DeoptimizationFeature.class);
+        if (Deoptimizer.Options.LazyDeoptimization.getValue()) {
+            access.registerAsRoot(lazyDeoptStubPrimitiveReturnMethod, true, "Lazy deoptimization stub for primitive return values, registered in " + DeoptimizationFeature.class);
+            access.registerAsRoot(lazyDeoptStubObjectReturnMethod, true, "Lazy deoptimization stub for object return values, registered in " + DeoptimizationFeature.class);
+        }
 
-        /*
-         * The deoptimize run time call is not used for method in the native image, but only for
-         * runtime compiled methods. Make sure it gets compiled.
-         */
-        access.registerAsRoot((AnalysisMethod) DeoptimizationRuntime.DEOPTIMIZE.findMethod(access.getMetaAccess()), true, "Deoptimization, registered in " + DeoptimizationFeature.class);
+        registerDeoptimizeRuntimeAsRoot(access, DeoptimizationFeature.class);
 
         if (DeoptTester.enabled()) {
             access.getBigBang().addRootMethod((AnalysisMethod) DeoptTester.DEOPTTEST.findMethod(access.getMetaAccess()), true, "Deoptimization test, registered in " + DeoptimizationFeature.class);
@@ -128,6 +139,12 @@ public final class DeoptimizationFeature implements InternalFeature {
         CompilationAccessImpl config = (CompilationAccessImpl) a;
         config.registerAsImmutable(ImageSingletons.lookup(DeoptimizationSupport.class));
         HostedMetaAccess metaAccess = config.getMetaAccess();
-        DeoptimizationSupport.setDeoptStubPointer(new MethodPointer(metaAccess.lookupJavaMethod(deoptStubMethod)));
+        if (ImageLayerBuildingSupport.firstImageBuild()) {
+            DeoptimizationSupport.setEagerDeoptStubPointer(MethodRefSupport.createMethodPointer(metaAccess.lookupJavaMethod(eagerDeoptStubMethod)));
+            if (Deoptimizer.Options.LazyDeoptimization.getValue()) {
+                DeoptimizationSupport.setLazyDeoptStubPrimitiveReturnPointer(MethodRefSupport.createMethodPointer(metaAccess.lookupJavaMethod(lazyDeoptStubPrimitiveReturnMethod)));
+                DeoptimizationSupport.setLazyDeoptStubObjectReturnPointer(MethodRefSupport.createMethodPointer(metaAccess.lookupJavaMethod(lazyDeoptStubObjectReturnMethod)));
+            }
+        }
     }
 }

@@ -26,18 +26,18 @@ package com.oracle.svm.hosted.substitute;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.List;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.annotate.Delete;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.annotation.AnnotationValue;
 import com.oracle.svm.hosted.annotation.CustomSubstitutionMethod;
-import com.oracle.svm.hosted.annotation.SubstrateAnnotationExtractor;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
 import jdk.graal.compiler.nodes.ConstantNode;
@@ -53,16 +53,17 @@ public class DeletedMethod extends CustomSubstitutionMethod {
                     SubstrateOptionsParser.HOSTED_OPTION_PREFIX);
 
     private final String message;
-    private final AnnotationValue[] injectedAnnotations;
+    private final List<AnnotationValue> injectedAnnotations;
 
-    public DeletedMethod(ResolvedJavaMethod original, Delete deleteAnnotation) {
+    public DeletedMethod(ResolvedJavaMethod original, AnnotationValue deleteAnnotation) {
         super(original);
-        this.message = deleteAnnotation.value();
-        this.injectedAnnotations = SubstrateAnnotationExtractor.prepareInjectedAnnotations(deleteAnnotation);
+        VMError.guarantee(GuestAccess.get().elements.Delete.equals(deleteAnnotation.getAnnotationType()));
+        this.message = deleteAnnotation.getString("value");
+        this.injectedAnnotations = List.of(deleteAnnotation);
     }
 
     @Override
-    public AnnotationValue[] getInjectedAnnotations() {
+    public List<AnnotationValue> getInjectedAnnotations() {
         return injectedAnnotations;
     }
 

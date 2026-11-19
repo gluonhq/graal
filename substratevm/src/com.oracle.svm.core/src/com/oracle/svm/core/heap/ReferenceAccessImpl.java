@@ -24,24 +24,30 @@
  */
 package com.oracle.svm.core.heap;
 
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.core.common.CompressEncoding;
-import jdk.graal.compiler.word.BarrieredAccess;
-import jdk.graal.compiler.word.ObjectAccess;
-import jdk.graal.compiler.word.Word;
+import org.graalvm.word.impl.BarrieredAccess;
+import org.graalvm.word.impl.ObjectAccess;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 public class ReferenceAccessImpl implements ReferenceAccess {
 
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -53,7 +59,7 @@ public class ReferenceAccessImpl implements ReferenceAccess {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Word readObjectAsUntrackedPointer(Pointer p, boolean compressed) {
         Object obj = readObjectAt(p, compressed);
-        return Word.objectToUntrackedPointer(obj);
+        return Word.objectToUntrackedWord(obj);
     }
 
     @Override
@@ -62,7 +68,7 @@ public class ReferenceAccessImpl implements ReferenceAccess {
     public Object readObjectAt(Pointer p, boolean compressed) {
         Word w = (Word) p;
         if (compressed) {
-            return ObjectAccess.readObject(WordFactory.nullPointer(), p);
+            return ObjectAccess.readObject(Word.nullPointer(), p);
         } else {
             return w.readObject(0);
         }
@@ -74,7 +80,7 @@ public class ReferenceAccessImpl implements ReferenceAccess {
     public void writeObjectAt(Pointer p, Object value, boolean compressed) {
         Word w = (Word) p;
         if (compressed) {
-            ObjectAccess.writeObject(WordFactory.nullPointer(), p, value);
+            ObjectAccess.writeObject(Word.nullPointer(), p, value);
         } else {
             // this overload has no uncompression semantics
             w.writeObject(0, value);
@@ -96,12 +102,6 @@ public class ReferenceAccessImpl implements ReferenceAccess {
     public native Object uncompressReference(UnsignedWord ref);
 
     @Override
-    @Fold
-    public boolean haveCompressedReferences() {
-        return SubstrateOptions.SpawnIsolates.getValue();
-    }
-
-    @Override
     @AlwaysInline("Performance")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public CompressEncoding getCompressEncoding() {
@@ -110,14 +110,32 @@ public class ReferenceAccessImpl implements ReferenceAccess {
 
     @Fold
     @Override
-    public UnsignedWord getAddressSpaceSize() {
-        int compressionShift = ReferenceAccess.singleton().getCompressEncoding().getShift();
-        if (compressionShift > 0) {
-            int referenceSize = ConfigurationValues.getObjectLayout().getReferenceSize();
-            return WordFactory.unsigned(1L << (referenceSize * Byte.SIZE)).shiftLeft(compressionShift);
+    public UnsignedWord getMaxAddressSpaceSize() {
+        int referenceSize = ObjectLayout.singleton().getReferenceSize();
+        UnsignedWord addressSpaceSize;
+        if (referenceSize == Integer.BYTES) {
+            int compressionShift = ReferenceAccess.singleton().getCompressEncoding().getShift();
+            addressSpaceSize = Word.unsigned(1L << (referenceSize * Byte.SIZE)).shiftLeft(compressionShift);
+        } else {
+            assert referenceSize == Long.BYTES;
+            // Assume that 48 bit is the maximum address space that can be used.
+            addressSpaceSize = Word.unsigned((1L << 48) - 1);
         }
-        // Assume that 48 bit is the maximum address space that can be used.
-        return WordFactory.unsigned((1L << 48) - 1);
+
+        if (SubstrateOptions.ConcealedOptions.MaxReservedAddressSpaceSize.getValue() > 0) {
+            addressSpaceSize = UnsignedUtils.min(Word.unsigned(SubstrateOptions.ConcealedOptions.MaxReservedAddressSpaceSize.getValue()), addressSpaceSize);
+
+            if (SubstrateOptions.GraalOS.getValue()) {
+                /*
+                 * Use a smaller address space to avoid that individual mmap calls are larger than
+                 * the max. reserved address space size.
+                 */
+                assert addressSpaceSize.aboveThan(Heap.getHeap().getHeapBaseAlignment());
+                addressSpaceSize = addressSpaceSize.subtract(Heap.getHeap().getHeapBaseAlignment());
+            }
+        }
+
+        return addressSpaceSize;
     }
 
     @Fold

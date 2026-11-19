@@ -24,18 +24,19 @@
  */
 package com.oracle.svm.hosted.code;
 
+import com.oracle.svm.hosted.CFunctionOptionsGuestValue;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.graalvm.nativeimage.AnnotationAccess;
 import org.graalvm.nativeimage.c.function.CFunction;
 
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.function.CFunctionOptions;
+import com.oracle.svm.core.CFunctionGuestValue;
 import com.oracle.svm.core.graal.code.CGlobalDataInfo;
 import com.oracle.svm.core.thread.VMThreads.StatusSupport;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -45,8 +46,8 @@ public class CFunctionSubstitutionProcessor extends SubstitutionProcessor {
     @Override
     public ResolvedJavaMethod lookup(ResolvedJavaMethod method) {
         ResolvedJavaMethod wrapper = method;
-        if (method.isNative() && method.isAnnotationPresent(CFunction.class)) {
-            if (AnnotationAccess.isAnnotationPresent(method, Uninterruptible.class)) {
+        if (method.isNative() && GuestAnnotationAccess.isAnnotationPresent(method, CFunction.class)) {
+            if (GuestAnnotationAccess.isAnnotationPresent(method, GuestAccess.elements().Uninterruptible)) {
                 throw VMError.shouldNotReachHere("Native method '%s' incorrectly annotated with @Uninterruptible. Please use @CFunction(transition = NO_TRANSITION) instead.",
                                 method.format("%H.%n(%p)"));
             }
@@ -60,12 +61,12 @@ public class CFunctionSubstitutionProcessor extends SubstitutionProcessor {
     }
 
     private static int getNewThreadStatus(ResolvedJavaMethod method) {
-        CFunctionOptions cFunctionOptions = method.getAnnotation(CFunctionOptions.class);
+        CFunctionOptionsGuestValue cFunctionOptions = CFunctionOptionsGuestValue.get(method);
         if (cFunctionOptions != null) {
             return StatusSupport.getNewThreadStatus(cFunctionOptions.transition());
         }
 
-        CFunction cFunctionAnnotation = method.getAnnotation(CFunction.class);
+        CFunctionGuestValue cFunctionAnnotation = CFunctionGuestValue.get(method);
         if (cFunctionAnnotation != null) {
             return StatusSupport.getNewThreadStatus(cFunctionAnnotation.transition());
         }

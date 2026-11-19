@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,8 +34,12 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.InvalidPathException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.text.DateFormatSymbols;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Iterator;
 import java.util.ServiceLoader;
+import java.util.TimeZone;
 
 /**
  * Miscellaneous methods for modifying and generating file system paths.
@@ -83,6 +87,47 @@ public class PathUtilities {
      */
     public static String getPath(String first, String... more) {
         return PROVIDER.getPath(first, more);
+    }
+
+    /**
+     * This circumvents initializing path and date-formatting support at libgraal runtime. This is
+     * needed to avoid String-based class lookup, for example to find resource bundle
+     * {@code sun.text.resources.cldr.FormatData} as part of {@link SimpleDateFormat} construction,
+     * and allows us to avoid class-loading support in the image. Regular runtime compilation runs
+     * in a closed-world image. Ristretto additionally supports loading guest classes at runtime but
+     * prohibits class loading on compiler threads, so all compiler-owned path and date-formatting
+     * state must likewise be initialized before such a thread uses it.
+     */
+    private static final SimpleDateFormat SIMPLE_DATE_FORMAT = getSimpleDateFormat();
+
+    private static SimpleDateFormat getSimpleDateFormat() {
+        SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss.SSS");
+        /*
+         * Without explicit symbols, formatting can consult the locale provider for calendar
+         * display names even though SimpleDateFormat already contains the required symbols.
+         */
+        simpleDateFormat.setDateFormatSymbols(simpleDateFormat.getDateFormatSymbols());
+        simpleDateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+        /*
+         * Initialize the provider while PathUtilities itself is initialized so getting the first
+         * absolute diagnostic path cannot trigger class loading on a compiler thread.
+         */
+        getAbsolutePath(".");
+        return simpleDateFormat;
+    }
+
+    public static DateFormatSymbols getSharedDateFormatSymbols() {
+        // SimpleDateFormat is not thread-safe
+        synchronized (SIMPLE_DATE_FORMAT) {
+            return SIMPLE_DATE_FORMAT.getDateFormatSymbols();
+        }
+    }
+
+    public static String getDateString(Date date) {
+        // SimpleDateFormat is not thread-safe
+        synchronized (SIMPLE_DATE_FORMAT) {
+            return SIMPLE_DATE_FORMAT.format(date);
+        }
     }
 
     /**
@@ -170,7 +215,7 @@ public class PathUtilities {
      * way to get this in Java. Normally it is 255. But for AUFS it is 242. See AUFS_MAX_NAMELEN in
      * http://aufs.sourceforge.net/aufs3/man.html.
      */
-    private static final int MAX_FILE_NAME_LENGTH = 242;
+    public static final int MAX_FILE_NAME_LENGTH = 242;
 
     private static final String ELLIPSIS = "...";
 

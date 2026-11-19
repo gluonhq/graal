@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,10 +45,13 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.util.List;
 
+import com.oracle.truffle.api.RootCallTarget;
 import org.graalvm.polyglot.Context;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -73,6 +76,7 @@ import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest;
@@ -385,6 +389,63 @@ public class RootNodeTest {
         }
     }
 
+    static final class TestFindInstrumentableRootNode extends RootNode {
+
+        Node instrumentableNode;
+
+        TestFindInstrumentableRootNode(Node instrumentableNode) {
+            super(null);
+            this.instrumentableNode = instrumentableNode;
+        }
+
+        @Override
+        public Object execute(VirtualFrame frame) {
+            assertStacks();
+            return null;
+        }
+
+        @TruffleBoundary
+        private void assertStacks() {
+            Truffle.getRuntime().iterateFrames((e) -> {
+                if (e.getCallTarget() == getCallTarget()) {
+                    assertSame(instrumentableNode, e.getInstrumentableCallNode());
+                }
+                return e;
+            });
+
+            boolean found = false;
+            List<TruffleStackTraceElement> stackTrace = TruffleStackTrace.getStackTrace(new Exception());
+            for (TruffleStackTraceElement e : stackTrace) {
+                if (e.getTarget() == getCallTarget()) {
+                    assertSame(instrumentableNode, e.getInstrumentableLocation());
+                    found = true;
+                }
+            }
+            assertTrue(found);
+        }
+
+        @Override
+        protected Node findInstrumentableCallNode(Node callNode, Frame frame, int bytecodeIndex) {
+            return instrumentableNode;
+        }
+
+    }
+
+    @Test
+    public void testGetInstrumentableNode() {
+        new TestFindInstrumentableRootNode(null).getCallTarget().call();
+        Node node = new Node() {
+        };
+        RootNode root = new TestFindInstrumentableRootNode(node);
+        root.insert(node);
+        root.getCallTarget().call();
+
+        node = new Node() {
+        };
+        RootNode invalidRoot = new TestFindInstrumentableRootNode(node);
+        assertThrows(AssertionError.class, () -> invalidRoot.getCallTarget().call());
+    }
+
     private static TruffleStackTraceElement getStackTraceElementFor(Throwable t, RootNode rootNode) {
         for (TruffleStackTraceElement stackTraceElement : TruffleStackTrace.getStackTrace(t)) {
             if (rootNode == stackTraceElement.getTarget().getRootNode()) {
@@ -624,4 +685,125 @@ public class RootNodeTest {
 
     }
 
+    @Test
+    public void testInitializeCallTarget() {
+        CountingInitializationRootNode root = new CountingInitializationRootNode();
+        assertNull(TestAPIAccessor.nodeAccess().getCallTargetWithoutInitialization(root));
+
+        root.initializeCallTarget();
+        CallTarget target = TestAPIAccessor.nodeAccess().getCallTargetWithoutInitialization(root);
+        assertEquals(1, root.prepareCount);
+        assertEquals(0, root.executeCount);
+
+        root.initializeCallTarget();
+        assertSame(target, root.getCallTarget());
+        assertEquals(1, root.prepareCount);
+        assertEquals(42, root.call(null, -1, new Object[0]));
+        assertEquals(1, root.executeCount);
+    }
+
+    @Test
+    public void testRootCallsRequireInitializedCallTarget() {
+        CountingInitializationRootNode root = new CountingInitializationRootNode();
+        IndirectCallNode cached = IndirectCallNode.create();
+        IndirectCallNode uncached = IndirectCallNode.getUncached();
+
+        assertThrows(IllegalStateException.class, () -> root.call(null, -1, new Object[0]));
+        assertThrows(IllegalStateException.class, () -> cached.call(root, -1, new Object[0]));
+        assertThrows(IllegalStateException.class, () -> uncached.call(root, -1, new Object[0]));
+        assertNull(TestAPIAccessor.nodeAccess().getCallTargetWithoutInitialization(root));
+        assertEquals(0, root.prepareCount);
+        assertEquals(0, root.executeCount);
+
+        root.initializeCallTarget();
+        assertEquals(42, root.call(null, -1, new Object[0]));
+        assertEquals(42, cached.call(root, -1, new Object[0]));
+        assertEquals(42, uncached.call(root, -1, new Object[0]));
+        assertEquals(1, root.prepareCount);
+        assertEquals(3, root.executeCount);
+    }
+
+    private static final class CountingInitializationRootNode extends RootNode {
+        private int prepareCount;
+        private int executeCount;
+
+        CountingInitializationRootNode() {
+            super(null);
+        }
+
+        @Override
+        public Object execute(VirtualFrame frame) {
+            executeCount++;
+            return 42;
+        }
+
+        @Override
+        protected void prepareForCall() {
+            prepareCount++;
+        }
+    }
+
+    @Test
+    public void testPrepareForCall() {
+        LazyInitializedRootNode root = new LazyInitializedRootNode();
+        assertEquals(false, root.execute(null));
+        RootCallTarget rootCallTarget = root.getCallTarget();
+        assertEquals(true, rootCallTarget.call());
+    }
+
+    static final class LazyInitializedRootNode extends RootNode {
+        private boolean isInitialized = false;
+
+        LazyInitializedRootNode() {
+            super(null);
+        }
+
+        @Override
+        public Object execute(VirtualFrame frame) {
+            return isInitialized;
+        }
+
+        @Override
+        protected void prepareForCall() {
+            isInitialized = true;
+        }
+    }
+
+    @Test
+    public void testPrepareForCallPreventCall() {
+        PreventCallWhenUninitializedRootNode root = new PreventCallWhenUninitializedRootNode();
+        assertEquals(false, root.execute(null));
+        root.initialize();
+        assertEquals(true, root.getCallTarget().call());
+
+        PreventCallWhenUninitializedRootNode root2 = new PreventCallWhenUninitializedRootNode();
+        assertEquals(false, root2.execute(null));
+        assertThrows(IllegalStateException.class, root2::getCallTarget);
+        assertThrows(IllegalStateException.class, root2::initializeCallTarget);
+        assertNull(TestAPIAccessor.nodeAccess().getCallTargetWithoutInitialization(root2));
+    }
+
+    static final class PreventCallWhenUninitializedRootNode extends RootNode {
+        private boolean isInitialized = false;
+
+        PreventCallWhenUninitializedRootNode() {
+            super(null);
+        }
+
+        @Override
+        public Object execute(VirtualFrame frame) {
+            return isInitialized;
+        }
+
+        public void initialize() {
+            isInitialized = true;
+        }
+
+        @Override
+        protected void prepareForCall() {
+            if (!isInitialized) {
+                throw new IllegalStateException("Root node is not ready to be used as a call target.");
+            }
+        }
+    }
 }

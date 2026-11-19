@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,11 +40,17 @@
  */
 package org.graalvm.wasm.test;
 
+import static org.graalvm.wasm.test.WasmTestUtils.hexStringToByteArray;
 import static org.graalvm.wasm.utils.WasmBinaryTools.compileWat;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.function.Consumer;
 
@@ -53,13 +59,16 @@ import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.ByteSequence;
 import org.graalvm.wasm.ModuleLimits;
+import org.graalvm.wasm.WasmCodeEntry;
 import org.graalvm.wasm.WasmConstant;
 import org.graalvm.wasm.WasmContext;
+import org.graalvm.wasm.WasmFunction;
 import org.graalvm.wasm.WasmFunctionInstance;
 import org.graalvm.wasm.WasmInstance;
 import org.graalvm.wasm.WasmLanguage;
 import org.graalvm.wasm.WasmModule;
 import org.graalvm.wasm.WasmTable;
+import org.graalvm.wasm.WasmType;
 import org.graalvm.wasm.api.ByteArrayBuffer;
 import org.graalvm.wasm.api.Dictionary;
 import org.graalvm.wasm.api.Executable;
@@ -68,19 +77,25 @@ import org.graalvm.wasm.api.InteropArray;
 import org.graalvm.wasm.api.ModuleExportDescriptor;
 import org.graalvm.wasm.api.ModuleImportDescriptor;
 import org.graalvm.wasm.api.Sequence;
-import org.graalvm.wasm.api.TableKind;
-import org.graalvm.wasm.api.ValueType;
 import org.graalvm.wasm.api.WebAssembly;
 import org.graalvm.wasm.constants.Sizes;
+import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
 import org.graalvm.wasm.exception.WasmJsApiException;
-import org.graalvm.wasm.globals.DefaultWasmGlobal;
+import org.graalvm.wasm.exception.WasmRuntimeException;
 import org.graalvm.wasm.globals.WasmGlobal;
 import org.graalvm.wasm.memory.WasmMemory;
-import org.graalvm.wasm.predefined.testutil.TestutilModule;
+import org.graalvm.wasm.memory.WasmMemoryLibrary;
+import org.graalvm.wasm.nodes.WasmFixedMemoryImplFunctionNode;
+import org.graalvm.wasm.nodes.WasmMemoryOverheadModeFunctionRootNode;
+import org.graalvm.wasm.types.NumberType;
+import org.graalvm.wasm.types.ReferenceType;
+import org.graalvm.wasm.utils.WasmBinaryTools;
 import org.junit.Assert;
 import org.junit.Test;
 
+import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.TruffleStackTrace;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.ArityException;
@@ -89,14 +104,27 @@ import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
 import com.oracle.truffle.api.interop.InvalidBufferOffsetException;
-import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.api.nodes.NodeUtil;
 import com.oracle.truffle.api.nodes.RootNode;
 
 public class WasmJsApiSuite {
     private static final String REF_TYPES_OPTION = "wasm.BulkMemoryAndRefTypes";
+    private static final String EXCEPTIONS_OPTION = "wasm.Exceptions";
+
+    private static WasmFunctionInstance createWasmFunctionInstance(WasmContext context, int[] paramTypes, int[] resultTypes, RootNode functionRootNode) {
+        WasmModule module = WasmModule.createBuiltin(context.language(), "dummyModule");
+        module.allocateFunctionType(paramTypes, resultTypes, context.getContextOptions().supportMultiValue(), context.language());
+        WasmFunction func = module.declareFunction(0);
+        func.setTarget(functionRootNode.getCallTarget());
+        WasmInstance moduleInstance = context.contextStore().readInstance(module);
+        // Perform normal linking steps, incl. assignTypeEquivalenceClasses().
+        // Functions need to have type equivalence classes assigned for indirect calls.
+        moduleInstance.store().linker().tryLink(moduleInstance);
+        return new WasmFunctionInstance(moduleInstance, func, functionRootNode.getCallTarget());
+    }
 
     @Test
     public void testCompile() throws IOException {
@@ -138,6 +166,53 @@ public class WasmJsApiSuite {
     }
 
     @Test
+    public void testMemoryOverheadModeRetainsFunctionGraph() throws ReflectiveOperationException {
+        try (Context context = Context.newBuilder(WasmLanguage.ID).allowExperimentalOptions(true).option("wasm.MemoryOverheadMode", "true").build()) {
+            context.initialize(WasmLanguage.ID);
+            context.enter();
+            try {
+                WebAssembly wasm = new WebAssembly(WasmContext.get(null));
+                WasmModule module = wasm.moduleDecode(binaryWithExports);
+                Assert.assertNotNull(module.codeEntries());
+                WasmInstance instance = wasm.moduleInstantiate(module, WasmConstant.NULL);
+                Assert.assertNull(module.codeEntries());
+
+                Field codeEntryField = WasmMemoryOverheadModeFunctionRootNode.class.getDeclaredField("codeEntry");
+                codeEntryField.setAccessible(true);
+                for (int functionIndex = 0; functionIndex < module.numFunctions(); functionIndex++) {
+                    RootNode root = ((RootCallTarget) instance.target(functionIndex)).getRootNode();
+                    Assert.assertTrue(root instanceof WasmMemoryOverheadModeFunctionRootNode);
+                    Assert.assertEquals(1, NodeUtil.findAllNodeInstances(root, WasmFixedMemoryImplFunctionNode.class).size());
+                    WasmCodeEntry codeEntry = (WasmCodeEntry) codeEntryField.get(root);
+                    Assert.assertNotNull(codeEntry);
+                    Assert.assertSame(module.function(functionIndex), codeEntry.function());
+                    Assert.assertSame(module.bytecode(), codeEntry.bytecode());
+                }
+            } finally {
+                context.leave();
+            }
+        }
+    }
+
+    @Test
+    public void testMemoryOverheadModeProhibitsExecution() throws InteropException {
+        try (Context context = Context.newBuilder(WasmLanguage.ID).allowExperimentalOptions(true).option("wasm.MemoryOverheadMode", "true").build()) {
+            context.initialize(WasmLanguage.ID);
+            context.enter();
+            try {
+                WebAssembly wasm = new WebAssembly(WasmContext.get(null));
+                WasmModule module = wasm.moduleDecode(binaryWithExports);
+                WasmInstance instance = wasm.moduleInstantiate(module, WasmConstant.NULL);
+                Object main = WebAssembly.instanceExport(instance, "main");
+                WasmException exception = Assert.assertThrows(WasmException.class, () -> InteropLibrary.getUncached(main).execute(main));
+                Assert.assertEquals(Failure.MEMORY_OVERHEAD_MODE.name, InteropLibrary.getUncached(exception).readMember(exception, "failure"));
+            } finally {
+                context.leave();
+            }
+        }
+    }
+
+    @Test
     public void testInstantiateWithImports() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
@@ -162,6 +237,7 @@ public class WasmJsApiSuite {
         runMemoryTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             final WasmMemory memory = WebAssembly.memAlloc(4, 8, false);
+            final WasmMemoryLibrary memoryLib = WasmMemoryLibrary.getUncached();
             final Dictionary importObject = Dictionary.create(new Object[]{
                             "host", Dictionary.create(new Object[]{
                                             "defaultMemory", memory
@@ -170,9 +246,9 @@ public class WasmJsApiSuite {
             final WasmInstance instance = moduleInstantiate(wasm, binaryWithMemoryImport, importObject);
             try {
                 final Object initZero = WebAssembly.instanceExport(instance, "initZero");
-                Assert.assertEquals("Must be zero initially.", 0, memory.load_i32(null, 0));
+                Assert.assertEquals("Must be zero initially.", 0, memoryLib.load_i32(memory, null, 0));
                 InteropLibrary.getUncached(initZero).execute(initZero);
-                Assert.assertEquals("Must be 174 after initialization.", 174, memory.load_i32(null, 0));
+                Assert.assertEquals("Must be 174 after initialization.", 174, memoryLib.load_i32(memory, null, 0));
             } catch (InteropException e) {
                 throw new RuntimeException(e);
             }
@@ -186,8 +262,9 @@ public class WasmJsApiSuite {
             WasmInstance instance = moduleInstantiate(wasm, binaryWithMemoryExport, null);
             try {
                 final WasmMemory memory = (WasmMemory) WebAssembly.instanceExport(instance, "memory");
+                final WasmMemoryLibrary memoryLib = WasmMemoryLibrary.getUncached();
                 final Object readZero = WebAssembly.instanceExport(instance, "readZero");
-                memory.store_i32(null, 0, 174);
+                memoryLib.store_i32(memory, null, 0, 174);
                 final Object result = InteropLibrary.getUncached(readZero).execute(readZero);
                 Assert.assertEquals("Must be 174.", 174, InteropLibrary.getUncached(result).asInt(result));
             } catch (InteropException e) {
@@ -200,19 +277,19 @@ public class WasmJsApiSuite {
     public void testInstantiateWithImportTable() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmTable table = wasm.tableAlloc(4, 8, TableKind.anyfunc, WasmConstant.NULL);
+            final WasmTable table = wasm.tableAlloc(4, 8, ReferenceType.FUNCREF, WasmConstant.NULL);
             Dictionary importObject = Dictionary.create(new Object[]{
                             "host", Dictionary.create(new Object[]{
                                             "defaultTable", table
                             }),
             });
-            wasm.tableWrite(table, 0, new WasmFunctionInstance(context,
+            wasm.tableWrite(table, 0, createWasmFunctionInstance(context, WasmType.VOID_TYPE_ARRAY, WasmType.I32_TYPE_ARRAY,
                             new RootNode(context.language()) {
                                 @Override
                                 public Object execute(VirtualFrame frame) {
                                     return 210;
                                 }
-                            }.getCallTarget()));
+                            }));
             final WasmInstance instance = moduleInstantiate(wasm, binaryWithTableImport, importObject);
             try {
                 final Object callFirst = WebAssembly.instanceExport(instance, "callFirst");
@@ -242,7 +319,7 @@ public class WasmJsApiSuite {
     private static void checkInstantiateWithImportGlobal(byte[] binaryWithGlobalImport, String globalType, Object globalValue) throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = wasm.globalAlloc(ValueType.valueOf(globalType), false, globalValue);
+            final WasmGlobal global = wasm.globalAlloc(WebAssembly.parseInteropValueType(globalType), false, globalValue);
             Dictionary importObject = Dictionary.create(new Object[]{
                             "host", Dictionary.create(new Object[]{
                                             "defaultGlobal", global
@@ -289,7 +366,7 @@ public class WasmJsApiSuite {
             final WebAssembly wasm = new WebAssembly(context);
             final WasmInstance exportInstance = moduleInstantiate(wasm, binaryWithExports, null);
             final Object func = WebAssembly.instanceExport(exportInstance, "main");
-            final WasmGlobal global = wasm.globalAlloc(ValueType.anyfunc, false, func);
+            final WasmGlobal global = wasm.globalAlloc(ReferenceType.FUNCREF, false, func);
             Dictionary importObject = Dictionary.create(new Object[]{
                             "host", Dictionary.create(new Object[]{
                                             "defaultGlobal", global
@@ -325,7 +402,7 @@ public class WasmJsApiSuite {
         runTest(WasmJsApiSuite::disableRefTypes, context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.anyfunc, false, WasmConstant.NULL);
+                wasm.globalAlloc(ReferenceType.FUNCREF, false, WasmConstant.NULL);
                 Assert.fail("Should have failed - ref types not enabled");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -338,7 +415,7 @@ public class WasmJsApiSuite {
         runTest(WasmJsApiSuite::disableRefTypes, context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.externref, false, WasmConstant.NULL);
+                wasm.globalAlloc(ReferenceType.EXTERNREF, false, WasmConstant.NULL);
                 Assert.fail("Should have failed - ref types not enabled");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -351,7 +428,7 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.i32, true, WasmConstant.NULL);
+                wasm.globalAlloc(NumberType.I32, true, WasmConstant.NULL);
                 Assert.fail("Should have failed - invalid global type");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -364,7 +441,7 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.anyfunc, true, 0);
+                wasm.globalAlloc(ReferenceType.FUNCREF, true, 0);
                 Assert.fail("Should have failed - invalid global type");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -377,7 +454,7 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.anyfunc, true, "foo");
+                wasm.globalAlloc(ReferenceType.FUNCREF, true, "foo");
                 Assert.fail("Should have failed - invalid global type");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -390,7 +467,7 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.globalAlloc(ValueType.anyfunc, true, new Executable(args -> 0));
+                wasm.globalAlloc(ReferenceType.FUNCREF, true, new Executable(args -> 0));
                 Assert.fail("Should have failed - invalid global type");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -402,8 +479,8 @@ public class WasmJsApiSuite {
     public void testCreateRefTypeGlobalWithNull() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            wasm.globalAlloc(ValueType.anyfunc, true, WasmConstant.NULL);
-            wasm.globalAlloc(ValueType.externref, true, WasmConstant.NULL);
+            wasm.globalAlloc(ReferenceType.FUNCREF, true, WasmConstant.NULL);
+            wasm.globalAlloc(ReferenceType.EXTERNREF, true, WasmConstant.NULL);
         });
     }
 
@@ -411,14 +488,15 @@ public class WasmJsApiSuite {
     public void testGlobalWriteAnyfuncToI32() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = wasm.globalAlloc(ValueType.i32, true, 0);
+            final WasmGlobal global = wasm.globalAlloc(NumberType.I32, true, 0);
             try {
-                wasm.globalWrite(global, new WasmFunctionInstance(context, new RootNode(context.language()) {
-                    @Override
-                    public Object execute(VirtualFrame frame) {
-                        return 0;
-                    }
-                }.getCallTarget()));
+                wasm.globalWrite(global, createWasmFunctionInstance(context, WasmType.VOID_TYPE_ARRAY, WasmType.I32_TYPE_ARRAY,
+                                new RootNode(context.language()) {
+                                    @Override
+                                    public Object execute(VirtualFrame frame) {
+                                        return 0;
+                                    }
+                                }));
                 Assert.fail("Should have failed - invalid global type");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
@@ -430,7 +508,7 @@ public class WasmJsApiSuite {
     public void testGlobalWriteExternrefToI32() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = wasm.globalAlloc(ValueType.i32, true, 0);
+            final WasmGlobal global = wasm.globalAlloc(NumberType.I32, true, 0);
             try {
                 wasm.globalWrite(global, "foo");
                 Assert.fail("Should have failed - invalid global type");
@@ -444,7 +522,7 @@ public class WasmJsApiSuite {
     public void testGlobalWriteObjectToAnyfunc() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = wasm.globalAlloc(ValueType.anyfunc, true, WasmConstant.NULL);
+            final WasmGlobal global = wasm.globalAlloc(ReferenceType.FUNCREF, true, WasmConstant.NULL);
             try {
                 wasm.globalWrite(global, "foo");
                 Assert.fail("Should have failed - invalid global type");
@@ -458,7 +536,7 @@ public class WasmJsApiSuite {
     public void testGlobalWriteOrdinaryFuncToAnyfunc() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = wasm.globalAlloc(ValueType.anyfunc, true, WasmConstant.NULL);
+            final WasmGlobal global = wasm.globalAlloc(ReferenceType.FUNCREF, true, WasmConstant.NULL);
             try {
                 wasm.globalWrite(global, new Executable(args -> 0));
                 Assert.fail("Should have failed - invalid global type");
@@ -472,8 +550,8 @@ public class WasmJsApiSuite {
     public void testGlobalWriteNull() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal anyfunc = wasm.globalAlloc(ValueType.anyfunc, true, WasmConstant.NULL);
-            final WasmGlobal externref = wasm.globalAlloc(ValueType.externref, true, WasmConstant.NULL);
+            final WasmGlobal anyfunc = wasm.globalAlloc(ReferenceType.FUNCREF, true, WasmConstant.NULL);
+            final WasmGlobal externref = wasm.globalAlloc(ReferenceType.EXTERNREF, true, WasmConstant.NULL);
             wasm.globalWrite(anyfunc, WasmConstant.NULL);
             wasm.globalWrite(externref, WasmConstant.NULL);
         });
@@ -483,7 +561,7 @@ public class WasmJsApiSuite {
     public void testGlobalWriteAnyfuncRefTypesDisabled() throws IOException {
         runTest(WasmJsApiSuite::disableRefTypes, context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = new DefaultWasmGlobal(ValueType.anyfunc, true, WasmConstant.NULL);
+            final WasmGlobal global = WasmGlobal.allocRef(ReferenceType.FUNCREF, true, WasmConstant.NULL);
             try {
                 wasm.globalWrite(global, WasmConstant.NULL);
                 Assert.fail("Should have failed - ref types not enabled");
@@ -497,7 +575,7 @@ public class WasmJsApiSuite {
     public void testGlobalWriteExternrefRefTypesDisabled() throws IOException {
         runTest(WasmJsApiSuite::disableRefTypes, context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmGlobal global = new DefaultWasmGlobal(ValueType.externref, true, WasmConstant.NULL);
+            final WasmGlobal global = WasmGlobal.allocRef(ReferenceType.EXTERNREF, true, WasmConstant.NULL);
             try {
                 wasm.globalWrite(global, WasmConstant.NULL);
                 Assert.fail("Should have failed - ref types not enabled");
@@ -600,13 +678,13 @@ public class WasmJsApiSuite {
             final WasmInstance instance = moduleInstantiate(wasm, exportMemoryTwice, null);
             final InteropLibrary lib = InteropLibrary.getUncached();
             try {
-                final Object f = new WasmFunctionInstance(context,
+                final Object f = createWasmFunctionInstance(context, WasmType.VOID_TYPE_ARRAY, WasmType.I32_TYPE_ARRAY,
                                 new RootNode(context.language()) {
                                     @Override
                                     public Object execute(VirtualFrame frame) {
                                         return 42;
                                     }
-                                }.getCallTarget());
+                                });
                 final Object writeTable = wasm.readMember("table_write");
                 final Object readTable = wasm.readMember("table_read");
                 final Object a = WebAssembly.instanceExport(instance, "a");
@@ -834,13 +912,13 @@ public class WasmJsApiSuite {
             context.readModule(binaryWithMixedExports, limits);
 
             final int noLimit = Integer.MAX_VALUE;
-            limits = new ModuleLimits(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, 6, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit,
-                            noLimit);
+            limits = new ModuleLimits(noLimit, noLimit, noLimit, noLimit, noLimit, 6, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit,
+                            noLimit, noLimit, noLimit, noLimit);
             context.readModule(binaryWithMixedExports, limits);
 
             try {
-                limits = new ModuleLimits(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, 5, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit,
-                                noLimit);
+                limits = new ModuleLimits(noLimit, noLimit, noLimit, noLimit, noLimit, 5, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit,
+                                noLimit, noLimit, noLimit, noLimit);
                 context.readModule(binaryWithMixedExports, limits);
                 Assert.fail("Should have failed - export count exceeds the limit");
             } catch (WasmException ex) {
@@ -886,15 +964,13 @@ public class WasmJsApiSuite {
             final WasmInstance instance = moduleInstantiate(wasm, binaryWithMixedExports, null);
             final InteropLibrary lib = InteropLibrary.getUncached();
 
-            WasmContext wasmContext = WasmContext.get(null);
-            final WasmFunctionInstance functionInstance = new WasmFunctionInstance(
-                            wasmContext,
-                            new RootNode(wasmContext.language()) {
+            final WasmFunctionInstance functionInstance = createWasmFunctionInstance(context, WasmType.VOID_TYPE_ARRAY, WasmType.I32_TYPE_ARRAY,
+                            new RootNode(context.language()) {
                                 @Override
                                 public Object execute(VirtualFrame frame) {
                                     return 42;
                                 }
-                            }.getCallTarget());
+                            });
 
             // We should be able to set element 1.
             try {
@@ -1377,8 +1453,8 @@ public class WasmJsApiSuite {
             final WebAssembly wasm = new WebAssembly(context);
             final WasmInstance instance = moduleInstantiate(wasm, source, null);
             final WasmFunctionInstance fn = (WasmFunctionInstance) WebAssembly.instanceExport(instance, "func");
-            final String fnType = WebAssembly.functionTypeToString(fn.function());
-            Assert.assertEquals("func_type", "0(i32 i64)f32", fnType);
+            final String fnInfo = WebAssembly.functionInfo(fn.function());
+            Assert.assertEquals("func_type", "0(i32 i64)f32", fnInfo);
         });
     }
 
@@ -1389,14 +1465,21 @@ public class WasmJsApiSuite {
             final WebAssembly wasm = new WebAssembly(context);
             final WasmInstance instance = moduleInstantiate(wasm, source, null);
             final WasmFunctionInstance fn = (WasmFunctionInstance) WebAssembly.instanceExport(instance, "f");
-            final String fnType = WebAssembly.functionTypeToString(fn.function());
-            Assert.assertEquals("func_type", "0(i32 i64)f32 f64", fnType);
+            final String fnInfo = WebAssembly.functionInfo(fn.function());
+            Assert.assertEquals("func_type", "0(i32 i64)f32 f64", fnInfo);
         });
     }
 
     @Test
     public void testMultiValueReferencePassThrough() throws IOException, InterruptedException {
-        final byte[] source = compileWat("data", """
+        final byte[] source1 = compileWat("data", """
+                        (module
+                        (type (func (result i32)))
+                        (func (export "func") (type 0)
+                        i32.const 42
+                        ))
+                        """);
+        final byte[] source2 = compileWat("data", """
                         (module
                         (type (func (result funcref externref)))
                         (import "m" "f" (func (type 0)))
@@ -1406,7 +1489,8 @@ public class WasmJsApiSuite {
                         """);
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final var func = new Executable((args) -> 0);
+            final WasmInstance instance1 = moduleInstantiate(wasm, source1, null);
+            final Object func = WebAssembly.instanceExport(instance1, "func");
             final var f = new Executable((args) -> {
                 final Object[] result = new Object[2];
                 result[0] = func;
@@ -1414,8 +1498,8 @@ public class WasmJsApiSuite {
                 return InteropArray.create(result);
             });
             final Dictionary importObject = Dictionary.create(new Object[]{"m", Dictionary.create(new Object[]{"f", f})});
-            final WasmInstance instance = moduleInstantiate(wasm, source, importObject);
-            final Object main = WebAssembly.instanceExport(instance, "main");
+            final WasmInstance instance2 = moduleInstantiate(wasm, source2, importObject);
+            final Object main = WebAssembly.instanceExport(instance2, "main");
             final InteropLibrary lib = InteropLibrary.getUncached();
             try {
                 Object result = lib.execute(main);
@@ -1431,13 +1515,12 @@ public class WasmJsApiSuite {
     }
 
     @Test
-    public void testInitialMemorySizeOutOfBounds() throws IOException {
+    public void testInitialMemoryOver2GB() throws IOException {
         runMemoryTest(context -> {
-            try {
-                WebAssembly.memAlloc(32768, 32770, false);
-                Assert.fail("Should have failed - initial memory size exceeds implementation limit");
-            } catch (WasmJsApiException e) {
-                Assert.assertEquals("Range error expected", WasmJsApiException.Kind.RangeError, e.kind());
+            // Unsafe memory required for memories of size >= 2GB
+            if (context.getContextOptions().useUnsafeMemory()) {
+                WasmMemory memory = WebAssembly.memAlloc(32769, 32770, false);
+                Assert.assertEquals("memory size >= 2GB supported", 32769, WasmMemoryLibrary.getUncached().size(memory));
             }
         });
     }
@@ -1468,12 +1551,58 @@ public class WasmJsApiSuite {
     }
 
     @Test
+    public void testMemoryWithoutDeclaredMaximum() throws IOException {
+        runMemoryTest(context -> {
+            WasmMemory memory = WebAssembly.memAlloc(1, Sizes.NO_MEMORY_MAXIMUM, false);
+            Assert.assertFalse(memory.hasDeclaredMaxSize());
+            Assert.assertEquals(Sizes.NO_MEMORY_MAXIMUM, memory.declaredMaxSize());
+            Assert.assertEquals(Sizes.NO_MEMORY_MAXIMUM, WebAssembly.memMax(memory));
+            Assert.assertEquals(1, WebAssembly.memGrow(memory, 1));
+        });
+    }
+
+    @Test
+    public void testMemoryWithDeclaredMaximum() throws IOException {
+        runMemoryTest(context -> {
+            WasmMemory memory = WebAssembly.memAlloc(1, 2, false);
+            Assert.assertEquals(2, WebAssembly.memMax(memory));
+        });
+    }
+
+    @Test
+    public void testMemory64AllocationAndGrow() throws IOException {
+        runTest(options -> {
+            options.option("wasm.Memory64", "true");
+            options.option("wasm.UseUnsafeMemory", "true");
+        }, context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final InteropLibrary lib = InteropLibrary.getUncached();
+            try {
+                final Object memAlloc = wasm.readMember("mem_alloc");
+                final Object memGrow = wasm.readMember("mem_grow");
+                final WasmMemory memory = (WasmMemory) lib.execute(memAlloc, 1L, 3L, false, true);
+                Assert.assertTrue(memory.hasIndexType64());
+                Assert.assertEquals(1L, lib.execute(memGrow, memory, 1L));
+                Assert.assertEquals(2L, WasmMemoryLibrary.getUncached().size(memory));
+                try {
+                    lib.execute(memGrow, memory, Long.MAX_VALUE);
+                    Assert.fail("Expected a range error");
+                } catch (WasmJsApiException e) {
+                    Assert.assertEquals(WasmJsApiException.Kind.RangeError, e.kind());
+                }
+            } catch (InteropException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    @Test
     public void testInitialTableSizeOutOfBounds() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
                 // Negative numbers represent unsigned values
-                wasm.tableAlloc(-10, -8, TableKind.anyfunc, WasmConstant.NULL);
+                wasm.tableAlloc(-10, -8, ReferenceType.FUNCREF, WasmConstant.NULL);
                 Assert.fail("Should have failed - initial table size exceeds implementation limit");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Range error expected", WasmJsApiException.Kind.RangeError, e.kind());
@@ -1486,7 +1615,7 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                wasm.tableAlloc(2, 1, TableKind.anyfunc, WasmConstant.NULL);
+                wasm.tableAlloc(2, 1, ReferenceType.FUNCREF, WasmConstant.NULL);
                 Assert.fail("Should have failed - min table size bigger than max size");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Range error expected", WasmJsApiException.Kind.RangeError, e.kind());
@@ -1499,12 +1628,82 @@ public class WasmJsApiSuite {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
             try {
-                WasmTable table = wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL);
+                WasmTable table = wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL);
                 WebAssembly.tableGrow(table, 1, WasmConstant.NULL);
                 Assert.fail("Should have failed - try to grow table beyond max size");
             } catch (WasmJsApiException e) {
                 Assert.assertEquals("Range error expected", WasmJsApiException.Kind.RangeError, e.kind());
             }
+        });
+    }
+
+    @Test
+    public void testTableGrowRejectsInvalidConcreteReference() throws IOException {
+        /*
+         * Equivalent WAT:
+         *
+         * (module
+         *   (type $small (struct (field i32)))
+         *   (type $big (struct (field i32) (field i32)))
+         *   (table (export "table") 1 2 (ref null $big))
+         *   (func (export "makeSmall") (result (ref $small))
+         *     i32.const 42
+         *     struct.new $small)
+         * )
+         */
+        final byte[] tableModule = hexStringToByteArray(
+                        "0061736d010000000110035f017f005f027f007f006000016400030201020406",
+                        "016301010102071502057461626c650100096d616b65536d616c6c00000a0901",
+                        "0700412afb00000b");
+        runTest(options -> options.option("wasm.GC", "true"), context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final WasmInstance instance = moduleInstantiate(wasm, tableModule, null);
+            final WasmTable table = (WasmTable) WebAssembly.instanceExport(instance, "table");
+
+            assertTableGrowRejectsTypeError(table, 42);
+
+            final Object small;
+            try {
+                final Object makeSmall = WebAssembly.instanceExport(instance, "makeSmall");
+                small = InteropLibrary.getUncached().execute(makeSmall);
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+            assertTableGrowRejectsTypeError(table, small);
+            Assert.assertEquals("Invalid growth must not change the table size", 1, table.size());
+        });
+    }
+
+    private static void assertTableGrowRejectsTypeError(WasmTable table, Object value) {
+        try {
+            WebAssembly.tableGrow(table, 1, value);
+            Assert.fail("Table.grow must reject a value incompatible with the table element type");
+        } catch (WasmJsApiException e) {
+            Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
+        }
+    }
+
+    @Test
+    public void testTableAllocRejectsInvalidFuncrefValue() throws IOException {
+        runTest(context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            try {
+                wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, 42);
+                Assert.fail("Table allocation must reject a value incompatible with the table element type");
+            } catch (WasmJsApiException e) {
+                Assert.assertEquals("Type error expected", WasmJsApiException.Kind.TypeError, e.kind());
+            }
+        });
+    }
+
+    @Test
+    public void testTableAllocAcceptsExternrefValue() throws IOException {
+        runTest(context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final Object value = new Object();
+            final WasmTable table = wasm.tableAlloc(2, 2, ReferenceType.EXTERNREF, value);
+            Assert.assertSame("Initial externref value should be stored at index 0", value, WebAssembly.tableRead(table, 0));
+            Assert.assertSame("Initial externref value should be stored at index 1", value, WebAssembly.tableRead(table, 1));
         });
     }
 
@@ -1515,7 +1714,7 @@ public class WasmJsApiSuite {
             final InteropLibrary lib = InteropLibrary.getUncached();
             try {
                 final Object tableAlloc = wasm.readMember("table_alloc");
-                lib.execute(tableAlloc, 1, 1, "anyfunc", WasmConstant.NULL);
+                lib.execute(tableAlloc, 1, 1, "funcref", WasmConstant.NULL);
             } catch (UnknownIdentifierException | UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
                 throw new RuntimeException(e);
             }
@@ -1595,7 +1794,7 @@ public class WasmJsApiSuite {
             try {
                 final Object tableAlloc = wasm.readMember("table_alloc");
                 final Object tableGet = wasm.readMember("table_read");
-                final Object table = lib.execute(tableAlloc, 1, "anyfunc", WasmConstant.NULL);
+                final Object table = lib.execute(tableAlloc, 1, "funcref", WasmConstant.NULL);
                 final Object value = lib.execute(tableGet, table, 0);
                 Assert.assertEquals("Element should be null", WasmConstant.NULL, value);
             } catch (UnknownIdentifierException | UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
@@ -1612,7 +1811,7 @@ public class WasmJsApiSuite {
             try {
                 final Object tableAlloc = wasm.readMember("table_alloc");
                 final Object tableGet = wasm.readMember("table_read");
-                final Object table = lib.execute(tableAlloc, 1, 1, "anyfunc", WasmConstant.NULL);
+                final Object table = lib.execute(tableAlloc, 1, 1, "funcref", WasmConstant.NULL);
                 final Object value = lib.execute(tableGet, table, 0);
                 Assert.assertEquals("Element should be null", WasmConstant.NULL, value);
             } catch (UnknownIdentifierException | UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
@@ -1628,7 +1827,7 @@ public class WasmJsApiSuite {
             final InteropLibrary lib = InteropLibrary.getUncached();
             try {
                 final Object tableAlloc = wasm.readMember("table_alloc");
-                lib.execute(tableAlloc, "a", 1, "anyfunc", WasmConstant.NULL);
+                lib.execute(tableAlloc, "a", 1, "funcref", WasmConstant.NULL);
                 Assert.fail("Should have thrown");
             } catch (UnknownIdentifierException | UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
                 throw new RuntimeException(e);
@@ -1646,9 +1845,9 @@ public class WasmJsApiSuite {
             try {
                 final Object tableAlloc = wasm.readMember("table_alloc");
                 final Object tableRead = wasm.readMember("table_read");
-                final Object table = lib.execute(tableAlloc, 1, "anyfunc", "anyfunc", WasmConstant.NULL);
+                final Object table = lib.execute(tableAlloc, 1, "funcref", WasmConstant.NULL, "funcref");
                 final Object value = lib.execute(tableRead, table, 0);
-                Assert.assertEquals("Element should be anyfunc", "anyfunc", value);
+                Assert.assertEquals("Element should be null", WasmConstant.NULL, value);
             } catch (UnknownIdentifierException | UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
                 throw new RuntimeException(e);
             }
@@ -1679,7 +1878,7 @@ public class WasmJsApiSuite {
     public void testGlobalEmbedderData() throws IOException {
         runTest(context -> {
             WebAssembly wasm = new WebAssembly(context);
-            WasmGlobal global = wasm.globalAlloc(ValueType.i32, false, 0);
+            WasmGlobal global = wasm.globalAlloc(NumberType.I32, false, 0);
             checkEmbedderData(global);
         });
     }
@@ -1696,7 +1895,7 @@ public class WasmJsApiSuite {
     public void testTableEmbedderData() throws IOException {
         runTest(context -> {
             final WebAssembly wasm = new WebAssembly(context);
-            final WasmTable table = wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL);
+            final WasmTable table = wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL);
             checkEmbedderData(table);
         });
     }
@@ -2105,15 +2304,15 @@ public class WasmJsApiSuite {
             WebAssembly wasm = new WebAssembly(context);
             Dictionary importObject = Dictionary.create(new Object[]{
                             "globals", Dictionary.create(new Object[]{
-                                            "global0", wasm.globalAlloc(ValueType.i32, false, 1),
-                                            "global1", wasm.globalAlloc(ValueType.i32, false, 2),
-                                            "global2", wasm.globalAlloc(ValueType.i32, false, 3),
-                                            "global3", wasm.globalAlloc(ValueType.i32, false, 4),
-                                            "global4", wasm.globalAlloc(ValueType.i32, false, 5),
-                                            "global5", wasm.globalAlloc(ValueType.i32, false, 6),
-                                            "global6", wasm.globalAlloc(ValueType.i32, false, 7),
-                                            "global7", wasm.globalAlloc(ValueType.i32, false, 8),
-                                            "global8", wasm.globalAlloc(ValueType.i32, false, 9),
+                                            "global0", wasm.globalAlloc(NumberType.I32, false, 1),
+                                            "global1", wasm.globalAlloc(NumberType.I32, false, 2),
+                                            "global2", wasm.globalAlloc(NumberType.I32, false, 3),
+                                            "global3", wasm.globalAlloc(NumberType.I32, false, 4),
+                                            "global4", wasm.globalAlloc(NumberType.I32, false, 5),
+                                            "global5", wasm.globalAlloc(NumberType.I32, false, 6),
+                                            "global6", wasm.globalAlloc(NumberType.I32, false, 7),
+                                            "global7", wasm.globalAlloc(NumberType.I32, false, 8),
+                                            "global8", wasm.globalAlloc(NumberType.I32, false, 9),
                             }),
             });
             WasmInstance instance = moduleInstantiate(wasm, importManyGlobalsBytes, importObject);
@@ -2193,15 +2392,15 @@ public class WasmJsApiSuite {
             WebAssembly wasm = new WebAssembly(context);
             Dictionary importObject = Dictionary.create(new Object[]{
                             "tables", Dictionary.create(new Object[]{
-                                            "table0", wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL),
-                                            "table1", wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL),
-                                            "table2", wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL),
-                                            "table3", wasm.tableAlloc(1, 1, TableKind.anyfunc, WasmConstant.NULL),
-                                            "table4", wasm.tableAlloc(1, 1, TableKind.externref, WasmConstant.NULL),
-                                            "table5", wasm.tableAlloc(1, 1, TableKind.externref, WasmConstant.NULL),
-                                            "table6", wasm.tableAlloc(1, 1, TableKind.externref, WasmConstant.NULL),
-                                            "table7", wasm.tableAlloc(1, 1, TableKind.externref, WasmConstant.NULL),
-                                            "table8", wasm.tableAlloc(1, 1, TableKind.externref, WasmConstant.NULL),
+                                            "table0", wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL),
+                                            "table1", wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL),
+                                            "table2", wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL),
+                                            "table3", wasm.tableAlloc(1, 1, ReferenceType.FUNCREF, WasmConstant.NULL),
+                                            "table4", wasm.tableAlloc(1, 1, ReferenceType.EXTERNREF, WasmConstant.NULL),
+                                            "table5", wasm.tableAlloc(1, 1, ReferenceType.EXTERNREF, WasmConstant.NULL),
+                                            "table6", wasm.tableAlloc(1, 1, ReferenceType.EXTERNREF, WasmConstant.NULL),
+                                            "table7", wasm.tableAlloc(1, 1, ReferenceType.EXTERNREF, WasmConstant.NULL),
+                                            "table8", wasm.tableAlloc(1, 1, ReferenceType.EXTERNREF, WasmConstant.NULL),
                             })
             });
             WasmInstance instance = moduleInstantiate(wasm, importManyTablesBytes, importObject);
@@ -2271,42 +2470,367 @@ public class WasmJsApiSuite {
         });
     }
 
+    @Test
+    public void testImportMultipleFunctionsWithTheSameName() throws IOException, InterruptedException {
+        String sourceText = """
+                        (module
+                        (type $t2 (func (param i32 i32) (result i32)))
+                        (type $t3 (func (param i32 i32 i32) (result i32)))
+                        (type $t4 (func (param i32 i32 i32 i32) (result i32)))
+                        (import "importModule" "sum" (func $sum2 (type $t2)))
+                        (import "importModule" "sum" (func $sum3 (type $t3)))
+                        (import "importModule" "sum" (func $sum4 (type $t4)))
+                        (func (export "calculate") (result i32)
+                            i32.const 42
+                            i32.const 43
+                            call $sum2
+                            i32.const 44
+                            i32.const 45
+                            i32.const 46
+                            call $sum3
+                            i32.const 47
+                            i32.const 48
+                            i32.const 49
+                            i32.const 50
+                            call $sum4
+                            i32.add
+                            i32.add
+                        )
+                        )
+                        """;
+        byte[] sourceBytes = compileWat("importMultipleFunctionsWithTheSameName", sourceText);
+        runTest(context -> {
+            WebAssembly wasm = new WebAssembly(context);
+            Executable hostSum = new Executable(args -> Arrays.stream(args).mapToInt(a -> (int) a).sum());
+            Dictionary importObject = Dictionary.create(new Object[]{
+                            "importModule", Dictionary.create(new Object[]{
+                                            "sum", hostSum,
+                            }),
+            });
+            WasmInstance instance = moduleInstantiate(wasm, sourceBytes, importObject);
+
+            try {
+                InteropLibrary lib = InteropLibrary.getUncached();
+                Object sum = lib.execute(WebAssembly.instanceExport(instance, "calculate"));
+                int intSum = lib.asInt(sum);
+                Assert.assertEquals("Incorrect result", 414, intSum);
+            } catch (InteropException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    @Test
+    public void testReimportWasmFunctionViaImportObject() throws IOException, InterruptedException {
+        for (boolean directly : new boolean[]{false, true}) {
+            String mod1 = directly ? """
+                            (module
+                            (type $t2 (func (param i32 i32) (result i32)))
+                            (import "host" "sum" (func $sum2 (type $t2)))
+                            (export "sum" (func $sum2))
+                            )
+                            """ : """
+                            (module
+                            (type $t2 (func (param i32 i32) (result i32)))
+                            (import "host" "sum" (func $sum2 (type $t2)))
+                            (func (export "sum") (type $t2)
+                                local.get 0
+                                local.get 1
+                                call $sum2
+                            )
+                            )
+                            """;
+            String mod2 = """
+                            (module
+                            (type $t2 (func (param i32 i32) (result i32)))
+                            (import "mod1" "sum" (func $sum2 (type $t2)))
+                            (func (export "calculate") (result i32)
+                                i32.const 41
+                                i32.const 42
+                                call $sum2
+                            )
+                            )
+                            """;
+            byte[] sourceBytesMod1 = compileWat("reimportWasmFunction1", mod1);
+            byte[] sourceBytesMod2 = compileWat("reimportWasmFunction2", mod2);
+            runTest(context -> {
+                WebAssembly wasm = new WebAssembly(context);
+                try {
+                    Executable hostSum = new Executable(args -> Arrays.stream(args).mapToInt(a -> (int) a).sum());
+                    Dictionary importObj1 = Dictionary.create(new Object[]{
+                                    "host", Dictionary.create(new Object[]{
+                                                    "sum", hostSum,
+                                    }),
+                    });
+                    WasmInstance instance1 = moduleInstantiate(wasm, sourceBytesMod1, importObj1);
+                    var mod1Sum = WebAssembly.instanceExport(instance1, "sum");
+                    Dictionary importObj2 = Dictionary.create(new Object[]{
+                                    "mod1", Dictionary.create(new Object[]{
+                                                    "sum", mod1Sum,
+                                    }),
+                    });
+                    WasmInstance instance2 = moduleInstantiate(wasm, sourceBytesMod2, importObj2);
+
+                    InteropLibrary lib = InteropLibrary.getUncached();
+                    Object sum = lib.execute(WebAssembly.instanceExport(instance2, "calculate"));
+                    int intSum = lib.asInt(sum);
+                    Assert.assertEquals("Incorrect result", 83, intSum);
+                } catch (InteropException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testSharedMemoryGrow() throws IOException {
+        runTest(options -> options.option("wasm.UseUnsafeMemory", "true"), context -> {
+            WasmMemory sharedMemory = WebAssembly.memAlloc(1, 2, true);
+            ByteBuffer preGrowBuffer = WebAssembly.memAsByteBuffer(sharedMemory);
+            long previousSize = WebAssembly.memGrow(sharedMemory, 1);
+            Assert.assertEquals("Wrong previous size reported by mem.grow", 1, previousSize);
+            ByteBuffer postGrowBuffer = WebAssembly.memAsByteBuffer(sharedMemory);
+            preGrowBuffer.put(0, (byte) 42);
+            Assert.assertEquals("Value written to pre-grow buffer not seen in post-grow buffer", 42, postGrowBuffer.get(0));
+            postGrowBuffer.put(1, (byte) 21);
+            Assert.assertEquals("Value written to post-grow buffer not seen in pre-grow buffer", 21, preGrowBuffer.get(1));
+            preGrowBuffer.put(Sizes.MEMORY_PAGE_SIZE, (byte) 42);
+            Assert.assertEquals("Value written to pre-grow buffer not seen in post-grow buffer in grown section", 42, postGrowBuffer.get(Sizes.MEMORY_PAGE_SIZE));
+            postGrowBuffer.put(Sizes.MEMORY_PAGE_SIZE + 1, (byte) 21);
+            Assert.assertEquals("Value written to post-grow buffer not seen in pre-grow buffer in grown section", 21, preGrowBuffer.get(Sizes.MEMORY_PAGE_SIZE + 1));
+        });
+    }
+
+    /**
+     * Setting option wasm.Builtins=wasi_snapshot_preview1 should not break imports via JS API.
+     */
+    @Test
+    public void testWasip1EnabledNoImports() throws IOException {
+        runTest(options -> options.option("wasm.Builtins", "testutil:testutil,wasi_snapshot_preview1"), context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final Dictionary importObject = Dictionary.create(new Object[]{});
+            final WasmInstance instance = moduleInstantiate(wasm, binaryWithExports, importObject);
+            try {
+                final Object main = WebAssembly.instanceExport(instance, "main");
+                final Object result = InteropLibrary.getUncached(main).execute(main);
+                Assert.assertEquals(42, InteropLibrary.getUncached(result).asInt(result));
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
+    /**
+     * Setting option wasm.Builtins=wasi_snapshot_preview1 should not break imports via JS API.
+     */
+    @Test
+    public void testWasip1EnabledWithHostFunctionImport() throws IOException, InterruptedException {
+        byte[] binary = compileWat("binaryWithImportsAndExports", """
+                        (module
+                            (func $inc (import "host" "inc") (param i32) (result i32))
+                            (func $addPlusOne (param $lhs i32) (param $rhs i32) (result i32)
+                                local.get $lhs
+                                local.get $rhs
+                                i32.add
+                                call $inc
+                            )
+                            (memory 1 1)
+                            (export "addPlusOne" (func $addPlusOne))
+                            (export "memory" (memory 0)) ;; required for wasi_snapshot_preview1
+                        )
+                        """);
+
+        runTest(options -> options.option("wasm.Builtins", "testutil:testutil,wasi_snapshot_preview1"), context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final Dictionary importObject = Dictionary.create(new Object[]{
+                            "host", Dictionary.create(new Object[]{
+                                            "inc", new Executable(args -> ((int) args[0]) + 1)
+                            }),
+            });
+            final WasmInstance instance = moduleInstantiate(wasm, binary, importObject);
+            try {
+                final Object addPlusOne = WebAssembly.instanceExport(instance, "addPlusOne");
+                final Object result = InteropLibrary.getUncached(addPlusOne).execute(addPlusOne, 17, 3);
+                Assert.assertEquals("17 + 3 + 1 = 21.", 21, InteropLibrary.getUncached(result).asInt(result));
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
+    /**
+     * Trigger a {@link WasmException} during a call performed via an uncached
+     * {@link InteropLibrary}.
+     */
+    @Test
+    public void testUncachedIndirectCallException() throws IOException, InterruptedException {
+        byte[] binary = compileWat("binaryWithImportsAndExports", """
+                        (module
+                            (memory 1 1)
+                            (func $trap (result i32)
+                                ;; deliberately trigger a trap
+                                unreachable
+                            )
+                            (export "trap" (func $trap))
+                        )
+                        """);
+
+        runTest(context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final WasmInstance instance = moduleInstantiate(wasm, binary, WasmConstant.NULL);
+            try {
+                final Object trap = WebAssembly.instanceExport(instance, "trap");
+                InteropLibrary.getUncached(trap).execute(trap);
+                Assert.fail("Expected a WasmException but none was thrown.");
+            } catch (WasmException e) {
+                var stackTrace = TruffleStackTrace.getStackTrace(e);
+                Assert.assertFalse(stackTrace.isEmpty());
+                for (var stackTraceElement : stackTrace) {
+                    Assert.assertEquals(-1, stackTraceElement.getBytecodeIndex());
+                }
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
+    /**
+     * Tests that an exception thrown by WebAssembly can be caught in the embedder. Checks that the
+     * correct tag and exception fields are present.
+     */
+    @Test
+    public void testExceptionFromInsideWasm() throws IOException, InterruptedException {
+        final byte[] binary = compileWat("exceptions-inside", """
+                        (module
+                            (tag $E (export "E") (param i32 externref))
+                            (func (export "raise") (param i32 externref)
+                                (throw $E (local.get 0) (local.get 1))
+                            )
+                        )""", EnumSet.of(WasmBinaryTools.WabtOption.EXCEPTIONS));
+        runTest(builder -> builder.option(EXCEPTIONS_OPTION, "true"), context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+            final WasmInstance instance = moduleInstantiate(wasm, binary, null);
+            final Object raise = WebAssembly.instanceExport(instance, "raise");
+            final Object tag = WebAssembly.instanceExport(instance, "E");
+
+            final Object extern = "foo";
+
+            try {
+                try {
+                    // Trigger the exception with fields: 7 (i32) and extern (externref)
+                    InteropLibrary.getUncached(raise).execute(raise, 7, extern);
+                    Assert.fail("Expected a WebAssembly exception but none was thrown.");
+                } catch (WasmRuntimeException ex) {
+                    InteropLibrary exInterop = InteropLibrary.getUncached(ex);
+                    // Verify it's an interop exception
+                    Assert.assertTrue("Should be an interop exception", exInterop.isException(ex));
+
+                    // Verify the tag
+                    final Object exnTag = WebAssembly.exnTag(new Object[]{ex});
+                    Assert.assertEquals("Unexpected exception tag", tag, exnTag);
+
+                    // Verify the fields
+                    Assert.assertTrue("Wasm exception should have fields as array elements", exInterop.hasArrayElements(ex));
+                    Assert.assertEquals("Expected 2 exception fields", 2, exInterop.getArraySize(ex));
+                    Assert.assertEquals("First field mismatch", 7, InteropLibrary.getUncached().asInt(exInterop.readArrayElement(ex, 0)));
+                    Assert.assertSame("Second field mismatch", extern, exInterop.readArrayElement(ex, 1));
+                }
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
+    /**
+     * Tests that GraalWasm can catch wasm exceptions instantiated and thrown by the host. Also
+     * checks that the correct tag and exception fields are present.
+     */
+    @Test
+    public void testExceptionFromOutsideWasm() throws IOException, InterruptedException {
+        // 1) Module that defines and exports the tag.
+        final byte[] tagModule = compileWat("exceptions-tag", """
+                        (module
+                            (tag $E (export "E") (param i32 externref))
+                        )""", EnumSet.of(WasmBinaryTools.WabtOption.EXCEPTIONS));
+
+        // 2) Module that imports the tag and a host function. It calls the host function
+        // and catches exceptions with the imported tag, returning the exception fields.
+        final byte[] consumerModule = compileWat("exceptions-outside-consumer", """
+                        (module
+                            (type $host_t (func))
+                            (tag $E (import "m" "E") (param i32 externref))
+                            (func $host (import "m" "host") (type $host_t))
+                            (func (export "callAndHandle") (result i32 externref)
+                                (block $h (result i32 externref)
+                                    (try_table (result i32 externref) (catch $E $h)
+                                        (call $host)
+                                        ;; In case the host does not throw, produce dummy values (won't be reached in this test).
+                                        (i32.const -1)
+                                        (ref.null extern)
+                                    )
+                                )
+                            )
+                        )""", EnumSet.of(WasmBinaryTools.WabtOption.EXCEPTIONS));
+
+        runTest(builder -> builder.option(EXCEPTIONS_OPTION, "true"), context -> {
+            final WebAssembly wasm = new WebAssembly(context);
+
+            // Instantiate the tag-defining module and obtain the tag object.
+            final WasmInstance tagModuleInstance = moduleInstantiate(wasm, tagModule, null);
+            final Object tag = WebAssembly.instanceExport(tagModuleInstance, "E");
+
+            final Object extern = "foo";
+
+            // Import object providing the tag and the throwing host callback.
+            final Dictionary importObject = Dictionary.create(new Object[]{
+                            "m", Dictionary.create(new Object[]{
+                                            "E", tag,
+                                            "host", new Executable(args -> {
+                                                throw wasm.exnAlloc(new Object[]{tag, 7, extern});
+                                            })
+                            }),
+            });
+
+            // Instantiate the consumer and call its function that catches our exception.
+            final WasmInstance consumer = moduleInstantiate(wasm, consumerModule, importObject);
+            final Object callAndHandle = WebAssembly.instanceExport(consumer, "callAndHandle");
+            try {
+                final InteropLibrary interop = InteropLibrary.getUncached();
+                final Object result = interop.execute(callAndHandle);
+
+                // The catch $E returns the fields; verify them.
+                Assert.assertTrue("Result must be a multi-value array", interop.hasArrayElements(result));
+                Assert.assertEquals("Expected 2 results", 2, interop.getArraySize(result));
+                Assert.assertEquals("First field mismatch", 7, interop.asInt(interop.readArrayElement(result, 0)));
+                Assert.assertSame("Second field mismatch", extern, interop.readArrayElement(result, 1));
+            } catch (InteropException e) {
+                throw new AssertionError(e);
+            }
+        });
+    }
+
     private static void runMemoryTest(Consumer<WasmContext> testCase) throws IOException {
         runTest(null, testCase);
         runTest(options -> options.option("wasm.UseUnsafeMemory", "true"), testCase);
     }
 
-    private static void runTest(Consumer<WasmContext> testCase) throws IOException {
+    public static void runTest(Consumer<WasmContext> testCase) throws IOException {
         runTest(null, testCase);
     }
 
-    private static void runTest(Consumer<Context.Builder> options, Consumer<WasmContext> testCase) throws IOException {
+    public static void runTest(Consumer<Context.Builder> options, Consumer<WasmContext> testCase) throws IOException {
         final Context.Builder contextBuilder = Context.newBuilder(WasmLanguage.ID);
+        contextBuilder.option("wasm.Builtins", "testutil:testutil");
         if (options != null) {
             options.accept(contextBuilder);
         }
-        contextBuilder.option("wasm.Builtins", "testutil:testutil");
         try (Context context = contextBuilder.build()) {
             Source.Builder sourceBuilder = Source.newBuilder(WasmLanguage.ID, ByteSequence.create(binaryWithExports), "main");
             Source source = sourceBuilder.build();
-            context.eval(source);
-            Value main = context.getBindings(WasmLanguage.ID).getMember("main").getMember("main");
+            Value mainInstance = context.eval(source).newInstance();
+            Value main = mainInstance.getMember("exports").getMember("main");
             main.execute();
-            Value run = context.getBindings(WasmLanguage.ID).getMember("testutil").getMember(TestutilModule.Names.RUN_CUSTOM_INITIALIZATION);
-            run.execute(new GuestCode(testCase));
-        }
-    }
-
-    private static final class GuestCode implements Consumer<WasmContext>, TruffleObject {
-        private final Consumer<WasmContext> testCase;
-
-        private GuestCode(Consumer<WasmContext> testCase) {
-            this.testCase = testCase;
-        }
-
-        @Override
-        public void accept(WasmContext context) {
-            testCase.accept(context);
+            WasmTestUtils.runInWasmContext(context, testCase);
         }
     }
 
@@ -2676,8 +3200,8 @@ public class WasmJsApiSuite {
                     (byte) 0x61, (byte) 0x6d, (byte) 0x65, (byte) 0x02, (byte) 0x05, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x01, (byte) 0x00,
     };
 
-    private static WasmInstance moduleInstantiate(WebAssembly wasm, byte[] source, Object importObject) {
+    public static WasmInstance moduleInstantiate(WebAssembly wasm, byte[] source, Object importObject) {
         final WasmModule module = wasm.moduleDecode(source);
-        return wasm.moduleInstantiate(module, importObject);
+        return wasm.moduleInstantiate(module, Objects.requireNonNullElse(importObject, WasmConstant.NULL));
     }
 }

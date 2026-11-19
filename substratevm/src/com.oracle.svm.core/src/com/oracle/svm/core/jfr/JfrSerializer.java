@@ -24,7 +24,10 @@
  */
 package com.oracle.svm.core.jfr;
 
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+
 /** Serializers are only written upon a new chunk. */
 public interface JfrSerializer {
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
     void write(JfrChunkWriter writer);
 }

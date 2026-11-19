@@ -32,6 +32,8 @@ import jdk.graal.compiler.core.common.cfg.BasicBlock;
 import jdk.graal.compiler.core.common.cfg.AbstractControlFlowGraph;
 import jdk.graal.compiler.core.common.cfg.CodeEmissionOrder;
 import jdk.graal.compiler.core.common.cfg.CFGLoop;
+import jdk.graal.compiler.nodes.cfg.HIRBlock;
+import jdk.graal.compiler.nodes.debug.SlowPathBeginNode;
 import jdk.graal.compiler.options.OptionValues;
 
 /**
@@ -69,7 +71,7 @@ public class DefaultCodeEmissionOrder<T extends BasicBlock<T>> implements CodeEm
         PriorityQueue<T> worklist = BasicBlockOrderUtils.initializeWorklist(startBlock, visitedBlocks);
         computeCodeEmittingOrder(order, worklist, visitedBlocks, computationTime);
         BasicBlockOrderUtils.checkStartBlock(order, startBlock);
-        return order.toIdArray();
+        return moveSlowPathBlocksLast(order.toIdArray());
     }
 
     /**
@@ -171,5 +173,39 @@ public class DefaultCodeEmissionOrder<T extends BasicBlock<T>> implements CodeEm
             }
         }
         return false;
+    }
+
+    /**
+     * Performs a stable partition that keeps the original order inside both the normal-code and
+     * slow-path groups. Only slow-path blocks outside loops are moved to the end of the method; loop
+     * blocks keep their original position to preserve the invariant that all blocks of a loop are
+     * scheduled before any block following the loop.
+     */
+    private int[] moveSlowPathBlocksLast(int[] blockIds) {
+        int[] reordered = new int[blockIds.length];
+        int index = 0;
+        for (int blockId : blockIds) {
+            if (!canMoveSlowPathBlockLast(blockId)) {
+                reordered[index++] = blockId;
+            }
+        }
+        for (int blockId : blockIds) {
+            if (canMoveSlowPathBlockLast(blockId)) {
+                reordered[index++] = blockId;
+            }
+        }
+        return reordered;
+    }
+
+    /**
+     * Returns whether {@code blockId} names a slow-path block that can be moved without splitting a
+     * loop's contiguous code emission region.
+     */
+    private boolean canMoveSlowPathBlockLast(int blockId) {
+        if (blockId == AbstractControlFlowGraph.INVALID_BLOCK_ID) {
+            return false;
+        }
+        BasicBlock<?> block = startBlock.getBlocks()[blockId];
+        return block.getLoopDepth() == 0 && block instanceof HIRBlock hirBlock && hirBlock.getBeginNode() instanceof SlowPathBeginNode;
     }
 }

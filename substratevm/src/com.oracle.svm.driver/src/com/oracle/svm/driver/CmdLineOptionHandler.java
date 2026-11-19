@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,26 +24,17 @@
  */
 package com.oracle.svm.driver;
 
-import java.io.File;
-import java.nio.file.Paths;
-import java.util.List;
-import java.util.Optional;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-import com.oracle.svm.core.VM;
-import com.oracle.svm.core.option.OptionOrigin;
-import com.oracle.svm.core.option.OptionUtils;
 import com.oracle.svm.core.util.ExitStatus;
 import com.oracle.svm.driver.NativeImage.ArgumentQueue;
-import com.oracle.svm.util.LogUtils;
+import com.oracle.svm.shared.option.OptionOrigin;
+import com.oracle.svm.shared.util.LogUtils;
 
 import jdk.graal.compiler.options.OptionType;
 
 class CmdLineOptionHandler extends NativeImage.OptionHandler<NativeImage> {
-
-    private static final String HELP_TEXT = NativeImage.getResource("/Help.txt");
-    private static final String HELP_EXTRA_TEXT = NativeImage.getResource("/HelpExtra.txt");
 
     static final String VERBOSE_OPTION = "--verbose";
     static final String DRY_RUN_OPTION = "--dry-run";
@@ -51,8 +42,6 @@ class CmdLineOptionHandler extends NativeImage.OptionHandler<NativeImage> {
     /* Defunct legacy options that we have to accept to maintain backward compatibility */
     private static final String VERBOSE_SERVER_OPTION = "--verbose-server";
     private static final String SERVER_OPTION_PREFIX = "--server-";
-
-    private static final String LAUNCHER_NAME = "native-image";
 
     boolean useDebugAttach = false;
 
@@ -75,44 +64,12 @@ class CmdLineOptionHandler extends NativeImage.OptionHandler<NativeImage> {
     }
 
     private boolean consume(ArgumentQueue args, String headArg) {
+        DriverPathOptions.Match pathOption = DriverPathOptions.matchCmdLine(args);
+        if (pathOption != null) {
+            pathOption.consume(nativeImage);
+            return true;
+        }
         switch (headArg) {
-            case "--help":
-                args.poll();
-                singleArgumentCheck(args, headArg);
-                nativeImage.showMessage(HELP_TEXT);
-                nativeImage.showNewline();
-                nativeImage.apiOptionHandler.printOptions(nativeImage::showMessage, false);
-                nativeImage.showNewline();
-                nativeImage.optionRegistry.showOptions(null, true, nativeImage::showMessage);
-                nativeImage.showNewline();
-                System.exit(ExitStatus.OK.getValue());
-                return true;
-            case "--version":
-                args.poll();
-                singleArgumentCheck(args, headArg);
-                printVersion();
-                System.exit(ExitStatus.OK.getValue());
-                return true;
-            case "--help-extra":
-                args.poll();
-                singleArgumentCheck(args, headArg);
-                nativeImage.showMessage(HELP_EXTRA_TEXT);
-                nativeImage.apiOptionHandler.printOptions(nativeImage::showMessage, true);
-                nativeImage.showNewline();
-                nativeImage.optionRegistry.showOptions(OptionUtils.MacroOptionKind.Macro, true, nativeImage::showMessage);
-                nativeImage.showNewline();
-                System.exit(ExitStatus.OK.getValue());
-                return true;
-            case "--configurations-path":
-                args.poll();
-                String configPath = args.poll();
-                if (configPath == null) {
-                    NativeImage.showError(headArg + " requires a " + File.pathSeparator + " separated list of directories");
-                }
-                for (String configDir : configPath.split(File.pathSeparator)) {
-                    nativeImage.addMacroOptionRoot(Paths.get(configDir));
-                }
-                return true;
             case "--exclude-config":
                 args.poll();
                 handleExcludeConfigOption(headArg, args);
@@ -138,13 +95,40 @@ class CmdLineOptionHandler extends NativeImage.OptionHandler<NativeImage> {
                 String optionNames = args.poll();
                 nativeImage.setPrintFlagsWithExtraHelpOptionQuery(optionNames);
                 return true;
+            case "--print-options":
+                args.poll();
+                if (!args.isEmpty() && !args.peek().startsWith("-")) {
+                    throw NativeImage.showError("'--print-options' does not accept a positional format. Use '--print-options=<format>' instead.");
+                }
+                nativeImage.apiOptionHandler.printComprehensiveOptions(message -> NativeImage.showMessage(message), "table");
+                System.exit(ExitStatus.OK.getValue());
+                return true;
             case VERBOSE_SERVER_OPTION:
                 args.poll();
                 LogUtils.warning("Ignoring server-mode native-image argument " + headArg + ".");
                 return true;
         }
 
+        if (headArg.startsWith("--print-options=")) {
+            String formatArg = args.poll();
+            String format = formatArg.substring("--print-options=".length());
+            nativeImage.apiOptionHandler.printComprehensiveOptions(message -> NativeImage.showMessage(message), format);
+            System.exit(ExitStatus.OK.getValue());
+            return true;
+        }
+
+        if (headArg.startsWith("--expert-options-detail=")) {
+            args.poll();
+            String optionNames = headArg.substring("--expert-options-detail=".length());
+            nativeImage.setPrintFlagsWithExtraHelpOptionQuery(optionNames);
+            return true;
+        }
+
         if (headArg.startsWith(BundleSupport.BUNDLE_OPTION)) {
+            // warning should be early, before any other output of the feature
+            if (nativeImage.bundleSupport == null) {
+                LogUtils.warning("Native Image Bundles are an experimental feature.");
+            }
             nativeImage.bundleSupport = BundleSupport.create(nativeImage, args.poll(), args);
             return true;
         }
@@ -203,53 +187,5 @@ class CmdLineOptionHandler extends NativeImage.OptionHandler<NativeImage> {
             throw NativeImage.showError(headArg + " was used with an invalid resource regular expression: %s", pse);
         }
         nativeImage.addExcludeConfig(jarPattern, excludeConfigPattern);
-    }
-
-    /**
-     * Prints version output following
-     * "src/java.base/share/classes/java/lang/VersionProps.java.template#print(boolean)".
-     */
-    private void printVersion() {
-        /* First line: platform version. */
-        String javaVersion = System.getProperty("java.version");
-        String javaVersionDate = System.getProperty("java.version.date");
-        Optional<String> versionOpt = Runtime.version().optional();
-        boolean isLTS = versionOpt.isPresent() && versionOpt.get().startsWith("LTS");
-        nativeImage.showMessage("%s %s %s", LAUNCHER_NAME, javaVersion, javaVersionDate, isLTS ? " LTS" : "");
-
-        /* Second line: runtime version (ie, libraries). */
-        String javaRuntimeVersion = System.getProperty("java.runtime.version");
-
-        String jdkDebugLevel = System.getProperty("jdk.debug", "release");
-        if ("release".equals(jdkDebugLevel)) {
-            /* Do not show debug level "release" builds */
-            jdkDebugLevel = "";
-        } else {
-            jdkDebugLevel = jdkDebugLevel + " ";
-        }
-
-        String javaRuntimeName = System.getProperty("java.runtime.name");
-        String vendorVersion = VM.getVendorVersion();
-        vendorVersion = vendorVersion.isEmpty() ? "" : " " + vendorVersion;
-        nativeImage.showMessage("%s%s (%sbuild %s)", javaRuntimeName, vendorVersion, jdkDebugLevel, javaRuntimeVersion);
-
-        /* Third line: VM information. */
-        String javaVMName = System.getProperty("java.vm.name");
-        String javaVMVersion = System.getProperty("java.vm.version");
-        String javaVMInfo = System.getProperty("java.vm.info");
-        nativeImage.showMessage("%s%s (%sbuild %s, %s)", javaVMName, vendorVersion, jdkDebugLevel, javaVMVersion, javaVMInfo);
-    }
-
-    private static void singleArgumentCheck(ArgumentQueue args, String arg) {
-        if (!args.isEmpty()) {
-            NativeImage.showError("Option " + arg + " cannot be combined with other options.");
-        }
-    }
-
-    @Override
-    void addFallbackBuildArgs(List<String> buildArgs) {
-        if (nativeImage.isVerbose()) {
-            buildArgs.add(VERBOSE_OPTION);
-        }
     }
 }

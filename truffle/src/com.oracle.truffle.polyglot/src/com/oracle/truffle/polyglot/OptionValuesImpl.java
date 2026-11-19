@@ -50,7 +50,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 
+import org.graalvm.options.ConstantOptionKey;
 import org.graalvm.options.OptionDescriptor;
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionKey;
@@ -68,18 +70,24 @@ final class OptionValuesImpl implements OptionValues {
     private final SandboxPolicy sandboxPolicy;
     private final Map<OptionKey<?>, Object> values;
     private List<OptionDescriptor> usedDeprecatedDescriptors;
-    private final Map<OptionKey<?>, String> unparsedValues;
     private volatile Set<OptionKey<?>> validAssertKeys;
     private final boolean trackDeprecatedOptions;
 
-    OptionValuesImpl(OptionDescriptors descriptors, SandboxPolicy sandboxPolicy, boolean preserveUnparsedValues, boolean trackDeprecatedOptions) {
+    OptionValuesImpl(OptionDescriptors descriptors, SandboxPolicy sandboxPolicy, boolean trackDeprecatedOptions) {
         Objects.requireNonNull(descriptors);
         Objects.requireNonNull(sandboxPolicy);
         this.descriptors = descriptors;
         this.sandboxPolicy = sandboxPolicy;
         this.values = new HashMap<>();
-        this.unparsedValues = preserveUnparsedValues ? new HashMap<>() : null;
         this.trackDeprecatedOptions = trackDeprecatedOptions;
+    }
+
+    private OptionValuesImpl(OptionValuesImpl copy) {
+        this.values = new HashMap<>(copy.values);
+        this.descriptors = copy.descriptors;
+        this.sandboxPolicy = copy.sandboxPolicy;
+        this.usedDeprecatedDescriptors = copy.usedDeprecatedDescriptors;
+        this.trackDeprecatedOptions = copy.trackDeprecatedOptions;
     }
 
     @Override
@@ -144,14 +152,14 @@ final class OptionValuesImpl implements OptionValues {
         return true;
     }
 
-    public void putAll(PolyglotEngineImpl engine, Map<String, String> providedValues, boolean allowExperimentalOptions) {
+    public void putAll(Map<String, String> providedValues, boolean allowExperimentalOptions, Supplier<OptionDescriptors> allOptionsSupplier) {
         for (String key : providedValues.keySet()) {
-            put(engine, key, providedValues.get(key), allowExperimentalOptions);
+            put(key, providedValues.get(key), allowExperimentalOptions, allOptionsSupplier);
         }
     }
 
-    public OptionDescriptor put(PolyglotEngineImpl engine, String key, String value, boolean allowExperimentalOptions) {
-        OptionDescriptor descriptor = findDescriptor(engine, key, allowExperimentalOptions);
+    public OptionDescriptor put(String key, String value, boolean allowExperimentalOptions, Supplier<OptionDescriptors> allOptionsSupplier) {
+        OptionDescriptor descriptor = findDescriptor(key, allowExperimentalOptions, allOptionsSupplier);
         if (sandboxPolicy != SandboxPolicy.TRUSTED) {
             SandboxPolicy optionSandboxPolicy = descriptors instanceof TruffleOptionDescriptors ? ((TruffleOptionDescriptors) descriptors).getSandboxPolicy(key) : SandboxPolicy.TRUSTED;
             if (sandboxPolicy.isStricterThan(optionSandboxPolicy)) {
@@ -182,6 +190,21 @@ final class OptionValuesImpl implements OptionValues {
         } catch (IllegalArgumentException e) {
             throw PolyglotEngineException.illegalArgument(e);
         }
+        if (descriptor.isConstant()) {
+            if (optionKey instanceof ConstantOptionKey<?> constantOptionKey) {
+                Object fixedValue = constantOptionKey.getConstantValue();
+                if (!Objects.equals(convertedValue, fixedValue)) {
+                    throw PolyglotEngineException.illegalArgument(String.format(
+                                    "Option '%s' is constant and is already fixed to '%s'. " +
+                                                    "Engine|Context.Builder.option() may repeat that value, but cannot change it to '%s'. " +
+                                                    "To choose a different value, set -Dpolyglot.%s=<value> before the polyglot runtime is initialized " +
+                                                    "(HotSpot: JVM command line; native image: native-image build).",
+                                    descriptor.getName(), fixedValue, value, descriptor.getName()));
+                }
+            } else {
+                throw PolyglotEngineException.illegalArgument(String.format("Option '%s' marked constant must use ConstantOptionKey.", descriptor.getName()));
+            }
+        }
         if (trackDeprecatedOptions && descriptor.isDeprecated()) {
             if (usedDeprecatedDescriptors == null) {
                 usedDeprecatedDescriptors = new ArrayList<>();
@@ -189,20 +212,7 @@ final class OptionValuesImpl implements OptionValues {
             usedDeprecatedDescriptors.add(descriptor);
         }
         values.put(descriptor.getKey(), convertedValue);
-
-        if (unparsedValues != null) {
-            unparsedValues.put(descriptor.getKey(), value);
-        }
         return descriptor;
-    }
-
-    private OptionValuesImpl(OptionValuesImpl copy) {
-        this.values = new HashMap<>(copy.values);
-        this.descriptors = copy.descriptors;
-        this.sandboxPolicy = copy.sandboxPolicy;
-        this.unparsedValues = copy.unparsedValues;
-        this.usedDeprecatedDescriptors = copy.usedDeprecatedDescriptors;
-        this.trackDeprecatedOptions = copy.trackDeprecatedOptions;
     }
 
     private <T> boolean contains(OptionKey<T> optionKey) {
@@ -274,17 +284,10 @@ final class OptionValuesImpl implements OptionValues {
         return !values.isEmpty();
     }
 
-    String getUnparsedOptionValue(OptionKey<?> key) {
-        if (unparsedValues == null) {
-            throw new IllegalStateException("Unparsed values are not supported");
-        }
-        return unparsedValues.get(key);
-    }
-
-    private OptionDescriptor findDescriptor(PolyglotEngineImpl engine, String key, boolean allowExperimentalOptions) {
+    private OptionDescriptor findDescriptor(String key, boolean allowExperimentalOptions, Supplier<OptionDescriptors> allOptionsSupplier) {
         OptionDescriptor descriptor = descriptors.get(key);
         if (descriptor == null) {
-            throw failNotFound(engine, key);
+            throw failNotFound(key, allOptionsSupplier);
         }
         if (!allowExperimentalOptions && descriptor.getStability() == OptionStability.EXPERIMENTAL) {
             throw failExperimental(key);
@@ -298,11 +301,11 @@ final class OptionValuesImpl implements OptionValues {
         return PolyglotEngineException.illegalArgument(message);
     }
 
-    private RuntimeException failNotFound(PolyglotEngineImpl engine, String key) {
+    private RuntimeException failNotFound(String key, Supplier<OptionDescriptors> allOptionsSupplier) {
         OptionDescriptors allOptions;
         Exception errorOptions = null;
         try {
-            allOptions = engine == null ? this.descriptors : engine.getAllOptions();
+            allOptions = allOptionsSupplier == null ? this.descriptors : allOptionsSupplier.get();
         } catch (Exception e) {
             errorOptions = e;
             allOptions = this.descriptors;
@@ -364,13 +367,6 @@ final class OptionValuesImpl implements OptionValues {
 
     @Override
     public String toString() {
-        Map<OptionKey<?>, ? extends Object> options;
-        if (unparsedValues != null) {
-            options = this.unparsedValues;
-        } else {
-            options = this.values;
-        }
-
         StringBuilder b = new StringBuilder("{");
         String sep = "";
         for (OptionDescriptor descriptor : getDescriptors()) {
@@ -379,7 +375,7 @@ final class OptionValuesImpl implements OptionValues {
                 b.append(sep);
                 b.append(descriptor.getName());
                 b.append("=");
-                b.append(options.get(key));
+                b.append(values.get(key));
                 sep = ", ";
             }
         }

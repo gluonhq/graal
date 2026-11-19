@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -55,7 +55,7 @@ import com.oracle.truffle.regex.util.BitSets;
  *
  * @see CompressedCodePointSet
  */
-public final class AllTransitionsInOneTreeMatcher extends Matchers {
+public final class AllTransitionsInOneTreeMatcher {
 
     /**
      * Data structure for optimized matching of multiple ranges in one lower byte range.
@@ -102,7 +102,7 @@ public final class AllTransitionsInOneTreeMatcher extends Matchers {
      *            exclusive upper bound) would be: {@code [0x10, 0xff, 0x2000]}.
      * @param successors the list of successors corresponding to every range in the sorted list of
      *            ranges. Every entry in this array is an index of
-     *            {@link DFAStateNode#getSuccessors()}, or a negative index. A negative index can
+     *            {@link DFAState#getSuccessors()}, or a negative index. A negative index can
      *            mean one of two things: {@code -1} denotes "no successor", indices below
      *            {@code -1} denote {@link AllTransitionsInOneTreeLeafMatcher leaf matchers}. These
      *            specialized matchers are used when many ranges lie in the same lower byte range,

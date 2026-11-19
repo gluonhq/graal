@@ -31,7 +31,7 @@ import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -177,7 +177,7 @@ public final class GraphOutput<G, M> implements Closeable, WritableByteChannel {
          * (when the {@link GraphOutput} &amp; co. classes were introduced). The default can be
          * changed to other known versions manually by calling this method.
          * <p>
-         * Note: the the default version is 7.0 since version 20.2. Previous versions used default
+         * Note: the default version is 7.0 since version 20.2. Previous versions used default
          * version 4.0
          *
          * @param majorVersion by default 7, newer version may be known
@@ -302,7 +302,7 @@ public final class GraphOutput<G, M> implements Closeable, WritableByteChannel {
         public Builder<G, N, M> attr(String name, Object value) {
             requireVersion(7, 0);
             if (properties == null) {
-                properties = new HashMap<>(5);
+                properties = new LinkedHashMap<>(5);
             }
             properties.put(name, value);
             return this;

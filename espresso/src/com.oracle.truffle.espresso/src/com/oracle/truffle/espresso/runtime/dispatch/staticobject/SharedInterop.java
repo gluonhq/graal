@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,7 +20,6 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.runtime.dispatch.staticobject;
 
 import java.math.BigInteger;
@@ -35,7 +34,6 @@ import java.util.Objects;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.Specialization;
@@ -2109,36 +2107,35 @@ public class SharedInterop {
     }
 
     @ExportMessage
-    public static boolean hasLanguage(StaticObject receiver,
+    public static boolean hasLanguageId(StaticObject receiver,
                     @Cached IndirectCallNode callNode,
                     @Cached CallSharedInteropMessage sharedCallNode) {
         int dispatchId = receiver.getKlass().getDispatchId();
-        InteropMessage.Message message = InteropMessage.Message.HasLanguage;
+        InteropMessage.Message message = InteropMessage.Message.HasLanguageId;
         if (InteropMessageFactories.isShareable(dispatchId, message)) {
             dispatchId = InteropMessageFactories.sourceDispatch(dispatchId, message);
             return (boolean) sharedCallNode.call(dispatchId, message, receiver);
         }
-        CallTarget target = getTarget(receiver, InteropMessage.Message.HasLanguage);
+        CallTarget target = getTarget(receiver, InteropMessage.Message.HasLanguageId);
         if (target != null) {
             return (boolean) callNode.call(target, receiver);
         }
         return false;
     }
 
-    @SuppressWarnings("unchecked")
     @ExportMessage
-    public static Class<? extends TruffleLanguage<?>> getLanguage(StaticObject receiver,
+    public static String getLanguageId(StaticObject receiver,
                     @Cached IndirectCallNode callNode,
                     @Cached CallSharedInteropMessage sharedCallNode) throws UnsupportedMessageException {
         int dispatchId = receiver.getKlass().getDispatchId();
-        InteropMessage.Message message = InteropMessage.Message.GetLanguage;
+        InteropMessage.Message message = InteropMessage.Message.GetLanguageId;
         if (InteropMessageFactories.isShareable(dispatchId, message)) {
             dispatchId = InteropMessageFactories.sourceDispatch(dispatchId, message);
-            return (Class<? extends TruffleLanguage<?>>) sharedCallNode.call(dispatchId, message, receiver);
+            return (String) sharedCallNode.call(dispatchId, message, receiver);
         }
-        CallTarget target = getTarget(receiver, InteropMessage.Message.GetLanguage);
+        CallTarget target = getTarget(receiver, InteropMessage.Message.GetLanguageId);
         if (target != null) {
-            return (Class<? extends TruffleLanguage<?>>) callNode.call(target, receiver);
+            return (String) callNode.call(target, receiver);
         }
         throw unsupported();
     }
@@ -2147,6 +2144,9 @@ public class SharedInterop {
     public static boolean hasMetaObject(StaticObject receiver,
                     @Cached IndirectCallNode callNode,
                     @Cached CallSharedInteropMessage sharedCallNode) {
+        if (receiver.isStaticStorage()) {
+            return true;
+        }
         int dispatchId = receiver.getKlass().getDispatchId();
         InteropMessage.Message message = InteropMessage.Message.HasMetaObject;
         if (InteropMessageFactories.isShareable(dispatchId, message)) {
@@ -2164,6 +2164,9 @@ public class SharedInterop {
     public static Object getMetaObject(StaticObject receiver,
                     @Cached IndirectCallNode callNode,
                     @Cached CallSharedInteropMessage sharedCallNode) throws UnsupportedMessageException {
+        if (receiver.isStaticStorage()) {
+            return receiver.getKlass().getMeta().java_lang_Object.mirror();
+        }
         int dispatchId = receiver.getKlass().getDispatchId();
         InteropMessage.Message message = InteropMessage.Message.GetMetaObject;
         if (InteropMessageFactories.isShareable(dispatchId, message)) {

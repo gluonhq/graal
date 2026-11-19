@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,6 +35,7 @@ import static jdk.graal.compiler.lir.LIRInstruction.OperandFlag.UNINITIALIZED;
 import static jdk.graal.compiler.lir.LIRInstruction.OperandMode.ALIVE;
 import static jdk.graal.compiler.lir.LIRInstruction.OperandMode.DEF;
 import static jdk.graal.compiler.lir.LIRInstruction.OperandMode.TEMP;
+import static jdk.graal.compiler.lir.LIRInstruction.OperandMode.USE_KILL;
 import static jdk.graal.compiler.lir.LIRValueUtil.isVirtualStackSlot;
 import static jdk.vm.ci.code.ValueUtil.isStackSlot;
 
@@ -96,6 +97,14 @@ public abstract class LIRInstruction {
         USE,
 
         /**
+         * The value must have been defined before. It is read at the beginning of the instruction,
+         * and then killed by the instruction. The value is not live after the instruction, but its
+         * lifetime still overlaps the instruction, so a register assigned to it cannot also be
+         * assigned to a {@link #TEMP} or {@link #DEF} operand of the same instruction.
+         */
+        USE_KILL,
+
+        /**
          * The value must have been defined before. It is alive before the instruction and
          * throughout the instruction. A register assigned to it cannot be assigned to a
          * {@link #TEMP} or {@link #DEF} operand. The value can be used again after the instruction,
@@ -127,6 +136,13 @@ public abstract class LIRInstruction {
     @Retention(RetentionPolicy.RUNTIME)
     @Target(ElementType.FIELD)
     public @interface Alive {
+
+        OperandFlag[] value() default OperandFlag.REG;
+    }
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.FIELD)
+    public @interface UseKill {
 
         OperandFlag[] value() default OperandFlag.REG;
     }
@@ -205,6 +221,7 @@ public abstract class LIRInstruction {
     static {
         ALLOWED_FLAGS = new EnumMap<>(OperandMode.class);
         ALLOWED_FLAGS.put(OperandMode.USE, EnumSet.of(REG, STACK, COMPOSITE, CONST, ILLEGAL, HINT, UNINITIALIZED));
+        ALLOWED_FLAGS.put(USE_KILL, EnumSet.of(REG, STACK, COMPOSITE, ILLEGAL));
         ALLOWED_FLAGS.put(ALIVE, EnumSet.of(REG, STACK, COMPOSITE, CONST, ILLEGAL, HINT, UNINITIALIZED, OUTGOING));
         ALLOWED_FLAGS.put(TEMP, EnumSet.of(REG, STACK, COMPOSITE, ILLEGAL, HINT));
         ALLOWED_FLAGS.put(DEF, EnumSet.of(REG, STACK, COMPOSITE, ILLEGAL, HINT));
@@ -274,6 +291,10 @@ public abstract class LIRInstruction {
         instructionClass.forEachAlive(this, proc);
     }
 
+    public final void forEachUseKill(InstructionValueProcedure proc) {
+        instructionClass.forEachUseKill(this, proc);
+    }
+
     public final void forEachTemp(InstructionValueProcedure proc) {
         instructionClass.forEachTemp(this, proc);
     }
@@ -286,6 +307,32 @@ public abstract class LIRInstruction {
         instructionClass.forEachState(this, proc);
     }
 
+    /**
+     * Walks operand annotation buckets in the canonical forward order: input, alive, useKill, temp,
+     * output. Any {@code null} handler is skipped.
+     *
+     * Note that this does not cover frame-state visitation; use
+     * {@link #forEachState(InstructionStateProcedure)} or {@link #forEachState(StateProcedure)}
+     * explicitly.
+     */
+    public final void forEachValue(InstructionValueProcedure proc) {
+        if (proc != null) {
+            forEachInput(proc);
+        }
+        if (proc != null) {
+            forEachAlive(proc);
+        }
+        if (proc != null) {
+            forEachUseKill(proc);
+        }
+        if (proc != null) {
+            forEachTemp(proc);
+        }
+        if (proc != null) {
+            forEachOutput(proc);
+        }
+    }
+
     // ValueProcedures
     public final void forEachInput(ValueProcedure proc) {
         instructionClass.forEachUse(this, proc);
@@ -293,6 +340,10 @@ public abstract class LIRInstruction {
 
     public final void forEachAlive(ValueProcedure proc) {
         instructionClass.forEachAlive(this, proc);
+    }
+
+    public final void forEachUseKill(ValueProcedure proc) {
+        instructionClass.forEachUseKill(this, proc);
     }
 
     public final void forEachTemp(ValueProcedure proc) {
@@ -325,6 +376,10 @@ public abstract class LIRInstruction {
         instructionClass.visitEachAlive(this, proc);
     }
 
+    public final void visitEachUseKill(InstructionValueConsumer proc) {
+        instructionClass.visitEachUseKill(this, proc);
+    }
+
     public final void visitEachTemp(InstructionValueConsumer proc) {
         instructionClass.visitEachTemp(this, proc);
     }
@@ -337,6 +392,72 @@ public abstract class LIRInstruction {
         instructionClass.visitEachState(this, proc);
     }
 
+    /**
+     * Walks operand annotation buckets in the canonical forward order: input, alive, useKill, temp,
+     * output. Any {@code null} handler is skipped.
+     *
+     * Note that this does not cover frame-state visitation; use
+     * {@link #visitEachState(InstructionValueConsumer)} or {@link #visitEachState(ValueConsumer)}
+     * explicitly.
+     */
+    public final void visitEachValueForward(InstructionValueConsumer proc) {
+        visitEachValueForward(proc, proc, proc, proc, proc);
+    }
+
+    /**
+     * Walks operand annotation buckets in the canonical forward order: input, alive, useKill, temp,
+     * output. Any {@code null} handler is skipped.
+     *
+     * Note that this does not cover frame-state visitation; use
+     * {@link #visitEachState(InstructionValueConsumer)} or {@link #visitEachState(ValueConsumer)}
+     * explicitly.
+     */
+    public final void visitEachValueForward(InstructionValueConsumer inputProc, InstructionValueConsumer aliveProc, InstructionValueConsumer useKillProc,
+                    InstructionValueConsumer tempProc, InstructionValueConsumer outputProc) {
+        if (inputProc != null) {
+            visitEachInput(inputProc);
+        }
+        if (aliveProc != null) {
+            visitEachAlive(aliveProc);
+        }
+        if (useKillProc != null) {
+            visitEachUseKill(useKillProc);
+        }
+        if (tempProc != null) {
+            visitEachTemp(tempProc);
+        }
+        if (outputProc != null) {
+            visitEachOutput(outputProc);
+        }
+    }
+
+    /**
+     * Walks operand annotation buckets in the canonical reverse order: output, temp, useKill,
+     * alive, input. Any {@code null} handler is skipped.
+     *
+     * Note that this does not cover frame-state visitation; use
+     * {@link #visitEachState(InstructionValueConsumer)} or {@link #visitEachState(ValueConsumer)}
+     * explicitly.
+     */
+    public final void visitEachValueReverse(InstructionValueConsumer inputProc, InstructionValueConsumer aliveProc, InstructionValueConsumer useKillProc,
+                    InstructionValueConsumer tempProc, InstructionValueConsumer outputProc) {
+        if (outputProc != null) {
+            visitEachOutput(outputProc);
+        }
+        if (tempProc != null) {
+            visitEachTemp(tempProc);
+        }
+        if (useKillProc != null) {
+            visitEachUseKill(useKillProc);
+        }
+        if (aliveProc != null) {
+            visitEachAlive(aliveProc);
+        }
+        if (inputProc != null) {
+            visitEachInput(inputProc);
+        }
+    }
+
     // ValueConsumers
     public final void visitEachInput(ValueConsumer proc) {
         instructionClass.visitEachUse(this, proc);
@@ -344,6 +465,10 @@ public abstract class LIRInstruction {
 
     public final void visitEachAlive(ValueConsumer proc) {
         instructionClass.visitEachAlive(this, proc);
+    }
+
+    public final void visitEachUseKill(ValueConsumer proc) {
+        instructionClass.visitEachUseKill(this, proc);
     }
 
     public final void visitEachTemp(ValueConsumer proc) {
@@ -471,11 +596,6 @@ public abstract class LIRInstruction {
 
     public LIRInstructionClass<?> getLIRInstructionClass() {
         return instructionClass;
-    }
-
-    @Override
-    public int hashCode() {
-        return id;
     }
 
     public boolean needsClearUpperVectorRegisters() {

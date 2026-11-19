@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -46,7 +46,7 @@ import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.graalvm.wasm.WasmType;
-import org.graalvm.wasm.constants.GlobalModifier;
+import org.graalvm.wasm.constants.Mutability;
 import org.graalvm.wasm.test.AbstractBinarySuite;
 import org.junit.Assert;
 import org.junit.Test;
@@ -75,9 +75,9 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // ;; main hex code
         // )
         // )
-        return newBuilder().addType(EMPTY_BYTES, new byte[]{WasmType.I32_TYPE}).addTable((byte) 3, (byte) 3, WasmType.FUNCREF_TYPE).addFunction((byte) 0, EMPTY_BYTES, "41 00 0B").addFunction((byte) 0,
-                        EMPTY_BYTES, "41 01 0B").addFunction((byte) 0, EMPTY_BYTES, "41 02 0B").addFunction((byte) 0, EMPTY_BYTES, mainHexCode).addFunctionExport(
-                                        (byte) 3, "main");
+        return newBuilder().addType(EMPTY_INTS, new int[]{WasmType.I32_TYPE}).addTable(3, 3, WasmType.FUNCREF_TYPE).addFunction(0, EMPTY_INTS, "41 00 0B").addFunction(0,
+                        EMPTY_INTS, "41 01 0B").addFunction(0, EMPTY_INTS, "41 02 0B").addFunction(0, EMPTY_INTS, mainHexCode).addFunctionExport(
+                                        3, "main");
     }
 
     @Test
@@ -222,7 +222,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // i32.const 0
         //
         // (elem declare (ref.func 3))
-        final byte[] binary = getDefaultTableInitBuilder("D2 03 1A 41 00 0B").addFunction((byte) 0, EMPTY_BYTES, "41 03 0B").addElements("03 00 01 03").build();
+        final byte[] binary = getDefaultTableInitBuilder("D2 03 1A 41 00 0B").addFunction(0, EMPTY_INTS, "41 03 0B").addElements("03 00 01 03").build();
         runRuntimeTest(binary, instance -> {
             Value main = instance.getMember("main");
             Value result = main.execute();
@@ -238,11 +238,35 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // i32.const 0
         //
         // (elem declare (ref.func 3))
-        final byte[] binary = getDefaultTableInitBuilder("D2 03 1A 41 00 0B").addFunction((byte) 0, EMPTY_BYTES, "41 03 0B").addElements("07 70 01 D2 03 0B").build();
+        final byte[] binary = getDefaultTableInitBuilder("D2 03 1A 41 00 0B").addFunction(0, EMPTY_INTS, "41 03 0B").addElements("07 70 01 D2 03 0B").build();
         runRuntimeTest(binary, instance -> {
             Value main = instance.getMember("main");
             Value result = main.execute();
             Assert.assertEquals("Unexpected return value", 0, result.asInt());
+        });
+    }
+
+    @Test
+    public void testTableInitDeclarativeElementSegmentSecondInstantiation() throws IOException {
+        // main:
+        // i32.const 0
+        // i32.const 0
+        // i32.const 1
+        // table.init 0 0
+        // i32.const 0
+        //
+        // (elem declare func 0)
+        final byte[] binary = getDefaultTableInitBuilder("41 00 41 00 41 01 FC 0C 00 00 41 00 0B").addElements("03 00 01 00").build();
+        runParserTest(binary, (context, source) -> {
+            Value module = context.eval(source);
+            module.newInstance();
+            Value main = module.newInstance().getMember("exports").getMember("main");
+            try {
+                main.execute();
+                Assert.fail("Should have thrown");
+            } catch (PolyglotException e) {
+                Assert.assertTrue("Expect out of bounds error", e.getMessage().contains("out of bounds table access"));
+            }
         });
     }
 
@@ -308,7 +332,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 context.eval(source);
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected type mismatch error", e.getMessage().contains("Invalid constant expression for table elem expression:"));
+                Assert.assertTrue("Expected type mismatch error", e.getMessage().contains("Expected result types [funcref], but got [i32]"));
             }
         });
     }
@@ -531,17 +555,53 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
     }
 
     @Test
+    public void testTableInitActiveElementSegmentZeroLength() throws IOException {
+        // main:
+        // i32.const 0
+        // i32.const 0
+        // i32.const 0
+        // table.init 2 0
+        // i32.const 0
+        //
+        // (elem (i32.const 0) func)
+        // (elem func 0)
+        // (elem (table 0) (i32.const 0) func)
+        final byte[] binary = getDefaultTableInitBuilder("41 00 41 00 41 00 FC 0C 02 00 41 00 0B").addElements("00 41 00 0B 00").addElements("01 00 01 00").addElements("02 00 41 00 0B 00 00").build();
+        runRuntimeTest(binary, instance -> {
+            Value main = instance.getMember("main");
+            Value result = main.execute();
+            Assert.assertEquals("Unexpected return value", 0, result.asInt());
+        });
+    }
+
+    @Test
     public void testMultipleTables() throws IOException {
         // (table 1 1 funcref)
         // (table 1 1 externref)
-        final byte[] binary = newBuilder().addTable((byte) 1, (byte) 1, WasmType.FUNCREF_TYPE).addTable((byte) 1, (byte) 1, WasmType.EXTERNREF_TYPE).build();
-        runParserTest(binary, Context::eval);
+        // (table 1 1 exnref)
+        final byte[] binary = newBuilder().addTable(1, 1, WasmType.FUNCREF_TYPE).addTable(1, 1, WasmType.EXTERNREF_TYPE).addTable(1, 1, WasmType.EXNREF_TYPE).build();
+        runParserTest(binary, options -> options.option("wasm.Exceptions", "true"), Context::eval);
+    }
+
+    @Test
+    public void testCatchRefHandlersProduceNonNullReferences() throws IOException {
+        final int nonNullExnRef = WasmType.withNullable(false, WasmType.EXN_HEAPTYPE);
+        final BinaryBuilder builder = newBuilder();
+        builder.addType(EMPTY_INTS, new int[]{nonNullExnRef});
+        builder.addType(EMPTY_INTS, EMPTY_INTS);
+        builder.addTag((byte) 0, (byte) 1);
+        // block (result (ref exn)) { try_table (catch_ref 0 0) { throw 0 } }
+        builder.addFunction(0, EMPTY_INTS, "02 64 69 1F 40 01 01 00 00 08 00 0B 00 0B 0B");
+        // block (result (ref exn)) { try_table (catch_all_ref 0) { throw 0 } }
+        builder.addFunction(0, EMPTY_INTS, "02 64 69 1F 40 01 03 00 08 00 0B 00 0B 0B");
+        final byte[] binary = builder.build();
+        runParserTest(binary, options -> options.option("wasm.Exceptions", "true"), Context::eval);
     }
 
     @Test
     public void testTableInvalidElemType() throws IOException {
         // (table 1 1 i32)
-        final byte[] binary = newBuilder().addTable((byte) 1, (byte) 1, WasmType.I32_TYPE).build();
+        final byte[] binary = newBuilder().addTable(1, 1, WasmType.I32_TYPE).build();
         runParserTest(binary, (context, source) -> {
             try {
                 context.eval(source);
@@ -562,7 +622,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // ;; main hex code
         // )
         // )
-        return newBuilder().addType(EMPTY_BYTES, new byte[]{WasmType.I32_TYPE}).addMemory((byte) 1, (byte) 1).addFunction((byte) 0, EMPTY_BYTES, mainHexCode).addFunctionExport((byte) 0, "main");
+        return newBuilder().addType(EMPTY_INTS, new int[]{WasmType.I32_TYPE}).addMemory(1, 1).addFunction(0, EMPTY_INTS, mainHexCode).addFunctionExport(0, "main");
     }
 
     @Test
@@ -696,7 +756,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -741,7 +801,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -764,7 +824,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -787,7 +847,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -825,7 +885,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -846,7 +906,7 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
                 main.execute();
                 Assert.fail("Should have thrown");
             } catch (PolyglotException e) {
-                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out of bounds memory access"));
+                Assert.assertTrue("Expected out of bounds error", e.getMessage().contains("out-of-bounds") && e.getMessage().contains("memory access"));
             }
         });
     }
@@ -873,9 +933,25 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // (func (export "main") (type 0)
         // global.get 0
         // )
-        final byte[] binary = newBuilder().addGlobal(GlobalModifier.CONSTANT, WasmType.EXTERNREF_TYPE, "D0 6F 0B").addType(EMPTY_BYTES, new byte[]{WasmType.EXTERNREF_TYPE}).addFunction((byte) 0,
-                        EMPTY_BYTES, "23 00 0B").addFunctionExport((byte) 0, "main").build();
+        final byte[] binary = newBuilder().addGlobal(Mutability.CONSTANT, WasmType.EXTERNREF_TYPE, "D0 6F 0B").addType(EMPTY_INTS, new int[]{WasmType.EXTERNREF_TYPE}).addFunction(0,
+                        EMPTY_INTS, "23 00 0B").addFunctionExport(0, "main").build();
         runRuntimeTest(binary, instance -> {
+            Value main = instance.getMember("main");
+            Value result = main.execute();
+            Assert.assertTrue("Unexpected result value", result.isNull());
+        });
+    }
+
+    @Test
+    public void testGlobalWithNullException() throws IOException {
+        // (global exnref (ref.null))
+        // (type (func (result exnref)))
+        // (func (export "main") (type 0)
+        // global.get 0
+        // )
+        final byte[] binary = newBuilder().addGlobal(Mutability.CONSTANT, WasmType.EXNREF_TYPE, "D0 69 0B").addType(EMPTY_INTS, new int[]{WasmType.EXNREF_TYPE}).addFunction(0,
+                        EMPTY_INTS, "23 00 0B").addFunctionExport(0, "main").build();
+        runRuntimeTest(binary, options -> options.option("wasm.Exceptions", "true"), instance -> {
             Value main = instance.getMember("main");
             Value result = main.execute();
             Assert.assertTrue("Unexpected result value", result.isNull());
@@ -897,9 +973,9 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // i32.const 0
         // call_indirect 0 (type 0)
         // )
-        final byte[] binary = newBuilder().addGlobal(GlobalModifier.CONSTANT, WasmType.FUNCREF_TYPE, "D2 00 0B").addTable((byte) 1, (byte) 1, WasmType.FUNCREF_TYPE).addType(EMPTY_BYTES,
-                        new byte[]{WasmType.I32_TYPE}).addFunction((byte) 0, EMPTY_BYTES, "41 01 0B").addFunction((byte) 0, EMPTY_BYTES, "41 00 23 00 26 00 41 00 11 00 00 0B").addFunctionExport(
-                                        (byte) 1, "main").build();
+        final byte[] binary = newBuilder().addGlobal(Mutability.CONSTANT, WasmType.FUNCREF_TYPE, "D2 00 0B").addTable(1, 1, WasmType.FUNCREF_TYPE).addType(EMPTY_INTS,
+                        new int[]{WasmType.I32_TYPE}).addFunction(0, EMPTY_INTS, "41 01 0B").addFunction(0, EMPTY_INTS, "41 00 23 00 26 00 41 00 11 00 00 0B").addFunctionExport(
+                                        1, "main").build();
         runRuntimeTest(binary, instance -> {
             Value main = instance.getMember("main");
             Value result = main.execute();
@@ -938,13 +1014,13 @@ public class ReferenceTypesValidationSuite extends AbstractBinarySuite {
         // table.set 1
         // )
         // (elem (table 0) (ref.func 0) (ref.func 1))
-        final byte[] binary = newBuilder().addTable((byte) 2, (byte) 2, WasmType.FUNCREF_TYPE).addTable((byte) 2, (byte) 2, WasmType.EXTERNREF_TYPE).addType(EMPTY_BYTES,
-                        new byte[]{WasmType.I32_TYPE}).addType(new byte[]{WasmType.I32_TYPE, WasmType.FUNCREF_TYPE}, new byte[]{WasmType.EXTERNREF_TYPE, WasmType.FUNCREF_TYPE}).addType(EMPTY_BYTES,
-                                        new byte[]{WasmType.EXTERNREF_TYPE, WasmType.FUNCREF_TYPE}).addType(new byte[]{WasmType.I32_TYPE, WasmType.EXTERNREF_TYPE}, EMPTY_BYTES).addFunction((byte) 0,
-                                                        EMPTY_BYTES, "41 01 0B").addFunction((byte) 0, EMPTY_BYTES, "41 02 0B").addFunction((byte) 1, EMPTY_BYTES, "20 00 25 01 20 01 0B").addFunction(
-                                                                        (byte) 2, EMPTY_BYTES, "41 01 41 00 25 00 10 02 0B").addFunction((byte) 3, EMPTY_BYTES,
-                                                                                        "20 00 20 01 26 01 0B").addFunctionExport((byte) 3,
-                                                                                                        "main").addFunctionExport((byte) 4, "setRef").addElements("00 41 00 0B 02 00 01").build();
+        final byte[] binary = newBuilder().addTable(2, 2, WasmType.FUNCREF_TYPE).addTable(2, 2, WasmType.EXTERNREF_TYPE).addType(EMPTY_INTS,
+                        new int[]{WasmType.I32_TYPE}).addType(new int[]{WasmType.I32_TYPE, WasmType.FUNCREF_TYPE}, new int[]{WasmType.EXTERNREF_TYPE, WasmType.FUNCREF_TYPE}).addType(EMPTY_INTS,
+                                        new int[]{WasmType.EXTERNREF_TYPE, WasmType.FUNCREF_TYPE}).addType(new int[]{WasmType.I32_TYPE, WasmType.EXTERNREF_TYPE}, EMPTY_INTS).addFunction(0,
+                                                        EMPTY_INTS, "41 01 0B").addFunction(0, EMPTY_INTS, "41 02 0B").addFunction(1, EMPTY_INTS, "20 00 25 01 20 01 0B").addFunction(
+                                                                        2, EMPTY_INTS, "41 01 41 00 25 00 10 02 0B").addFunction(3, EMPTY_INTS,
+                                                                                        "20 00 20 01 26 01 0B").addFunctionExport(3,
+                                                                                                        "main").addFunctionExport(4, "setRef").addElements("00 41 00 0B 02 00 01").build();
         runRuntimeTest(binary, instance -> {
             Value setRef = instance.getMember("setRef");
             setRef.execute(0, "foo");

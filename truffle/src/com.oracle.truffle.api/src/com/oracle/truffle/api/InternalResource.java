@@ -68,6 +68,9 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+
+import org.graalvm.nativeimage.ImageInfo;
 
 /**
  * Represents an internal resource of a language that can be lazily unpacked to a cache user
@@ -102,7 +105,7 @@ import java.util.function.BooleanSupplier;
  *
  * The resource files are listed in the
  * {@code META-INF/resources/<language-id>/<resource-id>/<os>/<arch>/file-list} file. For the file
- * list format, refer to {@link InternalResource.Env#unpackFiles(Env, Path)}. Additionally, the
+ * list format, refer to {@link InternalResource#unpackFiles(Env, Path)}. Additionally, the
  * {@code META-INF/resources/<language-id>/<resource-id>/<os>/<arch>/sha256} file contains an
  * SHA-256 hash of the resource files. It is recommended to use non-encapsulated resource paths that
  * include the component ID and resource ID, as this helps prevent ambiguity when the language or
@@ -142,7 +145,7 @@ public interface InternalResource {
      *
      * @since 23.1
      */
-    String versionHash(Env env);
+    String versionHash(Env env) throws IOException;
 
     /**
      * Access to common utilities for unpacking resource files.
@@ -154,11 +157,13 @@ public interface InternalResource {
         private final Class<? extends InternalResource> resourceClass;
         private final Module owner;
         private final BooleanSupplier contextPreinitializationCheck;
+        private final boolean forNativeImageBuild;
 
-        Env(InternalResource resource, BooleanSupplier contextPreinitializationCheck) {
+        Env(InternalResource resource, BooleanSupplier contextPreinitializationCheck, boolean forNativeImageBuild) {
             this.resourceClass = resource.getClass();
             this.owner = resourceClass.getModule();
             this.contextPreinitializationCheck = Objects.requireNonNull(contextPreinitializationCheck, "ContextPreinitializationCheck  must be non-null.");
+            this.forNativeImageBuild = forNativeImageBuild;
         }
 
         /**
@@ -176,9 +181,8 @@ public interface InternalResource {
          *
          * @since 23.1
          */
-        @SuppressWarnings("static-method")
         public boolean inNativeImageBuild() {
-            return TruffleOptions.AOT;
+            return forNativeImageBuild;
         }
 
         /**
@@ -220,7 +224,7 @@ public interface InternalResource {
             if (location.isAbsolute()) {
                 throw new IllegalArgumentException("Location must be a relative path, but the absolute path " + location + " was given.");
             }
-            try (BufferedReader in = new BufferedReader(new InputStreamReader(findResource(location), StandardCharsets.UTF_8))) {
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(getResourceStream(location), StandardCharsets.UTF_8))) {
                 List<String> content = new ArrayList<>();
                 for (String line = in.readLine(); line != null; line = in.readLine()) {
                     content.add(line);
@@ -257,12 +261,15 @@ public interface InternalResource {
          *            {@code target} folder. In other words, the file list entries are resolved
          *            using the {@code target} directory after removing the {@code relativizeTo}
          *            path.
+         * @param filter resource path filter. Only resources at resource paths for which the filter
+         *            predicate returns <code>true</code> are unpacked.
          * @throws IllegalArgumentException if {@code relativizeTo} is an absolute path or file list
          *             contains an absolute path
          * @throws IOException in case of IO error
-         * @since 23.1
+         * @since 24.2
          */
-        public void unpackResourceFiles(Path source, Path target, Path relativizeTo) throws IOException {
+        public void unpackResourceFiles(Path source, Path target, Path relativizeTo, Predicate<Path> filter) throws IOException {
+            Objects.requireNonNull(filter);
             if (source.isAbsolute()) {
                 throw new IllegalArgumentException("Source must be a relative path, but the absolute path " + source + " was given.");
             }
@@ -277,13 +284,28 @@ public interface InternalResource {
                     throw new IllegalArgumentException("The file list must contain only relative paths, but the absolute path " + resource + " was given.");
                 }
                 Path relativizedPath = resource.startsWith(relativizeTo) ? relativizeTo.relativize(resource) : relativizeTo;
-                copyResource(resource, target.resolve(relativizedPath), attrs);
+                if (filter.test(resource)) {
+                    copyResource(resource, target.resolve(relativizedPath), attrs);
+                }
             }
+        }
+
+        /**
+         * Extracts files from the module, which owns the {@link InternalResource} implementation
+         * class, listed in the {@code source} file list and places them into the {@code target}
+         * folder. Same as {@link #unpackResourceFiles(Path, Path, Path, Predicate)} with
+         * <code>filter = p -> true</code>.
+         *
+         * @see #unpackResourceFiles(Path, Path, Path, Predicate)
+         * @since 23.1
+         */
+        public void unpackResourceFiles(Path source, Path target, Path relativizeTo) throws IOException {
+            unpackResourceFiles(source, target, relativizeTo, p -> true);
         }
 
         private Properties loadFileList(Path source) throws IOException {
             Properties props = new Properties();
-            try (BufferedInputStream in = new BufferedInputStream(findResource(source))) {
+            try (BufferedInputStream in = new BufferedInputStream(getResourceStream(source))) {
                 props.load(in);
             }
             return props;
@@ -301,8 +323,8 @@ public interface InternalResource {
             return PosixFilePermissions.fromString(attrComponents[0].trim());
         }
 
-        private InputStream findResource(Path path) throws IOException {
-            String resourceName = path.toString().replace(File.separatorChar, '/');
+        private InputStream getResourceStream(Path resourcePath) throws IOException {
+            String resourceName = resourcePath.toString().replace(File.separatorChar, '/');
             InputStream stream;
             if (owner.isNamed()) {
                 stream = owner.getResourceAsStream(resourceName);
@@ -329,7 +351,7 @@ public interface InternalResource {
             URL location = codeSource != null ? codeSource.getLocation() : null;
             if (location == null) {
                 return preferred;  // Classloader does not provide code source location, return the
-                                   // first resource
+                // first resource
             }
             Path classOwner = fileURL(location);
             if (classOwner == null) {
@@ -373,10 +395,11 @@ public interface InternalResource {
         private void copyResource(Path source, Path target, Set<PosixFilePermission> attrs) throws IOException {
             Path parent = target.getParent();
             if (parent == null) {
-                throw CompilerDirectives.shouldNotReachHere("RelativeResourcePath must be non-empty.");
+                throw new AssertionError("RelativeResourcePath must be non-empty.");
             }
             Files.createDirectories(parent);
-            try (BufferedInputStream in = new BufferedInputStream(findResource(source))) {
+            try (BufferedInputStream in = new BufferedInputStream(getResourceStream(source))) {
+                // Parfait_ALLOW path-traversal (ClassLoader#getResources protects from root escape)
                 Files.copy(in, target);
             }
             if (getOS() != OS.WINDOWS) {
@@ -457,7 +480,43 @@ public interface InternalResource {
          *
          * @since 23.1
          */
-        WINDOWS("windows");
+        WINDOWS("windows"),
+
+        /**
+         * Represents an unsupported operating system.
+         * <p>
+         * To enable execution on unsupported platforms, the system property
+         * {@code -Dpolyglot.engine.allowUnsupportedPlatform=true} must be explicitly set. If this
+         * property is not set and the platform is unsupported, the {@link #getCurrent()} method
+         * will throw an {@link IllegalStateException}.
+         *
+         * @since 25.1
+         */
+        UNSUPPORTED("unsupported");
+
+        private static final String PROPERTY_ALLOW_UNSUPPORTED_PLATFORM = "polyglot.engine.allowUnsupportedPlatform";
+
+        private static volatile Boolean allowsUnsupportedPlatformValue;
+
+        private static boolean allowsUnsupportedPlatform() {
+            Boolean res = allowsUnsupportedPlatformValue;
+            if (res == null) {
+                synchronized (OS.class) {
+                    res = allowsUnsupportedPlatformValue;
+                    if (res == null) {
+                        res = Boolean.getBoolean(OS.PROPERTY_ALLOW_UNSUPPORTED_PLATFORM);
+                        if (!ImageInfo.inImageBuildtimeCode()) {
+                            /*
+                             * Avoid caching the property value during image build time, as it would
+                             * require resetting it in the image heap later.
+                             */
+                            allowsUnsupportedPlatformValue = res;
+                        }
+                    }
+                }
+            }
+            return res;
+        }
 
         private final String id;
 
@@ -483,15 +542,19 @@ public interface InternalResource {
         public static OS getCurrent() {
             String os = System.getProperty("os.name");
             if (os == null) {
-                throw CompilerDirectives.shouldNotReachHere("The 'os.name' system property is not set.");
+                throw new AssertionError("The 'os.name' system property is not set.");
             } else if (os.equalsIgnoreCase("linux")) {
                 return LINUX;
             } else if (os.equalsIgnoreCase("mac os x") || os.equalsIgnoreCase("darwin")) {
                 return DARWIN;
             } else if (os.toLowerCase().startsWith("windows")) {
                 return WINDOWS;
+            } else if (allowsUnsupportedPlatform()) {
+                return UNSUPPORTED;
             } else {
-                throw CompilerDirectives.shouldNotReachHere("Unsupported OS name " + os);
+                throw new IllegalStateException(String.format("Unsupported operating system: '%s'. " +
+                                "If you want to continue using this unsupported platform, set the system property '-D%s=true'. " +
+                                "Note that unsupported platforms require additional command line options to be functional.", os, PROPERTY_ALLOW_UNSUPPORTED_PLATFORM));
             }
         }
     }
@@ -515,7 +578,19 @@ public interface InternalResource {
          *
          * @since 23.1
          */
-        AMD64("amd64");
+        AMD64("amd64"),
+
+        /**
+         * Represents an unsupported architecture.
+         * <p>
+         * To enable execution on unsupported platforms, the system property
+         * {@code -Dpolyglot.engine.allowUnsupportedPlatform=true} must be explicitly set. If this
+         * property is not set and the platform is unsupported, the {@link #getCurrent()} method
+         * will throw an {@link IllegalStateException}.
+         *
+         * @since 25.1
+         */
+        UNSUPPORTED("unsupported");
 
         private final String id;
 
@@ -541,12 +616,20 @@ public interface InternalResource {
         public static CPUArchitecture getCurrent() {
             String arch = System.getProperty("os.arch");
             if (arch == null) {
-                throw CompilerDirectives.shouldNotReachHere("The 'os.arch' system property is not set.");
+                throw new AssertionError("The 'os.arch' system property is not set.");
             }
             return switch (arch) {
                 case "amd64", "x86_64" -> AMD64;
                 case "aarch64", "arm64" -> AARCH64;
-                default -> throw CompilerDirectives.shouldNotReachHere("Unsupported CPU architecture " + arch);
+                default -> {
+                    if (OS.allowsUnsupportedPlatform()) {
+                        yield UNSUPPORTED;
+                    } else {
+                        throw new IllegalStateException(String.format("Unsupported CPU architecture: '%s'. " +
+                                        "If you want to allow unsupported CPU architectures (which will cause the fallback Truffle runtime to be used and may disable some language features), " +
+                                        "set the system property '-D%s=true'.", arch, OS.PROPERTY_ALLOW_UNSUPPORTED_PLATFORM));
+                    }
+                }
             };
         }
     }

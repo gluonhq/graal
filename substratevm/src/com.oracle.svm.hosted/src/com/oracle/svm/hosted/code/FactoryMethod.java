@@ -24,17 +24,20 @@
  */
 package com.oracle.svm.hosted.code;
 
+import static com.oracle.svm.util.GuestAnnotationAccess.newAnnotationValue;
+
+import java.util.List;
+
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.svm.core.NeverInlineTrivial;
-import com.oracle.svm.hosted.annotation.AnnotationValue;
-import com.oracle.svm.hosted.annotation.SubstrateAnnotationExtractor;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
-import com.oracle.svm.util.ReflectionUtil;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -49,11 +52,14 @@ import jdk.vm.ci.meta.Signature;
 public final class FactoryMethod extends NonBytecodeMethod {
 
     private final ResolvedJavaMethod targetConstructor;
+    private final ResolvedJavaType instantiatedType;
     private final boolean throwAllocatedObject;
 
-    FactoryMethod(String name, ResolvedJavaMethod targetConstructor, ResolvedJavaType declaringClass, Signature signature, ConstantPool constantPool, boolean throwAllocatedObject) {
+    FactoryMethod(String name, ResolvedJavaMethod targetConstructor, ResolvedJavaType instantiatedType, ResolvedJavaType declaringClass, Signature signature, ConstantPool constantPool,
+                    boolean throwAllocatedObject) {
         super(name, true, declaringClass, signature, constantPool);
         this.targetConstructor = targetConstructor;
+        this.instantiatedType = instantiatedType;
         this.throwAllocatedObject = throwAllocatedObject;
 
         assert targetConstructor.isConstructor() : targetConstructor;
@@ -66,16 +72,10 @@ public final class FactoryMethod extends NonBytecodeMethod {
      * machine code for allocations is large. Note that this does not preclude later inlining of the
      * method as part of the regular AOT compilation pipeline.
      */
-    @NeverInlineTrivial("FactoryMethod")
-    @SuppressWarnings("unused")
-    private static void annotationHolder() {
-    }
-
-    private static final AnnotationValue[] INJECTED_ANNOTATIONS = SubstrateAnnotationExtractor.prepareInjectedAnnotations(
-                    ReflectionUtil.lookupMethod(FactoryMethod.class, "annotationHolder").getAnnotation(NeverInlineTrivial.class));
+    private static final List<AnnotationValue> INJECTED_ANNOTATIONS = List.of(newAnnotationValue(NeverInlineTrivial.class, "reason", "FactoryMethod"));
 
     @Override
-    public AnnotationValue[] getInjectedAnnotations() {
+    public List<AnnotationValue> getInjectedAnnotations() {
         return INJECTED_ANNOTATIONS;
     }
 
@@ -85,8 +85,9 @@ public final class FactoryMethod extends NonBytecodeMethod {
         FactoryMethodSupport support = ImageSingletons.lookup(FactoryMethodSupport.class);
 
         AnalysisMethod aTargetConstructor = kit.getMetaAccess().getUniverse().lookup(targetConstructor);
+        AnalysisType aInstantiatedType = kit.getMetaAccess().getUniverse().lookup(instantiatedType);
 
-        AbstractNewObjectNode newInstance = support.createNewInstance(kit, aTargetConstructor.getDeclaringClass(), true);
+        AbstractNewObjectNode newInstance = support.createNewInstance(kit, aInstantiatedType, true);
 
         ValueNode[] originalArgs = kit.getInitialArguments().toArray(ValueNode.EMPTY_ARRAY);
         ValueNode[] invokeArgs = new ValueNode[originalArgs.length + 1];
@@ -104,5 +105,13 @@ public final class FactoryMethod extends NonBytecodeMethod {
 
     public ResolvedJavaMethod getTargetConstructor() {
         return targetConstructor;
+    }
+
+    public boolean throwAllocatedObject() {
+        return throwAllocatedObject;
+    }
+
+    public ResolvedJavaType getInstantiatedType() {
+        return instantiatedType;
     }
 }

@@ -30,25 +30,39 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.genscavenge.AlignedHeapChunk.AlignedHeader;
+import com.oracle.svm.core.genscavenge.StackVerifier.VerifyFrameReferencesVisitor;
 import com.oracle.svm.core.genscavenge.UnalignedHeapChunk.UnalignedHeader;
+import com.oracle.svm.core.genscavenge.compacting.CompactingAlignedChunkAccess;
+import com.oracle.svm.core.genscavenge.metaspace.MetaspaceImpl;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.heap.ObjectHeader;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
-import com.oracle.svm.core.heap.ObjectVisitor;
+import com.oracle.svm.core.heap.DerivedReferenceSupport;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.ObjectHeader;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.heap.ObjectVisitor;
 import com.oracle.svm.core.heap.ReferenceAccess;
 import com.oracle.svm.core.heap.ReferenceInternals;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
 import com.oracle.svm.core.hub.InteriorObjRefWalker;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.api.replacements.Fold;
-import jdk.graal.compiler.word.Word;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class HeapVerifier {
     private static final ObjectVerifier OBJECT_VERIFIER = new ObjectVerifier();
     private static final ObjectReferenceVerifier REFERENCE_VERIFIER = new ObjectReferenceVerifier();
@@ -57,7 +71,7 @@ public class HeapVerifier {
     public HeapVerifier() {
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static HeapVerifier singleton() {
         return ImageSingletons.lookup(HeapVerifier.class);
     }
@@ -65,6 +79,7 @@ public class HeapVerifier {
     public boolean verify(Occasion occasion) {
         boolean success = true;
         success &= verifyImageHeap();
+        success &= verifyMetaspace();
         success &= verifyYoungGeneration(occasion);
         success &= verifyOldGeneration();
         success &= verifyRememberedSets();
@@ -73,17 +88,24 @@ public class HeapVerifier {
 
     protected boolean verifyImageHeap() {
         boolean success = true;
-        for (ImageHeapInfo info = HeapImpl.getFirstImageHeapInfo(); info != null; info = info.next) {
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
             success &= verifyAlignedChunks(null, info.getFirstWritableAlignedChunk());
             success &= verifyUnalignedChunks(null, info.getFirstWritableUnalignedChunk(), info.getLastWritableUnalignedChunk());
         }
         return success;
     }
 
+    private static boolean verifyMetaspace() {
+        if (!Metaspace.isSupported()) {
+            return true;
+        }
+        return MetaspaceImpl.singleton().verify();
+    }
+
     private static boolean verifyYoungGeneration(Occasion occasion) {
         boolean success = true;
         YoungGeneration youngGeneration = HeapImpl.getHeapImpl().getYoungGeneration();
-        if (occasion == HeapVerifier.Occasion.AFTER_COLLECTION) {
+        if (occasion == Occasion.During || occasion == Occasion.After) {
             Space eden = youngGeneration.getEden();
             if (!eden.isEmpty()) {
                 Log.log().string("Eden contains chunks after a collection: firstAlignedChunk: ").zhex(eden.getFirstAlignedHeapChunk()).string(", firstUnalignedChunk: ")
@@ -120,41 +142,36 @@ public class HeapVerifier {
          * After we are done with all other verifications, it is guaranteed that the heap is in a
          * reasonable state. Now, we can verify the remembered sets without having to worry about
          * basic heap consistency.
-         */
-        if (!SerialGCOptions.useRememberedSet() || !SerialGCOptions.VerifyRememberedSet.getValue()) {
-            return true;
-        }
-
-        /*
+         *
          * It would be nice to assert that all cards in the image heap and old generation are clean
          * after a garbage collection. For the image heap, it is pretty much impossible to do that
          * as the GC itself dirties the card table. For the old generation, it is also not possible
          * at the moment because the reference handling may result in dirty cards.
          */
-
         boolean success = true;
         RememberedSet rememberedSet = RememberedSet.get();
-        /*
-         * For the image heap, we can't verify that all cards are clean after a GC because the GC
-         * itself may result in dirty cards.
-         */
-        for (ImageHeapInfo info = HeapImpl.getFirstImageHeapInfo(); info != null; info = info.next) {
+
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
             success &= rememberedSet.verify(info.getFirstWritableAlignedChunk());
             success &= rememberedSet.verify(info.getFirstWritableUnalignedChunk(), info.getLastWritableUnalignedChunk());
+        }
+
+        if (Metaspace.isSupported()) {
+            success &= MetaspaceImpl.singleton().verifyRememberedSets();
         }
 
         success &= HeapImpl.getHeapImpl().getOldGeneration().verifyRememberedSets();
         return success;
     }
 
-    static boolean verifyRememberedSet(Space space) {
+    public static boolean verifyRememberedSet(Space space) {
         boolean success = true;
         success &= RememberedSet.get().verify(space.getFirstAlignedHeapChunk());
         success &= RememberedSet.get().verify(space.getFirstUnalignedHeapChunk());
         return success;
     }
 
-    static boolean verifySpace(Space space) {
+    public static boolean verifySpace(Space space) {
         boolean success = true;
         success &= verifyChunkList(space, "aligned", space.getFirstAlignedHeapChunk(), space.getLastAlignedHeapChunk());
         success &= verifyChunkList(space, "unaligned", space.getFirstUnalignedHeapChunk(), space.getLastUnalignedHeapChunk());
@@ -166,7 +183,7 @@ public class HeapVerifier {
     private static boolean verifyChunkList(Space space, String kind, HeapChunk.Header<?> firstChunk, HeapChunk.Header<?> lastChunk) {
         boolean result = true;
         HeapChunk.Header<?> current = firstChunk;
-        HeapChunk.Header<?> previous = WordFactory.nullPointer();
+        HeapChunk.Header<?> previous = Word.nullPointer();
         while (current.isNonNull()) {
             HeapChunk.Header<?> previousOfCurrent = HeapChunk.getPrevious(current);
             if (previousOfCurrent.notEqual(previous)) {
@@ -188,6 +205,7 @@ public class HeapVerifier {
 
     private static boolean verifyAlignedChunks(Space space, AlignedHeader firstAlignedHeapChunk) {
         boolean success = true;
+
         AlignedHeader aChunk = firstAlignedHeapChunk;
         while (aChunk.isNonNull()) {
             if (space != aChunk.getSpace()) {
@@ -196,12 +214,19 @@ public class HeapVerifier {
                 success = false;
             }
 
-            if (aChunk.getShouldSweepInsteadOfCompact()) {
-                Log.log().string("Aligned chunk ").zhex(aChunk).string(" is marked for sweeping while this should only be used during collections.").newline();
-                success = false;
+            if (SerialGCOptions.useCompactingOldGen()) {
+                if (!CompactingAlignedChunkAccess.verifyChunkHeaderNotMarkedUncommitted(aChunk)) {
+                    Log.log().string("Chunk header for aligned chunk ").zhex(aChunk).string(" is marked as being in uncommitted memory.").newline();
+                    success = false;
+                }
+
+                if (!CompactingAlignedChunkAccess.verifyMinimumUncommitSize(aChunk, AlignedChunkPartialUncommitter.MINIMUM_UNCOMMIT_SIZE)) {
+                    Log.log().string("Aligned chunk ").zhex(aChunk).string(" has an uncommitted range smaller than the minimum uncommit size.").newline();
+                    success = false;
+                }
             }
 
-            OBJECT_VERIFIER.initialize(aChunk, WordFactory.nullPointer());
+            OBJECT_VERIFIER.initialize(aChunk, Word.nullPointer());
             AlignedHeapChunk.walkObjects(aChunk, OBJECT_VERIFIER);
             aChunk = HeapChunk.getNext(aChunk);
             success &= OBJECT_VERIFIER.result;
@@ -210,11 +235,12 @@ public class HeapVerifier {
     }
 
     private static boolean verifyUnalignedChunks(Space space, UnalignedHeader firstUnalignedHeapChunk) {
-        return verifyUnalignedChunks(space, firstUnalignedHeapChunk, WordFactory.nullPointer());
+        return verifyUnalignedChunks(space, firstUnalignedHeapChunk, Word.nullPointer());
     }
 
     private static boolean verifyUnalignedChunks(Space space, UnalignedHeader firstUnalignedHeapChunk, UnalignedHeader lastUnalignedHeapChunk) {
         boolean success = true;
+
         UnalignedHeader uChunk = firstUnalignedHeapChunk;
         while (uChunk.isNonNull()) {
             if (space != uChunk.getSpace()) {
@@ -223,7 +249,7 @@ public class HeapVerifier {
                 success = false;
             }
 
-            OBJECT_VERIFIER.initialize(WordFactory.nullPointer(), uChunk);
+            OBJECT_VERIFIER.initialize(Word.nullPointer(), uChunk);
             UnalignedHeapChunk.walkObjects(uChunk, OBJECT_VERIFIER);
             success &= OBJECT_VERIFIER.result;
 
@@ -243,13 +269,14 @@ public class HeapVerifier {
             return false;
         }
 
-        int objectAlignment = ConfigurationValues.getObjectLayout().getAlignment();
+        int objectAlignment = ObjectLayout.singleton().getAlignment();
         if (ptr.unsignedRemainder(objectAlignment).notEqual(0)) {
             Log.log().string("Object ").zhex(ptr).string(" is not properly aligned to ").signed(objectAlignment).string(" bytes.").newline();
             return false;
         }
 
-        Word header = ObjectHeader.readHeaderFromPointer(ptr);
+        ObjectHeader oh = Heap.getHeap().getObjectHeader();
+        Word header = oh.readHeaderFromPointer(ptr);
         if (ObjectHeaderImpl.isProducedHeapChunkZapped(header) || ObjectHeaderImpl.isConsumedHeapChunkZapped(header)) {
             Log.log().string("Object ").zhex(ptr).string(" has a zapped header: ").zhex(header).newline();
             return false;
@@ -260,19 +287,22 @@ public class HeapVerifier {
             return false;
         }
 
-        if (SerialGCOptions.useCompactingOldGen() && ObjectHeaderImpl.isMarkedHeader(header)) {
+        if (!HeapImpl.getHeap().getObjectHeader().isEncodedObjectHeader(header)) {
+            Log.log().string("Object ").zhex(ptr).string(" does not have a valid hub: ").zhex(header).newline();
+            return false;
+        }
+
+        if (ObjectHeaderImpl.isMarkedHeader(header)) {
             Log.log().string("Object ").zhex(ptr).string(" has a marked header: ").zhex(header).newline();
             return false;
         }
 
         assert aChunk.isNonNull() ^ uChunk.isNonNull();
         HeapChunk.Header<?> chunk = aChunk.isNonNull() ? aChunk : uChunk;
-        if (HeapImpl.isImageHeapAligned() || !HeapImpl.getHeapImpl().isInImageHeap(obj)) {
-            HeapChunk.Header<?> enclosingHeapChunk = HeapChunk.getEnclosingHeapChunk(obj);
-            if (chunk.notEqual(enclosingHeapChunk)) {
-                Log.log().string("Object ").zhex(ptr).string(" should have ").zhex(chunk).string(" as its enclosing chunk but getEnclosingHeapChunk returned ").zhex(enclosingHeapChunk).newline();
-                return false;
-            }
+        HeapChunk.Header<?> enclosingHeapChunk = HeapChunk.getEnclosingHeapChunk(obj);
+        if (chunk.notEqual(enclosingHeapChunk)) {
+            Log.log().string("Object ").zhex(ptr).string(" should have ").zhex(chunk).string(" as its enclosing chunk but getEnclosingHeapChunk returned ").zhex(enclosingHeapChunk).newline();
+            return false;
         }
 
         Pointer chunkStart = HeapChunk.asPointer(chunk);
@@ -304,17 +334,16 @@ public class HeapVerifier {
             // Not all objects in the image heap have the remembered set bit in the header, so
             // we can't verify that this bit is set.
 
-        } else if (space.isOldSpace()) {
+        } else if (space.isOldSpace() || space.isMetaspace()) {
             if (SerialGCOptions.useRememberedSet() && !RememberedSet.get().hasRememberedSet(header)) {
-                Log.log().string("Object ").zhex(ptr).string(" is in old generation chunk ").zhex(chunk).string(" but does not have a remembered set.").newline();
+                Log.log().string("Object ").zhex(ptr).string(" is in ").string(space.getName()).string(" chunk ").zhex(chunk).string(" but does not have a remembered set.").newline();
                 return false;
             }
-        }
-
-        DynamicHub hub = KnownIntrinsics.readHub(obj);
-        if (!HeapImpl.getHeapImpl().isInImageHeap(hub)) {
-            Log.log().string("Object ").zhex(ptr).string(" references a hub that is not in the image heap: ").zhex(Word.objectToUntrackedPointer(hub)).newline();
-            return false;
+        } else if (space.isYoungSpace()) {
+            if (SerialGCOptions.useRememberedSet() && RememberedSet.get().hasRememberedSet(header)) {
+                Log.log().string("Object ").zhex(ptr).string(" is in ").string(space.getName()).string(" chunk ").zhex(chunk).string(" but has a remembered set.").newline();
+                return false;
+            }
         }
 
         return verifyReferences(obj);
@@ -330,7 +359,7 @@ public class HeapVerifier {
         InteriorObjRefWalker.walkObject(obj, REFERENCE_VERIFIER);
 
         boolean success = REFERENCE_VERIFIER.result;
-        DynamicHub hub = KnownIntrinsics.readHub(obj);
+        DynamicHub hub = DynamicHubIntrinsics.readHub(obj);
         if (hub.isReferenceInstanceClass()) {
             // The referent field of java.lang.Reference is excluded from the reference map, so we
             // need to verify it separately.
@@ -349,21 +378,28 @@ public class HeapVerifier {
         return verifyReference(parentObject, objRef, ptr);
     }
 
-    // This method is executed exactly once for each object reference in the heap and on the stack.
-    private static boolean verifyReference(Object parentObject, Pointer reference, Pointer referencedObject) {
-        if (referencedObject.isNull()) {
+    public static boolean verifyDerivedReference(Object parentObject, Pointer baseObjRef, Pointer derivedObjRef, boolean compressed) {
+        Pointer base = DerivedReferenceSupport.readReferenceAsPointer(baseObjRef, compressed);
+        Pointer derived = DerivedReferenceSupport.readReferenceAsPointer(derivedObjRef, compressed);
+        if (derived.isNull()) {
             return true;
         }
 
-        if (SerialGCOptions.VerifyReferencesPointIntoValidChunk.getValue() && !HeapImpl.getHeapImpl().isInHeap(referencedObject)) {
-            Log.log().string("Object reference at ").zhex(reference).string(" points outside the Java heap: ").zhex(referencedObject).string(". ");
+        if (base.isNull()) {
+            Log.log().string("Derived object reference at ").zhex(derivedObjRef).string(" is non-null but the base reference at ").zhex(baseObjRef).string(" is null: ").zhex(derived).string(". ");
             printParent(parentObject);
             return false;
         }
 
-        if (!ObjectHeaderImpl.getObjectHeaderImpl().pointsToObjectHeader(referencedObject)) {
-            Log.log().string("Object reference at ").zhex(reference).string(" does not point to a Java object or the object header of the Java object is invalid: ").zhex(referencedObject)
-                            .string(". ");
+        if (!verifyReference(parentObject, baseObjRef, base)) {
+            return false;
+        }
+
+        Object baseObject = base.toObject();
+        Pointer baseEnd = base.add(LayoutEncoding.getSizeFromObjectInGC(baseObject));
+        if (derived.belowThan(base) || derived.aboveOrEqual(baseEnd)) {
+            Log.log().string("Derived object reference at ").zhex(derivedObjRef).string(" points outside its base object: derived=").zhex(derived).string(", base=").zhex(base)
+                            .string(", baseEnd=").zhex(baseEnd).string(". ");
             printParent(parentObject);
             return false;
         }
@@ -371,11 +407,60 @@ public class HeapVerifier {
         return true;
     }
 
-    private static void printParent(Object parentObject) {
-        if (parentObject != null) {
-            Log.log().string("The object that contains the invalid reference is of type ").string(parentObject.getClass().getName()).newline();
+    // This method is executed exactly once for each object reference in the heap and on the stack.
+    private static boolean verifyReference(Object parentObject, Pointer reference, Pointer referencedObject) {
+        if (referencedObject.isNull()) {
+            return true;
+        }
+
+        if (SerialGCOptions.VerifyReferencesPointIntoValidChunk.getValue() && !HeapImpl.getHeapImpl().isInHeapSlow(referencedObject)) {
+            Log.log().string("Object reference at ").zhex(reference).string(" points outside the Java heap: ").zhex(referencedObject).string(". ");
+            printParent(parentObject);
+            return false;
+        }
+
+        ObjectHeader oh = Heap.getHeap().getObjectHeader();
+        Word header = oh.readHeaderFromPointer(referencedObject);
+        if (!ObjectHeaderImpl.getObjectHeaderImpl().isEncodedObjectHeader(header)) {
+            Log.log().string("Object reference at ").zhex(reference).string(" does not point to a Java object or the object header of the Java object is invalid: ").zhex(referencedObject)
+                            .string(". ");
+            printParent(parentObject);
+            return false;
+        }
+
+        if (ObjectHeaderImpl.isAlignedHeader(header)) {
+            AlignedHeader chunk = AlignedHeapChunk.getEnclosingChunkFromObjectPointer(referencedObject);
+            if (referencedObject.belowThan(AlignedHeapChunk.getObjectsStart(chunk)) || referencedObject.aboveOrEqual(HeapChunk.getTopPointer(chunk))) {
+                Log.log().string("Object reference at ").zhex(reference).string(" points to ").zhex(referencedObject).string(", which is outside the usable part of the corresponding aligned chunk. ");
+                printParent(parentObject);
+                return false;
+            }
         } else {
-            Log.log().string("The invalid reference is on the stack").newline();
+            assert ObjectHeaderImpl.isUnalignedHeader(header);
+            UnalignedHeader chunk = UnalignedHeapChunk.getEnclosingChunkFromObjectPointer(referencedObject);
+            if (referencedObject != UnalignedHeapChunk.getObjectStart(chunk)) {
+                Log.log().string("Object reference at ").zhex(reference).string(" points to ").zhex(referencedObject)
+                                .string(", which is outside the usable part of the corresponding unaligned chunk. ");
+                printParent(parentObject);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void printParent(Object parentObject) {
+        if (parentObject instanceof VerifyFrameReferencesVisitor visitor) {
+            Log.log().string("The invalid reference is on the stack:").indent(true);
+            Log.log().string("isolate thread: ").zhex(visitor.getIsolateThread()).newline();
+            Log.log().string("sp=").zhex(visitor.getSP()).newline();
+
+            Log.log().string("ip=").zhex(visitor.getIP()).string(" (");
+            SubstrateDiagnostics.printLocationInfo(Log.log(), (UnsignedWord) visitor.getIP(), true, false);
+            Log.log().string(")").indent(false);
+        } else {
+            assert parentObject != null;
+            Log.log().string("The object that contains the invalid reference is of type ").string(parentObject.getClass().getName()).newline();
         }
     }
 
@@ -396,9 +481,8 @@ public class HeapVerifier {
         }
 
         @Override
-        public boolean visitObject(Object object) {
+        public void visitObject(Object object) {
             result &= verifyObject(object, aChunk, uChunk);
-            return true;
         }
     }
 
@@ -414,14 +498,28 @@ public class HeapVerifier {
         }
 
         @Override
-        public boolean visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
+        public void visitObjectReferences(Pointer firstObjRef, boolean compressed, int referenceSize, Object holderObject, int count) {
+            Pointer pos = firstObjRef;
+            Pointer end = firstObjRef.add(Word.unsigned(count).multiply(referenceSize));
+            while (pos.belowThan(end)) {
+                visitObjectReference(pos, compressed, holderObject);
+                pos = pos.add(referenceSize);
+            }
+        }
+
+        private void visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
             result &= verifyReference(holderObject, objRef, compressed);
-            return true;
+        }
+
+        @Override
+        public void visitDerivedReference(Pointer baseObjRef, Pointer derivedObjRef, boolean compressed, Object holderObject) {
+            result &= verifyDerivedReference(holderObject, baseObjRef, derivedObjRef, compressed);
         }
     }
 
     public enum Occasion {
-        BEFORE_COLLECTION,
-        AFTER_COLLECTION
+        Before,
+        During,
+        After
     }
 }

@@ -1,0 +1,99 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted;
+
+import java.util.Objects;
+
+import jdk.graal.compiler.phases.util.BytecodeHandlerConfig;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+/**
+ * Hosted-only identity for a registered bytecode handler stub. The invoke plugin maps each handler
+ * method, interpreter holder, configuration, and template index to its generated stub wrapper. The
+ * outline phase uses this mapping to find the wrapper, and hosted initialization uses it to build
+ * the threaded and main-dispatch handler tables.
+ * <p>
+ * Keys with a null method identify the default handler and threaded-handler table for one
+ * interpreter configuration and template index.
+ */
+public final class BytecodeHandlerStubKey {
+
+    private final ResolvedJavaMethod method;
+    private final ResolvedJavaType interpreterHolder;
+    private final BytecodeHandlerConfig handlerConfig;
+    private final int templateIndex;
+
+    private BytecodeHandlerStubKey(ResolvedJavaMethod method, ResolvedJavaType interpreterHolder, BytecodeHandlerConfig handlerConfig, int templateIndex) {
+        this.method = method;
+        this.interpreterHolder = Objects.requireNonNull(interpreterHolder);
+        this.handlerConfig = Objects.requireNonNull(handlerConfig);
+        this.templateIndex = templateIndex;
+    }
+
+    public static BytecodeHandlerStubKey create(ResolvedJavaMethod method, ResolvedJavaType interpreterHolder, BytecodeHandlerConfig handlerConfig) {
+        return create(method, interpreterHolder, handlerConfig, 0);
+    }
+
+    public static BytecodeHandlerStubKey create(ResolvedJavaMethod method, ResolvedJavaType interpreterHolder, BytecodeHandlerConfig handlerConfig, int templateIndex) {
+        return new BytecodeHandlerStubKey(method, interpreterHolder, handlerConfig, templateIndex);
+    }
+
+    public static BytecodeHandlerStubKey createDefaultHandlerKey(ResolvedJavaType interpreterHolder, BytecodeHandlerConfig handlerConfig, int templateIndex) {
+        return new BytecodeHandlerStubKey(null, interpreterHolder, handlerConfig, templateIndex);
+    }
+
+    public ResolvedJavaMethod method() {
+        return method;
+    }
+
+    public ResolvedJavaType interpreterHolder() {
+        return interpreterHolder;
+    }
+
+    public BytecodeHandlerConfig handlerConfig() {
+        return handlerConfig;
+    }
+
+    public int templateIndex() {
+        return templateIndex;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (!(obj instanceof BytecodeHandlerStubKey other)) {
+            return false;
+        }
+        return Objects.equals(method, other.method) && interpreterHolder.equals(other.interpreterHolder) && handlerConfig.equals(other.handlerConfig) && templateIndex == other.templateIndex;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(method, interpreterHolder, handlerConfig, templateIndex);
+    }
+}

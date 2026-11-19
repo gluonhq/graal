@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,10 +28,12 @@ import static jdk.graal.compiler.core.common.calc.FloatConvert.I2D;
 import static jdk.graal.compiler.core.common.calc.FloatConvert.I2F;
 import static jdk.graal.compiler.core.common.calc.FloatConvert.L2D;
 import static jdk.graal.compiler.core.common.calc.FloatConvert.L2F;
+import static jdk.graal.compiler.core.common.calc.FloatConvert.UI2D;
+import static jdk.graal.compiler.core.common.calc.FloatConvert.UI2F;
+import static jdk.graal.compiler.core.common.calc.FloatConvert.UL2D;
+import static jdk.graal.compiler.core.common.calc.FloatConvert.UL2F;
 import static jdk.vm.ci.code.CodeUtil.isPowerOf2;
 
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
 import jdk.graal.compiler.core.common.LIRKind;
@@ -483,8 +485,7 @@ public final class IntegerStamp extends PrimitiveStamp {
 
     @Override
     public Stamp constant(Constant c, MetaAccessProvider meta) {
-        if (c instanceof PrimitiveConstant) {
-            PrimitiveConstant primitiveConstant = (PrimitiveConstant) c;
+        if (c instanceof PrimitiveConstant primitiveConstant) {
             long value = primitiveConstant.asLong();
             if (primitiveConstant.getJavaKind() == JavaKind.Boolean && value == 1) {
                 // Need to special case booleans as integer stamps are always signed values.
@@ -499,20 +500,15 @@ public final class IntegerStamp extends PrimitiveStamp {
 
     @Override
     public SerializableConstant deserialize(ByteBuffer buffer) {
-        switch (getBits()) {
-            case 1:
-                return JavaConstant.forBoolean(buffer.get() != 0);
-            case 8:
-                return JavaConstant.forByte(buffer.get());
-            case 16:
-                return JavaConstant.forShort(buffer.getShort());
-            case 32:
-                return JavaConstant.forInt(buffer.getInt());
-            case 64:
-                return JavaConstant.forLong(buffer.getLong());
-            default:
+        return switch (getBits()) {
+            case 1 -> JavaConstant.forBoolean(buffer.get() != 0);
+            case 8 -> JavaConstant.forByte(buffer.get());
+            case 16 -> JavaConstant.forShort(buffer.getShort());
+            case 32 -> JavaConstant.forInt(buffer.getInt());
+            case 64 -> JavaConstant.forLong(buffer.getLong());
+            default ->
                 throw GraalError.shouldNotReachHereUnexpectedValue(getBits()); // ExcludeFromJacocoGeneratedReport
-        }
+        };
     }
 
     @Override
@@ -536,20 +532,15 @@ public final class IntegerStamp extends PrimitiveStamp {
 
     @Override
     public ResolvedJavaType javaType(MetaAccessProvider metaAccess) {
-        switch (getBits()) {
-            case 1:
-                return metaAccess.lookupJavaType(Boolean.TYPE);
-            case 8:
-                return metaAccess.lookupJavaType(Byte.TYPE);
-            case 16:
-                return metaAccess.lookupJavaType(Short.TYPE);
-            case 32:
-                return metaAccess.lookupJavaType(Integer.TYPE);
-            case 64:
-                return metaAccess.lookupJavaType(Long.TYPE);
-            default:
+        return switch (getBits()) {
+            case 1 -> metaAccess.lookupJavaType(Boolean.TYPE);
+            case 8 -> metaAccess.lookupJavaType(Byte.TYPE);
+            case 16 -> metaAccess.lookupJavaType(Short.TYPE);
+            case 32 -> metaAccess.lookupJavaType(Integer.TYPE);
+            case 64 -> metaAccess.lookupJavaType(Long.TYPE);
+            default ->
                 throw GraalError.shouldNotReachHereUnexpectedValue(getBits()); // ExcludeFromJacocoGeneratedReport
-        }
+        };
     }
 
     @Override
@@ -755,8 +746,7 @@ public final class IntegerStamp extends PrimitiveStamp {
         if (this == stamp) {
             return true;
         }
-        if (stamp instanceof IntegerStamp) {
-            IntegerStamp other = (IntegerStamp) stamp;
+        if (stamp instanceof IntegerStamp other) {
             return getBits() == other.getBits();
         }
         return false;
@@ -764,8 +754,7 @@ public final class IntegerStamp extends PrimitiveStamp {
 
     @Override
     public boolean isCompatible(Constant constant) {
-        if (constant instanceof PrimitiveConstant) {
-            PrimitiveConstant prim = (PrimitiveConstant) constant;
+        if (constant instanceof PrimitiveConstant prim) {
             JavaKind kind = prim.getJavaKind();
             return kind.isNumericInteger() && kind.getBitCount() == getBits();
         }
@@ -795,10 +784,10 @@ public final class IntegerStamp extends PrimitiveStamp {
         final int prime = 31;
         int result = 1;
         result = prime * result + super.hashCode();
-        result = prime * result + (int) (lowerBound ^ (lowerBound >>> 32));
-        result = prime * result + (int) (upperBound ^ (upperBound >>> 32));
-        result = prime * result + (int) (mustBeSet ^ (mustBeSet >>> 32));
-        result = prime * result + (int) (mayBeSet ^ (mayBeSet >>> 32));
+        result = prime * result + Long.hashCode(lowerBound);
+        result = prime * result + Long.hashCode(upperBound);
+        result = prime * result + Long.hashCode(mustBeSet);
+        result = prime * result + Long.hashCode(mayBeSet);
         result = prime * result + Boolean.hashCode(canBeZero);
         return result;
     }
@@ -909,9 +898,9 @@ public final class IntegerStamp extends PrimitiveStamp {
         if (bits == 64) {
             if (a > 0 && b > 0) {
                 return a > 0x7FFFFFFF_FFFFFFFFL / b;
-            } else if (a > 0 && b <= 0) {
+            } else if (a > 0) {
                 return b < 0x80000000_00000000L / a;
-            } else if (a <= 0 && b > 0) {
+            } else if (b > 0) {
                 return a < 0x80000000_00000000L / b;
             } else {
                 // a<=0 && b <=0
@@ -999,6 +988,12 @@ public final class IntegerStamp extends PrimitiveStamp {
      */
     public static boolean negateCanOverflow(IntegerStamp stamp) {
         return stamp.lowerBound() == CodeUtil.minValue(stamp.getBits());
+    }
+
+    /** Returns {@code true} if the two stamps cannot have any common set bits. */
+    public static boolean bitwiseDisjoint(IntegerStamp x, IntegerStamp y) {
+        GraalError.guarantee(x.getBits() == y.getBits(), "must be compatible: %s / %s", x, y);
+        return (x.mayBeSet() & y.mayBeSet()) == 0;
     }
 
     public static final ArithmeticOpTable OPS = new ArithmeticOpTable(
@@ -1317,7 +1312,7 @@ public final class IntegerStamp extends PrimitiveStamp {
                                     }
                                 }
 
-                                assert newLowerBound <= newUpperBound : Assertions.errorMessageContext("newLowerBound", newLowerBound, "newUpperBonud", newUpperBound, "stamp1", stamp1, "stamp2",
+                                assert newLowerBound <= newUpperBound : Assertions.errorMessageContext("newLowerBound", newLowerBound, "newUpperBound", newUpperBound, "stamp1", stamp1, "stamp2",
                                                 stamp2);
                                 return StampFactory.forIntegerWithMask(bits, newLowerBound, newUpperBound, 0, newMayBeSet);
                             }
@@ -1604,7 +1599,11 @@ public final class IntegerStamp extends PrimitiveStamp {
                                 // Math.abs(...) - 1 does not work in a case
                                 magnitude = CodeUtil.maxValue(b.getBits());
                             } else {
-                                magnitude = Math.max(Math.abs(b.lowerBound()), Math.abs(b.upperBound())) - 1;
+                                try {
+                                    magnitude = Math.max(NumUtil.safeAbs(b.lowerBound()), NumUtil.safeAbs(b.upperBound())) - 1;
+                                } catch (ArithmeticException e) {
+                                    return stamp1.unrestricted();
+                                }
                             }
                             newLowerBound = Math.max(newLowerBound, -magnitude);
                             newUpperBound = Math.min(newUpperBound, magnitude);
@@ -1664,34 +1663,66 @@ public final class IntegerStamp extends PrimitiveStamp {
                             IntegerStamp b = (IntegerStamp) stamp2;
                             assert a.getBits() == b.getBits() : "Bits must match " + Assertions.errorMessageContext("a", a, "b", b);
 
+                            if (a.isUnrestricted() && b.isUnrestricted()) {
+                                return a;
+                            }
+
                             int bits = a.getBits();
                             long mustBeSet = a.mustBeSet & b.mustBeSet;
                             long mayBeSet = a.mayBeSet & b.mayBeSet;
-                            if (significantBit(bits, mayBeSet) == 0) {
-                                /*
-                                 * The result will be positive. Try to refine the bounds. We can
-                                 * only exploit positive bounds, and one of the inputs may be
-                                 * negative. For example, for [-20, -10] & [10, 20] we can use the
-                                 * positive 20 as an upper bound for the result, but the other
-                                 * value's upper bound -10 gives no useful information.
-                                 */
-                                long upperBound = maxValueForMasks(bits, mustBeSet, mayBeSet);
-                                if (a.lowerBound >= 0) {
-                                    upperBound = Math.min(upperBound, a.upperBound);
-                                }
-                                if (b.lowerBound >= 0) {
-                                    upperBound = Math.min(upperBound, b.upperBound);
-                                }
-                                return create(bits, 0, upperBound, mustBeSet, mayBeSet);
-                            } else if (significantBit(bits, mustBeSet) == 1) {
-                                /*
-                                 * The result will be negative. Try to refine the bounds. Both upper
-                                 * bounds must be negative, so we can exploit both.
-                                 */
-                                long upperBound = Math.min(maxValueForMasks(bits, mustBeSet, mayBeSet), Math.min(a.upperBound, b.upperBound));
-                                return create(bits, minValueForMasks(bits, mustBeSet, mayBeSet), upperBound, mustBeSet, mayBeSet);
+                            long lowerBound = minValueForMasks(bits, mustBeSet, mayBeSet);
+                            long upperBound = maxValueForMasks(bits, mustBeSet, mayBeSet);
+
+                            /*
+                             * Attempt to refine the bounds of (a & b) using the identity
+                             * (x & y) == x - (x & ~y).
+                             * Let R = x & ~y, calculate its bounds from its masks. Then:
+                             *
+                             * x.lowerBound - R.upperBound <= (x & y) <= x.upperBound - R.lowerBound
+                             *
+                             * And these bounds can be better than ones derived only from the masks of (x & y).
+                             * For example, consider [10, 20] & [-20, -10]:
+                             *
+                             * x.mustBeSet = 0x00000000    x.mayBeSet = 0x0000001F
+                             * y.mustBeSet = 0xFFFFFFE0    y.mayBeSet = 0xFFFFFFFF
+                             * initial result: stampForMask(32, 0x00000000, 0x0000001F) == [0, 31]
+                             * masks for R = x & ~y:
+                             *   R.mustBeSet = x.mustBeSet & ~y.mayBeSet = 0x00000000
+                             *   R.mayBeSet  = x.mayBeSet & ~y.mustBeSet = 0x0000001F
+                             *   stampForMask(32, 0x00000000, 0x0000001F) == [0, 31]
+                             * refining initial stamp with [x.lowerBound - R.upperBound, x.upperBound - R.lowerBound]
+                             *   = [0, 31] intersect [10 - 31, 20 - 0] = [0, 20]
+                             *
+                             * With reversed parameters (x: [-20, -10], y: [10, 20]), R may be negative,
+                             * but the same interval calculation remains valid. Therefore, both (x, y) and
+                             * (y, x) are considered because either operand order may provide an improvement.
+                             *
+                             * Another example: with [10, 20] & -8, the resulting stamp is [8, 16].
+                             * Similarly, for [-20, -10] & -8 we can obtain [-24, -16].
+                             *
+                             * Both operand permutations can independently improve the initial stamp, for example:
+                             *
+                             * x=[88, 92] & y=[75, 94]  (mask-based stamp = [64, 95])
+                             * for x - (x & ~y)
+                             *    R = x & ~y = [0, 31]
+                             *    x - R = [88 - 31, 92 - 0] = [57, 92]
+                             *    this improves the upper bound to 92
+                             * for y - (y & ~x)
+                             *    R = y & ~x = [0, 7]
+                             *    y - R = [75 - 7, 94 - 0] = [68, 94]
+                             *    this improves the lower bound to 68
+                             */
+                            for (int i = 0; i < 2; i++) {
+                                IntegerStamp x = i == 0 ? a : b;
+                                IntegerStamp y = i == 0 ? b : a;
+                                long rMustBeSet = x.mustBeSet & ~y.mayBeSet;
+                                long rMayBeSet = x.mayBeSet & ~y.mustBeSet;
+                                long rLower = minValueForMasks(bits, rMustBeSet, rMayBeSet);
+                                long rUpper = maxValueForMasks(bits, rMustBeSet, rMayBeSet);
+                                lowerBound = Math.max(lowerBound, NumUtil.subSaturatingSigned(bits, x.lowerBound, rUpper));
+                                upperBound = Math.min(upperBound, NumUtil.subSaturatingSigned(bits, x.upperBound, rLower));
                             }
-                            return stampForMask(bits, mustBeSet, mayBeSet);
+                            return create(bits, lowerBound, upperBound, mustBeSet, mayBeSet);
                         }
 
                         @Override
@@ -1725,7 +1756,41 @@ public final class IntegerStamp extends PrimitiveStamp {
                             IntegerStamp b = (IntegerStamp) stamp2;
                             assert a.getBits() == b.getBits() : "Bits must match " + Assertions.errorMessageContext("a", a, "b", b);
 
-                            return stampForMask(a.getBits(), a.mustBeSet() | b.mustBeSet(), a.mayBeSet() | b.mayBeSet());
+                            if (a.isUnrestricted() && b.isUnrestricted()) {
+                                return a;
+                            }
+
+                            int bits = a.getBits();
+                            long mustBeSet = a.mustBeSet | b.mustBeSet;
+                            long mayBeSet = a.mayBeSet | b.mayBeSet;
+                            long lowerBound = minValueForMasks(bits, mustBeSet, mayBeSet);
+                            long upperBound = maxValueForMasks(bits, mustBeSet, mayBeSet);
+
+                            /*
+                             * Attempt to refine the bounds of (a | b) using the identity
+                             * (x | y) == x + (~x & y). Let A = (~x & y) and calculate its mask-based
+                             * bounds. Then:
+                             *
+                             * x.lowerBound + A.lowerBound <= (x | y) <= x.upperBound + A.upperBound
+                             *
+                             * For example, for [-20, -10] | [10, 20]:
+                             *
+                             * initial mask-based bounds = [-32, -1]
+                             * A = ~x & y = [0, 31]
+                             * x + A = [-20 + 0, -10 + 31] = [-20, 21]
+                             * refined bounds = [-32, -1] intersect [-20, 21] = [-20, -1]
+                             */
+                            for (int i = 0; i < 2; i++) {
+                                IntegerStamp x = i == 0 ? a : b;
+                                IntegerStamp y = i == 0 ? b : a;
+                                long aMustBeSet = y.mustBeSet & ~x.mayBeSet;
+                                long aMayBeSet = y.mayBeSet & ~x.mustBeSet;
+                                long aLower = minValueForMasks(bits, aMustBeSet, aMayBeSet);
+                                long aUpper = maxValueForMasks(bits, aMustBeSet, aMayBeSet);
+                                lowerBound = Math.max(lowerBound, NumUtil.addSaturatingSigned(bits, x.lowerBound, aLower));
+                                upperBound = Math.min(upperBound, NumUtil.addSaturatingSigned(bits, x.upperBound, aUpper));
+                            }
+                            return create(bits, lowerBound, upperBound, mustBeSet, mayBeSet);
                         }
 
                         @Override
@@ -1756,11 +1821,13 @@ public final class IntegerStamp extends PrimitiveStamp {
                             IntegerStamp a = (IntegerStamp) stamp1;
                             IntegerStamp b = (IntegerStamp) stamp2;
                             assert a.getBits() == b.getBits() : "Bits must match " + Assertions.errorMessageContext("a", a, "b", b);
+                            if (a.isUnrestricted() || b.isUnrestricted()) {
+                                return a.unrestricted();
+                            }
                             if (b.lowerBound == -1 && b.upperBound == -1) {
                                 /*
                                  * This is a bitwise negation. Fold with the Not op which takes
-                                 * bounds into account, unlike the code below which only uses the
-                                 * masks.
+                                 * bounds into account.
                                  */
                                 return OPS.getNot().foldStamp(a);
                             } else if (a.lowerBound == -1 && a.upperBound == -1) {
@@ -1770,7 +1837,42 @@ public final class IntegerStamp extends PrimitiveStamp {
                             long variableBits = (a.mustBeSet() ^ a.mayBeSet()) | (b.mustBeSet() ^ b.mayBeSet());
                             long newMustBeSet = (a.mustBeSet() ^ b.mustBeSet()) & ~variableBits;
                             long newMayBeSet = (a.mustBeSet() ^ b.mustBeSet()) | variableBits;
-                            return stampForMask(a.getBits(), newMustBeSet, newMayBeSet);
+                            long andMustBeSet = a.mustBeSet & b.mustBeSet;
+                            long andMayBeSet = a.mayBeSet & b.mayBeSet;
+                            int bits = a.getBits();
+                            long andLower = minValueForMasks(bits, andMustBeSet, andMayBeSet);
+                            long andUpper = maxValueForMasks(bits, andMustBeSet, andMayBeSet);
+
+                            /*
+                             * Refine the bounds using the identity (x ^ y) == (x + y) - 2 * (x & y).
+                             * Let A = (x & y) and calculate its mask-based bounds. Then:
+                             *
+                             * x.lowerBound + y.lowerBound - 2*A.upperBound <= x ^ y <= x.upperBound + y.upperBound - 2*A.lowerBound
+                             *
+                             * For example, for [10, 20] ^ 1
+                             * initial mask bounds = [0, 31]
+                             * A = [10, 20] & 1 = [0, 1]:
+                             * lower = 10 + 1 - 2 * 1 = 9
+                             * upper = 20 + 1 - 2 * 0 = 21
+                             * refined bounds = [0, 31] intersect [9, 21] = [9, 21].
+                             *
+                             * For [0, 2] ^ [0, 4]:
+                             * initial mask bounds = [0, 7]
+                             * A = [0, 2] & [0, 4] = [0, 3] (mask bounds)
+                             * lower = 0 + 0 - 2 * 3 = -6
+                             * upper = 2 + 4 - 2 * 0 = 6
+                             * refined bounds = [0, 7] intersect [-6, 6] = [0, 6].
+                             */
+                            try {
+                                long lowerBound = Math.subtractExact(Math.addExact(a.lowerBound, b.lowerBound), Math.multiplyExact(2L, andUpper));
+                                long upperBound = Math.subtractExact(Math.addExact(a.upperBound, b.upperBound), Math.multiplyExact(2L, andLower));
+                                lowerBound = Math.max(minValueForMasks(bits, newMustBeSet, newMayBeSet), lowerBound);
+                                upperBound = Math.min(maxValueForMasks(bits, newMustBeSet, newMayBeSet), upperBound);
+                                return create(bits, lowerBound, upperBound, newMustBeSet, newMayBeSet);
+                            } catch (ArithmeticException e) {
+                                // Keep the mask bounds if any intermediate calculation overflowed
+                                return stampForMask(bits, newMustBeSet, newMayBeSet);
+                            }
                         }
 
                         @Override
@@ -1789,22 +1891,18 @@ public final class IntegerStamp extends PrimitiveStamp {
                     new ArithmeticOpTable.ShiftOp.Shl() {
 
                         @Override
-                        public Constant foldConstant(Constant value, int amount) {
+                        public Constant foldConstant(Constant value, Constant amount) {
                             PrimitiveConstant c = (PrimitiveConstant) value;
-                            switch (c.getJavaKind()) {
-                                case Byte:
-                                    return JavaConstant.forByte((byte) (c.asInt() << amount));
-                                case Char:
-                                    return JavaConstant.forChar((char) (c.asInt() << amount));
-                                case Short:
-                                    return JavaConstant.forShort((short) (c.asInt() << amount));
-                                case Int:
-                                    return JavaConstant.forInt(c.asInt() << amount);
-                                case Long:
-                                    return JavaConstant.forLong(c.asLong() << amount);
-                                default:
-                                    throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
-                            }
+                            PrimitiveConstant s = (PrimitiveConstant) amount;
+                            long shift = s.getJavaKind() == JavaKind.Long ? s.asLong() : s.asInt();
+                            return switch (c.getJavaKind()) {
+                                case Byte -> JavaConstant.forByte((byte) (c.asInt() << shift));
+                                case Char -> JavaConstant.forChar((char) (c.asInt() << shift));
+                                case Short -> JavaConstant.forShort((short) (c.asInt() << shift));
+                                case Int -> JavaConstant.forInt(c.asInt() << shift);
+                                case Long -> JavaConstant.forLong(c.asLong() << shift);
+                                default -> throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
+                            };
                         }
 
                         private boolean testNoSignChangeAfterShifting(int bits, long value, int shiftAmount) {
@@ -1817,8 +1915,9 @@ public final class IntegerStamp extends PrimitiveStamp {
                         }
 
                         @Override
-                        public Stamp foldStamp(Stamp stamp, IntegerStamp shift) {
+                        public Stamp foldStampImpl(Stamp stamp, Stamp amount) {
                             IntegerStamp value = (IntegerStamp) stamp;
+                            IntegerStamp shift = (IntegerStamp) amount;
                             int bits = value.getBits();
                             if (value.isEmpty()) {
                                 return value;
@@ -1829,15 +1928,13 @@ public final class IntegerStamp extends PrimitiveStamp {
                             }
 
                             int shiftMask = getShiftAmountMask(stamp);
-                            int shiftBits = Integer.bitCount(shiftMask);
                             if (shift.lowerBound() == shift.upperBound()) {
                                 int shiftAmount = (int) (shift.lowerBound() & shiftMask);
                                 if (shiftAmount == 0) {
                                     return value;
                                 }
                                 if (shiftAmount >= bits) {
-                                    IntegerStamp result = IntegerStamp.create(bits, 0, 0, 0, 0);
-                                    return result;
+                                    return IntegerStamp.create(bits, 0, 0, 0, 0);
                                 }
                                 // the mask of bits that will be lost or shifted into the sign bit
                                 if (testNoSignChangeAfterShifting(bits, value.lowerBound(), shiftAmount) && testNoSignChangeAfterShifting(bits, value.upperBound(), shiftAmount)) {
@@ -1845,24 +1942,60 @@ public final class IntegerStamp extends PrimitiveStamp {
                                      * use a better stamp if neither lower nor upper bound can lose
                                      * bits
                                      */
-                                    IntegerStamp result = IntegerStamp.create(bits, value.lowerBound() << shiftAmount, value.upperBound() << shiftAmount,
+                                    return IntegerStamp.create(bits, value.lowerBound() << shiftAmount, value.upperBound() << shiftAmount,
                                                     (value.mustBeSet() << shiftAmount) & CodeUtil.mask(bits), (value.mayBeSet() << shiftAmount) & CodeUtil.mask(bits));
-                                    return result;
                                 }
                             }
-                            if ((shift.lowerBound() >>> shiftBits) == (shift.upperBound() >>> shiftBits)) {
-                                long defaultMask = CodeUtil.mask(bits);
-                                long mustBeSet = defaultMask;
-                                long mayBeSet = 0;
-                                for (long i = shift.lowerBound(); i <= shift.upperBound(); i++) {
-                                    if (shift.contains(i)) {
-                                        mustBeSet &= value.mustBeSet() << (i & shiftMask);
-                                        mayBeSet |= value.mayBeSet() << (i & shiftMask);
+                            long defaultMask = CodeUtil.mask(bits);
+                            long mustBeSet = defaultMask;
+                            long mayBeSet = 0;
+                            long lowerBound = CodeUtil.maxValue(bits);
+                            long upperBound = CodeUtil.minValue(bits);
+
+                            /*
+                             * The loop below checks the shift stamp range, but some values in the range may not be in
+                             * the actual stamp based on its mayBeSet mask, so we check shift.contains() every iteration.
+                             * But since the loop is capped at shiftMask+1 iterations, for longer intervals, we need to
+                             * check every shift amount because we only iterate through [shift.lowerBound, shift.lowerBound+shiftMask]
+                             */
+                            boolean coversAllShiftAmounts = Long.compareUnsigned(shift.upperBound() - shift.lowerBound(), shiftMask) > 0;
+                            if ((coversAllShiftAmounts || shift.contains(0)) && value.isUnrestricted()) {
+                                // unrestricted << [0, x] => unrestricted
+                                return value;
+                            }
+                            // Iterate over the possible shift amounts combining the resulting masks and bounds
+                            long sh = shift.lowerBound();
+                            for (int iterations = 0; iterations <= shiftMask; iterations++) {
+                                if (coversAllShiftAmounts || shift.contains(sh)) {
+                                    int shiftAmount = (int) (sh & shiftMask);
+                                    long shiftedMustBeSet = (value.mustBeSet() << shiftAmount) & defaultMask;
+                                    long shiftedMayBeSet = (value.mayBeSet() << shiftAmount) & defaultMask;
+                                    mustBeSet &= shiftedMustBeSet;
+                                    mayBeSet |= shiftedMayBeSet;
+                                    /* Try to improve the signed bounds for this shift. Shifting the input
+                                     * bounds is valid if no significant bits are lost and the sign does not
+                                     * change. Otherwise, calculate bounds from the shifted masks.
+                                     */
+                                    if (shiftAmount < bits && testNoSignChangeAfterShifting(bits, value.lowerBound(), shiftAmount) &&
+                                                    testNoSignChangeAfterShifting(bits, value.upperBound(), shiftAmount)) {
+                                        lowerBound = Math.min(lowerBound, value.lowerBound() << shiftAmount);
+                                        upperBound = Math.max(upperBound, value.upperBound() << shiftAmount);
+                                    } else {
+                                        lowerBound = Math.min(lowerBound, minValueForMasks(bits, shiftedMustBeSet, shiftedMayBeSet));
+                                        upperBound = Math.max(upperBound, maxValueForMasks(bits, shiftedMustBeSet, shiftedMayBeSet));
                                     }
                                 }
-                                return IntegerStamp.stampForMask(bits, mustBeSet, mayBeSet & defaultMask);
+                                if (sh == shift.upperBound()) {
+                                    break;
+                                }
+                                sh++;
                             }
-                            return value.unrestricted();
+                            return IntegerStamp.create(bits, lowerBound, upperBound, mustBeSet, mayBeSet);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant c) {
+                            return c instanceof PrimitiveConstant pc && pc.asLong() == 0;
                         }
 
                         @Override
@@ -1874,27 +2007,24 @@ public final class IntegerStamp extends PrimitiveStamp {
                     new ArithmeticOpTable.ShiftOp.Shr() {
 
                         @Override
-                        public Constant foldConstant(Constant value, int amount) {
+                        public Constant foldConstant(Constant value, Constant amount) {
                             PrimitiveConstant c = (PrimitiveConstant) value;
-                            switch (c.getJavaKind()) {
-                                case Byte:
-                                    return JavaConstant.forByte((byte) (c.asInt() >> amount));
-                                case Char:
-                                    return JavaConstant.forChar((char) (c.asInt() >> amount));
-                                case Short:
-                                    return JavaConstant.forShort((short) (c.asInt() >> amount));
-                                case Int:
-                                    return JavaConstant.forInt(c.asInt() >> amount);
-                                case Long:
-                                    return JavaConstant.forLong(c.asLong() >> amount);
-                                default:
-                                    throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
-                            }
+                            PrimitiveConstant s = (PrimitiveConstant) amount;
+                            long shift = s.getJavaKind() == JavaKind.Long ? s.asLong() : s.asInt();
+                            return switch (c.getJavaKind()) {
+                                case Byte -> JavaConstant.forByte((byte) (c.asInt() >> shift));
+                                case Char -> JavaConstant.forChar((char) (c.asInt() >> shift));
+                                case Short -> JavaConstant.forShort((short) (c.asInt() >> shift));
+                                case Int -> JavaConstant.forInt(c.asInt() >> shift);
+                                case Long -> JavaConstant.forLong(c.asLong() >> shift);
+                                default -> throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
+                            };
                         }
 
                         @Override
-                        public Stamp foldStamp(Stamp stamp, IntegerStamp shift) {
+                        public Stamp foldStampImpl(Stamp stamp, Stamp amount) {
                             IntegerStamp value = (IntegerStamp) stamp;
+                            IntegerStamp shift = (IntegerStamp) amount;
                             int bits = value.getBits();
                             if (value.isEmpty()) {
                                 return value;
@@ -1909,12 +2039,50 @@ public final class IntegerStamp extends PrimitiveStamp {
                                 int extraBits = 64 - bits;
                                 long defaultMask = CodeUtil.mask(bits);
                                 // shifting back and forth performs sign extension
-                                long mustBeSet = (value.mustBeSet() << extraBits) >> (shiftCount + extraBits) & defaultMask;
-                                long mayBeSet = (value.mayBeSet() << extraBits) >> (shiftCount + extraBits) & defaultMask;
+                                int signExtendShift = (int) Math.min(shiftCount + extraBits, Long.SIZE - 1);
+                                long mustBeSet = (value.mustBeSet() << extraBits) >> signExtendShift & defaultMask;
+                                long mayBeSet = (value.mayBeSet() << extraBits) >> signExtendShift & defaultMask;
                                 return IntegerStamp.create(bits, value.lowerBound() >> shiftCount, value.upperBound() >> shiftCount, mustBeSet, mayBeSet);
                             }
-                            long mask = IntegerStamp.mayBeSetFor(bits, value.lowerBound(), value.upperBound());
-                            return IntegerStamp.stampForMask(bits, 0, mask);
+                            int shiftMask = getShiftAmountMask(stamp);
+                            int shiftBits = Integer.bitCount(shiftMask);
+                            int minShift = 0;
+                            int maxShift = shiftMask;
+                            if ((shift.lowerBound() >>> shiftBits) == (shift.upperBound() >>> shiftBits)) {
+                                /* The bounds can be masked without losing information when only the lower shiftBits
+                                 * of the range are variable. For example, the shift range [0xAC2, 0xAC5] for a 32-bit shift:
+                                 * lowerBound: 1010110|00010
+                                 * upperBound: 1010110|00101
+                                 * shiftMask:          11111 (shiftBits = 5)
+                                 * Since the discarded upper bits are equal, the range of masked shifts is continuous,
+                                 * (in this case, [minShift=2, maxShift=5]), so we only need to consider those when
+                                 * refining the operation's bounds.
+                                 * When this isn't the case, the masked shift amounts are discontinuous, for example,
+                                 * with >> [0x1E, 0x21]:
+                                 * lowerBound: 0|11110
+                                 * upperBound: 1|00001
+                                 * The actual masked shifts are {30, 31, 0, 1}. In that case we use the full shift
+                                 * range of [0, 31].
+                                 */
+                                minShift = (int) (shift.lowerBound() & shiftMask);
+                                maxShift = (int) (shift.upperBound() & shiftMask);
+                            }
+                            /*
+                             * For nonnegative values of x, x >> s decreases as s increases. For negative values,
+                             * it increases (toward -1). So the shift amount (min/max) used for the signed bounds
+                             * depends on each bound's sign. For example:
+                             * With positive bounds: [10, 20] >> [1, 2] = [10 >> 2, 20 >> 1]
+                             * With negative bounds: [-20, -10] >> [1, 2] = [-20 >> 1, -10 >> 2]
+                             * With a range that crosses zero: [-10, 10] >> [1, 2] = [-10 >> 1, 10 >> 1]
+                             */
+                            long lowerBound = value.lowerBound() >> (value.lowerBound() < 0 ? minShift : maxShift);
+                            long upperBound = value.upperBound() >> (value.upperBound() < 0 ? maxShift : minShift);
+                            return IntegerStamp.create(bits, lowerBound, upperBound);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant c) {
+                            return c instanceof PrimitiveConstant pc && pc.asLong() == 0;
                         }
 
                         @Override
@@ -1926,27 +2094,24 @@ public final class IntegerStamp extends PrimitiveStamp {
                     new ArithmeticOpTable.ShiftOp.UShr() {
 
                         @Override
-                        public Constant foldConstant(Constant value, int amount) {
+                        public Constant foldConstant(Constant value, Constant amount) {
                             PrimitiveConstant c = (PrimitiveConstant) value;
-                            switch (c.getJavaKind()) {
-                                case Byte:
-                                    return JavaConstant.forByte((byte) (c.asInt() >>> amount));
-                                case Char:
-                                    return JavaConstant.forChar((char) (c.asInt() >>> amount));
-                                case Short:
-                                    return JavaConstant.forShort((short) (c.asInt() >>> amount));
-                                case Int:
-                                    return JavaConstant.forInt(c.asInt() >>> amount);
-                                case Long:
-                                    return JavaConstant.forLong(c.asLong() >>> amount);
-                                default:
-                                    throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
-                            }
+                            PrimitiveConstant s = (PrimitiveConstant) amount;
+                            long shift = s.getJavaKind() == JavaKind.Long ? s.asLong() : s.asInt();
+                            return switch (c.getJavaKind()) {
+                                case Byte -> JavaConstant.forByte((byte) (c.asInt() >>> shift));
+                                case Char -> JavaConstant.forChar((char) (c.asInt() >>> shift));
+                                case Short -> JavaConstant.forShort((short) (c.asInt() >>> shift));
+                                case Int -> JavaConstant.forInt(c.asInt() >>> shift);
+                                case Long -> JavaConstant.forLong(c.asLong() >>> shift);
+                                default -> throw GraalError.shouldNotReachHereUnexpectedValue(c.getJavaKind()); // ExcludeFromJacocoGeneratedReport
+                            };
                         }
 
                         @Override
-                        public Stamp foldStamp(Stamp stamp, IntegerStamp shift) {
+                        public Stamp foldStampImpl(Stamp stamp, Stamp amount) {
                             IntegerStamp value = (IntegerStamp) stamp;
+                            IntegerStamp shift = (IntegerStamp) amount;
                             int bits = value.getBits();
                             if (value.isEmpty()) {
                                 return value;
@@ -1960,16 +2125,57 @@ public final class IntegerStamp extends PrimitiveStamp {
                                     return stamp;
                                 }
 
-                                long mustBeSet = value.mustBeSet() >>> shiftCount;
-                                long mayBeSet = value.mayBeSet() >>> shiftCount;
-                                if (value.lowerBound() < 0) {
-                                    return IntegerStamp.create(bits, mustBeSet, mayBeSet, mustBeSet, mayBeSet);
-                                } else {
-                                    return IntegerStamp.create(bits, value.lowerBound() >>> shiftCount, value.upperBound() >>> shiftCount, mustBeSet, mayBeSet);
+                                long mustBeSet;
+                                long mayBeSet;
+                                if (bits < Integer.SIZE) {
+                                    /*
+                                     * Byte and short constants are sign-extended to int before
+                                     * applying >>> and narrowing back to their original bit width.
+                                     */
+                                    long defaultMask = CodeUtil.mask(bits);
+                                    long signBit = 1L << (bits - 1);
+                                    long highBits = CodeUtil.mask(Integer.SIZE) & ~defaultMask;
+                                    long signExtendedMustBeSet = value.mustBeSet();
+                                    long signExtendedMayBeSet = value.mayBeSet();
+                                    if ((value.mustBeSet() & signBit) != 0) {
+                                        signExtendedMustBeSet |= highBits;
+                                    }
+                                    if ((value.mayBeSet() & signBit) != 0) {
+                                        signExtendedMayBeSet |= highBits;
+                                    }
+                                    mustBeSet = (signExtendedMustBeSet >>> shiftCount) & defaultMask;
+                                    mayBeSet = (signExtendedMayBeSet >>> shiftCount) & defaultMask;
+                                    return IntegerStamp.stampForMask(bits, mustBeSet, mayBeSet);
                                 }
+
+                                mustBeSet = value.mustBeSet() >>> shiftCount;
+                                mayBeSet = value.mayBeSet() >>> shiftCount;
+                                return IntegerStamp.create(bits, value.unsignedLowerBound() >>> shiftCount, value.unsignedUpperBound() >>> shiftCount, mustBeSet, mayBeSet);
                             }
-                            long mask = IntegerStamp.mayBeSetFor(bits, value.lowerBound(), value.upperBound());
-                            return IntegerStamp.stampForMask(bits, 0, mask);
+                            if (bits < Integer.SIZE) {
+                                long mask = IntegerStamp.mayBeSetFor(bits, value.lowerBound(), value.upperBound());
+                                return IntegerStamp.stampForMask(bits, 0, mask);
+                            }
+                            int shiftMask = getShiftAmountMask(stamp);
+                            int shiftBits = Integer.bitCount(shiftMask);
+                            int minShift = 0;
+                            int maxShift = shiftMask;
+                            if ((shift.lowerBound() >>> shiftBits) == (shift.upperBound() >>> shiftBits)) {
+                                minShift = (int) (shift.lowerBound() & shiftMask);
+                                maxShift = (int) (shift.upperBound() & shiftMask);
+                            }
+                            if (maxShift == 0) {
+                                return value;
+                            }
+                            // The result can only be negative if the (masked) shift stamp includes zero, treat it separately
+                            int minPositiveShift = Math.max(1, minShift);
+                            Stamp result = IntegerStamp.create(bits, value.unsignedLowerBound() >>> maxShift, value.unsignedUpperBound() >>> minPositiveShift);
+                            return minShift == 0 ? result.meet(value) : result;
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant c) {
+                            return c instanceof PrimitiveConstant pc && pc.asLong() == 0;
                         }
 
                         @Override
@@ -1983,7 +2189,9 @@ public final class IntegerStamp extends PrimitiveStamp {
                         @Override
                         public Constant foldConstant(Constant value) {
                             PrimitiveConstant c = (PrimitiveConstant) value;
-                            return JavaConstant.forIntegerKind(c.getJavaKind(), Math.abs(c.asLong()));
+                            // if an overflow happens in taking abs for the constant that is what
+                            // the code would do so we want that
+                            return JavaConstant.forIntegerKind(c.getJavaKind(), NumUtil.unsafeAbs(c.asLong()));
                         }
 
                         @Override
@@ -1994,7 +2202,7 @@ public final class IntegerStamp extends PrimitiveStamp {
                             IntegerStamp stamp = (IntegerStamp) input;
                             int bits = stamp.getBits();
                             if (stamp.lowerBound == stamp.upperBound) {
-                                long value = CodeUtil.convert(Math.abs(stamp.lowerBound()), stamp.getBits(), false);
+                                long value = CodeUtil.convert(NumUtil.unsafeAbs(stamp.lowerBound()), stamp.getBits(), false);
                                 return createConstant(stamp.getBits(), value);
                             }
                             if (stamp.lowerBound() == CodeUtil.minValue(bits)) {
@@ -2043,6 +2251,9 @@ public final class IntegerStamp extends PrimitiveStamp {
 
                         @Override
                         public Stamp invertStamp(int inputBits, int resultBits, Stamp outStamp) {
+                            if (inputBits == resultBits) {
+                                return outStamp;
+                            }
                             IntegerStamp stamp = (IntegerStamp) outStamp;
                             if (stamp.isEmpty()) {
                                 return createEmptyStamp(inputBits);
@@ -2103,6 +2314,9 @@ public final class IntegerStamp extends PrimitiveStamp {
 
                         @Override
                         public Stamp invertStamp(int inputBits, int resultBits, Stamp outStamp) {
+                            if (inputBits == resultBits) {
+                                return outStamp;
+                            }
                             IntegerStamp stamp = (IntegerStamp) outStamp;
                             if (stamp.isEmpty()) {
                                 return createEmptyStamp(inputBits);
@@ -2179,11 +2393,11 @@ public final class IntegerStamp extends PrimitiveStamp {
                                  * @formatter:on
                                  */
                                 if (zeroInExtension) {
-                                    long msbZeroMask = ~(1 << (inputBits - 1));
+                                    long msbZeroMask = ~(1L << (inputBits - 1));
                                     inputMustBeSet &= msbZeroMask;
                                     inputMayBeSet &= msbZeroMask;
                                 } else if (oneInExtension) {
-                                    long msbOneMask = 1 << (inputBits - 1);
+                                    long msbOneMask = 1L << (inputBits - 1);
                                     inputMustBeSet |= msbOneMask;
                                     inputMayBeSet |= msbOneMask;
                                 }
@@ -2396,6 +2610,148 @@ public final class IntegerStamp extends PrimitiveStamp {
                         }
                     },
 
+                    new ArithmeticOpTable.BinaryOp.SAdd(false, true) {
+
+                        @Override
+                        public Constant foldConstant(Constant a, Constant b) {
+                            PrimitiveConstant x = (PrimitiveConstant) a;
+                            PrimitiveConstant y = (PrimitiveConstant) b;
+                            GraalError.guarantee(x.getJavaKind() == y.getJavaKind(), "unexpected kinds %s and %s", x.getJavaKind(), y.getJavaKind());
+                            int bits = x.getJavaKind().getBitCount();
+                            return JavaConstant.forIntegerKind(x.getJavaKind(), NumUtil.addSaturatingSigned(bits, x.asLong(), y.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp a, Stamp b) {
+                            if (a.isEmpty()) {
+                                return a;
+                            }
+                            if (b.isEmpty()) {
+                                return b;
+                            }
+                            IntegerStamp x = (IntegerStamp) a;
+                            IntegerStamp y = (IntegerStamp) b;
+                            GraalError.guarantee(x.getBits() == y.getBits(), "unexpected stamps %s and %s", x, y);
+                            int bits = x.getBits();
+                            long lowerBound = NumUtil.addSaturatingSigned(bits, x.lowerBound(), y.lowerBound());
+                            long upperBound = NumUtil.addSaturatingSigned(bits, x.upperBound(), y.upperBound());
+                            return create(bits, lowerBound, upperBound);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant value) {
+                            PrimitiveConstant n = (PrimitiveConstant) value;
+                            return n.asLong() == 0;
+                        }
+                    },
+
+                    new ArithmeticOpTable.BinaryOp.SSub(false, false) {
+
+                        @Override
+                        public Constant foldConstant(Constant a, Constant b) {
+                            PrimitiveConstant x = (PrimitiveConstant) a;
+                            PrimitiveConstant y = (PrimitiveConstant) b;
+                            GraalError.guarantee(x.getJavaKind() == y.getJavaKind(), "unexpected kinds %s and %s", x.getJavaKind(), y.getJavaKind());
+                            int bits = x.getJavaKind().getBitCount();
+                            return JavaConstant.forIntegerKind(x.getJavaKind(), NumUtil.subSaturatingSigned(bits, x.asLong(), y.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp a, Stamp b) {
+                            if (a.isEmpty()) {
+                                return a;
+                            }
+                            if (b.isEmpty()) {
+                                return b;
+                            }
+                            IntegerStamp x = (IntegerStamp) a;
+                            IntegerStamp y = (IntegerStamp) b;
+                            GraalError.guarantee(x.getBits() == y.getBits(), "unexpected stamps %s and %s", x, y);
+                            int bits = x.getBits();
+                            long lowerBound = NumUtil.subSaturatingSigned(bits, x.lowerBound(), y.upperBound());
+                            long upperBound = NumUtil.subSaturatingSigned(bits, x.upperBound(), y.lowerBound());
+                            return create(bits, lowerBound, upperBound);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant value) {
+                            PrimitiveConstant n = (PrimitiveConstant) value;
+                            return n.asLong() == 0;
+                        }
+                    },
+
+                    new ArithmeticOpTable.BinaryOp.SUAdd(true, true) {
+
+                        @Override
+                        public Constant foldConstant(Constant a, Constant b) {
+                            PrimitiveConstant x = (PrimitiveConstant) a;
+                            PrimitiveConstant y = (PrimitiveConstant) b;
+                            GraalError.guarantee(x.getJavaKind() == y.getJavaKind(), "unexpected kinds %s and %s", x.getJavaKind(), y.getJavaKind());
+                            int bits = x.getJavaKind().getBitCount();
+                            return JavaConstant.forIntegerKind(x.getJavaKind(), NumUtil.addSaturatingUnsigned(bits, x.asLong(), y.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp a, Stamp b) {
+                            if (a.isEmpty()) {
+                                return a;
+                            }
+                            if (b.isEmpty()) {
+                                return b;
+                            }
+                            IntegerStamp x = (IntegerStamp) a;
+                            IntegerStamp y = (IntegerStamp) b;
+                            GraalError.guarantee(x.getBits() == y.getBits(), "unexpected stamps %s and %s", x, y);
+                            int bits = x.getBits();
+                            long lowerBound = NumUtil.addSaturatingUnsigned(bits, x.unsignedLowerBound(), y.unsignedLowerBound());
+                            long upperBound = NumUtil.addSaturatingUnsigned(bits, x.unsignedUpperBound(), y.unsignedUpperBound());
+                            return StampFactory.forUnsignedInteger(bits, lowerBound, upperBound);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant value) {
+                            PrimitiveConstant n = (PrimitiveConstant) value;
+                            return n.asLong() == 0;
+                        }
+                    },
+
+                    new ArithmeticOpTable.BinaryOp.SUSub(false, false) {
+
+                        @Override
+                        public Constant foldConstant(Constant a, Constant b) {
+                            PrimitiveConstant x = (PrimitiveConstant) a;
+                            PrimitiveConstant y = (PrimitiveConstant) b;
+                            GraalError.guarantee(x.getJavaKind() == y.getJavaKind(), "unexpected kinds %s and %s", x.getJavaKind(), y.getJavaKind());
+                            int bits = x.getJavaKind().getBitCount();
+                            return JavaConstant.forIntegerKind(x.getJavaKind(), NumUtil.subSaturatingUnsigned(bits, x.asLong(), y.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp a, Stamp b) {
+                            if (a.isEmpty()) {
+                                return a;
+                            }
+                            if (b.isEmpty()) {
+                                return b;
+                            }
+                            IntegerStamp x = (IntegerStamp) a;
+                            IntegerStamp y = (IntegerStamp) b;
+                            GraalError.guarantee(x.getBits() == y.getBits(), "unexpected stamps %s and %s", x, y);
+                            int bits = x.getBits();
+                            long lowerBound = NumUtil.subSaturatingUnsigned(bits, x.unsignedLowerBound(), y.unsignedUpperBound());
+                            long upperBound = NumUtil.subSaturatingUnsigned(bits, x.unsignedUpperBound(), y.unsignedLowerBound());
+                            return StampFactory.forUnsignedInteger(bits, lowerBound, upperBound);
+                        }
+
+                        @Override
+                        public boolean isNeutral(Constant value) {
+                            PrimitiveConstant n = (PrimitiveConstant) value;
+                            return n.asLong() == 0;
+                        }
+                    },
+
+                    null, // FMA
+
                     new ArithmeticOpTable.ReinterpretOp() {
 
                         @Override
@@ -2420,39 +2776,27 @@ public final class IntegerStamp extends PrimitiveStamp {
                         private static final long INT_MASK = CodeUtil.mask(32);
                         private static final long LONG_MASK = CodeUtil.mask(64);
 
-                        private static int integerCompress(int i, int mask) {
-                            try {
-                                Method compress = Integer.class.getDeclaredMethod("compress", int.class, int.class);
-                                return (Integer) compress.invoke(null, i, mask);
-                            } catch (NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
-                                throw GraalError.shouldNotReachHere(e, "Integer.compress is introduced in Java 19");
-                            }
-                        }
-
-                        private static long longCompress(long i, long mask) {
-                            try {
-                                Method compress = Long.class.getDeclaredMethod("compress", long.class, long.class);
-                                return (Long) compress.invoke(null, i, mask);
-                            } catch (NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
-                                throw GraalError.shouldNotReachHere(e, "Long.compress is introduced in Java 19");
-                            }
-                        }
-
                         @Override
                         public Constant foldConstant(Constant a, Constant b) {
                             PrimitiveConstant i = (PrimitiveConstant) a;
                             PrimitiveConstant mask = (PrimitiveConstant) b;
 
                             if (i.getJavaKind() == JavaKind.Int) {
-                                return JavaConstant.forInt(integerCompress(i.asInt(), mask.asInt()));
+                                return JavaConstant.forInt(Integer.compress(i.asInt(), mask.asInt()));
                             } else {
                                 GraalError.guarantee(i.getJavaKind() == JavaKind.Long, "unexpected Java kind %s", i.getJavaKind());
-                                return JavaConstant.forLong(longCompress(i.asLong(), mask.asLong()));
+                                return JavaConstant.forLong(Long.compress(i.asLong(), mask.asLong()));
                             }
                         }
 
                         @Override
                         protected Stamp foldStampImpl(Stamp a, Stamp b) {
+                            if (a.isEmpty()) {
+                                return a;
+                            }
+                            if (b.isEmpty()) {
+                                return b;
+                            }
                             IntegerStamp valueStamp = (IntegerStamp) a;
                             IntegerStamp maskStamp = (IntegerStamp) b;
 
@@ -2463,10 +2807,10 @@ public final class IntegerStamp extends PrimitiveStamp {
                                 }
                                 // compress result will always be positive
                                 return IntegerStamp.create(32,
-                                                integerCompress((int) valueStamp.mustBeSet(), (int) maskStamp.mustBeSet()) & INT_MASK,
-                                                integerCompress((int) valueStamp.mayBeSet(), (int) maskStamp.mayBeSet()) & INT_MASK,
+                                                Integer.compress((int) valueStamp.mustBeSet(), (int) maskStamp.mustBeSet()) & INT_MASK,
+                                                Integer.compress((int) valueStamp.mayBeSet(), (int) maskStamp.mayBeSet()) & INT_MASK,
                                                 0,
-                                                integerCompress((int) INT_MASK, (int) maskStamp.mayBeSet()) & INT_MASK);
+                                                Integer.compress((int) INT_MASK, (int) maskStamp.mayBeSet()) & INT_MASK);
                             } else {
                                 GraalError.guarantee(valueStamp.getStackKind() == JavaKind.Long, "unexpected Java kind %s", valueStamp.getStackKind());
                                 if (maskStamp.mayBeSet() == LONG_MASK && valueStamp.canBeNegative()) {
@@ -2475,33 +2819,15 @@ public final class IntegerStamp extends PrimitiveStamp {
                                 }
                                 // compress result will always be positive
                                 return IntegerStamp.create(64,
-                                                longCompress(valueStamp.mustBeSet(), maskStamp.mustBeSet()),
-                                                longCompress(valueStamp.mayBeSet(), maskStamp.mayBeSet()),
+                                                Long.compress(valueStamp.mustBeSet(), maskStamp.mustBeSet()),
+                                                Long.compress(valueStamp.mayBeSet(), maskStamp.mayBeSet()),
                                                 0,
-                                                longCompress(LONG_MASK, maskStamp.mayBeSet()));
+                                                Long.compress(LONG_MASK, maskStamp.mayBeSet()));
                             }
                         }
                     },
 
                     new BinaryOp.Expand(false, false) {
-
-                        private static int integerExpand(int i, int mask) {
-                            try {
-                                Method expand = Integer.class.getDeclaredMethod("expand", int.class, int.class);
-                                return (Integer) expand.invoke(null, i, mask);
-                            } catch (NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
-                                throw GraalError.shouldNotReachHere(e, "Integer.expand is introduced in Java 19");
-                            }
-                        }
-
-                        private static long longExpand(long i, long mask) {
-                            try {
-                                Method expand = Long.class.getDeclaredMethod("expand", long.class, long.class);
-                                return (Long) expand.invoke(null, i, mask);
-                            } catch (NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
-                                throw GraalError.shouldNotReachHere(e, "Long.expand is introduced in Java 19");
-                            }
-                        }
 
                         @Override
                         public Constant foldConstant(Constant a, Constant b) {
@@ -2509,10 +2835,10 @@ public final class IntegerStamp extends PrimitiveStamp {
                             PrimitiveConstant mask = (PrimitiveConstant) b;
 
                             if (i.getJavaKind() == JavaKind.Int) {
-                                return JavaConstant.forInt(integerExpand(i.asInt(), mask.asInt()));
+                                return JavaConstant.forInt(Integer.expand(i.asInt(), mask.asInt()));
                             } else {
                                 GraalError.guarantee(i.getJavaKind() == JavaKind.Long, "unexpected Java kind %s", i.getJavaKind());
-                                return JavaConstant.forLong(longExpand(i.asLong(), mask.asLong()));
+                                return JavaConstant.forLong(Long.expand(i.asLong(), mask.asLong()));
                             }
                         }
 
@@ -2603,6 +2929,90 @@ public final class IntegerStamp extends PrimitiveStamp {
                             assert stamp.getBits() == 64 : stamp;
                             double lowerBound = stamp.lowerBound();
                             double upperBound = stamp.upperBound();
+                            return StampFactory.forFloat(JavaKind.Double, lowerBound, upperBound, true);
+                        }
+                    },
+
+                    new ArithmeticOpTable.FloatConvertOp(UI2F) {
+
+                        @Override
+                        public Constant foldConstant(Constant c) {
+                            PrimitiveConstant value = (PrimitiveConstant) c;
+                            return JavaConstant.forFloat(NumUtil.unsignedToFloat(Integer.toUnsignedLong(value.asInt())));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp input) {
+                            if (input.isEmpty()) {
+                                return StampFactory.empty(JavaKind.Float);
+                            }
+                            IntegerStamp stamp = (IntegerStamp) input;
+                            assert stamp.getBits() == 32 : stamp;
+                            float lowerBound = NumUtil.unsignedToFloat(stamp.unsignedLowerBound());
+                            float upperBound = NumUtil.unsignedToFloat(stamp.unsignedUpperBound());
+                            return StampFactory.forFloat(JavaKind.Float, lowerBound, upperBound, true);
+                        }
+                    },
+
+                    new ArithmeticOpTable.FloatConvertOp(UL2F) {
+
+                        @Override
+                        public Constant foldConstant(Constant c) {
+                            PrimitiveConstant value = (PrimitiveConstant) c;
+                            return JavaConstant.forFloat(NumUtil.unsignedToFloat(value.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp input) {
+                            if (input.isEmpty()) {
+                                return StampFactory.empty(JavaKind.Float);
+                            }
+                            IntegerStamp stamp = (IntegerStamp) input;
+                            assert stamp.getBits() == 64 : stamp;
+                            float lowerBound = NumUtil.unsignedToFloat(stamp.unsignedLowerBound());
+                            float upperBound = NumUtil.unsignedToFloat(stamp.unsignedUpperBound());
+                            return StampFactory.forFloat(JavaKind.Float, lowerBound, upperBound, true);
+                        }
+                    },
+
+                    new ArithmeticOpTable.FloatConvertOp(UI2D) {
+
+                        @Override
+                        public Constant foldConstant(Constant c) {
+                            PrimitiveConstant value = (PrimitiveConstant) c;
+                            return JavaConstant.forDouble(NumUtil.unsignedToDouble(Integer.toUnsignedLong(value.asInt())));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp input) {
+                            if (input.isEmpty()) {
+                                return StampFactory.empty(JavaKind.Double);
+                            }
+                            IntegerStamp stamp = (IntegerStamp) input;
+                            assert stamp.getBits() == 32 : stamp;
+                            double lowerBound = NumUtil.unsignedToDouble(stamp.unsignedLowerBound());
+                            double upperBound = NumUtil.unsignedToDouble(stamp.unsignedUpperBound());
+                            return StampFactory.forFloat(JavaKind.Double, lowerBound, upperBound, true);
+                        }
+                    },
+
+                    new ArithmeticOpTable.FloatConvertOp(UL2D) {
+
+                        @Override
+                        public Constant foldConstant(Constant c) {
+                            PrimitiveConstant value = (PrimitiveConstant) c;
+                            return JavaConstant.forDouble(NumUtil.unsignedToDouble(value.asLong()));
+                        }
+
+                        @Override
+                        protected Stamp foldStampImpl(Stamp input) {
+                            if (input.isEmpty()) {
+                                return StampFactory.empty(JavaKind.Double);
+                            }
+                            IntegerStamp stamp = (IntegerStamp) input;
+                            assert stamp.getBits() == 64 : stamp;
+                            double lowerBound = NumUtil.unsignedToDouble(stamp.unsignedLowerBound());
+                            double upperBound = NumUtil.unsignedToDouble(stamp.unsignedUpperBound());
                             return StampFactory.forFloat(JavaKind.Double, lowerBound, upperBound, true);
                         }
                     });

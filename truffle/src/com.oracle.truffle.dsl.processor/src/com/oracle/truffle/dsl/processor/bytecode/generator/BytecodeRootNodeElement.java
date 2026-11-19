@@ -1,0 +1,3303 @@
+/*
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.dsl.processor.bytecode.generator;
+
+import static com.oracle.truffle.dsl.processor.bytecode.generator.ElementHelpers.addField;
+import static com.oracle.truffle.dsl.processor.bytecode.generator.ElementHelpers.arrayOf;
+import static com.oracle.truffle.dsl.processor.bytecode.generator.ElementHelpers.createInitializedVariable;
+import static com.oracle.truffle.dsl.processor.bytecode.generator.ElementHelpers.generic;
+import static com.oracle.truffle.dsl.processor.bytecode.generator.ElementHelpers.wildcard;
+import static com.oracle.truffle.dsl.processor.generator.GeneratorUtils.addOverride;
+import static com.oracle.truffle.dsl.processor.generator.GeneratorUtils.mergeSuppressWarnings;
+import static javax.lang.model.element.Modifier.ABSTRACT;
+import static javax.lang.model.element.Modifier.FINAL;
+import static javax.lang.model.element.Modifier.PRIVATE;
+import static javax.lang.model.element.Modifier.PUBLIC;
+import static javax.lang.model.element.Modifier.STATIC;
+import static javax.lang.model.element.Modifier.VOLATILE;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.lang.invoke.VarHandle;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
+
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.ArrayType;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeMirror;
+import javax.lang.model.util.ElementFilter;
+
+import com.oracle.truffle.dsl.processor.ProcessorContext;
+import com.oracle.truffle.dsl.processor.TruffleTypes;
+import com.oracle.truffle.dsl.processor.bytecode.model.BytecodeDSLModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.BytecodeDSLModel.LoadIllegalLocalStrategy;
+import com.oracle.truffle.dsl.processor.bytecode.model.CustomOperationModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.ImmediateKind;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.ImmediateWidth;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.InstructionImmediate;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.InstructionImmediateEncoding;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.InstructionKind;
+import com.oracle.truffle.dsl.processor.bytecode.model.OperationModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.OperationModel.OperationKind;
+import com.oracle.truffle.dsl.processor.bytecode.model.Signature.Operand;
+import com.oracle.truffle.dsl.processor.bytecode.model.SourceSectionKind;
+import com.oracle.truffle.dsl.processor.expression.DSLExpression;
+import com.oracle.truffle.dsl.processor.expression.DSLExpression.Variable;
+import com.oracle.truffle.dsl.processor.generator.DSLExpressionGenerator;
+import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory;
+import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory.GeneratorMode;
+import com.oracle.truffle.dsl.processor.generator.GeneratorUtils;
+import com.oracle.truffle.dsl.processor.generator.NodeConstants;
+import com.oracle.truffle.dsl.processor.generator.StaticConstants;
+import com.oracle.truffle.dsl.processor.generator.TypeSystemCodeGenerator;
+import com.oracle.truffle.dsl.processor.java.ElementUtils;
+import com.oracle.truffle.dsl.processor.java.model.CodeAnnotationMirror;
+import com.oracle.truffle.dsl.processor.java.model.CodeAnnotationValue;
+import com.oracle.truffle.dsl.processor.java.model.CodeElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeExecutableElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeNames;
+import com.oracle.truffle.dsl.processor.java.model.CodeTree;
+import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
+import com.oracle.truffle.dsl.processor.java.model.CodeTypeElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeTypeMirror;
+import com.oracle.truffle.dsl.processor.java.model.CodeTypeParameterElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeVariableElement;
+import com.oracle.truffle.dsl.processor.java.model.GeneratedTypeMirror;
+import com.oracle.truffle.dsl.processor.model.AssumptionExpression;
+import com.oracle.truffle.dsl.processor.model.CacheExpression;
+import com.oracle.truffle.dsl.processor.model.GuardExpression;
+import com.oracle.truffle.dsl.processor.model.SpecializationData;
+import com.oracle.truffle.dsl.processor.parser.NodeParser;
+
+/**
+ * Central code generation class for Bytecode DSL root nodes.
+ */
+public final class BytecodeRootNodeElement extends AbstractElement {
+
+    static final String USER_LOCALS_START_INDEX = "USER_LOCALS_START_INDEX";
+    static final String BCI_INDEX = "BCI_INDEX";
+    static final String CONTINUATION_FRAME_INDEX = "CONTINUATION_FRAME_INDEX";
+    static final String EMPTY_INT_ARRAY = "EMPTY_INT_ARRAY";
+    static final String EMPTY_BYTE_ARRAY = "EMPTY_BYTE_ARRAY";
+
+    // !Important: Keep these in sync with InstructionBytecodeSizeTest!
+    // Estimated number of Java bytecodes per instruction.
+    private static final int ESTIMATED_CUSTOM_INSTRUCTION_SIZE = 27;
+    private static final int ESTIMATED_EXTRACTED_INSTRUCTION_SIZE = 20;
+    // Estimated number of bytecodes needed if they are just part of the switch table.
+    private static final int GROUP_DISPATCH_SIZE = 40;
+    // Estimated number of java bytecodes needed for a bytecode loop including exception handling
+    private static final int ESTIMATED_BYTECODE_FOOTPRINT = 1000;
+    // Limit from HotSpot to be classified as a huge method and therefore not be JIT compiled
+    static final int JAVA_JIT_BYTECODE_LIMIT = 8000;
+
+    // The abstract builder and descriptor class (different from builderType if
+    // GenerateBytecodeTestVariants used)
+    final TypeMirror abstractBuilderType;
+
+    final BytecodeDSLModel model;
+    final SourceInfoTable sourceInfoTable;
+
+    /**
+     * We generate several CodeTypeElements to implement a Bytecode DSL interpreter. For each type,
+     * a corresponding Factory class generates it and its members.
+     * <p>
+     * When generating code, some factories need to refer to other generated types. We declare those
+     * types here as fields to make them accessible (i.e. the fields below are *not* a complete list
+     * of the generated types).
+     */
+
+    // The builder class invoked by the language parser to generate the bytecode.
+    final BuilderElement builder;
+    final TypeMirror bytecodeBuilderType;
+    final DeclaredType parserType;
+    final SerializationEncodingElement serializationEncodingElement;
+
+    // Singleton fields for accessing arrays and the frame.
+    private final CodeVariableElement fastAccess;
+    private final CodeVariableElement byteArraySupport;
+    private final CodeVariableElement frameExtensions;
+
+    // Root node and ContinuationLocation classes to support yield.
+    final ContinuationRootNodeImplElement continuationRootNodeImpl;
+
+    // Implementations of public classes that Truffle interpreters interact with.
+    final BytecodeRootNodesImplElement bytecodeRootNodesImpl = new BytecodeRootNodesImplElement(this);
+    private final BytecodeDescriptorElement bytecodeDescriptorElement = new BytecodeDescriptorElement(this);
+
+    // Helper classes that map interpreter constructs to constants.
+    final InstructionsElement instructionsElement = new InstructionsElement(this);
+    final OperationConstantsElement operationsElement = new OperationConstantsElement(this);
+    final FrameTagConstantsElement frameTagsElement;
+
+    // Helper class that tracks the number of guest-language loop iterations. The count must be
+    // wrapped in an object, otherwise the loop unrolling logic of ExplodeLoop.MERGE_EXPLODE
+    // will create a new "state" for each count.
+    final LoopCounterElement loopCounter = new LoopCounterElement(this);
+    final VirtualStateElement virtualState;
+    final CounterStateElement counterState = new CounterStateElement(this);
+
+    final BranchBackwardThrowExceptionElement branchBackwardThrowException;
+    BytecodeConfigEncoderImplElement configEncoder;
+    OldBytecodesBoxElement oldBytecodesBoxElement;
+    AbstractBytecodeNodeElement abstractBytecodeNode;
+    BytecodeNodeElement cachedBytecodeNode;
+    BytecodeNodeElement cachedTailCallBytecodeNode;
+
+    TagNodeElement tagNode;
+    TagRootNodeElement tagRootNode;
+    InstructionTracerAccessImplElement instructionTracerAccessImplElement;
+    InstructionDescriptorImplElement instructionDescriptorImpl;
+    InstructionDescriptorListElement instructionDescriptorList;
+    InstructionImplElement instructionImpl;
+    final BytecodeTransitionImplElement bytecodeTransitionImplElement;
+
+    private Map<TypeMirror, CodeExecutableElement> expectMethods = new HashMap<>();
+
+    BytecodeRootNodeElement(BytecodeDSLModel model, TypeMirror abstractBuilderType) {
+        super(null, Set.of(PUBLIC, FINAL), ElementKind.CLASS, ElementUtils.findPackageElement(model.getTemplateType()), model.getName());
+        if (model.hasErrors()) {
+            throw new IllegalArgumentException("Models with errors are not supported.");
+        }
+
+        this.model = model;
+        this.virtualState = new VirtualStateElement(this);
+        this.configEncoder = this.add(new BytecodeConfigEncoderImplElement(this));
+        this.builder = new BuilderElement(this);
+        this.abstractBuilderType = abstractBuilderType == null ? types.BytecodeBuilder : abstractBuilderType;
+        this.bytecodeBuilderType = builder.asType();
+
+        this.parserType = generic(types.BytecodeParser, abstractBuilderType == null ? bytecodeBuilderType : abstractBuilderType);
+        setSuperClass(model.getTemplateType().asType());
+        addField(this, Set.of(PRIVATE, STATIC, FINAL), int[].class, EMPTY_INT_ARRAY, "new int[0]");
+        if (model.enableCompressedSources) {
+            addField(this, Set.of(PRIVATE, STATIC, FINAL), byte[].class, EMPTY_BYTE_ARRAY, "new byte[0]");
+        }
+
+        addField(this, Set.of(PRIVATE, STATIC, FINAL), Object[].class, "EMPTY_ARRAY", "new Object[0]");
+        this.fastAccess = addField(this, Set.of(PRIVATE, STATIC, FINAL), types.BytecodeDSLAccess, "ACCESS");
+        this.fastAccess.setInit(createFastAccessFieldInitializer(model.allowUnsafe));
+        this.byteArraySupport = addField(this, Set.of(PRIVATE, STATIC, FINAL), types.ByteArraySupport, "BYTES");
+        this.byteArraySupport.createInitBuilder().startCall("ACCESS.getByteArraySupport").end();
+        addField(this, Set.of(PRIVATE, STATIC, FINAL), types.BytecodeDSLAccess, "SAFE_ACCESS") //
+                        .createInitBuilder().tree(createFastAccessFieldInitializer(false));
+        addField(this, Set.of(PRIVATE, STATIC, FINAL), types.ByteArraySupport, "SAFE_BYTES") //
+                        .createInitBuilder().startCall("SAFE_ACCESS.getByteArraySupport").end();
+        this.frameExtensions = addField(this, Set.of(PRIVATE, STATIC, FINAL), types.FrameExtensions, "FRAMES");
+        this.frameExtensions.createInitBuilder().startCall("ACCESS.getFrameExtensions").end();
+
+        // Print a summary of the model in a docstring at the start.
+        this.createDocBuilder().startDoc().lines(model.pp()).end();
+        mergeSuppressWarnings(this, "static-method");
+
+        if (model.hasYieldOperation()) {
+            continuationRootNodeImpl = new ContinuationRootNodeImplElement(this);
+        } else {
+            continuationRootNodeImpl = null;
+        }
+
+        if (model.usesBoxingElimination() || model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.CUSTOM_EXCEPTION) {
+            frameTagsElement = this.add(new FrameTagConstantsElement(this));
+        } else {
+            frameTagsElement = null;
+        }
+
+        if (model.enableInstructionTracing) {
+            this.instructionTracerAccessImplElement = new InstructionTracerAccessImplElement(this);
+        }
+        this.instructionDescriptorImpl = new InstructionDescriptorImplElement(this);
+        this.instructionDescriptorList = new InstructionDescriptorListElement(this);
+
+        this.instructionImpl = new InstructionImplElement(this);
+
+        if (model.enableTagInstrumentation) {
+            this.tagNode = new TagNodeElement(this);
+            this.tagRootNode = new TagRootNodeElement(this);
+        }
+
+        this.add(bytecodeDescriptorElement);
+
+        this.sourceInfoTable = new SourceInfoTable();
+
+        if (model.isBytecodeUpdatable()) {
+            this.oldBytecodesBoxElement = this.add(new OldBytecodesBoxElement(this));
+        }
+
+        this.branchBackwardThrowException = add(new BranchBackwardThrowExceptionElement(parent));
+
+        this.abstractBytecodeNode = this.add(new AbstractBytecodeNodeElement(this));
+        this.bytecodeTransitionImplElement = new BytecodeTransitionImplElement(this);
+
+        if (model.enableTagInstrumentation) {
+            tagNode.lazyInit();
+            tagRootNode.lazyInit();
+        }
+
+        CodeVariableElement bytecodeNode = new CodeVariableElement(Set.of(PRIVATE, VOLATILE), abstractBytecodeNode.asType(), "bytecode");
+        this.add(child(bytecodeNode));
+        this.add(new CodeVariableElement(Set.of(PRIVATE, FINAL), bytecodeRootNodesImpl.asType(), "nodes"));
+        addJavadoc(this.add(new CodeVariableElement(Set.of(PRIVATE, FINAL), type(int.class), "stackBase")),
+                        "The number of frame slots required for locals. Live stack operands occupy [stackBase, sp), where sp points to the next free slot.");
+        if (model.usesBoxingElimination()) {
+            addJavadoc(this.add(new CodeVariableElement(Set.of(PRIVATE, FINAL), type(int.class), "numLocals")), "The total number of locals created.");
+        }
+        this.add(new CodeVariableElement(Set.of(PRIVATE, FINAL), type(int.class), "buildIndex"));
+        this.add(createBytecodeUpdater());
+
+        // Define constants for accessing the frame.
+        this.addAll(createFrameLayoutConstants());
+
+        sourceInfoTable.lazyInit();
+
+        // Define the generated Node classes for custom instructions.
+        List<CodeTypeElement> dataClasses = new ArrayList<>();
+        StaticConstants consts = new StaticConstants();
+        for (InstructionModel instr : model.getInstructions()) {
+            if (instr.nodeData == null || instr.quickeningBase != null) {
+                continue;
+            }
+            dataClasses.add(createCachedDataClass(instr, consts));
+        }
+        if (model.epilogExceptional != null) {
+            dataClasses.add(createCachedDataClass(model.epilogExceptional.operation.instruction(), consts));
+        }
+        consts.addElementsTo(this);
+
+        instructionsElement.lazyInit();
+
+        // Define the interpreter implementations.
+        cachedBytecodeNode = this.add(new BytecodeNodeElement(this, InterpreterTier.CACHED, "CachedBytecodeNode", BytecodeNodeElement.HandlerLayout.DEFAULT));
+        abstractBytecodeNode.getPermittedSubclasses().add(cachedBytecodeNode.asType());
+        if (model.enableTailCallHandlers) {
+            cachedTailCallBytecodeNode = this.add(new BytecodeNodeElement(this, InterpreterTier.CACHED, "CachedBytecodeNodeTailCall", BytecodeNodeElement.HandlerLayout.TAIL_CALL));
+            abstractBytecodeNode.getPermittedSubclasses().add(cachedTailCallBytecodeNode.asType());
+        }
+
+        this.add(bytecodeTransitionImplElement);
+
+        CodeTypeElement initialBytecodeNode;
+        CodeTypeElement tailCallInitialBytecodeNode = null;
+        if (model.enableUncachedInterpreter) {
+            CodeTypeElement uncachedBytecodeNode = this.add(new BytecodeNodeElement(this, InterpreterTier.UNCACHED, "UncachedBytecodeNode", BytecodeNodeElement.HandlerLayout.DEFAULT));
+            abstractBytecodeNode.getPermittedSubclasses().add(uncachedBytecodeNode.asType());
+            initialBytecodeNode = uncachedBytecodeNode;
+            if (model.enableTailCallHandlers) {
+                tailCallInitialBytecodeNode = this.add(new BytecodeNodeElement(this, InterpreterTier.UNCACHED, "UncachedBytecodeNodeTailCall", BytecodeNodeElement.HandlerLayout.TAIL_CALL));
+                abstractBytecodeNode.getPermittedSubclasses().add(tailCallInitialBytecodeNode.asType());
+            }
+        } else {
+            CodeTypeElement uninitializedBytecodeNode = this.add(new BytecodeNodeElement(this, InterpreterTier.UNINITIALIZED, "UninitializedBytecodeNode", BytecodeNodeElement.HandlerLayout.DEFAULT));
+            abstractBytecodeNode.getPermittedSubclasses().add(uninitializedBytecodeNode.asType());
+            initialBytecodeNode = uninitializedBytecodeNode;
+        }
+
+        // Define helper classes containing the constants for instructions and operations.
+        this.add(instructionsElement);
+
+        operationsElement.lazyInit();
+        this.add(operationsElement);
+
+        // Define the builder class.
+        builder.lazyInit();
+        this.add(builder);
+
+        if (model.enableSerialization) {
+            this.serializationEncodingElement = this.add(new SerializationEncodingElement(this));
+        } else {
+            this.serializationEncodingElement = null;
+        }
+
+        if (model.enableInstructionTracing) {
+            this.add(instructionTracerAccessImplElement);
+            instructionTracerAccessImplElement.lazyInit();
+        }
+        this.add(instructionDescriptorImpl);
+        this.add(instructionDescriptorList);
+        this.add(instructionImpl);
+
+        if (model.enableTagInstrumentation) {
+            this.add(tagNode);
+            this.add(tagRootNode);
+        }
+
+        instructionDescriptorImpl.lazyInit();
+        instructionImpl.lazyInit();
+
+        this.add(createNewConfigBuilder());
+
+        // Define implementations for the public classes that Truffle interpreters interact
+        // with.
+        bytecodeRootNodesImpl.lazyInit();
+        this.add(bytecodeRootNodesImpl);
+
+        bytecodeDescriptorElement.lazyInit();
+
+        CodeVariableElement descriptor = new CodeVariableElement(Set.of(PUBLIC, STATIC, FINAL), bytecodeDescriptorElement.asType(), "BYTECODE");
+        descriptor.createInitBuilder().startNew(bytecodeDescriptorElement.asType()).end();
+        this.getEnclosedElements().add(0, descriptor);
+
+        this.add(new ExceptionHandlerImplElement(this));
+        this.add(new ExceptionHandlerListElement(this));
+        this.add(new SourceInformationImplElement(this));
+        this.add(new SourceInformationListElement(this));
+        this.add(new SourceInformationTreeImplElement(this));
+        this.add(new LocalVariableImplElement(this));
+        this.add(new LocalVariableListElement(this));
+
+        // Define the classes that implement continuations (yield).
+        if (model.hasYieldOperation()) {
+            continuationRootNodeImpl.lazyInit();
+            this.add(continuationRootNodeImpl);
+        }
+
+        int numHandlerKinds = 0;
+        this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "HANDLER_CATCH")).createInitBuilder().string(String.valueOf(numHandlerKinds++));
+        this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "HANDLER_FINALLY")).createInitBuilder().string(String.valueOf(numHandlerKinds++));
+
+        if (model.epilogExceptional != null) {
+            this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "HANDLER_EPILOG_EXCEPTIONAL")).createInitBuilder().string(
+                            String.valueOf(numHandlerKinds++));
+        }
+        if (model.enableTagInstrumentation) {
+            this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "HANDLER_TAG_EXCEPTIONAL")).createInitBuilder().string(String.valueOf(numHandlerKinds++));
+        }
+
+        if (model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.DEFAULT_VALUE) {
+            CodeVariableElement var = this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(Object.class), "DEFAULT_LOCAL_VALUE"));
+            var.createInitBuilder().tree(DSLExpressionGenerator.write(model.defaultLocalValueExpression, null, Map.of()));
+        } else {
+            CodeVariableElement var = this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(Object.class), "EXPECTED_FRAME_DESCRIPTOR_DEFAULT_VALUE"));
+            var.createInitBuilder().startStaticCall(types.FrameDescriptor, "newBuilder().defaultValueIllegal().build().getDefaultValue").end();
+        }
+
+        if (model.variadicStackLimitExpression != null) {
+            CodeVariableElement var = this.add(new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "VARIADIC_STACK_LIMIT"));
+            CodeTreeBuilder b = var.createInitBuilder();
+            boolean needsValidation = model.variadicStackLimitExpression.resolveConstant() == null;
+            if (needsValidation) {
+                CodeExecutableElement validateVariadicStackLimit = this.add(createValidateVariadicStackLimit());
+                b.startCall(validateVariadicStackLimit.getSimpleName().toString());
+            }
+            b.tree(DSLExpressionGenerator.write(model.variadicStackLimitExpression, null, Map.of()));
+            if (needsValidation) {
+                b.end();
+            }
+
+        }
+
+        // Define the generated node's constructor(s).
+        this.addAll(createConstructors());
+        this.add(createSetInitialBytecodeNode(initialBytecodeNode, tailCallInitialBytecodeNode));
+
+        // Define the execute method.
+        this.add(createExecute());
+
+        // Define a continueAt method.
+        // This method delegates to the current tier's continueAt, handling the case where
+        // the tier changes.
+        this.add(createContinueAt());
+        this.add(createTransitionToCached());
+        this.add(createUpdateBytecode());
+
+        // Other root node overrides.
+        this.add(createIsInstrumentable());
+        this.add(createPrepareForCall());
+        this.addOptional(createPrepareForInstrumentation());
+        this.addOptional(createPrepareForCompilation());
+        this.add(createVisitCloneableNodes());
+
+        if (model.enableTagInstrumentation) {
+            this.add(createFindInstrumentableCallNode());
+        }
+
+        // Define a loop counter class to track how many back-edges have been taken.
+        this.add(loopCounter);
+        if (model.enableTailCallHandlers) {
+            this.add(virtualState);
+            this.add(counterState);
+        }
+
+        // Define the static method to create a root node.
+        this.add(createCreate());
+
+        // Define serialization methods and helper fields.
+        if (model.enableSerialization) {
+            this.add(createSerialize());
+            this.add(createSerializeBuilderBytecode());
+            this.add(createSerializeExecutionBytecode());
+            this.add(createDeserialize());
+            this.add(createDeserializeBuilderBytecode());
+            this.add(createDeserializeExecutionBytecode());
+        }
+
+        // Our serialized representation encodes Tags as shorts.
+        // Construct mappings to/from these shorts for serialization/deserialization.
+        if (!model.getProvidedTags().isEmpty()) {
+            CodeVariableElement classToTag = new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL),
+                            generic(ConcurrentHashMap.class,
+                                            type(Integer.class),
+                                            arrayOf(generic(context.getDeclaredType(Class.class), wildcard(types.Tag, null)))),
+                            "TAG_MASK_TO_TAGS");
+            classToTag.createInitBuilder().string("new ConcurrentHashMap<>()");
+            this.add(classToTag);
+            CodeExecutableElement classToTagMethod = createMapTagMaskToTagsArray();
+            this.add(classToTagMethod);
+        }
+
+        // Define helper methods for throwing exceptions.
+        this.add(createSneakyThrow());
+        this.add(createAssertionFailed());
+
+        // Define methods for cloning the root node.
+        this.addOptional(createIsCloningAllowed());
+        this.addOptional(createCloneUninitializedSupported());
+        this.add(new CodeVariableElement(Set.of(Modifier.PRIVATE), generic(types.BytecodeSupport_CloneReferenceList, asType()), "clones"));
+        this.addOptional(createCloneUninitialized());
+
+        this.add(createFindBytecodeIndex());
+        this.add(createIsCaptureFramesForTrace());
+
+        // Define helpers for locals.
+        this.add(createGetBytecodeNode());
+        this.add(createGetBytecodeNodeImpl());
+        this.add(createGetBytecodeRootNode());
+
+        this.add(createInvalidate());
+
+        this.add(createGetRootNodes());
+        this.addOptional(createGetSource());
+        this.add(createGetSourceSection());
+        CodeExecutableElement translateStackTraceElement = this.addOptional(createTranslateStackTraceElement());
+        if (translateStackTraceElement != null) {
+            abstractBytecodeNode.add(createCreateStackTraceElement());
+        }
+
+        this.add(createComputeSize());
+
+        if (model.usesBoxingElimination()) {
+            for (TypeMirror boxingEliminatedType : model.boxingEliminatedTypes) {
+                this.add(createApplyQuickening(boxingEliminatedType));
+                this.add(createIsQuickening(boxingEliminatedType));
+            }
+            this.add(createUndoQuickening());
+            this.add(createCreateCachedTags());
+
+        }
+
+        if (clonesNeedUnquickenedBytecode()) {
+            this.add(createUnquickenBytecode());
+        }
+
+        if (model.isBytecodeUpdatable()) {
+            /*
+             * When updating bytecode, we patch "invalidate" instructions in the old bytecode array.
+             * We still need access to the original instructions, so we store it to this field
+             * before invalidating. Since multiple bytecode nodes may share this bytecode array, the
+             * field is a shared box.
+             *
+             * This field is added late to exclude it from the constructor/update method params.
+             */
+            abstractBytecodeNode.add(new CodeVariableElement(Set.of(VOLATILE), oldBytecodesBoxElement.asType(), "oldBytecodesBox"));
+        }
+
+        /*
+         * These calls should occur after all methods have been added. They use the generated root
+         * node's method set to determine what method delegate/stub methods to generate.
+         */
+        if (model.hasYieldOperation()) {
+            continuationRootNodeImpl.addRootNodeDelegateMethods();
+        }
+        if (model.enableSerialization) {
+            addMethodStubsToSerializationRootNode();
+        }
+
+        this.addAll(dataClasses);
+    }
+
+    private CodeExecutableElement createNewConfigBuilder() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC), types.BytecodeConfig_Builder, "newConfigBuilder");
+        method.createBuilder().startReturn().startStaticCall(types.BytecodeConfig, "newBuilder").staticReference(configEncoder.asType(), "INSTANCE").end().end();
+        return method;
+    }
+
+    private CodeExecutableElement createValidateVariadicStackLimit() {
+        CodeExecutableElement validateVariadicStackLimit = new CodeExecutableElement(Set.of(PRIVATE, STATIC), type(int.class), "validateVariadicStackLimit",
+                        new CodeVariableElement(type(int.class), "limit"));
+        CodeTreeBuilder b = validateVariadicStackLimit.createBuilder();
+        b.startIf().string("limit <= 1").end().startBlock();
+        b.startThrow().startNew(type(IllegalStateException.class)).doubleQuote("The variadic stack limit must be greater than 1.").end().end();
+        b.end().startElseIf().string("limit % 2 != 0").end().startBlock();
+        b.startThrow().startNew(type(IllegalStateException.class)).doubleQuote("The variadic stack limit must be a power of 2.").end().end();
+        b.end().startElseIf().string("limit > Short.MAX_VALUE").end().startBlock();
+        b.startThrow().startNew(type(IllegalStateException.class)).doubleQuote("The variadic stack limit must be smaller or equal to Short.MAX_VALUE").end().end();
+        b.end();
+        b.statement("return limit");
+        return validateVariadicStackLimit;
+    }
+
+    /**
+     * Generates a constructor that initializes the bytecode node and, when serialization is
+     * enabled, a base constructor without bytecode initialization.
+     */
+    private List<CodeExecutableElement> createConstructors() {
+        CodeExecutableElement ctor = new CodeExecutableElement(Set.of(PRIVATE), null, this.getSimpleName().toString());
+        ctor.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        ctor.addParameter(new CodeVariableElement(types.FrameDescriptor_Builder, "builder"));
+        ctor.addParameter(new CodeVariableElement(bytecodeRootNodesImpl.asType(), "nodes"));
+        ctor.addParameter(new CodeVariableElement(type(int.class), "stackBase"));
+        ctor.addParameter(new CodeVariableElement(type(int.class), "frameSlotCount"));
+        if (model.usesBoxingElimination()) {
+            ctor.addParameter(new CodeVariableElement(type(int.class), "numLocals"));
+        }
+        ctor.addParameter(new CodeVariableElement(type(int.class), "buildIndex"));
+
+        CodeTreeBuilder b = ctor.getBuilder();
+
+        // super call
+        b.startStatement().startCall("super");
+        b.string("language");
+        if (model.fdBuilderConstructor != null) {
+            b.string("builder");
+        } else {
+            b.string("builder.build()");
+        }
+        b.end(2);
+
+        String expectedFrameDescriptorValue = model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.DEFAULT_VALUE ? "DEFAULT_LOCAL_VALUE" : "EXPECTED_FRAME_DESCRIPTOR_DEFAULT_VALUE";
+        b.startIf().string("getFrameDescriptor().getDefaultValue() != ").string(expectedFrameDescriptorValue).end().startBlock();
+        b.startThrow().startNew(type(IllegalStateException.class)).doubleQuote("The frame descriptor default value must not be changed by the bytecode root node constructor.").end().end();
+        b.end();
+
+        b.startIf().string("getFrameDescriptor().getNumberOfSlots() != frameSlotCount").end().startBlock();
+        b.startThrow().startNew(type(IllegalStateException.class)).doubleQuote("The number of frame slots must not be changed by the bytecode root node constructor.").end(2);
+        b.end();
+
+        b.statement("this.nodes = nodes");
+        b.statement("this.stackBase = stackBase");
+        if (model.usesBoxingElimination()) {
+            b.statement("this.numLocals = numLocals");
+        }
+        b.statement("this.buildIndex = buildIndex");
+
+        List<CodeExecutableElement> constructors = new ArrayList<>(2);
+        if (model.enableSerialization) {
+            /*
+             * Serialization needs a "root constructor" that does not initialize bytecode. The
+             * current generated code suits this purpose. Create a new constructor that delegates
+             * to the root constructor and then performs bytecode initialization.
+             */
+            addJavadoc(ctor, "Constructs a root before its bytecode node is available.");
+            constructors.add(ctor);
+            CodeExecutableElement rootConstructor = ctor;
+            ctor = CodeExecutableElement.cloneNoAnnotations(rootConstructor);
+            b = ctor.createBuilder();
+            b.startStatement().startCall("this");
+            for (VariableElement parameter : rootConstructor.getParameters()) {
+                b.variable(parameter);
+            }
+            b.end(2);
+        }
+        for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+            ctor.addParameter(new CodeVariableElement(var.asType(), var.getSimpleName().toString()));
+        }
+
+        b.startStatement().startCall("setInitialBytecodeNode");
+        for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+            b.string(var.getSimpleName().toString());
+        }
+        b.end(2);
+
+        addJavadoc(ctor, "Constructs a root and initializes its bytecode node.");
+        constructors.addFirst(ctor);
+        return constructors;
+    }
+
+    private CodeExecutableElement createSetInitialBytecodeNode(CodeTypeElement initialBytecodeNode, CodeTypeElement tailCallInitialBytecodeNode) {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PRIVATE), type(void.class), "setInitialBytecodeNode");
+        for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+            method.addParameter(new CodeVariableElement(var.asType(), var.getSimpleName().toString()));
+        }
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.startAssert().string("this.bytecode == null").end();
+        if (tailCallInitialBytecodeNode != null) {
+            b.startIf().staticReference(types.TruffleOptions, "AOT").end().startBlock();
+            b.startStatement().string("this.bytecode = ").startCall("insert").startStaticCall(tailCallInitialBytecodeNode.asType(), "create");
+            for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+                b.string(var.getSimpleName().toString());
+            }
+            b.end().end().end();
+            b.end().startElseBlock();
+            b.startStatement().string("this.bytecode = ").startCall("insert").startStaticCall(initialBytecodeNode.asType(), "create");
+            for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+                b.string(var.getSimpleName().toString());
+            }
+            b.end().end().end();
+            b.end();
+        } else {
+            b.startStatement().string("this.bytecode = ").startCall("insert").startStaticCall(initialBytecodeNode.asType(), "create");
+            for (VariableElement var : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+                b.string(var.getSimpleName().toString());
+            }
+            b.end().end().end();
+        }
+
+        return method;
+    }
+
+    void emitInitializeFrameDescriptorBuilder(CodeTreeBuilder b, String variableName, CodeTree slotCount) {
+        b.startDeclaration(types.FrameDescriptor_Builder, variableName).startStaticCall(types.FrameDescriptor, "newBuilder").tree(slotCount).end(2);
+        if (model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.DEFAULT_VALUE) {
+            b.startStatement().startCall(variableName, "defaultValue").staticReference(this.asType(), "DEFAULT_LOCAL_VALUE").end(2);
+        } else {
+            b.startStatement().startCall(variableName, "defaultValueIllegal").end(2);
+        }
+        b.startStatement().startCall(variableName, "useSlotKinds").string("false").end(2);
+        b.startStatement().startCall(variableName, "addSlots").tree(slotCount).end(2);
+    }
+
+    private CodeExecutableElement createExecute() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "execute", new String[]{"frame"});
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().startCall("continueAt");
+        b.string("bytecode");
+        b.string("0"); // bci
+        b.string("stackBase"); // sp
+        b.startGroup().cast(types.FrameWithoutBoxing).string("frame").end();
+        if (model.hasYieldOperation()) {
+            b.string("null"); // continuation root
+        }
+
+        b.end(2);
+
+        return ex;
+    }
+
+    final Map<InstructionModel, CodeExecutableElement> cachedExecuteMethods = new LinkedHashMap<>();
+    final Map<InstructionModel, CodeExecutableElement> uncachedExecuteMethods = new LinkedHashMap<>();
+    final Map<InstructionModel, CodeExecutableElement> specializeExecuteMethods = new LinkedHashMap<>();
+
+    private CodeTypeElement createCachedDataClass(InstructionModel instr, StaticConstants consts) {
+        NodeConstants nodeConsts = new NodeConstants();
+        BytecodeDSLNodeGeneratorPlugs plugs = new BytecodeDSLNodeGeneratorPlugs(this, instr);
+        FlatNodeGenFactory factory = new FlatNodeGenFactory(context, GeneratorMode.DEFAULT, instr.nodeData, consts, nodeConsts, plugs);
+
+        boolean forceFrame = false;
+        if (isStoreBciEnabled(model, InterpreterTier.CACHED) || model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.MANUAL) {
+            for (SpecializationData s : instr.nodeData.getReachableSpecializations()) {
+                if (isStoreBciBeforeSpecialization(model, InterpreterTier.CACHED, instr, s)) {
+                    forceFrame = true;
+                }
+            }
+        }
+        factory.setForceFrameInExecuteAndSpecialize(forceFrame);
+
+        String className = cachedDataClassName(instr);
+        CodeTypeElement el = new CodeTypeElement(Set.of(PRIVATE, STATIC, FINAL), ElementKind.CLASS, null, className);
+        el.setSuperClass(types.Node);
+        factory.create(el, false);
+
+        /*
+         * We filter methods named executeObject we do not use the default execute method we
+         * generate all of them explicitly. but we still want to generate one execute method to
+         * generate all necessary methods for other execute methods.
+         *
+         * Arguably that is a bit of a hack, but it makes the node generator simpler.
+         */
+        el.getEnclosedElements().removeAll(ElementFilter.methodsIn(el.getEnclosedElements()).stream().//
+                        filter((m) -> m.getSimpleName().toString().equals("executeObject")).toList());
+
+        CodeExecutableElement executeAndSpecialize = (CodeExecutableElement) ElementUtils.findMethod(el, "executeAndSpecialize");
+        if (executeAndSpecialize != null) {
+            specializeExecuteMethods.put(instr, executeAndSpecialize);
+        }
+
+        cachedExecuteMethods.put(instr, emitExecute(plugs, factory, el, instr, InterpreterTier.CACHED));
+        for (InstructionModel quickening : instr.getFlattenedQuickenedInstructions()) {
+            if (needsExecute(quickening)) {
+                cachedExecuteMethods.put(quickening, emitExecute(plugs, factory, el, quickening, InterpreterTier.CACHED));
+            }
+        }
+
+        for (InstructionModel quickening : instr.getFlattenedQuickenedInstructions()) {
+            if (!needsExecute(quickening)) {
+                cachedExecuteMethods.put(quickening, cachedExecuteMethods.get(quickening.quickeningBase));
+            }
+        }
+
+        if (model.enableUncachedInterpreter) {
+            uncachedExecuteMethods.put(instr, emitExecute(plugs, factory, el, instr, InterpreterTier.UNCACHED));
+        }
+
+        CodeExecutableElement quicken = plugs.getQuickenMethod();
+        if (quicken != null) {
+            el.getEnclosedElements().add(quicken);
+        }
+        nodeConsts.addToClass(el);
+
+        if (instr.canUseNodeSingleton()) {
+
+            for (VariableElement field : ElementFilter.fieldsIn(el.getEnclosedElements())) {
+                if (field.getModifiers().contains(STATIC)) {
+                    continue;
+                }
+                // safety check so we never have inconsistent conditions
+                throw new AssertionError("Instruction " + instr + " is used as singleton but has node fields " + field);
+            }
+
+            el.addAnnotationMirror(new CodeAnnotationMirror(types.DenyReplace));
+            CodeVariableElement singleton = new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL),
+                            el.asType(), "SINGLETON");
+            singleton.createInitBuilder().startNew(className).end();
+            el.add(singleton);
+
+            CodeExecutableElement isAdoptable = GeneratorUtils.override(types.Node, "isAdoptable");
+            isAdoptable.createBuilder().startReturn().string("false").end();
+            el.add(isAdoptable);
+        }
+
+        return el;
+    }
+
+    /**
+     * Returns <code>true</code> if we need a dedicated execute method for this instruction, else
+     * <code>false</code>.
+     */
+    private static boolean needsExecute(InstructionModel quickening) {
+        if (quickening.isReturnTypeQuickening()) {
+            return quickening.hasBoxingOverloadForType(quickening.signature.returnType());
+        }
+        return true;
+    }
+
+    /**
+     * Encodes the state used to begin execution. This encoding is used on method entry, on OSR
+     * transition, and on continuation resumption (if enabled). The encoding is as follows:
+     *
+     * <pre>
+     * SSSSSSSS SSSSSSSS SSSSSSSS SSSSSSSS BBBBBBBBB BBBBBBBBB BBBBBBBBB BBBBBBBBB
+     * </pre>
+     *
+     * Where {@code B} represents the bci and {@code S} represents the sp.
+     */
+    static String encodeState(String bci, String sp) {
+        return String.format("((%s & 0xFFFFFFFFL) << 32) | (%s & 0xFFFFFFFFL)", sp, bci);
+    }
+
+    static final String RETURN_BCI = "0xFFFFFFFF";
+
+    static String encodeReturnState(String sp) {
+        return String.format("((%s & 0xFFFFFFFFL) << 32) | %sL", sp, RETURN_BCI);
+    }
+
+    static String encodeNewBci(String bci, String state) {
+        return String.format("(%s & 0xFFFFFFFF00000000L) | (%s & 0xFFFFFFFFL)", state, bci);
+    }
+
+    static String decodeBci(String state) {
+        return String.format("(int) %s", state);
+    }
+
+    static String decodeSp(String state) {
+        return String.format("((int) (%s >>> 32))", state);
+    }
+
+    CodeTreeBuilder emitCastBytecodeIndexToInt(CodeTreeBuilder b) {
+        if (!ElementUtils.typeEquals(getBytecodeIndexType(), type(int.class))) {
+            return b.cast(type(int.class));
+        }
+        return b;
+    }
+
+    CodeTreeBuilder emitCastStackPointerToInt(CodeTreeBuilder b) {
+        if (!ElementUtils.typeEquals(getStackPointerType(), type(int.class))) {
+            return b.cast(type(int.class));
+        }
+        return b;
+    }
+
+    CodeTree castBytecodeIndexToInt(CodeTree bci) {
+        if (ElementUtils.typeEquals(getBytecodeIndexType(), type(int.class))) {
+            return bci;
+        } else {
+            return CodeTreeBuilder.createBuilder().cast(type(int.class)).tree(bci).build();
+        }
+    }
+
+    String castBytecodeIndexToInt(String bci) {
+        if (ElementUtils.typeEquals(getBytecodeIndexType(), type(int.class))) {
+            return bci;
+        } else {
+            return "(int) " + bci;
+        }
+    }
+
+    TypeMirror getBytecodeIndexType() {
+        return type(long.class);
+    }
+
+    TypeMirror getStackPointerType() {
+        return type(long.class);
+    }
+
+    void emitWriteBytecodeIndexToFrame(CodeTreeBuilder b, String frame, String value) {
+        b.startStatement();
+        BytecodeRootNodeElement.startSetFrame(b, getBytecodeIndexType()).string(frame).string(BytecodeRootNodeElement.BCI_INDEX).string(value).end();
+        b.end();
+    }
+
+    void emitReadBytecodeIndexFromFrame(CodeTreeBuilder b, String frame, boolean castToInt) {
+        if (castToInt) {
+            emitCastBytecodeIndexToInt(b);
+        }
+        BytecodeRootNodeElement.startGetFrame(b, frame, getBytecodeIndexType(), false).string(BytecodeRootNodeElement.BCI_INDEX).end();
+    }
+
+    private CodeExecutableElement createContinueAt() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), type(Object.class), "continueAt");
+        ex.addParameter(new CodeVariableElement(abstractBytecodeNode.asType(), "bc"));
+        ex.addParameter(new CodeVariableElement(getBytecodeIndexType(), "bci"));
+        ex.addParameter(new CodeVariableElement(getStackPointerType(), "sp"));
+        ex.addParameter(new CodeVariableElement(types.FrameWithoutBoxing, "frame"));
+        if (model.hasYieldOperation()) {
+            /*
+             * When we resume, this parameter is non-null and is included so that the root node can
+             * be patched when the interpreter transitions to cached.
+             */
+            ex.addParameter(new CodeVariableElement(continuationRootNodeImpl.asType(), "continuationRootNode"));
+        }
+
+        CodeTreeBuilder b = ex.createBuilder();
+
+        if (model.overridesBytecodeDebugListenerMethod("beforeRootExecute")) {
+            b.startStatement();
+            b.startCall("beforeRootExecute");
+            emitParseInstruction(b, "bc", "bci", CodeTreeBuilder.singleString("bc.readValidBytecode(bc.bytecodes, bci)"));
+            b.end();
+            b.end();
+        }
+
+        b.statement("boolean wasCompiled = CompilerDirectives.inCompiledCode()");
+
+        b.statement("long state = ", encodeState("bci", "sp"));
+
+        b.startWhile().string("true").end().startBlock();
+
+        b.startAssign("state");
+        b.startCall("bc", "continueAt");
+        b.string("this");
+        b.string("frame");
+        b.string("state");
+        if (model.hasYieldOperation()) {
+            b.string("continuationRootNode");
+        }
+        b.end();
+        b.end();
+
+        b.startIf().string(decodeBci("state"), " == ", RETURN_BCI).end().startBlock();
+        b.statement("break");
+        b.end().startElseBlock();
+        b.lineComment("Bytecode or tier changed");
+        b.tree(GeneratorUtils.createTransferToInterpreterAndInvalidate());
+
+        if (model.hasYieldOperation()) {
+            b.startIf().string("wasCompiled && continuationRootNode != null").end().startBlock();
+            b.statement("frame = continuationRootNode.syncToMaterializedFrame(frame, " + decodeSp("state") + ")");
+            b.end();
+        }
+
+        b.declaration(abstractBytecodeNode.asType(), "oldBytecode", "bc");
+        b.statement("bc = this.bytecode");
+        if (model.isBytecodeUpdatable()) {
+            b.startAssign("state");
+        } else {
+            b.startStatement();
+        }
+        b.string("oldBytecode.");
+        emitCallDefault(b, abstractBytecodeNode.transition);
+        b.end();
+
+        b.statement("wasCompiled = false");
+
+        b.end();
+        b.end();
+
+        String returnValue = uncheckedGetFrameObject(decodeSp("state"));
+        if (model.hasYieldOperation()) {
+            // The frame may outlive this invocation. Clear the result for liveness analysis.
+            b.declaration(type(Object.class), "result", returnValue);
+            b.startIf().string("CompilerDirectives.inCompiledCode()").end().startBlock();
+            b.statement(clearFrame("frame", decodeSp("state")));
+            b.end();
+            b.statement("return result");
+        } else {
+            b.startReturn().string(returnValue).end();
+        }
+        mergeSuppressWarnings(ex, "all");
+        return ex;
+    }
+
+    private Element createIsCaptureFramesForTrace() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "isCaptureFramesForTrace", new String[]{"compiled"}, new TypeMirror[]{type(boolean.class)});
+        CodeTreeBuilder b = ex.createBuilder();
+        if (model.captureFramesForTrace) {
+            b.lineComment("GenerateBytecode#captureFramesForTrace is true.");
+            b.statement("return true");
+        } else if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.FRAME) {
+            b.lineComment("BytecodeIndexMode.FRAME needs the frame for location computations.");
+            b.statement("return true");
+        } else if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.MANUAL) {
+            b.lineComment("BytecodeIndexMode.MANUAL needs the frame for manual location computations.");
+            b.statement("return true");
+        } else if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.CACHED_NODE && model.enableUncachedInterpreter) {
+            b.lineComment("The uncached interpreter (which is never compiled) needs the frame for location computations.");
+            b.lineComment("This may capture the frame in more situations than strictly necessary, but doing so in the interpreter is inexpensive.");
+            b.statement("return !compiled");
+        } else {
+            b.lineComment("Frame capture is not needed for bytecode index lookup or stack traces.");
+            b.statement("return false");
+        }
+        return ex;
+    }
+
+    private Element createFindBytecodeIndex() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "findBytecodeIndex", new String[]{"node", "frame"});
+        mergeSuppressWarnings(ex, "hiding");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startAssert().string("!(node instanceof ").type(types.BytecodeRootNode).string("): ").doubleQuote("A BytecodeRootNode should not be used as a call location.").end();
+        if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.FRAME || model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.MANUAL) {
+            if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.FRAME) {
+                b.startIf().string("node == null").end().startBlock();
+                b.statement("return -1");
+                b.end();
+                /*- TODO: GR-62198
+                b.startAssert();
+                b.startStaticCall(types.BytecodeNode, "get").string("node").end().instanceOf(abstractBytecodeNode.asType()).string(" : ").doubleQuote("invalid bytecode node passed");
+                b.end();
+                 */
+            }
+            b.startIf().string("frame == null || frame.getTag(BCI_INDEX) == ").staticReference(types.FrameSlotKind, "Illegal").string(".tag").end().startBlock();
+            b.lineComment("The bci index might be illegal if it was never set due to optimizations or manual updates.");
+            b.statement("return -1");
+            b.end();
+            b.startReturn();
+            emitReadBytecodeIndexFromFrame(b, "frame", true);
+            b.end();
+        } else if (model.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.CACHED_NODE) {
+            b.declaration(abstractBytecodeNode.asType(), "bytecode", "null");
+            b.declaration(types.Node, "prev", "node");
+            b.declaration(types.Node, "current", "node");
+            b.startWhile().string("current != null").end().startBlock();
+            b.startIf().string("current").instanceOf(abstractBytecodeNode.asType()).string(" b").end().startBlock();
+            b.statement("bytecode = b");
+            b.statement("break");
+            b.end();
+            b.statement("prev = current");
+            b.statement("current = prev.getParent()");
+            b.end();
+            b.startIf().string("bytecode == null").end().startBlock();
+            b.statement("return -1");
+            b.end();
+            b.statement("return bytecode.findBytecodeIndex(frame, prev)");
+        } else {
+            b.statement("return -1");
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createFindInstrumentableCallNode() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "findInstrumentableCallNode", new String[]{"callNode", "frame", "bytecodeIndex"});
+        ex.getModifiers().remove(Modifier.ABSTRACT);
+        ex.getModifiers().add(Modifier.FINAL);
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startDeclaration(types.BytecodeNode, "bc").startStaticCall(types.BytecodeNode, "get").string("callNode").end().end();
+        b.startIf().string("bc == null || !(bc instanceof AbstractBytecodeNode bytecodeNode)").end().startBlock();
+        ExecutableElement parentImpl = findImplementedRootNodeMethod("findInstrumentableCallNode", 3);
+        if (parentImpl == null) {
+            // edge case: root node could redeclare findInstrumentableCallNode as abstract.
+            b.startReturn().string("null").end();
+        } else {
+            b.startReturn().string("super.findInstrumentableCallNode(callNode, frame, bytecodeIndex)").end();
+        }
+        b.end();
+        b.statement("return bytecodeNode.findInstrumentableCallNode(bytecodeIndex)");
+        return ex;
+    }
+
+    private CodeVariableElement createBytecodeUpdater() {
+        TypeMirror updaterType = generic(type(AtomicReferenceFieldUpdater.class), this.asType(), abstractBytecodeNode.asType());
+        CodeVariableElement bytecodeUpdater = new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), updaterType, "BYTECODE_UPDATER");
+        bytecodeUpdater.createInitBuilder().startStaticCall(type(AtomicReferenceFieldUpdater.class), "newUpdater").typeLiteral(this.asType()).typeLiteral(
+                        abstractBytecodeNode.asType()).doubleQuote("bytecode").end();
+        return bytecodeUpdater;
+    }
+
+    private CodeExecutableElement createCreateCachedTags() {
+        CodeExecutableElement executable = new CodeExecutableElement(Set.of(PRIVATE, STATIC),
+                        type(byte[].class), "createCachedTags",
+                        new CodeVariableElement(type(int.class), "numLocals"));
+
+        CodeTreeBuilder b = executable.createBuilder();
+        b.statement("byte[] localTags = new byte[numLocals]");
+        b.statement("Arrays.fill(localTags, FrameSlotKind.Illegal.tag)");
+        b.statement("return localTags");
+        return executable;
+    }
+
+    private CodeExecutableElement createUndoQuickening() {
+        CodeExecutableElement executable = new CodeExecutableElement(Set.of(PRIVATE, STATIC),
+                        type(short.class), "undoQuickening",
+                        new CodeVariableElement(type(short.class), "$operand"));
+
+        CodeTreeBuilder b = executable.createBuilder();
+
+        b.startSwitch().string("$operand").end().startBlock();
+        for (InstructionModel instruction : model.getInstructions()) {
+            if (!instruction.isReturnTypeQuickening()) {
+                continue;
+            }
+            b.startCase().tree(createInstructionConstant(instruction)).end();
+            b.startCaseBlock();
+            b.startReturn().tree(createInstructionConstant(instruction.quickeningBase)).end();
+            b.end();
+        }
+        b.caseDefault();
+        b.startCaseBlock();
+        b.statement("return $operand");
+        b.end();
+        b.end();
+
+        return executable;
+    }
+
+    private CodeExecutableElement createApplyQuickening(TypeMirror type) {
+        CodeExecutableElement executable = new CodeExecutableElement(Set.of(PRIVATE, STATIC),
+                        type(short.class), createApplyQuickeningName(type),
+                        new CodeVariableElement(type(short.class), "$operand"));
+
+        CodeTreeBuilder b = executable.createBuilder();
+        b.startSwitch().string("$operand").end().startBlock();
+        for (InstructionModel instruction : model.getInstructions()) {
+            if (!instruction.isReturnTypeQuickening()) {
+                continue;
+            }
+
+            if (ElementUtils.typeEquals(instruction.signature.returnType(), type)) {
+                b.startCase().tree(createInstructionConstant(instruction.quickeningBase)).end();
+                b.startCase().tree(createInstructionConstant(instruction)).end();
+                b.startCaseBlock();
+                b.startReturn().tree(createInstructionConstant(instruction)).end();
+                b.end();
+            }
+        }
+        b.caseDefault();
+        b.startCaseBlock();
+        b.statement("return -1");
+        b.end();
+        b.end();
+
+        return executable;
+    }
+
+    private CodeExecutableElement createIsQuickening(TypeMirror type) {
+        CodeExecutableElement executable = new CodeExecutableElement(Set.of(PRIVATE, STATIC),
+                        type(boolean.class), createIsQuickeningName(type),
+                        new CodeVariableElement(type(short.class), "operand"));
+
+        CodeTreeBuilder b = executable.createBuilder();
+        List<InstructionModel> returnQuickenings = model.getInstructions().stream().//
+                        filter((i) -> i.isReturnTypeQuickening() && ElementUtils.typeEquals(i.signature.returnType(), type)).toList();
+
+        if (returnQuickenings.isEmpty()) {
+            b.returnFalse();
+        } else {
+            b.startSwitch().string("operand").end().startBlock();
+            for (InstructionModel instruction : returnQuickenings) {
+                b.startCase().tree(createInstructionConstant(instruction)).end();
+            }
+            b.startCaseBlock();
+            b.returnTrue();
+            b.end();
+            b.caseDefault();
+            b.startCaseBlock();
+            b.returnFalse();
+            b.end();
+            b.end();
+        }
+
+        return executable;
+    }
+
+    private CodeExecutableElement createMapTagMaskToTagsArray() {
+        TypeMirror tagClass = generic(context.getDeclaredType(Class.class), wildcard(types.Tag, null));
+        CodeExecutableElement classToTagMethod = new CodeExecutableElement(Set.of(PRIVATE, STATIC), arrayOf(generic(context.getDeclaredType(Class.class), wildcard(types.Tag, null))),
+                        "mapTagMaskToTagsArray");
+        classToTagMethod.addParameter(new CodeVariableElement(type(int.class), "tagMask"));
+        GeneratorUtils.mergeSuppressWarnings(classToTagMethod, "unchecked", "rawtypes");
+
+        CodeTreeBuilder b = classToTagMethod.createBuilder();
+
+        b.startStatement().type(generic(ArrayList.class, tagClass)).string(" tags = ").startNew("ArrayList<>").end().end();
+        int index = 0;
+        for (TypeMirror tag : model.getProvidedTags()) {
+            b.startIf().string(configEncoder.checkTagEnabled("tagMask", index)).end().startBlock();
+            b.startStatement().startCall("tags", "add").typeLiteral(tag).end().end();
+            b.end();
+            index++;
+        }
+        b.statement("return tags.toArray(new Class[tags.size()])");
+        return classToTagMethod;
+    }
+
+    private List<CodeVariableElement> createFrameLayoutConstants() {
+        List<CodeVariableElement> result = new ArrayList<>();
+        int reserved = 0;
+
+        if (model.needsBciSlot()) {
+            result.add(createInitializedVariable(Set.of(PRIVATE, STATIC, FINAL), int.class, BCI_INDEX, reserved++ + ""));
+        }
+
+        if (model.hasYieldOperation()) {
+            result.add(createInitializedVariable(Set.of(PRIVATE, STATIC, FINAL), int.class, CONTINUATION_FRAME_INDEX, reserved++ + ""));
+        }
+
+        result.add(createInitializedVariable(Set.of(PRIVATE, STATIC, FINAL), int.class, USER_LOCALS_START_INDEX, reserved + ""));
+
+        return result;
+    }
+
+    CodeTree createFastAccessFieldInitializer(boolean allowUnsafe) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startStaticCall(types.BytecodeDSLAccess, "lookup").string("BytecodeRootNodesImpl.VISIBLE_TOKEN").string(Boolean.toString(allowUnsafe)).end();
+        return b.build();
+    }
+
+    private CodeExecutableElement createIsCloningAllowed() {
+        ExecutableElement executable = ElementUtils.findOverride(ElementUtils.findMethod(types.RootNode, "isCloningAllowed"), model.templateType);
+        if (executable != null) {
+            return null;
+        }
+        CodeExecutableElement ex = GeneratorUtils.override(types.RootNode, "isCloningAllowed");
+        ex.createBuilder().returnTrue();
+        return ex;
+    }
+
+    private CodeExecutableElement createCloneUninitializedSupported() {
+        ExecutableElement executable = ElementUtils.findOverride(ElementUtils.findMethod(types.RootNode, "isCloneUninitializedSupported"), model.templateType);
+        if (executable != null && executable.getModifiers().contains(Modifier.FINAL)) {
+            return null;
+        }
+
+        CodeExecutableElement ex = GeneratorUtils.override(types.RootNode, "isCloneUninitializedSupported");
+        ex.createBuilder().returnTrue();
+        return ex;
+    }
+
+    private CodeExecutableElement createCloneUninitialized() {
+        ExecutableElement executable = ElementUtils.findOverride(ElementUtils.findMethod(types.RootNode, "cloneUninitialized"), model.templateType);
+        if (executable != null && executable.getModifiers().contains(Modifier.FINAL)) {
+            return null;
+        }
+        CodeExecutableElement ex = GeneratorUtils.override(types.RootNode, "cloneUninitialized");
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.declaration(this.asType(), "clone");
+        b.startSynchronized("nodes");
+        b.startAssign("clone").cast(this.asType()).string("this.copy()").end();
+        b.statement("clone.clones = null");
+        // The base copy method performs a shallow copy of all fields.
+        // Some fields should be manually reinitialized to default values.
+        b.statement("clone.bytecode = insert(this.bytecode.cloneUninitialized(clone))");
+        b.declaration(generic(types.BytecodeSupport_CloneReferenceList, this.asType()), "localClones", "this.clones");
+        b.startIf().string("localClones == null").end().startBlock();
+        b.startStatement().string("this.clones = localClones = ").startNew(generic(types.BytecodeSupport_CloneReferenceList, this.asType())).end().end();
+        b.end();
+
+        b.statement("localClones.add(clone)");
+        b.end();
+
+        emitFence(b);
+        b.startReturn().string("clone").end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createTranslateStackTraceElement() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "translateStackTraceElement", new String[]{"stackTraceElement"});
+        if (ex.getModifiers().contains(Modifier.FINAL)) {
+            // already overridden by the root node.
+            return null;
+        }
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn();
+        b.startStaticCall(abstractBytecodeNode.asType(), "createStackTraceElement");
+        b.string("stackTraceElement");
+        b.end();
+        b.end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createCreateStackTraceElement() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), type(Object.class), "createStackTraceElement");
+        ex.addParameter(new CodeVariableElement(types.TruffleStackTraceElement, "stackTraceElement"));
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn();
+        b.startCall("createDefaultStackTraceElement");
+        b.string("stackTraceElement");
+        b.end();
+        b.end();
+        return ex;
+    }
+
+    private CodeExecutableElement createGetSource() {
+        ExecutableElement executable = ElementUtils.findOverride(ElementUtils.findMethod(types.BytecodeRootNode, "getSource"), model.templateType);
+        if (executable != null) {
+            return null;
+        }
+
+        CodeExecutableElement ex = GeneratorUtils.override(types.BytecodeRootNode, "getSource");
+        ex.getModifiers().remove(Modifier.DEFAULT);
+        ex.getModifiers().add(Modifier.FINAL);
+        ex.getAnnotationMirrors().add(new CodeAnnotationMirror(types.CompilerDirectives_TruffleBoundary));
+        CodeTreeBuilder b = ex.createBuilder();
+
+        b.declaration(sourceInfoTable.getSourceInfoType(), "info", "bytecode.sourceInfo");
+        b.startIf().string("info == null || info.length == 0").end().startBlock();
+        b.startReturn().string("null").end();
+        b.end();
+
+        if (!model.enableCompressedSources) {
+            b.startDeclaration(type(int.class), "lastEntry");
+            b.string("info.length - ").variable(sourceInfoTable.entryLengthVariable);
+            b.end();
+            b.startIf();
+            b.tree(sourceInfoTable.loadStartBci("info", "lastEntry")).string(" == 0 &&").startIndention().newLine();
+            b.tree(sourceInfoTable.loadEndBci("info", "lastEntry")).string(" == bytecode.bytecodes.length").end();
+            b.end().startBlock();
+            b.startDeclaration(type(int.class), "sourceIndex");
+            b.tree(sourceInfoTable.loadSource("info", "lastEntry"));
+            b.end();
+            b.startReturn().string("bytecode.sources.get(sourceIndex)").end();
+            b.end(); // if
+
+            b.startReturn().string("null").end();
+            return ex;
+        } else {
+            b.declaration(type(int.class), "lastEntry", "0");
+            SourceInfoTable.emitInitCompressedSourceIterationVariables(b, type(int.class), "index");
+            b.startWhile().string("index < info.length - ").variable(sourceInfoTable.footerLengthVariable).end().startBlock();
+            b.statement("lastEntry = index");
+            b.statement("index += info[index] & 0xFF");
+            b.end();
+            b.statement("index = lastEntry + 1");
+            SourceInfoTable.emitDecodeVarintEntry(b, "info", "index");
+            b.declaration(type(int.class), "startBci", "(int) decoded");
+            SourceInfoTable.emitDecodeVarintEntry(b, "info", "index");
+            b.startIf().string("startBci == 0 && (int) decoded == bytecode.bytecodes.length").end().startBlock();
+            SourceInfoTable.emitDecodeVarintEntry(b, "info", "index");
+            b.startReturn().string("bytecode.sources.get((int) decoded)").end();
+            b.end();
+            b.startReturn().string("null").end();
+            return ex;
+        }
+    }
+
+    private CodeExecutableElement createGetSourceSection() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.Node, "getSourceSection");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().string("bytecode.getSourceSection()").end();
+        return ex;
+    }
+
+    private CodeExecutableElement createComputeSize() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "computeSize");
+
+        Collection<InstructionModel> instructions = model.getInstructions();
+        int[] lengths = instructions.stream() //
+                        .mapToInt(InstructionModel::getInstructionLength) //
+                        .sorted() //
+                        .toArray();
+        int midpoint = lengths.length / 2;
+
+        int median;
+        if (lengths.length % 2 == 0) {
+            median = (lengths[midpoint - 1] + lengths[midpoint]) / 2;
+        } else {
+            median = lengths[midpoint];
+        }
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startIf().string("!this.nodes.isParsed()").end().startBlock();
+        b.tree(GeneratorUtils.createTransferToInterpreterAndInvalidate());
+        b.startThrow().startNew(type(IllegalStateException.class));
+        // computeSize gets invoked while instantiating a call target.
+        b.doubleQuote("A call target cannot be created until bytecode parsing completes. Request a call target after the parse is complete instead.");
+        b.end(2);
+        b.end();
+        b.startReturn();
+        b.string("bytecode.bytecodes.length / ", Integer.toString(median), " /* median instruction length */");
+        b.end();
+        return ex;
+    }
+
+    private CodeExecutableElement createSneakyThrow() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), type(RuntimeException.class), "sneakyThrow");
+
+        TypeMirror throwable = type(Throwable.class);
+        CodeVariableElement param = new CodeVariableElement(throwable, "e");
+        ex.addParameter(param);
+
+        CodeTypeParameterElement tpE = new CodeTypeParameterElement(CodeNames.of("E"), throwable);
+        ex.getTypeParameters().add(tpE);
+        ex.addThrownType(tpE.asType());
+
+        mergeSuppressWarnings(ex, "unchecked");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startThrow();
+        b.cast(tpE.asType()).variable(param);
+        b.end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createAssertionFailed() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), type(AssertionError.class), "assertionFailed");
+        ex.addParameter(new CodeVariableElement(type(String.class), "message"));
+        ex.addParameter(new CodeVariableElement(type(Object.class), "args"));
+        ex.setVarArgs(true);
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startThrow().startNew(type(AssertionError.class));
+        b.startCall("message.formatted").string("args").end();
+        b.end(2);
+
+        // AssertionError.<init> is blocklisted from NI code. Create it behind a boundary.
+        return withTruffleBoundary(ex);
+    }
+
+    CodeExecutableElement withTruffleBoundary(CodeExecutableElement ex) {
+        ex.addAnnotationMirror(new CodeAnnotationMirror(types.CompilerDirectives_TruffleBoundary));
+        return ex;
+    }
+
+    private CodeExecutableElement createCreate() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PUBLIC, STATIC), generic(types.BytecodeRootNodes, model.templateType.asType()), "create");
+        ex.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        ex.addParameter(new CodeVariableElement(types.BytecodeConfig, "config"));
+        ex.addParameter(new CodeVariableElement(parserType, "parser"));
+
+        addJavadoc(ex, String.format("""
+                        Creates one or more bytecode nodes. This is the entrypoint for creating new {@link %s} instances.
+
+                        @param language the Truffle language instance.
+                        @param config indicates whether to parse metadata (e.g., source information).
+                        @param parser the parser that invokes a series of builder instructions to generate bytecode.
+                        """, model.getName()));
+
+        CodeTreeBuilder b = ex.getBuilder();
+        b.statement("return BYTECODE.create(language, config, parser)");
+        return ex;
+    }
+
+    void createFailInvalidTag(CodeTreeBuilder b, String tagLocal) {
+        b.startThrow().startNew(type(IllegalArgumentException.class)).startCall("String.format").doubleQuote(
+                        "Invalid tag specified. Tag '%s' not provided by language '" + ElementUtils.getQualifiedName(model.languageClass) + "'.").string(tagLocal, ".getName()").end().end().end();
+    }
+
+    private CodeExecutableElement createSerialize() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC), type(void.class), "serialize");
+        method.addParameter(new CodeVariableElement(type(DataOutput.class), "buffer"));
+        method.addParameter(new CodeVariableElement(types.BytecodeSerializer, "callback"));
+        method.addParameter(new CodeVariableElement(parserType, "parser"));
+        method.addThrownType(type(IOException.class));
+        CodeAnnotationMirror deprecated = new CodeAnnotationMirror(declaredType(Deprecated.class));
+        deprecated.setElementValue("since", new CodeAnnotationValue("25.7"));
+        method.getAnnotationMirrors().add(deprecated);
+
+        addJavadoc(method, """
+                        Serializes builder bytecode for the nodes parsed by {@code parser}.
+
+                        @deprecated Use {@link #serializeBuilderBytecode}.
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("serializeBuilderBytecode(buffer, callback, parser)");
+        return method;
+    }
+
+    private CodeExecutableElement createSerializeBuilderBytecode() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC), type(void.class), "serializeBuilderBytecode");
+        method.addParameter(new CodeVariableElement(type(DataOutput.class), "buffer"));
+        method.addParameter(new CodeVariableElement(types.BytecodeSerializer, "callback"));
+        method.addParameter(new CodeVariableElement(parserType, "parser"));
+        method.addThrownType(type(IOException.class));
+
+        addJavadoc(method, """
+                        Serializes the bytecode nodes parsed by the {@code parser} as a sequence of builder calls.
+
+                        @see BytecodeDescriptor#serializeBuilderBytecode
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("BYTECODE.serializeBuilderBytecode(buffer, callback, parser)");
+        return method;
+    }
+
+    private CodeExecutableElement createSerializeExecutionBytecode() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC), type(void.class), "serializeExecutionBytecode");
+        method.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        method.addParameter(new CodeVariableElement(type(DataOutput.class), "buffer"));
+        method.addParameter(new CodeVariableElement(types.BytecodeConfig, "config"));
+        method.addParameter(new CodeVariableElement(types.BytecodeSerializer, "callback"));
+        method.addParameter(new CodeVariableElement(parserType, "parser"));
+        method.addThrownType(type(IOException.class));
+
+        addJavadoc(method, """
+                        Serializes execution bytecode and its metadata for the requested {@code config}.
+
+                        @see BytecodeDescriptor#serializeExecutionBytecode
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("BYTECODE.serializeExecutionBytecode(language, buffer, config, callback, parser)");
+        return method;
+    }
+
+    private CodeExecutableElement createDeserialize() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC),
+                        generic(types.BytecodeRootNodes, model.getTemplateType().asType()), "deserialize");
+        method.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        method.addParameter(new CodeVariableElement(types.BytecodeConfig, "config"));
+        method.addParameter(new CodeVariableElement(generic(Supplier.class, DataInput.class), "builderBytecodeInput"));
+        method.addParameter(new CodeVariableElement(types.BytecodeDeserializer, "callback"));
+        method.addThrownType(type(IOException.class));
+        CodeAnnotationMirror deprecated = new CodeAnnotationMirror(declaredType(Deprecated.class));
+        deprecated.setElementValue("since", new CodeAnnotationValue("25.7"));
+        method.getAnnotationMirrors().add(deprecated);
+
+        addJavadoc(method, """
+                        Deserializes bytecode nodes by replaying serialized builder calls.
+
+                        @deprecated Use {@link #deserializeBuilderBytecode}.
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("return deserializeBuilderBytecode(language, config, builderBytecodeInput, callback)");
+        return method;
+    }
+
+    private CodeExecutableElement createDeserializeBuilderBytecode() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC),
+                        generic(types.BytecodeRootNodes, model.getTemplateType().asType()), "deserializeBuilderBytecode");
+        method.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        method.addParameter(new CodeVariableElement(types.BytecodeConfig, "config"));
+        method.addParameter(new CodeVariableElement(generic(Supplier.class, DataInput.class), "builderBytecodeInput"));
+        method.addParameter(new CodeVariableElement(types.BytecodeDeserializer, "callback"));
+        method.addThrownType(type(IOException.class));
+        addJavadoc(method, """
+                        Deserializes bytecode nodes by replaying serialized builder calls.
+
+                        @see BytecodeDescriptor#deserializeBuilderBytecode
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("return BYTECODE.deserializeBuilderBytecode(language, config, builderBytecodeInput, callback)");
+        return method;
+    }
+
+    private CodeExecutableElement createDeserializeExecutionBytecode() {
+        CodeExecutableElement method = new CodeExecutableElement(Set.of(PUBLIC, STATIC),
+                        generic(types.BytecodeRootNodes, model.getTemplateType().asType()), "deserializeExecutionBytecode");
+        method.addParameter(new CodeVariableElement(model.languageClass, "language"));
+        method.addParameter(new CodeVariableElement(types.BytecodeConfig, "config"));
+        method.addParameter(new CodeVariableElement(generic(Supplier.class, DataInput.class), "builderBytecodeInput"));
+        method.addParameter(new CodeVariableElement(generic(type(Function.class), types.BytecodeConfig, type(DataInput.class)), "executionBytecodeInput"));
+        method.addParameter(new CodeVariableElement(types.BytecodeDeserializer, "callback"));
+        method.addThrownType(type(IOException.class));
+        addJavadoc(method, """
+                        Deserializes bytecode nodes from a builder payload and an optional execution bytecode payload.
+
+                        @see BytecodeDescriptor#deserializeExecutionBytecode
+                        """);
+
+        CodeTreeBuilder b = method.createBuilder();
+        b.statement("return BYTECODE.deserializeExecutionBytecode(language, config, builderBytecodeInput, executionBytecodeInput, callback)");
+        return method;
+    }
+
+    private CodeExecutableElement createGetBytecodeNode() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.BytecodeRootNode, "getBytecodeNode");
+
+        ex.getModifiers().remove(Modifier.DEFAULT);
+        ex.getModifiers().add(Modifier.FINAL);
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().string("bytecode").end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createGetBytecodeNodeImpl() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), abstractBytecodeNode.asType(), "getBytecodeNodeImpl");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().string("bytecode").end();
+        return ex;
+    }
+
+    private CodeExecutableElement createInvalidate() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), type(void.class), "invalidate");
+        ex.addParameter(new CodeVariableElement(type(String.class), "reason"));
+        CodeTreeBuilder b = ex.createBuilder();
+        b.statement("this.reportReplace(this, this, reason)");
+        return ex;
+    }
+
+    private CodeExecutableElement createGetBytecodeRootNode() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), this.asType(), "getBytecodeRootNodeImpl");
+        ex.addParameter(new CodeVariableElement(type(int.class), "index"));
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().cast(this.asType()).string("this.nodes.getNode(index)").end();
+        return ex;
+    }
+
+    private CodeExecutableElement createGetRootNodes() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.BytecodeRootNode, "getRootNodes");
+        ex.setReturnType(generic(types.BytecodeRootNodes, model.templateType.asType()));
+        ex.getModifiers().remove(Modifier.DEFAULT);
+        ex.getModifiers().add(Modifier.FINAL);
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startReturn().string("this.nodes").end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createTransitionToCached() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), type(void.class), "transitionToCached");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.tree(GeneratorUtils.createTransferToInterpreterAndInvalidate());
+        b.declaration(abstractBytecodeNode.asType(), "oldBytecode");
+        b.declaration(abstractBytecodeNode.asType(), "newBytecode");
+        b.startDoBlock();
+        b.statement("oldBytecode = this.bytecode");
+        b.startAssign("newBytecode").startCall("insert").startCall("oldBytecode.toCached");
+        if (model.usesBoxingElimination()) {
+            b.string("this.numLocals");
+        }
+        b.end(3);
+
+        emitFence(b);
+        b.startIf().string("oldBytecode == newBytecode").end().startBlock();
+        b.statement("break");
+        b.end();
+        b.end().startDoWhile().startCall("!BYTECODE_UPDATER", "compareAndSet").string("this").string("oldBytecode").string("newBytecode").end().end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createUpdateBytecode() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE), abstractBytecodeNode.asType(), "updateBytecode");
+
+        for (VariableElement e : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+            ex.addParameter(new CodeVariableElement(e.asType(), e.getSimpleName().toString() + "_"));
+        }
+        ex.addParameter(new CodeVariableElement(type(CharSequence.class), "reason"));
+        if (model.hasYieldOperation()) {
+            ex.addParameter(new CodeVariableElement(type(int[].class), "continuations"));
+            ex.addParameter(new CodeVariableElement(type(int.class), "continuationsIndex"));
+        }
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.tree(GeneratorUtils.createNeverPartOfCompilation());
+        b.declaration(abstractBytecodeNode.asType(), "oldBytecode");
+        b.declaration(abstractBytecodeNode.asType(), "newBytecode");
+        b.startDoBlock();
+        b.statement("oldBytecode = this.bytecode");
+        b.startStatement();
+        b.string("newBytecode = ").startCall("insert").startCall("oldBytecode", "update");
+        for (VariableElement e : ElementFilter.fieldsIn(abstractBytecodeNode.getEnclosedElements())) {
+            b.string(e.getSimpleName().toString() + "_");
+        }
+        b.end().end(); // call, call
+        b.end(); // statement
+
+        if (model.isBytecodeUpdatable()) {
+            b.startIf().string("bytecodes_ != null").end().startBlock();
+            b.lineComment("Ensure old bytecodes are published before the new bytecode node.");
+            b.statement("oldBytecode.publishOldBytecodes()");
+            b.end().startElseBlock();
+            b.lineComment("When bytecode doesn't change, nodes are reused and should be re-adopted.");
+            b.statement("newBytecode.adoptNodesAfterUpdate()");
+            b.end();
+        } else {
+            b.startIf().string("bytecodes_ == null").end().startBlock();
+            b.lineComment("When bytecode doesn't change, nodes are reused and should be re-adopted.");
+            b.statement("newBytecode.adoptNodesAfterUpdate()");
+            b.end();
+        }
+        emitFence(b);
+        b.end().startDoWhile().startCall("!BYTECODE_UPDATER", "compareAndSet").string("this").string("oldBytecode").string("newBytecode").end().end();
+        b.newLine();
+
+        if (model.hasYieldOperation()) {
+            b.startAssert().string(configEncoder.compareHasYieldsBit("oldBytecode.configEncoding", "newBytecode.configEncoding")).string(" : ").doubleQuote(
+                            "has-yields bit must be preserved across reparsing and bytecode updates").end();
+        }
+
+        if (model.isBytecodeUpdatable()) {
+            b.startIf().string("bytecodes_ != null").end().startBlock();
+            b.lineComment("Ensure new bytecode node is published before invalidating the old bytecode.");
+            b.startStatement().startStaticCall(type(VarHandle.class), "storeStoreFence").end().end();
+            b.startStatement().startCall("oldBytecode.invalidate");
+            b.string("newBytecode");
+            b.string("reason");
+            b.end(2);
+            b.end();
+
+            if (model.hasYieldOperation()) {
+                // We need to patch the BytecodeNodes for continuations.
+                b.startFor().string("int i = 0; i < continuationsIndex; i = i + CONTINUATION_LENGTH").end().startBlock();
+                b.declaration(type(int.class), "constantPoolIndex", "continuations[i + CONTINUATION_OFFSET_CPI]");
+                b.declaration(type(int.class), "continuationBci", "continuations[i + CONTINUATION_OFFSET_BCI]");
+
+                if (model.enableInstructionTracing) {
+                    b.startAssert().string("oldBytecode.constants[continuations[i + CONTINUATION_OFFSET_OLD_CPI]] == newBytecode.constants[constantPoolIndex]").end();
+                }
+
+                b.startDeclaration(continuationRootNodeImpl.asType(), "continuationRootNode");
+                b.cast(continuationRootNodeImpl.asType());
+                b.string("newBytecode.constants[constantPoolIndex]");
+                b.end();
+
+                b.lineComment("locations may become null if they are no longer reachable.");
+                b.declaration(types.BytecodeLocation, "newLocation", "continuationBci == -1 ? null : newBytecode.getBytecodeLocation(continuationBci)");
+
+                b.startStatement().startCall("continuationRootNode", "updateBytecodeLocation");
+                b.string("newLocation");
+                b.string("oldBytecode");
+                b.string("newBytecode");
+                b.string("reason");
+                b.end(2);
+                b.end();
+
+                b.end(); // for
+            }
+        }
+
+        b.startAssert().startStaticCall(type(Thread.class), "holdsLock").string("this.nodes").end().end();
+        b.statement("var cloneReferences = this.clones");
+        b.startIf().string("cloneReferences != null").end().startBlock();
+        b.startStatement();
+        b.string("cloneReferences.forEach((clone) -> ").startBlock();
+
+        if (model.hasYieldOperation()) {
+            b.declaration(arrayOf(type(Object.class)), "clonedConstants", "constants_");
+            b.startIf().string("bytecodes_ != null && continuationsIndex != 0").end().startBlock();
+            b.declaration(abstractBytecodeNode.asType(), "clonedBytecode", "clone.bytecode");
+            b.statement("clonedConstants = Arrays.copyOf(clonedConstants, clonedConstants.length)");
+            b.lineComment("Preserve clone-owned continuation roots when installing reparsed constants.");
+            b.startFor().string("int i = 0; i < continuationsIndex; i = i + CONTINUATION_LENGTH").end().startBlock();
+            b.declaration(type(int.class), "constantPoolIndex", "continuations[i + CONTINUATION_OFFSET_CPI]");
+            if (model.enableInstructionTracing) {
+                b.declaration(type(int.class), "oldConstantPoolIndex", "continuations[i + CONTINUATION_OFFSET_OLD_CPI]");
+                b.startDeclaration(continuationRootNodeImpl.asType(), "continuationRootNode");
+                b.cast(continuationRootNodeImpl.asType());
+                b.string("clonedBytecode.constants[oldConstantPoolIndex]");
+                b.end();
+            } else {
+                b.startDeclaration(continuationRootNodeImpl.asType(), "continuationRootNode");
+                b.cast(continuationRootNodeImpl.asType());
+                b.string("clonedBytecode.constants[constantPoolIndex]");
+                b.end();
+            }
+            b.startStatement().startCall("ACCESS.writeObject");
+            b.string("clonedConstants");
+            b.string("constantPoolIndex");
+            b.string("continuationRootNode");
+            b.end(2);
+            b.end();
+            b.end();
+        }
+
+        b.startStatement();
+
+        b.startCall("clone", "updateBytecode");
+        for (VariableElement var : ex.getParameters()) {
+            switch (var.getSimpleName().toString()) {
+                case "bytecodes_":
+                    b.startGroup();
+                    b.string("bytecodes_ != null ? ");
+                    if (clonesNeedUnquickenedBytecode()) {
+                        // The bytecode was already published, so it may already be quickened.
+                        b.startCall("unquickenBytecode");
+                        b.variable(var);
+                        b.end();
+                    } else {
+                        b.variable(var);
+                    }
+                    b.string(" : null");
+                    b.end();
+                    break;
+                case "tagRoot_":
+                    b.startGroup();
+                    b.string("tagRoot_ != null ? ");
+                    b.cast(tagRootNode.asType());
+                    b.string("tagRoot_.deepCopy() : null");
+                    b.end();
+                    break;
+                case "constants_":
+                    if (model.hasYieldOperation()) {
+                        b.string("clonedConstants");
+                    } else {
+                        b.variable(var);
+                    }
+                    break;
+                default:
+                    b.variable(var);
+                    break;
+            }
+        }
+
+        b.end();
+        b.end();
+
+        b.end(); // block
+        b.string(")");
+        b.end(); // statement
+        b.end();
+
+        b.startReturn().string("newBytecode").end();
+
+        return ex;
+    }
+
+    private CodeExecutableElement createIsInstrumentable() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "isInstrumentable");
+        CodeTreeBuilder b = ex.createBuilder();
+        if (model.enableTagInstrumentation) {
+            ExecutableElement parentImpl = findImplementedRootNodeMethod("isInstrumentable", 0);
+            if (parentImpl != null) {
+                b.startReturn().string("super.isInstrumentable()").end();
+            } else {
+                b.statement("return true");
+            }
+        } else {
+            b.statement("return false");
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createPrepareForCall() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "prepareForCall");
+        CodeTreeBuilder b = ex.createBuilder();
+        b.startIf().string("!this.nodes.isParsed()").end().startBlock();
+        emitThrowIllegalStateException(ex, b, "A call target cannot be created until bytecode parsing completes. Request a call target after the parse is complete instead.");
+        b.end();
+
+        b.startStatement();
+        b.startCall("BYTECODE.prepareForCall");
+        b.startCall("getLanguage").typeLiteral(model.languageClass).end();
+        b.string("this");
+        b.end();
+        b.end();
+
+        ExecutableElement parentImpl = findImplementedRootNodeMethod("prepareForCall", 0);
+        if (parentImpl != null) {
+            b.statement("super.prepareForCall()");
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createPrepareForInstrumentation() {
+        if (!model.enableTagInstrumentation) {
+            return null;
+        }
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "prepareForInstrumentation", new String[]{"materializedTags"});
+        GeneratorUtils.mergeSuppressWarnings(ex, "unchecked");
+        CodeTreeBuilder b = ex.createBuilder();
+
+        b.declaration(types.BytecodeConfig_Builder, "b", "newConfigBuilder()");
+        b.lineComment("Sources are always needed for instrumentation.");
+        b.statement("b.addSourceContent()");
+
+        b.startFor().type(type(Class.class)).string(" tag : materializedTags").end().startBlock();
+        b.statement("b.addTag((Class<? extends Tag>) tag)");
+        b.end();
+
+        b.statement("getRootNodes().update(b.build())");
+        ExecutableElement parentImpl = findImplementedRootNodeMethod("prepareForInstrumentation", 1);
+        if (parentImpl != null) {
+            b.statement("super.prepareForInstrumentation(materializedTags)");
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createPrepareForCompilation() {
+        if (!model.enableUncachedInterpreter) {
+            return null;
+        }
+
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "prepareForCompilation", new String[]{"rootCompilation", "compilationTier", "lastTier"});
+        ex.getModifiers().add(Modifier.FINAL);
+        CodeTreeBuilder b = ex.createBuilder();
+
+        b.startReturn();
+        // Disable compilation for the uncached interpreter.
+        b.string("bytecode.getTier() != ").staticReference(types.BytecodeTier, "UNCACHED");
+
+        ExecutableElement parentImpl = findImplementedRootNodeMethod("prepareForCompilation", 3);
+        if (parentImpl != null) {
+            // Delegate to the parent impl.
+            b.string(" && ").startCall("super.prepareForCompilation").variables(ex.getParameters()).end();
+        }
+        b.end();
+        return ex;
+    }
+
+    private CodeExecutableElement createVisitCloneableNodes() {
+        CodeExecutableElement ex = overrideImplementRootNodeMethod(model, "visitCloneableNodes", new String[]{"visitor"});
+        CodeTreeBuilder b = ex.createBuilder();
+
+        b.statement("super.visitCloneableNodes(visitor)");
+        b.lineComment("Visit the captured bytecode version without locking or retrying concurrent updates.");
+        b.declaration(arrayOf(types.Node), "cachedNodes", "this.bytecode.getCachedNodes()");
+        b.startIf().string("cachedNodes != null").end().startBlock();
+        b.startFor().string("int i = 0; i < cachedNodes.length; i++").end().startBlock();
+        b.declaration(types.Node, "cachedNode", "cachedNodes[i]");
+        b.startIf().string("cachedNode != null").end().startBlock();
+        b.statement("cachedNode.accept(visitor)");
+        b.end();
+        b.end();
+        b.end();
+        return ex;
+    }
+
+    private ExecutableElement findImplementedRootNodeMethod(String name, int parameterCount) {
+        ExecutableElement parentImpl = ElementUtils.findMethodInClassHierarchy(ElementUtils.findMethod(types.RootNode, name, parameterCount), model.templateType);
+        if (parentImpl == null || parentImpl.getModifiers().contains(ABSTRACT)) {
+            return null;
+        }
+        return parentImpl;
+    }
+
+    /**
+     * If the node supports BE/quickening, clones should receive an unquickened copy of bytecode.
+     */
+    boolean clonesNeedUnquickenedBytecode() {
+        return (model.usesBoxingElimination() || model.enableQuickening);
+    }
+
+    private CodeExecutableElement createUnquickenBytecode() {
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), arrayOf(type(byte.class)), "unquickenBytecode");
+        ex.addParameter(new CodeVariableElement(arrayOf(type(byte.class)), "original"));
+
+        CodeTreeBuilder b = ex.createBuilder();
+        b.declaration(arrayOf(type(byte.class)), "copy", "Arrays.copyOf(original, original.length)");
+
+        b.declaration(getBytecodeIndexType(), "bci", "0");
+
+        b.startWhile().string("bci < copy.length").end().startBlock();
+        b.startSwitch().tree(readInstruction("copy", "bci")).end().startBlock();
+
+        if (ImmediateKind.STATE_PROFILE.width != ImmediateWidth.SHORT) {
+            throw new AssertionError("state bitset width changed");
+        }
+        Map<EqualityCodeTree, List<InstructionModel>> caseGrouping = EqualityCodeTree.group(b, model.getInstructions(), (InstructionModel instruction, CodeTreeBuilder group) -> {
+            if (instruction.isQuickening()) {
+                group.statement(writeInstruction("copy", "bci", createInstructionConstant(instruction.getQuickeningRoot())));
+            }
+            for (InstructionImmediate stateBitset : instruction.getImmediates(ImmediateKind.STATE_PROFILE)) {
+                group.statement(writeImmediate("copy", "bci", "(short) 0", stateBitset.encoding()));
+            }
+            group.startStatement().string("bci += ").string(instruction.getInstructionLength()).end();
+            group.statement("break");
+        });
+        for (var group : caseGrouping.entrySet()) {
+            List<InstructionModel> instructions = group.getValue();
+            for (InstructionModel instruction : instructions) {
+                b.startCase().tree(createInstructionConstant(instruction)).end();
+            }
+            b.startCaseBlock();
+            b.tree(group.getKey().getTree());
+            b.end();
+        }
+
+        b.end(); // switch
+        b.end(); // while
+
+        b.startReturn();
+        b.string("copy");
+        b.end();
+        return ex;
+    }
+
+    static String createApplyQuickeningName(TypeMirror type) {
+        return "applyQuickening" + ElementUtils.firstLetterUpperCase(ElementUtils.getSimpleName(type));
+    }
+
+    static String createIsQuickeningName(TypeMirror type) {
+        return "isQuickening" + ElementUtils.firstLetterUpperCase(ElementUtils.getSimpleName(type));
+    }
+
+    BytecodeDSLModel getModel() {
+        return model;
+    }
+
+    ProcessorContext getContext() {
+        return context;
+    }
+
+    CodeTypeElement getAbstractBytecodeNode() {
+        return abstractBytecodeNode;
+    }
+
+    CodeTypeElement getContinuationRootNodeImpl() {
+        return continuationRootNodeImpl;
+    }
+
+    private static Collection<DSLExpression> collectExpressions(SpecializationData specialization) {
+        Set<DSLExpression> boundVariables = new LinkedHashSet<>();
+        for (CacheExpression cache : specialization.getCaches()) {
+            if (cache.getDefaultExpression() != null) {
+                boundVariables.add(cache.getDefaultExpression());
+            }
+        }
+
+        for (GuardExpression guard : specialization.getGuards()) {
+            boundVariables.add(guard.getExpression());
+        }
+
+        for (AssumptionExpression assumption : specialization.getAssumptionExpressions()) {
+            boundVariables.add(assumption.getExpression());
+        }
+
+        // The parser omits the limit when it has no effect (specialization cannot have multiple instances).
+        DSLExpression limit = specialization.getLimitExpression();
+        if (limit != null) {
+            boundVariables.add(limit);
+        }
+
+        return boundVariables;
+    }
+
+    private CodeExecutableElement emitExecute(BytecodeDSLNodeGeneratorPlugs plugs, FlatNodeGenFactory factory, CodeTypeElement el, InstructionModel instruction, InterpreterTier tier) {
+        plugs.setInstruction(instruction);
+
+        List<SpecializationData> specializations;
+        boolean skipStateChecks;
+        if (instruction.getFilteredSpecializations() == null) {
+            specializations = instruction.nodeData.getReachableSpecializations();
+            skipStateChecks = false;
+        } else {
+            specializations = instruction.getFilteredSpecializations();
+            /*
+             * If specializations are filtered we know we know all of them are active at the same
+             * time, so we can skip state checks.
+             */
+            skipStateChecks = specializations.size() == 1;
+        }
+
+        boolean needsFrame = needsFrame(instruction, tier);
+        TypeMirror returnType = instruction.signature.returnType();
+        CodeExecutableElement executable = new CodeExecutableElement(Set.of(PRIVATE),
+                        returnType, executeMethodName(instruction, tier));
+
+        if (needsFrame) {
+            executable.addParameter(new CodeVariableElement(types.VirtualFrame, "frameValue"));
+        }
+
+        if (instruction.isEpilogExceptional()) {
+            executable.addParameter(new CodeVariableElement(types.AbstractTruffleException, "ex"));
+        } else {
+            int index = 0;
+            for (Operand operand : instruction.signature.operands()) {
+                executable.addParameter(new CodeVariableElement(operand.staticType(), "arg" + index));
+                index++;
+            }
+        }
+
+        if (hasUnexpectedExecuteValue(instruction)) {
+            executable.getThrownTypes().add(types.UnexpectedResultException);
+            lookupExpectMethod(instruction.getQuickeningRoot().signature.returnType(), returnType);
+        }
+
+        CodeExecutableElement element;
+        if (tier == InterpreterTier.UNCACHED && !instruction.operation.customModel.forcesCached()) {
+            executable.getModifiers().add(Modifier.STATIC);
+            element = factory.createUncachedExecute(executable);
+            el.add(element);
+        } else {
+            element = factory.emitExecuteMethod(el, executable, specializations, skipStateChecks && instruction.isQuickening());
+        }
+
+        if (needsFrame) {
+            element.findParameter("frameValue").setType(types.FrameWithoutBoxing);
+        }
+
+        return element;
+    }
+
+    boolean needsFrame(InstructionModel instruction, InterpreterTier tier) {
+        List<SpecializationData> specializations = instruction.nodeData.getReachableSpecializations();
+        if (instruction.isYield()) {
+            return true;
+        }
+
+        for (SpecializationData specialization : specializations) {
+            if (specialization.getFrame() != null) {
+                return true;
+            }
+            if (isStoreBciBeforeSpecialization(model, tier, instruction, specialization)) {
+                return true;
+            }
+
+            Set<Variable> boundVariables = collectExpressions(specialization).stream() //
+                            .map(DSLExpression::findBoundVariables)        // Set<Variable>
+                            .flatMap(Set::stream) //
+                            .collect(Collectors.toCollection(LinkedHashSet::new));
+
+            for (Variable v : boundVariables) {
+                if (v.getReceiver() != null) {
+                    // not a bound variable
+                    continue;
+                }
+                switch (v.getName()) {
+                    case NodeParser.SYMBOL_FRAME:
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    CodeExecutableElement lookupExpectMethod(TypeMirror currentType, TypeMirror targetType) {
+        if (ElementUtils.isVoid(targetType) || ElementUtils.isVoid(currentType)) {
+            throw new AssertionError("Invalid target type " + targetType);
+        }
+
+        CodeExecutableElement expectMethod = expectMethods.get(targetType);
+        if (expectMethod == null) {
+            expectMethod = TypeSystemCodeGenerator.createExpectMethod(Modifier.PRIVATE, model.typeSystem, currentType, targetType);
+            this.add(expectMethod);
+            expectMethods.put(targetType, expectMethod);
+        }
+        return expectMethod;
+    }
+
+    static String executeMethodName(InstructionModel instruction, InterpreterTier tier) {
+        if (!needsExecute(instruction)) {
+            // we share execute methods with return type quickenings.
+            return executeMethodName(instruction.quickeningBase, tier);
+        }
+        return "execute" + instruction.getQuickeningName() + (tier.isUncached() ? "$uncached" : "");
+    }
+
+    /**
+     * The template class may directly (or indirectly, through a parent) widen the visibility of a
+     * RootNode method. Our override must be at least as visible.
+     *
+     * (BytecodeRootNode methods are not an issue, because interface methods are all public.)
+     */
+
+    static CodeExecutableElement overrideImplementRootNodeMethod(BytecodeDSLModel model, String name) {
+        return overrideImplementRootNodeMethod(model, name, new String[0]);
+    }
+
+    static CodeExecutableElement overrideImplementRootNodeMethod(BytecodeDSLModel model, String name, String[] parameterNames) {
+        return overrideImplementRootNodeMethod(model, name, parameterNames, new TypeMirror[parameterNames.length]);
+    }
+
+    static CodeExecutableElement overrideImplementRootNodeMethod(BytecodeDSLModel model, String name, String[] parameterNames, TypeMirror[] parameterTypes) {
+        TruffleTypes types = model.getContext().getTypes();
+        CodeExecutableElement result = GeneratorUtils.override(types.RootNode, name, parameterNames, parameterTypes);
+
+        if (result == null) {
+            throw new IllegalArgumentException("Method with name " + name + " and types " + Arrays.toString(parameterTypes) + " not found.");
+        }
+
+        // If the RootNode method is already public, nothing to do.
+        if (ElementUtils.getVisibility(result.getModifiers()) == Modifier.PUBLIC) {
+            return result;
+        }
+
+        // Otherwise, in order to override it in user code, it must be protected. The only widening
+        // we need to worry about is from protected -> public.
+        if (ElementUtils.getVisibility(result.getModifiers()) != Modifier.PROTECTED) {
+            throw new AssertionError("Unexpected visibility of root node override.");
+        }
+
+        ExecutableElement override = ElementUtils.findInstanceMethod(model.templateType, name, parameterTypes);
+        if (override != null && ElementUtils.getVisibility(override.getModifiers()) == Modifier.PUBLIC) {
+            result.setVisibility(Modifier.PUBLIC);
+            return result;
+        }
+
+        for (TypeElement parent : ElementUtils.getSuperTypes(model.templateType)) {
+            override = ElementUtils.findInstanceMethod(parent, name, parameterTypes);
+            if (override == null) {
+                continue;
+            }
+            if (ElementUtils.getVisibility(override.getModifiers()) == Modifier.PUBLIC) {
+                result.setVisibility(Modifier.PUBLIC);
+                return result;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * In order to compile properly, SerializationRootNode must implement any abstract methods of
+     * the template class. Assuming the generated root node compiles properly, it must implement
+     * these same methods, and we can ensure SerializationRootNode will compile by creating stubs
+     * for each of the generated root node's public/protected instance methods.
+     *
+     * (Typically, the only abstract method is BytecodeRootNode#execute, but the template class
+     * *could* declare other abstract methods that are coincidentally implemented by the generated
+     * root node, like getSourceSection).
+     */
+    private void addMethodStubsToSerializationRootNode() {
+        for (ExecutableElement method : ElementUtils.getOverridableMethods(this)) {
+            CodeExecutableElement stub = CodeExecutableElement.cloneNoAnnotations(method);
+            addOverride(stub);
+            CodeTreeBuilder b = stub.createBuilder();
+            emitThrowIllegalStateException(stub, b, "method should not be called");
+            b.end(2);
+            builder.serializationRootNode.add(stub);
+        }
+    }
+
+    static Collection<List<InstructionModel>> groupInstructionsByLength(Collection<InstructionModel> models) {
+        return models.stream().sorted(Comparator.comparingInt((i) -> i.getInstructionLength())).collect(deterministicGroupingBy((m) -> m.getInstructionLength())).values();
+    }
+
+    void emitQuickening(CodeTreeBuilder b, String node, String bc, String bci, CodeTree oldInstruction, CodeTree newInstruction) {
+        boolean overridesOnQuicken = model.overridesBytecodeDebugListenerMethod("onQuicken");
+        if (overridesOnQuicken && oldInstruction == null) {
+            b.startBlock();
+            b.startDeclaration(instructionImpl.asType(), "oldInstruction");
+            emitParseInstruction(b, node, bci, readInstruction(bc, bci));
+            b.end();
+        }
+
+        b.statement(writeInstruction(bc, bci, newInstruction));
+
+        if (overridesOnQuicken) {
+            b.startStatement();
+            b.startCall(node, "getRoot().onQuicken");
+            if (oldInstruction == null) {
+                b.string("oldInstruction");
+            } else {
+                emitParseInstruction(b, node, bci, oldInstruction);
+            }
+            emitParseInstruction(b, node, bci, newInstruction);
+            b.end().end();
+
+            if (oldInstruction == null) {
+                b.end(); // block
+            }
+        }
+
+    }
+
+    void emitInvalidateInstruction(CodeTreeBuilder b, String node, String bc, String bci, CodeTree oldInstruction, CodeTree newInstruction) {
+        boolean overridesOnInvalidateInstruction = model.overridesBytecodeDebugListenerMethod("onInvalidateInstruction");
+        if (overridesOnInvalidateInstruction && oldInstruction == null) {
+            b.startBlock();
+            b.startDeclaration(instructionImpl.asType(), "oldInstruction");
+            emitParseInstruction(b, node, bci, readInstruction(bc, bci));
+            b.end();
+        }
+
+        b.statement(writeInstruction(bc, bci, newInstruction));
+
+        if (overridesOnInvalidateInstruction) {
+            b.startStatement();
+            b.startCall(node, "getRoot().onInvalidateInstruction");
+            if (oldInstruction == null) {
+                b.string("oldInstruction");
+            } else {
+                emitParseInstruction(b, node, bci, oldInstruction);
+            }
+            emitParseInstruction(b, node, bci, newInstruction);
+            b.end().end();
+
+            if (oldInstruction == null) {
+                b.end(); // block
+            }
+        }
+
+    }
+
+    void emitQuickening(CodeTreeBuilder b, String node, String bc, String bci, String oldInstruction, String newInstruction) {
+        emitQuickening(b, node, bc, bci, oldInstruction != null ? CodeTreeBuilder.singleString(oldInstruction) : null, CodeTreeBuilder.singleString(newInstruction));
+    }
+
+    void emitQuickeningOperand(CodeTreeBuilder b, String node, String bc,
+                    String baseBci,
+                    String baseInstruction,
+                    int operandIndex,
+                    String operandBci,
+                    String oldInstruction, String newInstruction) {
+        boolean overridesOnQuickenOperand = model.overridesBytecodeDebugListenerMethod("onQuickenOperand");
+        if (overridesOnQuickenOperand && oldInstruction == null) {
+            b.startBlock();
+            b.startDeclaration(instructionImpl.asType(), "oldInstruction");
+            emitParseInstruction(b, node, operandBci, readInstruction(bc, operandBci));
+            b.end();
+        }
+
+        b.statement(writeInstruction(bc, operandBci, newInstruction));
+
+        if (overridesOnQuickenOperand) {
+            b.startStatement();
+            b.startCall(node, "getRoot().onQuickenOperand");
+            CodeTree base = baseInstruction == null ? readInstruction(bc, baseBci) : CodeTreeBuilder.singleString(baseInstruction);
+            emitParseInstruction(b, node, baseBci, base);
+            b.string(operandIndex);
+            if (oldInstruction == null) {
+                b.string("oldInstruction");
+            } else {
+                emitParseInstruction(b, node, operandBci, CodeTreeBuilder.singleString(oldInstruction));
+            }
+            emitParseInstruction(b, node, operandBci, CodeTreeBuilder.singleString(newInstruction));
+            b.end().end();
+
+            if (oldInstruction == null) {
+                b.end(); // block
+            }
+        }
+
+    }
+
+    void emitOnSpecialize(CodeTreeBuilder b, String node, String bci, CodeTree operand, String specializationName) {
+        if (model.overridesBytecodeDebugListenerMethod("onSpecialize")) {
+            b.startStatement().startCall(node, "getRoot().onSpecialize");
+            emitParseInstruction(b, node, bci, operand);
+            b.doubleQuote(specializationName);
+            b.end().end();
+        }
+    }
+
+    CodeTreeBuilder emitParseInstruction(CodeTreeBuilder b, String node, String bci, CodeTree operand) {
+        b.startNew(instructionImpl.asType()).string(node).string(bci).tree(operand).end();
+        return b;
+    }
+
+    static boolean hasUnexpectedExecuteValue(InstructionModel instr) {
+        return ElementUtils.needsCastTo(instr.getQuickeningRoot().signature.returnType(), instr.signature.returnType());
+    }
+
+    public static <T, K> Collector<T, ?, Map<K, List<T>>> deterministicGroupingBy(Function<? super T, ? extends K> classifier) {
+        return Collectors.groupingBy(classifier, LinkedHashMap::new, Collectors.toList());
+    }
+
+    void emitFence(CodeTreeBuilder b) {
+        b.startStatement().startStaticCall(type(VarHandle.class), "storeStoreFence").end(2);
+    }
+
+    static void emitThrowAssertionError(CodeTreeBuilder b, String reason, String... args) {
+        b.startThrow().startCall("assertionFailed");
+        b.string(reason);
+        for (String arg : args) {
+            b.string(arg);
+        }
+        b.end(2);
+    }
+
+    /**
+     * Unfortunately HotSpot does not JIT methods bigger than {@link #JAVA_JIT_BYTECODE_LIMIT}
+     * bytecodes. So we need to split up the instructions.
+     */
+    static List<List<InstructionModel>> partitionInstructions(Collection<InstructionModel> originalInstructions) {
+        // filtered instructions
+        List<InstructionModel> instructions = originalInstructions.stream().toList();
+
+        int instructionCount = instructions.size();
+        int estimatedSize = ESTIMATED_BYTECODE_FOOTPRINT + (instructionCount * ESTIMATED_CUSTOM_INSTRUCTION_SIZE);
+
+        if (estimatedSize > JAVA_JIT_BYTECODE_LIMIT) {
+            List<InstructionModel> topLevelInstructions = new ArrayList<>();
+            List<InstructionModel> partitionableInstructions = new ArrayList<>();
+            for (InstructionModel instruction : instructions) {
+                if (instruction.kind != InstructionKind.CUSTOM || instruction.operation.kind == OperationKind.CUSTOM_YIELD ||
+                                instruction.operation.kind == OperationKind.CUSTOM_RETURN) {
+                    topLevelInstructions.add(instruction);
+                } else {
+                    partitionableInstructions.add(instruction);
+                }
+            }
+
+            int groupCount = (int) partitionableInstructions.stream().map(InstructionGroup::new).distinct().count();
+
+            int instructionsPerPartition = JAVA_JIT_BYTECODE_LIMIT / ESTIMATED_EXTRACTED_INSTRUCTION_SIZE;
+
+            // Estimate the space consumed by built-ins (which always go in the main partition).
+            int spaceUsedForBuiltins = ESTIMATED_BYTECODE_FOOTPRINT + (ESTIMATED_CUSTOM_INSTRUCTION_SIZE * topLevelInstructions.size());
+            int spaceUsedForDispatching = GROUP_DISPATCH_SIZE * groupCount;
+            // Any remaining space in the main partition can be used for custom instructions.
+            int spaceLeftForCustom = Math.max(0, JAVA_JIT_BYTECODE_LIMIT - spaceUsedForBuiltins - spaceUsedForDispatching);
+            int customInstructionsInTopLevelPartition = spaceLeftForCustom / ESTIMATED_CUSTOM_INSTRUCTION_SIZE;
+
+            topLevelInstructions.addAll(partitionableInstructions.subList(0, Math.min(partitionableInstructions.size(), customInstructionsInTopLevelPartition)));
+            List<InstructionModel> instructionsToPartition = partitionableInstructions.subList(customInstructionsInTopLevelPartition, partitionableInstructions.size());
+            List<List<InstructionModel>> partitions = new ArrayList<>();
+            partitions.add(topLevelInstructions);
+            for (int i = 0; i < instructionsToPartition.size(); i += instructionsPerPartition) {
+                partitions.add(instructionsToPartition.subList(i, Math.min(i + instructionsPerPartition, instructionsToPartition.size())));
+            }
+            return partitions;
+        } else {
+            return List.of(instructions);
+        }
+    }
+
+    record InstructionGroup(int stackEffect, int instructionLength) {
+        InstructionGroup(InstructionModel instr) {
+            this(instr.getStackEffect(), instr.getInstructionLength());
+        }
+    }
+
+    static void emitThrowIllegalArgumentException(CodeTreeBuilder b, String reasonString) {
+        b.tree(GeneratorUtils.createTransferToInterpreterAndInvalidate());
+        b.startThrow().startNew(ProcessorContext.getInstance().getType(IllegalArgumentException.class));
+        if (reasonString != null) {
+            b.doubleQuote(reasonString);
+        }
+        b.end(2);
+    }
+
+    static void emitThrowIllegalStateException(CodeExecutableElement method, CodeTreeBuilder b, String reasonString) {
+        GeneratorUtils.addBoundaryOrTransferToInterpreter(method, b);
+        b.startThrow().startNew(ProcessorContext.getInstance().getType(IllegalStateException.class));
+        if (reasonString != null) {
+            b.doubleQuote(reasonString);
+        }
+        b.end(2);
+    }
+
+    static void addJavadoc(CodeElement<?> element, String contents) {
+        addJavadoc(element, Arrays.asList(contents.split("\n")));
+    }
+
+    static void addJavadoc(CodeElement<?> element, List<String> lines) {
+        CodeTreeBuilder b = element.createDocBuilder();
+        b.startJavadoc();
+        for (String line : lines) {
+            if (line.isBlank()) {
+                b.string(" "); // inject a space so that empty lines get *'s
+            } else {
+                b.string(line);
+            }
+            b.newLine();
+        }
+        b.end();
+    }
+
+    CodeAnnotationMirror createExplodeLoopAnnotation(String kind) {
+        CodeAnnotationMirror explodeLoop = new CodeAnnotationMirror(types.ExplodeLoop);
+        if (kind != null) {
+            TypeElement loopExplosionKind = ElementUtils.castTypeElement(types.ExplodeLoop_LoopExplosionKind);
+            Optional<Element> enumValue = ElementUtils.getEnumValues(loopExplosionKind).stream().filter(
+                            value -> value.getSimpleName().contentEquals(kind)).findFirst();
+            if (enumValue.isEmpty()) {
+                throw new IllegalArgumentException(String.format("Unknown enum value for %s: %s", loopExplosionKind.getSimpleName(), kind));
+            }
+            CodeAnnotationValue value = new CodeAnnotationValue(enumValue.get());
+            explodeLoop.setElementValue("kind", value);
+
+        }
+        return explodeLoop;
+    }
+
+    CodeTree createInstructionConstant(InstructionModel instr) {
+        return CodeTreeBuilder.createBuilder().staticReference(instructionsElement.asType(), instr.getConstantName()).build();
+    }
+
+    CodeTree createOperationConstant(OperationModel op) {
+        return CodeTreeBuilder.createBuilder().staticReference(operationsElement.asType(), op.getConstantName()).build();
+    }
+
+    static String safeCastShort(String value) {
+        return String.format("safeCastShort(%s)", value);
+    }
+
+    static String safeCastUnsignedShort(String value) {
+        return String.format("safeCastUnsignedShort(%s)", value);
+    }
+
+    // Helpers to generate common strings
+    static CodeTree readInstruction(String bc, String bci) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("BYTES", "getShort");
+        b.string(bc);
+        b.string(bci);
+        b.end();
+        return b.build();
+    }
+
+    static CodeTree writeInstruction(String bc, String bci, String value) {
+        return writeInstruction(bc, bci, CodeTreeBuilder.singleString(value));
+    }
+
+    static CodeTree writeInstruction(String bc, String bci, CodeTree value) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("BYTES", "putShort");
+        b.string(bc);
+        b.string(bci);
+        b.tree(value);
+        b.end();
+        return b.build();
+    }
+
+    static String encodeInlinedConstant(ImmediateKind kind, String value) {
+        return switch (kind) {
+            case CONSTANT_LONG, CONSTANT_INT, CONSTANT_SHORT -> value;
+            case CONSTANT_DOUBLE -> "Double.doubleToRawLongBits(" + value + ")";
+            case CONSTANT_FLOAT -> "Float.floatToRawIntBits(" + value + ")";
+            case CONSTANT_CHAR -> "(short) (" + value + " - " + (1 << 15) + ")";
+            case CONSTANT_BYTE -> value; // byte can implicitly widen to short
+            case CONSTANT_BOOL -> "(short) (" + value + " ? 1 : 0)";
+            default -> {
+                throw new AssertionError("Unexpected inlined constant operand kind " + kind);
+            }
+        };
+    }
+
+    CodeTree decodeInlinedConstant(ImmediateKind kind, CodeTree value) {
+        return switch (kind) {
+            case CONSTANT_LONG, CONSTANT_INT, CONSTANT_SHORT -> value;
+            case CONSTANT_DOUBLE -> CodeTreeBuilder.createBuilder().startCall("Double.longBitsToDouble").tree(value).end().build();
+            case CONSTANT_FLOAT -> CodeTreeBuilder.createBuilder().startCall("Float.intBitsToFloat").tree(value).end().build();
+            case CONSTANT_CHAR -> CodeTreeBuilder.createBuilder().startGroup().cast(type(char.class)).startParentheses().tree(value).string(" + " + (1 << 15)).end(2).build();
+            case CONSTANT_BYTE -> CodeTreeBuilder.createBuilder().startGroup().cast(type(byte.class)).tree(value).end().build();
+            case CONSTANT_BOOL -> CodeTreeBuilder.createBuilder().startGroup().tree(value).string(" != 0").end().build();
+            default -> {
+                throw new AssertionError("Unexpected inlined constant operand kind " + kind);
+            }
+        };
+    }
+
+    static CodeTree decodeRelativeBytecodeIndex(String bci, String rawOffset) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startGroup();
+        b.string(rawOffset);
+        b.string(" == (byte) 0xff ? -1 : ");
+        b.string(bci);
+        b.string(" - ((0xff & ");
+        b.string(rawOffset);
+        b.string(") << 1)");
+        b.end();
+        return b.build();
+    }
+
+    static CodeTree readImmediate(String bc, String bci, InstructionImmediate immediate) {
+        return readImmediateWithOffset(bc, bci, immediate, immediate.offset());
+    }
+
+    static CodeTree readImmediateWithOffset(String bc, String bci, InstructionImmediate immediate, int offset) {
+        if (immediate.fixedValue().isPresent()) {
+            return immediate.fixedValue().get().tree();
+        }
+        if (!immediate.isEncoded()) {
+            throw new AssertionError("Tried to read an immediate that is neither fixed nor encoded in the instruction: " + immediate);
+        }
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        String accessor = switch (immediate.kind().width) {
+            case NONE -> throw new AssertionError("Non-encoded immediates cannot be read.");
+            case BYTE -> "getByte";
+            case SHORT -> "getShort";
+            case INT -> "getIntUnaligned";
+            case LONG -> "getLongUnaligned";
+        };
+        if (immediate.kind().isUnsigned()) {
+            b.startParentheses();
+        }
+        b.startCall("BYTES", accessor);
+        b.string(bc);
+        b.startGroup();
+        b.string(bci);
+        if (offset > 0) {
+            b.string(" + ").string(offset);
+        } else if (offset < 0) {
+            b.string(" - ").string(-offset);
+        }
+        b.string(" ");
+        b.startComment().string(" imm ", immediate.name(), " ").end();
+        b.end();
+        b.end();
+        if (immediate.kind().isUnsigned()) {
+            b.string(" & 0xffff");
+            b.end();
+        }
+        return b.build();
+    }
+
+    CodeTree readConstantImmediate(String bc, String bci, String bytecodeNode, InstructionImmediate imm, TypeMirror immediateType) {
+        if (imm.kind() == ImmediateKind.CONSTANT) {
+            return readConstFastPath(readImmediate(bc, bci, imm), bytecodeNode + ".constants", immediateType);
+        } else {
+            return decodeInlinedConstant(imm.kind(), readImmediate(bc, bci, imm));
+        }
+    }
+
+    static CodeTree writeImmediate(String bc, String bci, String value, InstructionImmediateEncoding immediate) {
+        return writeImmediate(bc, bci, CodeTreeBuilder.singleString(value), immediate);
+    }
+
+    static CodeTree writeImmediate(String bc, String bci, CodeTree value, InstructionImmediateEncoding immediate) {
+        if (immediate.width() == ImmediateWidth.NONE) {
+            throw new AssertionError("Non-encoded immediates cannot be written.");
+        }
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        String accessor = switch (immediate.width()) {
+            case NONE -> throw new AssertionError("Non-encoded immediates cannot be written.");
+            case BYTE -> "putByte";
+            case SHORT -> "putShort";
+            case INT -> "putInt";
+            case LONG -> "putLong";
+        };
+        b.startCall("BYTES", accessor);
+        b.string(bc);
+        b.startGroup();
+        b.string(bci).string(" + ").string(immediate.offset());
+        b.end();
+        b.tree(value);
+        b.end();
+        return b.build();
+    }
+
+    static String readInt(String array, String index) {
+        return String.format("BYTES.getInt(%s, %s)", array, index);
+    }
+
+    static String writeInt(String array, String index, String value) {
+        return String.format("BYTES.putInt(%s, %s, %s)", array, index, value);
+    }
+
+    static String readByte(String array, String index) {
+        return String.format("BYTES.getByte(%s, %s)", array, index);
+    }
+
+    static String writeByte(String array, String index, String value) {
+        return String.format("BYTES.putByte(%s, %s, %s)", array, index, value);
+    }
+
+    CodeTree readConstFastPath(CodeTree index, String constants) {
+        return readConstFastPath(index, constants, null);
+    }
+
+    CodeTree readConstFastPath(CodeTree index, String constants, TypeMirror knownType) {
+        return readConst(index, uncheckedCast(type(Object[].class), constants), knownType);
+    }
+
+    static CodeTree readConst(String index, String constants) {
+        return readConst(CodeTreeBuilder.singleString(index), CodeTreeBuilder.singleString(constants), null);
+    }
+
+    static CodeTree readConst(CodeTree index, CodeTree constants, TypeMirror knownType) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.readObject");
+        b.tree(constants);
+        b.tree(index);
+        b.end();
+        CodeTree tree = b.build();
+        if (knownType != null && !ElementUtils.isObject(knownType)) {
+            tree = uncheckedCast(ElementUtils.boxType(knownType), tree);
+        }
+        return tree;
+    }
+
+    static String readConstSafe(String index) {
+        return String.format("SAFE_ACCESS.readObject(constants, %s)", index);
+    }
+
+    static String readLongSafe(String array, String index) {
+        return String.format("SAFE_BYTES.getLong(%s, %s)", array, index);
+    }
+
+    static String readIntSafe(String array, String index) {
+        return String.format("SAFE_BYTES.getInt(%s, %s)", array, index);
+    }
+
+    static String readShortSafe(String array, String index) {
+        return String.format("SAFE_BYTES.getShort(%s, %s)", array, index);
+    }
+
+    static String readUnsignedShortSafe(String array, String index) {
+        return String.format("(SAFE_BYTES.getShort(%s, %s) & 0xffff)", array, index);
+    }
+
+    static String readByteSafe(String array, String index) {
+        return String.format("SAFE_BYTES.getByte(%s, %s)", array, index);
+    }
+
+    static CodeTree readIntArray(String array, String index) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.readInt");
+        b.string(array);
+        b.string(index);
+        b.end();
+        return b.build();
+    }
+
+    static CodeTree writeIntArray(String array, String index, String value) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.writeInt");
+        b.string(array);
+        b.string(index);
+        b.string(value);
+        b.end();
+        return b.build();
+    }
+
+    static CodeTree readTagNode(TypeMirror expectedType, CodeTree index) {
+        return readTagNode(expectedType, "tagRoot.tagNodes", index);
+    }
+
+    static CodeTree uncheckedCast(TypeMirror type, String value) {
+        return uncheckedCast(type, CodeTreeBuilder.singleString(value));
+    }
+
+    static CodeTree uncheckedCast(TypeMirror type, CodeTree value) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.uncheckedCast");
+        b.tree(value);
+        b.typeLiteral(type);
+        b.end();
+        return b.build();
+    }
+
+    static CodeTree readTagNode(TypeMirror expectedType, String tagNodes, CodeTree index) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.readObject");
+        b.string(tagNodes);
+        b.tree(index);
+        b.end();
+        return uncheckedCast(expectedType, b.build());
+    }
+
+    static CodeTree readTagNodeSafe(CodeTree index) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.string("tagRoot.tagNodes[" + index + "]");
+        b.end();
+        return b.build();
+    }
+
+    CodeTree readNodeProfile(TypeMirror expectedType, CodeTree index) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        b.startCall("ACCESS.uncheckedCast");
+        b.startCall("ACCESS.readObject");
+        b.tree(uncheckedCast(arrayOf(types.Node), "this.cachedNodes_"));
+        b.tree(index);
+        b.end();
+        b.typeLiteral(expectedType);
+        b.end();
+        return b.build();
+    }
+
+    static String uncheckedGetFrameObject(String index) {
+        return uncheckedGetFrameObject("frame", index);
+    }
+
+    static String uncheckedGetFrameObject(String frame, String index) {
+        return String.format("FRAMES.uncheckedGetObject(%s, %s)", frame, index);
+    }
+
+    static CodeTreeBuilder startRequireFrame(CodeTreeBuilder b, TypeMirror type) {
+        String methodName;
+        switch (type.getKind()) {
+            case BOOLEAN:
+                methodName = "requireBoolean";
+                break;
+            case BYTE:
+                methodName = "requireByte";
+                break;
+            case INT:
+                methodName = "requireInt";
+                break;
+            case LONG:
+                methodName = "requireLong";
+                break;
+            case FLOAT:
+                methodName = "requireFloat";
+                break;
+            case DOUBLE:
+                methodName = "requireDouble";
+                break;
+            default:
+                methodName = "requireObject";
+                break;
+        }
+        b.startCall("FRAMES", methodName);
+        return b;
+    }
+
+    static CodeTreeBuilder startExpectFrameUnsafe(CodeTreeBuilder b, String frame, TypeMirror type) {
+        return startExpectFrame(b, frame, type, true);
+    }
+
+    static CodeTreeBuilder startExpectFrame(CodeTreeBuilder b, String frame, TypeMirror type, boolean unsafe) {
+        String methodName;
+        switch (type.getKind()) {
+            case BOOLEAN:
+                methodName = "expectBoolean";
+                break;
+            case BYTE:
+                methodName = "expectByte";
+                break;
+            case INT:
+                methodName = "expectInt";
+                break;
+            case LONG:
+                methodName = "expectLong";
+                break;
+            case FLOAT:
+                methodName = "expectFloat";
+                break;
+            case DOUBLE:
+                methodName = "expectDouble";
+                break;
+            default:
+                methodName = "expectObject";
+                break;
+        }
+        if (unsafe) {
+            b.startCall("FRAMES", methodName);
+            b.string(frame);
+        } else {
+            b.startCall(frame, methodName);
+        }
+        return b;
+    }
+
+    static CodeTreeBuilder startGetFrameUnsafe(CodeTreeBuilder b, String frame, TypeMirror type) {
+        return startGetFrame(b, frame, type, true);
+    }
+
+    static CodeTreeBuilder startGetFrame(CodeTreeBuilder b, String frame, TypeMirror type, boolean unsafe) {
+        String methodName;
+        if (type == null) {
+            methodName = "getValue";
+        } else {
+            switch (type.getKind()) {
+                case BOOLEAN:
+                    methodName = "getBoolean";
+                    break;
+                case BYTE:
+                    methodName = "getByte";
+                    break;
+                case INT:
+                    methodName = "getInt";
+                    break;
+                case LONG:
+                    methodName = "getLong";
+                    break;
+                case FLOAT:
+                    methodName = "getFloat";
+                    break;
+                case DOUBLE:
+                    methodName = "getDouble";
+                    break;
+                default:
+                    methodName = "getObject";
+                    break;
+            }
+        }
+        if (unsafe) {
+            b.startCall("FRAMES", methodName);
+            b.string(frame);
+        } else {
+            b.startCall(frame, methodName);
+        }
+        return b;
+    }
+
+    static String getSetMethod(TypeMirror type) {
+        if (type == null) {
+            return "setValue";
+        } else {
+            return switch (type.getKind()) {
+                case BOOLEAN -> "setBoolean";
+                case BYTE -> "setByte";
+                case INT -> "setInt";
+                case LONG -> "setLong";
+                case FLOAT -> "setFloat";
+                case DOUBLE -> "setDouble";
+                default -> "setObject";
+            };
+        }
+    }
+
+    static CodeTreeBuilder startSetFrame(CodeTreeBuilder b, TypeMirror type) {
+        String methodName = getSetMethod(type);
+        b.startCall("FRAMES", methodName);
+        return b;
+    }
+
+    static String getSetPrimitiveOrObjectMethod(TypeMirror type) {
+        if (type == null) {
+            return "setValue";
+        } else {
+            return switch (type.getKind()) {
+                case BOOLEAN -> "setBooleanOrObject";
+                case BYTE -> "setByteOrObject";
+                case INT -> "setIntOrObject";
+                case LONG -> "setLongOrObject";
+                case FLOAT -> "setFloatOrObject";
+                case DOUBLE -> "setDoubleOrObject";
+                default -> "setObject";
+            };
+        }
+    }
+
+    static CodeTreeBuilder startSetPrimitiveOrObjectFrame(CodeTreeBuilder b, TypeMirror type) {
+        String methodName = getSetPrimitiveOrObjectMethod(type);
+        b.startCall("FRAMES", methodName);
+        return b;
+    }
+
+    static String setFrameObject(String index, String value) {
+        return setFrameObject("frame", index, value);
+    }
+
+    static String setFrameObject(String frame, String index, String value) {
+        return String.format("FRAMES.setObject(%s, %s, %s)", frame, index, value);
+    }
+
+    static String clearFrame(String frame, String index) {
+        return String.format("FRAMES.clear(%s, %s)", frame, index);
+    }
+
+    CodeTree hasContinuationFrame(String frameName) {
+        CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+        if (model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.DEFAULT_VALUE) {
+            b.startParentheses();
+        }
+        b.startCall(frameName, "isObject").string(BytecodeRootNodeElement.CONTINUATION_FRAME_INDEX).end();
+        if (model.loadIllegalLocalStrategy == LoadIllegalLocalStrategy.DEFAULT_VALUE) {
+            b.string(" && ");
+            b.startCall(frameName, "getObject").string(BytecodeRootNodeElement.CONTINUATION_FRAME_INDEX).end();
+            b.string(" != DEFAULT_LOCAL_VALUE");
+            b.end(); // parentheses
+        }
+        return b.build();
+    }
+
+    static String copyFrameSlot(String src, String dst) {
+        return String.format("FRAMES.copy(frame, %s, %s)", src, dst);
+    }
+
+    static String copyFrameTo(String srcFrame, String srcOffset, String dstFrame, String dstOffset, String length) {
+        return String.format("FRAMES.copyTo(%s, %s, %s, %s, %s)", srcFrame, srcOffset, dstFrame, dstOffset, length);
+    }
+
+    static String cachedDataClassName(InstructionModel instr) {
+        if (!instr.hasNodeImmediate() && !instr.canUseNodeSingleton()) {
+            return null;
+        }
+        if (instr.quickeningBase != null) {
+            return cachedDataClassName(instr.quickeningBase);
+        }
+        return instr.getInternalName() + "Node";
+    }
+
+    static GeneratedTypeMirror getCachedDataClassType(InstructionModel instr) {
+        return new GeneratedTypeMirror("", cachedDataClassName(instr));
+    }
+
+    void emitValidateInstructionTracer(CodeTreeBuilder b) {
+        b.startStatement().startStaticCall(type(Objects.class), "requireNonNull").string("tracer").end().end();
+        b.declaration("var", "exclusiveDescriptor", "tracer.getExclusiveBytecodeDescriptor()");
+        b.startIf().string("exclusiveDescriptor != null && exclusiveDescriptor != BYTECODE").end().startBlock();
+        b.startThrow().startNew(type(IllegalArgumentException.class));
+        b.startStaticCall(type(String.class), "format");
+        b.doubleQuote("The passed instruction tracer is exclusive to %s, but it was installed for %s.");
+        b.string("exclusiveDescriptor").string("BYTECODE");
+        b.end(); // static call
+        b.end().end(); // throw, new
+        b.end(); // if block
+    }
+
+    static void emitCallDefault(CodeTreeBuilder b,
+                    CodeExecutableElement method) {
+        emitCallDefault(b, method, null);
+    }
+
+    static void emitCallDefault(CodeTreeBuilder b,
+                    CodeExecutableElement method, BiConsumer<String, CodeTreeBuilder> argumentMapping) {
+        b.startCall(method.getSimpleName().toString());
+        for (VariableElement p : method.getParameters()) {
+            String name = p.getSimpleName().toString();
+            if (argumentMapping == null) {
+                b.string(name);
+            } else {
+                b.startGroup();
+                argumentMapping.accept(name, b);
+                b.end();
+            }
+        }
+        b.end(); // call
+    }
+
+    protected void emitThrowIllegalLocalException(CodeTreeBuilder b, CodeTree bci, CodeTree localBytecodeNode, CodeTree localIndex, boolean fastPath) {
+        if (model.loadIllegalLocalStrategy != LoadIllegalLocalStrategy.CUSTOM_EXCEPTION) {
+            throw new AssertionError();
+        }
+
+        if (fastPath && !ElementUtils.isAssignable(model.illegalLocalException, model.getContext().getTypes().AbstractTruffleException)) {
+            // If it's not a Truffle exception, always deopt.
+            b.tree(GeneratorUtils.createTransferToInterpreterAndInvalidate());
+        }
+
+        var factoryMethod = model.illegalLocalExceptionFactory;
+        b.startThrow();
+        b.startStaticCall(factoryMethod.method());
+        for (var param : factoryMethod.parameters()) {
+            switch (param) {
+                case NODE, BYTECODE_NODE -> {
+                    b.string("this");
+                }
+                case BYTECODE_LOCATION -> {
+                    if (bci == null) {
+                        throw new AssertionError();
+                    }
+                    b.startCall("findLocation").tree(castBytecodeIndexToInt(bci)).end();
+                }
+                case BYTECODE_INDEX -> {
+                    if (bci == null) {
+                        b.string("-1");
+                    } else {
+                        b.tree(castBytecodeIndexToInt(bci));
+                    }
+                }
+                case LOCAL_VARIABLE -> {
+                    b.startNew("LocalVariableImpl");
+                    b.tree(localBytecodeNode);
+                    b.startGroup();
+                    b.startParentheses().tree(localIndex).end();
+                    b.string(" * LOCALS_LENGTH");
+                    b.end();
+                    b.end();
+                }
+                default -> throw new AssertionError();
+            }
+        }
+        b.end(2);
+    }
+
+    /**
+     * Whether we store the bci at the beginning of an instruction execute, e.g. if all
+     * specializations require it or some other condition requires it.
+     */
+    public static boolean isStoreBciBeforeExecute(BytecodeDSLModel model, InterpreterTier tier, InstructionModel instr) {
+        // Store before execution only when automatic storage is enabled for this tier,
+        // or in manual mode for tag callbacks and custom operations that request storage.
+        boolean automatic = isStoreBciEnabled(model, tier);
+        if (!automatic && model.bytecodeIndexMode != BytecodeDSLModel.BytecodeIndexMode.MANUAL) {
+            return false;
+        }
+        return switch (instr.kind) {
+            case RETURN, YIELD -> automatic;
+            case TAG_ENTER, TAG_LEAVE, TAG_LEAVE_VOID, TAG_RESUME, TAG_YIELD, TAG_YIELD_NULL -> true;
+            case CUSTOM -> {
+                if (automatic && (instr.operation.kind == OperationKind.CUSTOM_YIELD || instr.operation.kind == OperationKind.CUSTOM_RETURN)) {
+                    // custom yield/return always need to set the bci in automatic modes
+                    yield true;
+                }
+                CustomOperationModel custom = instr.operation.customModel;
+                if (!custom.shouldStoreBytecodeIndex()) {
+                    yield false;
+                }
+
+                for (SpecializationData s : instr.nodeData.getReachableSpecializations()) {
+                    // if we use cached values in guards we need to store before execute regardless
+                    // otherwise the bytecode index is not up-to-date in the guard
+                    if (custom.shouldStoreBytecodeIndex(s) && s.isAnyGuardBoundWithCache()) {
+                        yield true;
+                    }
+                }
+
+                for (SpecializationData s : instr.nodeData.getReachableSpecializations()) {
+                    if (!custom.shouldStoreBytecodeIndex(s)) {
+                        yield false;
+                    }
+                }
+
+                yield true;
+            }
+            default -> false;
+        };
+    }
+
+    /**
+     * Returns <code>true</code> if we should set the bytecode index just before the specialization.
+     */
+    public static boolean isStoreBciBeforeSpecialization(BytecodeDSLModel model, InterpreterTier tier, InstructionModel instr, SpecializationData specialization) {
+        if (!isStoreBciEnabled(model, tier) && model.bytecodeIndexMode != BytecodeDSLModel.BytecodeIndexMode.MANUAL) {
+            return false;
+        }
+        switch (instr.kind) {
+            case CUSTOM:
+            case CUSTOM_SHORT_CIRCUIT:
+                CustomOperationModel custom = instr.operation.customModel;
+                if (!custom.shouldStoreBytecodeIndex(specialization)) {
+                    // does never perform any calls
+                    return false;
+                }
+                if (isStoreBciBeforeExecute(model, tier, instr)) {
+                    // already stored in execute
+                    return false;
+                }
+                return true;
+            default:
+                return false;
+
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if bytecode index storing in the frame is enabled, else
+     * <code>false</code>.
+     */
+    public static boolean isStoreBciEnabled(BytecodeDSLModel model, InterpreterTier tier) {
+        return model.storesBytecodeIndex(tier.isUncached());
+    }
+
+    /**
+     * Declares constants and methods on the root node and provides helper methods for interacting
+     * with the source info table.
+     */
+    final class SourceInfoTable {
+        /*
+         * A table entry needs enough attributes to encode all source section kinds. For suffix
+         * sections, an unresolved entry also needs two attributes to encode a link in the patch
+         * list (node id + table index).
+         */
+        static final int NUM_ATTRIBUTES = Math.max(SourceSectionKind.MAX_ATTRIBUTES, 2);
+
+        private final List<CodeVariableElement> constants;
+        final CodeVariableElement unspecifiedAttribute;
+        final CodeVariableElement sourceOffset;
+        final CodeVariableElement startBciOffset;
+        final CodeVariableElement endBciOffset;
+        final List<CodeVariableElement> attributeOffsets;
+        final int entryLength;
+        final CodeVariableElement entryLengthVariable;
+        final CodeVariableElement footerLengthVariable;
+        final ArrayType sourceInfoType;
+
+        public final CodeExecutableElement createSourceSection;
+
+        SourceInfoTable() {
+            this.constants = new ArrayList<>();
+            // -1 is a valid value for some SourceSection constructors.
+            this.unspecifiedAttribute = addConstant("UNSPECIFIED_ATTR", -2);
+            int offset = 0;
+            this.startBciOffset = addConstant("OFFSET_START_BCI", offset++);
+            this.endBciOffset = addConstant("OFFSET_END_BCI", offset++);
+            this.sourceOffset = addConstant("OFFSET_SOURCE", offset++);
+            this.attributeOffsets = new ArrayList<>();
+            for (int i = 0; i < NUM_ATTRIBUTES; i++) {
+                attributeOffsets.add(addConstant("OFFSET_ATTR" + (i + 1), offset++));
+            }
+            this.entryLength = offset;
+            this.entryLengthVariable = addConstant("ENTRY_LENGTH", this.entryLength);
+            this.footerLengthVariable = model.enableCompressedSources ? addConstant("FOOTER_LENGTH", Byte.BYTES) : null;
+
+            this.sourceInfoType = new CodeTypeMirror.ArrayCodeTypeMirror(type(model.enableCompressedSources ? byte.class : int.class));
+            this.createSourceSection = BytecodeRootNodeElement.this.add(createCreateSourceSection());
+            if (model.enableCompressedSources) {
+                BytecodeRootNodeElement.this.add(createDecodeVarint());
+            }
+        }
+
+        public ArrayType getSourceInfoType() {
+            return this.sourceInfoType;
+        }
+
+        private CodeVariableElement addConstant(String name, int value) {
+            CodeVariableElement result = new CodeVariableElement(Set.of(PRIVATE, STATIC, FINAL), type(int.class), "SOURCE_INFO_" + name);
+            result.createInitBuilder().string(value);
+            constants.add(result);
+            return result;
+        }
+
+        private CodeExecutableElement createCreateSourceSection() {
+            CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), types.SourceSection, "createSourceSection");
+            ex.addParameter(new CodeVariableElement(generic(List.class, types.Source), "sources"));
+            ex.addParameter(new CodeVariableElement(this.getSourceInfoType(), "info"));
+            ex.addParameter(new CodeVariableElement(type(int.class), "index"));
+
+            CodeTreeBuilder b = ex.createBuilder();
+            if (model.enableCompressedSources) {
+                emitInitCompressedSourceIterationVariables(b, type(int.class), "sourceInfoIndex", "index");
+                emitDecodeVarintEntry(b, "info", "sourceInfoIndex");
+                b.declaration(type(int.class), "sourceIndex", "(int) decoded");
+                emitDecodeVarintEntry(b, "info", "sourceInfoIndex");
+                b.declaration(type(int.class), "attr1", "(int) decoded - 2");
+                emitDecodeVarintEntry(b, "info", "sourceInfoIndex");
+                b.declaration(type(int.class), "attr2", "(int) decoded - 2");
+                emitDecodeVarintEntry(b, "info", "sourceInfoIndex");
+                b.declaration(type(int.class), "attr3", "(int) decoded - 2");
+                CodeTree decodedAttr4 = emitDecodeVarintEntry(b, "info", "sourceInfoIndex", null);
+                b.declaration(type(int.class), "attr4", CodeTreeBuilder.createBuilder().tree(decodedAttr4).string(" - 2").build());
+            } else {
+                b.declaration(type(int.class), "sourceIndex", loadElement("info", "index", sourceOffset));
+                b.declaration(type(int.class), "attr1", loadElement("info", "index", attributeOffsets.get(0)));
+                b.declaration(type(int.class), "attr2", loadElement("info", "index", attributeOffsets.get(1)));
+                b.declaration(type(int.class), "attr3", loadElement("info", "index", attributeOffsets.get(2)));
+                b.declaration(type(int.class), "attr4", loadElement("info", "index", attributeOffsets.get(3)));
+            }
+            b.declaration(types.Source, "source", "sources.get(sourceIndex)");
+
+            /*
+             * The builder does not allow user-specified attributes to be all negative unless they
+             * are all -1, which encodes an unavailable section. Some attributes may not be
+             * specified (e.g., in createSourceSection(-1)), but we use -2 to indicate
+             * "unspecified", so it suffices to check for all negative values.
+             */
+            b.startIf().string("attr1 < 0 && attr2 < 0 && attr3 < 0 && attr4 < 0").end().startBlock();
+            b.startReturn().string("source.createUnavailableSection()").end();
+            b.end().startElseIf().string("attr4 != ").variable(unspecifiedAttribute).end().startBlock();
+            b.startReturn().string("source.createSection(attr1, attr2, attr3, attr4)").end();
+            b.end().startElseIf().string("attr3 != ").variable(unspecifiedAttribute).end().startBlock();
+            b.startReturn().string("source.createSection(attr1, attr2, attr3)").end();
+            b.end().startElseIf().string("attr2 != ").variable(unspecifiedAttribute).end().startBlock();
+            b.startReturn().string("source.createSection(attr1, attr2)").end();
+            b.end().startElseBlock();
+            b.startAssert().string("attr1 != ").variable(unspecifiedAttribute).end();
+            b.startReturn().string("source.createSection(attr1)").end();
+            b.end();
+
+            return ex;
+        }
+
+        private CodeExecutableElement createDecodeVarint() {
+            CodeExecutableElement ex = new CodeExecutableElement(Set.of(PRIVATE, STATIC), type(long.class), "decodeVarint");
+            ex.addParameter(new CodeVariableElement(arrayOf(type(byte.class)), "info"));
+            ex.addParameter(new CodeVariableElement(type(int.class), "index"));
+            CodeTreeBuilder b = ex.createBuilder();
+            b.declaration(type(int.class), "readIndex", "index");
+            b.declaration(type(int.class), "currentByte");
+            b.declaration(type(int.class), "encoded", "0");
+            b.startDoBlock();
+            b.statement("currentByte = info[readIndex++] & 0xFF");
+            b.statement("encoded = (encoded << 7) | (currentByte & 0x7F)");
+            b.end().startDoWhile().string("(currentByte & 0x80) != 0").end().end();
+            b.startReturn().string("((long) readIndex << 32) | (encoded & 0xFFFF_FFFFL)").end();
+            return ex;
+        }
+
+        static void emitInitCompressedSourceIterationVariables(CodeTreeBuilder b, TypeMirror intType, String indexVar) {
+            emitInitCompressedSourceIterationVariables(b, intType, indexVar, "0");
+        }
+
+        static void emitInitCompressedSourceIterationVariables(CodeTreeBuilder b, TypeMirror intType, String indexVar, String initialIndex) {
+            b.declaration(intType, indexVar, initialIndex);
+            b.declaration(ProcessorContext.getInstance().getType(long.class), "decoded");
+        }
+
+        static CodeTree emitDecodeVarintEntry(CodeTreeBuilder b, String sourceInfo, String indexVar) {
+            return emitDecodeVarintEntry(b, sourceInfo, indexVar, indexVar);
+        }
+
+        static CodeTree emitDecodeVarintEntry(CodeTreeBuilder b, String sourceInfo, String readIndexVar, String writeIndexVar) {
+            b.startAssign("decoded").startCall("decodeVarint").string(sourceInfo).string(readIndexVar).end().end();
+            if (writeIndexVar != null) {
+                b.startAssign(writeIndexVar).string("(int) (decoded >>> 32)").end();
+            }
+            return CodeTreeBuilder.createBuilder().string("(int) decoded").build();
+        }
+
+        void lazyInit() {
+            // Defer adding constants until lazyInit so constants are grouped with other int
+            // constants
+            BytecodeRootNodeElement.this.addAll(constants);
+        }
+
+        public static CodeTree loadElement(String sourceInfo, String index, CodeVariableElement offset) {
+            CodeTreeBuilder b = CodeTreeBuilder.createBuilder();
+            b.string(sourceInfo).string("[").string(index).string(" + ").variable(offset).string("]");
+            return b.build();
+        }
+
+        public CodeTree loadStartBci(String sourceInfo, String index) {
+            return loadElement(sourceInfo, index, startBciOffset);
+        }
+
+        public CodeTree loadEndBci(String sourceInfo, String index) {
+            return loadElement(sourceInfo, index, endBciOffset);
+        }
+
+        public CodeTree loadSource(String sourceInfo, String index) {
+            return loadElement(sourceInfo, index, sourceOffset);
+        }
+    }
+
+}

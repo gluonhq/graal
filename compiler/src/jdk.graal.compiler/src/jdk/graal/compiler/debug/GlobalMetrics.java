@@ -35,7 +35,9 @@ import java.util.List;
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.MapCursor;
 import org.graalvm.collections.Pair;
+
 import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.serviceprovider.GraalServices;
 import jdk.graal.compiler.serviceprovider.IsolateUtil;
 
 /**
@@ -87,10 +89,21 @@ public class GlobalMetrics {
         }
     }
 
-    static Path generateFileName(String metricsFile) {
-        long isolateID = IsolateUtil.getIsolateID();
+    /**
+     * Substitutes {@code %p} in the given filename template with the execution ID and appends the
+     * isolate ID if this is an isolate-aware runtime.
+     *
+     * @param nameTemplate the filename template, which may contain {@code %p}
+     * @return the substituted filename template
+     */
+    public static Path generateFileName(String nameTemplate) {
+        String metricsFile = nameTemplate;
+        if (metricsFile.contains("%p")) {
+            metricsFile = metricsFile.replace("%p", GraalServices.getExecutionID());
+        }
         Path path;
-        if (isolateID != 0L) {
+        if (IsolateUtil.getIsolateAddress() != 0L) {
+            long isolateID = IsolateUtil.getIsolateID();
             int lastDot = metricsFile.lastIndexOf('.');
             if (lastDot != -1) {
                 path = Paths.get(metricsFile.substring(0, lastDot) + '@' + isolateID + metricsFile.substring(lastDot));

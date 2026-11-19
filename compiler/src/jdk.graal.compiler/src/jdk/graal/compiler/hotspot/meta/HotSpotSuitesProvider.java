@@ -27,13 +27,14 @@ package jdk.graal.compiler.hotspot.meta;
 import java.util.ListIterator;
 import java.util.Optional;
 
+import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.hotspot.GraalHotSpotVMConfig;
-import jdk.graal.compiler.hotspot.HotSpotGraalRuntime;
 import jdk.graal.compiler.hotspot.HotSpotGraalRuntimeProvider;
 import jdk.graal.compiler.hotspot.HotSpotGraphBuilderPhase;
 import jdk.graal.compiler.hotspot.lir.HotSpotZapRegistersPhase;
 import jdk.graal.compiler.hotspot.lir.VerifyMaxRegisterSizePhase;
+import jdk.graal.compiler.hotspot.phases.HotSpotDefaultInliningProvider;
 import jdk.graal.compiler.java.GraphBuilderPhase;
 import jdk.graal.compiler.java.SuitesProviderBase;
 import jdk.graal.compiler.lir.phases.LIRSuites;
@@ -48,14 +49,20 @@ import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.PhaseSuite;
 import jdk.graal.compiler.phases.common.AddressLoweringPhase;
-import jdk.graal.compiler.phases.common.BarrierSetVerificationPhase;
+import jdk.graal.compiler.phases.common.CanonicalizerPhase;
+import jdk.graal.compiler.phases.common.LoweringPhase;
 import jdk.graal.compiler.phases.common.UseTrappingNullChecksPhase;
-import jdk.graal.compiler.phases.common.WriteBarrierAdditionPhase;
+import jdk.graal.compiler.phases.common.priorityinline.PriorityInliningPhase;
+import jdk.graal.compiler.phases.constantblinding.ConstantBlindingPhase;
+import jdk.graal.compiler.phases.constantblinding.ConstantPreBlindingPhase;
+import jdk.graal.compiler.phases.constantblinding.DefaultConstantBlindingPhase;
+import jdk.graal.compiler.phases.schedule.SchedulePhase.FinalSchedulePhase;
 import jdk.graal.compiler.phases.tiers.HighTierContext;
 import jdk.graal.compiler.phases.tiers.LowTierContext;
-import jdk.graal.compiler.phases.tiers.MidTierContext;
 import jdk.graal.compiler.phases.tiers.Suites;
 import jdk.graal.compiler.phases.tiers.SuitesCreator;
+import jdk.graal.compiler.virtual.phases.ea.ObjectCloneRemovalPhase;
+import jdk.graal.compiler.virtual.phases.ea.ReadEliminationPhase;
 import jdk.vm.ci.code.Architecture;
 
 /**
@@ -79,26 +86,39 @@ public class HotSpotSuitesProvider extends SuitesProviderBase {
     @Override
     public Suites createSuites(OptionValues options, Architecture arch) {
         Suites suites = defaultSuitesCreator.createSuites(options, arch);
+
+        // Replace the default priority inliner with one that is `-Xcomp` aware.
+        suites.getHighTier().replacePhase(PriorityInliningPhase.class, new PriorityInliningPhase(CanonicalizerPhase.create(), options, new HotSpotDefaultInliningProvider(config)));
+
         if (runtime.getTarget().implicitNullCheckLimit > 0 && !runtime.getCompilerConfigurationName().equalsIgnoreCase("economy")) {
             ListIterator<BasePhase<? super LowTierContext>> position = suites.getLowTier().findPhase(AddressLoweringPhase.class);
             assert position != null : "There should be an " + AddressLoweringPhase.class.getName() + " in low tier.";
             position.previous();
             position.add(new UseTrappingNullChecksPhase());
         }
-
-        if (config.gc == HotSpotGraalRuntime.HotSpotGC.X) {
-            ListIterator<BasePhase<? super MidTierContext>> mid = suites.getMidTier().findPhase(WriteBarrierAdditionPhase.class);
-            // No write barriers required
-            mid.remove();
-
-            if (Assertions.assertionsEnabled()) {
-                // Perform some verification that the barrier type on all reads are properly set
-                ListIterator<BasePhase<? super LowTierContext>> position = suites.getLowTier().findPhase(AddressLoweringPhase.class);
-                position.previous();
-                position.add(new BarrierSetVerificationPhase());
+        if (ConstantBlindingPhase.Options.BlindConstants.getValue(options)) {
+            addPhaseBefore(suites.getLowTier(), FinalSchedulePhase.class, new DefaultConstantBlindingPhase());
+            addPhaseBefore(suites.getLowTier(), LoweringPhase.class, new ConstantPreBlindingPhase());
+        }
+        if (GraalOptions.OptReadElimination.getValue(options) && ReadEliminationPhase.Options.CloneReadElimination.getValue(options)) {
+            ListIterator<BasePhase<? super HighTierContext>> position = suites.getHighTier().findPhase(ReadEliminationPhase.class, true);
+            if (position != null) {
+                position.add(new ObjectCloneRemovalPhase());
             }
         }
         return suites;
+    }
+
+    private static <C> void addPhaseBefore(PhaseSuite<C> phaseSuite, Class<? extends BasePhase<? super C>> findPhase, BasePhase<? super C> insertPhase) {
+        insertPhase(phaseSuite, findPhase, insertPhase, true);
+    }
+
+    private static <C> void insertPhase(PhaseSuite<C> phaseSuite, Class<? extends BasePhase<? super C>> findPhase, BasePhase<? super C> insertPhase, boolean insertBefore) {
+        ListIterator<BasePhase<? super C>> position = phaseSuite.findPhase(findPhase);
+        if (insertBefore) {
+            position.previous();
+        }
+        position.add(insertPhase);
     }
 
     protected PhaseSuite<HighTierContext> createGraphBuilderSuite() {

@@ -25,11 +25,10 @@
 
 package com.oracle.svm.core.locks;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 public abstract class VMLockingPrimitive {
-
     /**
      * The function that initializes the locking primitive.
      *

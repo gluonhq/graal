@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2018, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -63,7 +63,7 @@ import jdk.graal.compiler.hotspot.HotSpotLIRGenerationResult;
 import jdk.graal.compiler.hotspot.HotSpotLIRGenerator;
 import jdk.graal.compiler.hotspot.HotSpotLockStack;
 import jdk.graal.compiler.hotspot.aarch64.g1.AArch64HotSpotG1BarrierSetLIRTool;
-import jdk.graal.compiler.hotspot.aarch64.x.AArch64HotSpotXBarrierSetLIRGenerator;
+import jdk.graal.compiler.hotspot.aarch64.shenandoah.AArch64HotSpotShenandoahBarrierSetLIRGenerator;
 import jdk.graal.compiler.hotspot.aarch64.z.AArch64HotSpotZBarrierSetLIRGenerator;
 import jdk.graal.compiler.hotspot.debug.BenchmarkCounters;
 import jdk.graal.compiler.hotspot.meta.HotSpotProviders;
@@ -79,6 +79,7 @@ import jdk.graal.compiler.lir.Variable;
 import jdk.graal.compiler.lir.VirtualStackSlot;
 import jdk.graal.compiler.lir.aarch64.AArch64AddressValue;
 import jdk.graal.compiler.lir.aarch64.AArch64Call;
+import jdk.graal.compiler.lir.aarch64.AArch64CRC32UpdateBytesOp;
 import jdk.graal.compiler.lir.aarch64.AArch64ControlFlow.StrategySwitchOp;
 import jdk.graal.compiler.lir.aarch64.AArch64FrameMapBuilder;
 import jdk.graal.compiler.lir.aarch64.AArch64Move;
@@ -116,14 +117,14 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
     private HotSpotDebugInfoBuilder debugInfoBuilder;
 
     protected static BarrierSetLIRGeneratorTool getBarrierSet(GraalHotSpotVMConfig config, HotSpotProviders providers) {
-        if (config.gc == HotSpotGraalRuntime.HotSpotGC.X) {
-            return new AArch64HotSpotXBarrierSetLIRGenerator(config, providers);
-        }
         if (config.gc == HotSpotGraalRuntime.HotSpotGC.G1) {
             return new AArch64G1BarrierSetLIRGenerator(new AArch64HotSpotG1BarrierSetLIRTool(config, providers));
         }
         if (config.gc == HotSpotGraalRuntime.HotSpotGC.Z) {
             return new AArch64HotSpotZBarrierSetLIRGenerator(config, providers);
+        }
+        if (config.gc == HotSpotGraalRuntime.HotSpotGC.Shenandoah) {
+            return new AArch64HotSpotShenandoahBarrierSetLIRGenerator(config, providers);
         }
         return null;
     }
@@ -141,6 +142,21 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
     @Override
     public HotSpotProviders getProviders() {
         return (HotSpotProviders) super.getProviders();
+    }
+
+    @Override
+    public Variable emitCRC32UpdateBytes(EnumSet<?> runtimeCheckedCPUFeatures, Value crc, Value bufferAddress, Value length) {
+        RegisterValue rResult = AArch64.r0.asValue(crc.getValueKind());
+        RegisterValue rCrc = AArch64.r0.asValue(crc.getValueKind());
+        RegisterValue rBuf = AArch64.r1.asValue(bufferAddress.getValueKind());
+        RegisterValue rLen = AArch64.r2.asValue(length.getValueKind());
+        emitMove(rCrc, crc);
+        emitMove(rBuf, bufferAddress);
+        emitMove(rLen, length);
+        append(new AArch64CRC32UpdateBytesOp(rResult, rCrc, rBuf, rLen));
+        Variable result = newVariable(crc.getValueKind());
+        emitMove(result, rResult);
+        return result;
     }
 
     @Override
@@ -171,12 +187,12 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
     private LIRFrameState currentRuntimeCallInfo;
 
     @Override
-    protected void emitForeignCallOp(ForeignCallLinkage linkage, Value targetAddress, Value result, Value[] arguments, Value[] temps, LIRFrameState info) {
+    protected void emitForeignCallOp(ForeignCallLinkage linkage, Value result, Value[] arguments, Value[] temps, LIRFrameState info) {
         currentRuntimeCallInfo = info;
-        if (AArch64Call.isNearCall(linkage)) {
-            append(new AArch64Call.DirectNearForeignCallOp(linkage, result, arguments, temps, info, label));
+        if (AArch64Call.isNearCall(linkage, getCodeCache())) {
+            append(new AArch64Call.DirectNearForeignCallOp(linkage, result, arguments, temps, linkage.getAdditionalReturns(), info, label));
         } else {
-            append(new AArch64Call.DirectFarForeignCallOp(linkage, result, arguments, temps, info, label));
+            append(new AArch64Call.DirectFarForeignCallOp(linkage, result, arguments, temps, linkage.getAdditionalReturns(), info, label));
         }
 
         // Handle different return value locations
@@ -349,7 +365,7 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
         AArch64SaveRegistersOp save = null;
         Stub stub = getStub();
         if (destroysRegisters && stub != null && stub.getLinkage().getEffect() == HotSpotForeignCallLinkage.RegisterEffect.COMPUTES_REGISTERS_KILLED) {
-            Register[] savedRegisters = getRegisterConfig().getAllocatableRegisters().toArray();
+            Register[] savedRegisters = getRegisterConfig().getAllocatableRegisters().toArray(Register[]::new);
             save = emitSaveAllRegisters(savedRegisters);
         }
 
@@ -436,7 +452,8 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
     }
 
     @Override
-    public void emitReturn(JavaKind kind, Value input) {
+    public void emitReturn(JavaKind kind, Value input, AllocatableValue tailCallTarget, AllocatableValue[] additionalReturns) {
+        GraalError.guarantee(Value.ILLEGAL.equals(tailCallTarget), "Returning to a custom return address is unsupported on HotSpot");
         AllocatableValue operand = Value.ILLEGAL;
         if (input != null) {
             operand = resultOperandFor(kind, input.getValueKind());
@@ -447,7 +464,7 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
             append(new AArch64RestoreRegistersOp(saveOnEntry.getSlots(), saveOnEntry));
         }
         Register thread = getProviders().getRegisters().getThreadRegister();
-        append(new AArch64HotSpotReturnOp(operand, getStub() != null, config, thread, getResult().requiresReservedStackAccessCheck()));
+        append(new AArch64HotSpotReturnOp(operand, additionalReturns, getStub() != null, config, thread, getResult().requiresReservedStackAccessCheck()));
     }
 
     /**
@@ -474,14 +491,11 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
 
     @Override
     public void emitZeroMemory(Value address, Value length, boolean isAligned) {
-        final EnumSet<AArch64.Flag> flags = ((AArch64) target().arch).getFlags();
-
         int zvaLength = config.zvaLength;
         boolean isDcZvaProhibited = 0 == zvaLength;
 
         // Use DC ZVA if it's not prohibited and AArch64 HotSpot flag UseBlockZeroing is on.
-        boolean useDcZva = !isDcZvaProhibited && flags.contains(AArch64.Flag.UseBlockZeroing);
-
+        boolean useDcZva = !isDcZvaProhibited && config.useBlockZeroing;
         emitZeroMemory(address, length, isAligned, useDcZva, zvaLength);
     }
 
@@ -506,21 +520,26 @@ public class AArch64HotSpotLIRGenerator extends AArch64LIRGenerator implements H
 
     @Override
     public int getArrayLengthOffset() {
-        return config.arrayOopDescLengthOffset();
+        return config.arrayLengthOffsetInBytes;
     }
 
     @Override
-    public Register getHeapBaseRegister() {
-        return getProviders().getRegisters().getHeapBaseRegister();
+    public boolean isReservedRegister(Register r) {
+        return getProviders().getRegisters().isReservedRegister(r);
     }
 
     @Override
-    protected int getVMPageSize() {
+    protected int getPageSizeForReadBoundaryCheck() {
         return config.vmPageSize;
     }
 
     @Override
     protected int getSoftwarePrefetchHintDistance() {
         return config.softwarePrefetchHintDistance;
+    }
+
+    @Override
+    public boolean useLSE() {
+        return config.useLSE;
     }
 }

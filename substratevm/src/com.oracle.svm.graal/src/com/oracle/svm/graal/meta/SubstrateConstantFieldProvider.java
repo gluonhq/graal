@@ -24,8 +24,9 @@
  */
 package com.oracle.svm.graal.meta;
 
-import jdk.graal.compiler.core.common.spi.JavaConstantFieldProvider;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
 
+import jdk.graal.compiler.core.common.spi.JavaConstantFieldProvider;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
@@ -50,11 +51,28 @@ public class SubstrateConstantFieldProvider extends JavaConstantFieldProvider {
 
     @Override
     protected boolean isSyntheticEnumSwitchMap(ResolvedJavaField field) {
+        if (field instanceof SubstrateField substrateField && substrateField.getDeclaringClass().getHub().isRuntimeLoaded()) {
+            return super.isSyntheticEnumSwitchMap(field);
+        }
+
         /*
          * Enum-switch fields are constant folded during native image generation, so no need to even
-         * check for such fields at run time.
+         * check for such fields at run time for AOT-loaded types.
          */
         assert !field.getName().equals("$VALUES") && !field.getName().equals("ENUM$VALUES") && !field.getName().startsWith("$SwitchMap$") && !field.getName().startsWith("$SWITCH_TABLE$");
         return false;
+    }
+
+    @Override
+    protected boolean isFinalField(ResolvedJavaField field, ConstantFieldTool<?> tool) {
+        if (RuntimeClassLoading.isSupported() && field.getName().equals("target") && field.getDeclaringClass().getName().equals("Ljava/lang/invoke/CallSite;")) {
+            /*
+             * GR-74244: since the compiler doesn't currently emit CallSiteTargetValue assumptions,
+             * it shouldn't fold reads of CallSite.target. See also
+             * Target_java_lang_invoke_MethodHandleNatives.setCallSiteTargetNormal.
+             */
+            return false;
+        }
+        return super.isFinalField(field, tool);
     }
 }

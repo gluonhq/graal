@@ -26,10 +26,11 @@ package jdk.graal.compiler.hotspot.stubs;
 
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
 import static jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor.Transition.SAFEPOINT;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.PENDING_EXCEPTION_LOCATION;
 import static jdk.vm.ci.hotspot.HotSpotCallingConventionType.NativeCall;
 import static org.graalvm.word.LocationIdentity.any;
 
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
@@ -49,7 +50,6 @@ import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.replacements.nodes.CStringConstant;
-import jdk.graal.compiler.word.Word;
 import jdk.vm.ci.code.Register;
 
 /**
@@ -86,7 +86,7 @@ public class CreateExceptionStub extends SnippetStub {
     }
 
     protected static Object createException(Register threadRegister, Class<? extends Throwable> exception) {
-        Word message = WordFactory.zero();
+        Word message = Word.zero();
         return createException(threadRegister, exception, message);
     }
 
@@ -109,7 +109,8 @@ public class CreateExceptionStub extends SnippetStub {
     }
 
     private static Object handleExceptionReturn(Word thread, int deoptimized) {
-        Object clearPendingException = HotSpotReplacementsUtil.clearPendingException(thread);
+        Object clearPendingException = PENDING_EXCEPTION_LOCATION.readObject(thread);
+        PENDING_EXCEPTION_LOCATION.writeObject(thread, null);
         // alwayDeoptimize is a testing option to force a deopt here but the code pattern should
         // keep both the deopt and return paths, so include a test against the exception which we
         // know should always succeed.

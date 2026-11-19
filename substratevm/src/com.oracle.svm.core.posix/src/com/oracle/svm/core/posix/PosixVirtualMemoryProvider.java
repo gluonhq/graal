@@ -37,9 +37,10 @@ import static com.oracle.svm.core.posix.headers.Mman.PROT_WRITE;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mmap;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.mprotect;
 import static com.oracle.svm.core.posix.headers.Mman.NoTransitions.munmap;
-import static org.graalvm.word.WordFactory.nullPointer;
+import static org.graalvm.word.impl.Word.nullPointer;
 
-import jdk.graal.compiler.word.Word;
+import java.util.random.RandomGenerator;
+
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.type.WordPointer;
@@ -47,20 +48,32 @@ import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.RuntimeRandomness;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.os.VirtualMemoryProvider;
 import com.oracle.svm.core.posix.headers.Unistd;
 import com.oracle.svm.core.util.PointerUtils;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 @AutomaticallyRegisteredFeature
 class PosixVirtualMemoryProviderFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
         if (!ImageSingletons.contains(VirtualMemoryProvider.class)) {
@@ -69,18 +82,25 @@ class PosixVirtualMemoryProviderFeature implements InternalFeature {
     }
 }
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
     protected static final int NO_FD = -1;
     protected static final int NO_FD_OFFSET = 0;
+
+    // Keep mappings in the lower half of the smallest commonly supported address range.
+    private static final int RANDOM_ADDRESS_BITS = Platform.includedIn(Platform.AARCH64.class) || Platform.includedIn(Platform.RISCV64.class) ? 38 : 47;
+    private static final long MAX_RANDOM_ADDRESS = 1L << RANDOM_ADDRESS_BITS;
+    // Limit randomization attempts for executable mappings.
+    private static final int MAX_RANDOMIZATION_ATTEMPTS = 10;
 
     private static final CGlobalData<WordPointer> CACHED_PAGE_SIZE = CGlobalDataFactory.createWord();
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static UnsignedWord getPageSize() {
         Word value = CACHED_PAGE_SIZE.get().read();
-        if (value.equal(WordFactory.zero())) {
+        if (value.equal(Word.zero())) {
             long queried = Unistd.NoTransitions.sysconf(Unistd._SC_PAGE_SIZE());
-            value = WordFactory.unsigned(queried);
+            value = Word.unsigned(queried);
             CACHED_PAGE_SIZE.get().write(value);
         }
         return value;
@@ -111,7 +131,7 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer reserve(UnsignedWord nbytes, UnsignedWord alignment, boolean executable) {
         if (nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         UnsignedWord granularity = getGranularity();
@@ -148,7 +168,7 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer mapFile(PointerBase start, UnsignedWord nbytes, WordBase fileHandle, UnsignedWord offset, int access) {
         if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         int flags = MAP_PRIVATE();
@@ -157,14 +177,14 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
         }
         int fd = (int) fileHandle.rawValue();
         Pointer result = mmap(start, nbytes, accessAsProt(access), flags, fd, offset.rawValue());
-        return result.notEqual(MAP_FAILED()) ? result : WordFactory.nullPointer();
+        return result.notEqual(MAP_FAILED()) ? result : Word.nullPointer();
     }
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer commit(PointerBase start, UnsignedWord nbytes, int access) {
         if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         int flags = MAP_ANON() | MAP_PRIVATE();
@@ -175,8 +195,32 @@ public class PosixVirtualMemoryProvider implements VirtualMemoryProvider {
         if (Platform.includedIn(Platform.MACOS_AARCH64.class) && (access & Access.FUTURE_EXECUTE) != 0) {
             flags |= MAP_JIT();
         }
+        Pointer result;
+        if (start.isNull() && (access & Access.FUTURE_EXECUTE) != 0 &&
+                        SubstrateOptions.RandomizeRuntimeCodeCache.getValue()) {
+            UnsignedWord granularity = getGranularity();
+            long slotCount = (MAX_RANDOM_ADDRESS - nbytes.rawValue()) / granularity.rawValue();
+            if (slotCount <= 1) {
+                return nullPointer();
+            }
+            RandomGenerator random = RuntimeRandomness.instance().getNonBlockingRandom();
+            for (int attempts = 0;; attempts++) {
+                long slot = Long.remainderUnsigned(random.nextLong(), slotCount - 1) + 1;
+                Pointer requested = Word.pointer(slot * granularity.rawValue());
+                result = mmap(requested, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
+                if (result.equal(requested) || result.equal(MAP_FAILED()) || attempts >= MAX_RANDOMIZATION_ATTEMPTS - 1) {
+                    /* Mapping succeeded and we got our slot, or it failed and we didn't get it,
+                       or we ran out of attempts - in any case stop trying */
+                    break;
+                }
+
+                /* Mapping succeeded, but we did not get the requested slot. Free the mapping and retry. */
+                munmap(result, nbytes);
+            }
+        } else {
+            result = mmap(start, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
+        }
         /* The memory returned by mmap is guaranteed to be zeroed. */
-        final Pointer result = mmap(start, nbytes, accessAsProt(access), flags, NO_FD, NO_FD_OFFSET);
         return result.notEqual(MAP_FAILED()) ? result : nullPointer();
     }
 

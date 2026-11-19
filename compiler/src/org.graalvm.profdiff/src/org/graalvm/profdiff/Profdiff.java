@@ -31,6 +31,7 @@ import org.graalvm.profdiff.args.IntegerArgument;
 import org.graalvm.profdiff.args.ProgramArgumentParser;
 import org.graalvm.profdiff.command.AOTAOTCommand;
 import org.graalvm.profdiff.command.AOTAOTWithJITProfileCommand;
+import org.graalvm.profdiff.command.CompareReplayedCommand;
 import org.graalvm.profdiff.command.HelpCommand;
 import org.graalvm.profdiff.command.JITAOTCommand;
 import org.graalvm.profdiff.command.JITJITCommand;
@@ -147,6 +148,7 @@ public class Profdiff {
         commandGroup.addCommand(new JITAOTCommand());
         commandGroup.addCommand(new AOTAOTCommand());
         commandGroup.addCommand(new AOTAOTWithJITProfileCommand());
+        commandGroup.addCommand(new CompareReplayedCommand());
         commandGroup.addCommand(new HelpCommand(programArguments.getArgumentParser()));
 
         try {

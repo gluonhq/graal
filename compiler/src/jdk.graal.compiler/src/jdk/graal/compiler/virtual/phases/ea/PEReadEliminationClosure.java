@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,6 +30,7 @@ import static jdk.graal.compiler.nodes.NamedLocationIdentity.ARRAY_LENGTH_LOCATI
 import java.util.EnumMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.function.Function;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.EconomicSet;
@@ -39,12 +40,14 @@ import org.graalvm.collections.Pair;
 import org.graalvm.word.LocationIdentity;
 
 import jdk.graal.compiler.core.common.cfg.CFGLoop;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.AbstractBeginNode;
 import jdk.graal.compiler.nodes.FieldLocationIdentity;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.GraphState.StageFlag;
+import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.LoopBeginNode;
 import jdk.graal.compiler.nodes.LoopExitNode;
 import jdk.graal.compiler.nodes.NamedLocationIdentity;
@@ -69,7 +72,9 @@ import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.type.StampTool;
 import jdk.graal.compiler.nodes.util.GraphUtil;
+import jdk.graal.compiler.nodes.virtual.FieldAliasNode;
 import jdk.graal.compiler.nodes.virtual.VirtualArrayNode;
+import jdk.graal.compiler.nodes.virtual.VirtualObjectNode;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.virtual.phases.ea.PEReadEliminationBlockState.ReadCacheEntry;
 import jdk.vm.ci.meta.JavaConstant;
@@ -87,8 +92,8 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
         }
     }
 
-    public PEReadEliminationClosure(ScheduleResult schedule, CoreProviders providers) {
-        super(schedule, providers);
+    public PEReadEliminationClosure(ScheduleResult schedule, CoreProviders providers, Function<VirtualObjectNode, FixedWithNextNode> anchorSupplier) {
+        super(schedule, providers, anchorSupplier);
     }
 
     @Override
@@ -111,30 +116,32 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
         }
 
         boolean deleted = false;
-        if (node instanceof LoadFieldNode) {
-            deleted = processLoadField((LoadFieldNode) node, state, effects);
-        } else if (node instanceof StoreFieldNode) {
-            deleted = processStoreField((StoreFieldNode) node, state, effects);
-        } else if (node instanceof LoadIndexedNode) {
-            deleted = processLoadIndexed((LoadIndexedNode) node, state, effects);
-        } else if (node instanceof StoreIndexedNode) {
-            deleted = processStoreIndexed((StoreIndexedNode) node, state, effects);
-        } else if (node instanceof ArrayLengthNode) {
-            deleted = processArrayLength((ArrayLengthNode) node, state, effects);
-        } else if (node instanceof UnboxNode) {
-            deleted = processUnbox((UnboxNode) node, state, effects);
-        } else if (node instanceof RawLoadNode) {
-            deleted = processUnsafeLoad((RawLoadNode) node, state, effects);
-        } else if (node instanceof RawStoreNode) {
-            deleted = processUnsafeStore((RawStoreNode) node, state, effects);
+        if (node instanceof LoadFieldNode loadFieldNode) {
+            deleted = processLoadField(loadFieldNode, state, effects);
+        } else if (node instanceof FieldAliasNode fieldAliasNode) {
+            deleted = processFieldAlias(fieldAliasNode, state);
+        } else if (node instanceof StoreFieldNode storeFieldNode) {
+            deleted = processStoreField(storeFieldNode, state, effects);
+        } else if (node instanceof LoadIndexedNode loadIndexedNode) {
+            deleted = processLoadIndexed(loadIndexedNode, state, effects);
+        } else if (node instanceof StoreIndexedNode storeIndexedNode) {
+            deleted = processStoreIndexed(storeIndexedNode, state, effects);
+        } else if (node instanceof ArrayLengthNode arrayLengthNode) {
+            deleted = processArrayLength(arrayLengthNode, state, effects);
+        } else if (node instanceof UnboxNode unboxNode) {
+            deleted = processUnbox(unboxNode, state, effects);
+        } else if (node instanceof RawLoadNode rawLoadNode) {
+            deleted = processUnsafeLoad(rawLoadNode, state, effects);
+        } else if (node instanceof RawStoreNode rawStoreNode) {
+            deleted = processUnsafeStore(rawStoreNode, state, effects);
         } else if (MemoryKill.isSingleMemoryKill(node)) {
             COUNTER_MEMORYCHECKPOINT.increment(node.getDebug());
             LocationIdentity identity = ((SingleMemoryKill) node).getKilledLocationIdentity();
-            processIdentity(state, identity);
+            processIdentity(state, identity, node instanceof Invoke);
         } else if (MemoryKill.isMultiMemoryKill(node)) {
             COUNTER_MEMORYCHECKPOINT.increment(node.getDebug());
             for (LocationIdentity identity : ((MultiMemoryKill) node).getKilledLocationIdentities()) {
-                processIdentity(state, identity);
+                processIdentity(state, identity, node instanceof Invoke);
             }
         }
 
@@ -147,8 +154,8 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
 
     private boolean processStore(FixedNode store, ValueNode object, LocationIdentity identity, int index, JavaKind accessKind, boolean overflowAccess, ValueNode value,
                     PEReadEliminationBlockState state, GraphEffectList effects) {
-        ValueNode unproxiedObject = GraphUtil.unproxify(object);
-        ValueNode cachedValue = state.getReadCache(object, identity, index, accessKind, this);
+        ValueNode unproxiedObject = GraphUtil.unproxify(getAlias(object));
+        ValueNode cachedValue = state.getReadCache(unproxiedObject, identity, index, accessKind, this);
 
         ValueNode finalValue = getScalarAlias(value);
         boolean result = false;
@@ -162,7 +169,7 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
     }
 
     private boolean processLoad(FixedNode load, ValueNode object, LocationIdentity identity, int index, JavaKind kind, PEReadEliminationBlockState state, GraphEffectList effects) {
-        ValueNode unproxiedObject = GraphUtil.unproxify(object);
+        ValueNode unproxiedObject = GraphUtil.unproxify(getAlias(object));
         ValueNode cachedValue = state.getReadCache(unproxiedObject, identity, index, kind, this);
         if (cachedValue != null) {
             // perform the read elimination
@@ -243,7 +250,7 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
                     state.killReadCache(location, index);
                 }
             } else {
-                processIdentity(state, location);
+                processIdentity(state, location, false);
             }
         } else {
             state.killReadCache();
@@ -269,7 +276,28 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
             state.killReadCache();
             return false;
         }
-        return processLoad(load, load.object(), new FieldLocationIdentity(load.field()), -1, load.field().getJavaKind(), state, effects);
+        if (load.field().isFinal()) {
+            ValueNode receiver = GraphUtil.unproxify(getAlias(load.object()));
+            ValueNode immutableAlias = state.getReadCache(receiver, new FieldLocationIdentity(load.field(), true), -1, load.field().getJavaKind(), this);
+            if (immutableAlias != null) {
+                effects.replaceAtUsages(load, immutableAlias, load);
+                addScalarAlias(load, immutableAlias);
+                return true;
+            }
+        }
+        return processLoad(load, load.object(), load.getLocationIdentity(), -1, load.field().getJavaKind(), state, effects);
+    }
+
+    /**
+     * Injects an aliasing relationship into the read cache.
+     */
+    private boolean processFieldAlias(FieldAliasNode fieldAliasNode, PEReadEliminationBlockState state) {
+        ValueNode receiver = GraphUtil.unproxify(fieldAliasNode.getReceiver());
+        LocationIdentity locationIdentity = fieldAliasNode.getLocationIdentity();
+        ValueNode cachedValue = state.getReadCache(receiver, locationIdentity, -1, fieldAliasNode.getField().getJavaKind(), this);
+        GraalError.guarantee(cachedValue == null, "FieldAliasNode %s should be inserted at the beginning of the method but there is an existing cached value %s", fieldAliasNode, cachedValue);
+        state.addReadCache(receiver, locationIdentity, -1, fieldAliasNode.getField().getJavaKind(), false, fieldAliasNode.getAlias(), this);
+        return false;
     }
 
     private boolean processStoreIndexed(StoreIndexedNode store, PEReadEliminationBlockState state, GraphEffectList effects) {
@@ -298,9 +326,9 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
         return processLoad(unbox, unbox.getValue(), UNBOX_LOCATIONS.get(unbox.getBoxingKind()), -1, unbox.getBoxingKind(), state, effects);
     }
 
-    private static void processIdentity(PEReadEliminationBlockState state, LocationIdentity identity) {
+    private static void processIdentity(PEReadEliminationBlockState state, LocationIdentity identity, boolean maybeKillImmutable) {
         if (identity.isAny()) {
-            state.killReadCache();
+            state.killReadCache(maybeKillImmutable);
         } else {
             state.killReadCache(identity, -1);
         }
@@ -441,6 +469,13 @@ public final class PEReadEliminationClosure extends PartialEscapeClosure<PEReadE
             values[0] = states.get(0).getReadCache(getPhiValueAt(phi, 0), identity, index, kind, PEReadEliminationClosure.this);
             if (values[0] != null) {
                 for (int i = 1; i < states.size(); i++) {
+                    ObjectState obj = getObjectState(states.get(i), getPhiValueAt(phi, i));
+                    if (obj != null && obj.isVirtual()) {
+                        // abort, the alias is still virtual and we cannot materialize it here
+                        // during read elimination
+                        return;
+                    }
+
                     ValueNode value = states.get(i).getReadCache(getPhiValueAt(phi, i), identity, index, kind, PEReadEliminationClosure.this);
                     // e.g. unsafe loads / stores with same identity and different access kinds see
                     // mergeReadCache(states)

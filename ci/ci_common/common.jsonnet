@@ -1,6 +1,7 @@
 # This file is only shared between the graal and graal-enterprise repositories.
 
 local common = import "../common.jsonnet";
+local utils = import "common-utils.libsonnet";
 local repo_config = import '../repo-configuration.libsonnet';
 
 common + common.frequencies + {
@@ -55,6 +56,13 @@ common + common.frequencies + {
         build + { "components" : components }
       for build in builds
     ],
+  # Add the specified components to the field `components`.
+  with_style_component(build)::
+    if std.objectHas(build, "name") && utils.contains(build.name, "-style-") then
+      $.with_components([build], ["style"])[0]
+    else
+      build
+    ,
 
   // Heap settings
   // *************
@@ -103,6 +111,11 @@ common + common.frequencies + {
   labsjdk21::            self["labsjdk-" + repo_config.graalvm_edition + "-21"],
   labsjdk21Debug::       self["labsjdk-" + repo_config.graalvm_edition + "-21Debug"],
   labsjdk21LLVM::        self["labsjdk-" + repo_config.graalvm_edition + "-21-llvm"],
+  graalvmee21::          self["graalvm-ee-21"],
+
+  labsjdk25::            self["labsjdk-" + repo_config.graalvm_edition + "-25"],
+  labsjdk25Debug::       self["labsjdk-" + repo_config.graalvm_edition + "-25Debug"],
+  labsjdk25LLVM::        self["labsjdk-" + repo_config.graalvm_edition + "-25-llvm"],
 
   labsjdkLatest::            self["labsjdk-" + repo_config.graalvm_edition + "-latest"],
   labsjdkLatestDebug::       self["labsjdk-" + repo_config.graalvm_edition + "-latestDebug"],
@@ -115,20 +128,19 @@ common + common.frequencies + {
       "*.bgv",
       "*/graal_dumps/*/*",
     ],
-    timelimit: "30:00",
   },
   local linux_deps_extras = {
     packages+: {
-      "apache/ant": ">=1.9.4",
+      "apache/ant": "==1.10.1",
     },
   },
 
   linux_amd64: common.linux_amd64 + graal_common_extras + linux_deps_extras,
+  linux_amd64_ol8: common.linux_amd64_ol8 + graal_common_extras + linux_deps_extras,
   linux_amd64_ol9: common.linux_amd64_ol9 + graal_common_extras + linux_deps_extras,
   linux_amd64_ubuntu: common.linux_amd64_ubuntu + graal_common_extras,
-  linux_aarch64: linux_deps_extras + common.linux_aarch64 + graal_common_extras,
-  linux_aarch64_ol9: linux_deps_extras + common.linux_aarch64_ol9 + graal_common_extras,
-  darwin_amd64: common.darwin_amd64 + graal_common_extras,
+  linux_aarch64: common.linux_aarch64 + graal_common_extras + linux_deps_extras,
+  linux_aarch64_ol9: common.linux_aarch64_ol9 + graal_common_extras + linux_deps_extras,
   darwin_aarch64: common.darwin_aarch64 + graal_common_extras,
   windows_amd64: common.windows_amd64 + graal_common_extras,
   windows_server_2016_amd64: common.windows_server_2016_amd64 + graal_common_extras,

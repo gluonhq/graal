@@ -45,7 +45,6 @@ import java.util.Map;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.interop.ArityException;
@@ -125,7 +124,7 @@ final class NFILibrary implements TruffleObject {
 
     @ExportMessage
     Object invokeMember(String symbol, Object[] args,
-                    @Bind("$node") Node node,
+                    @Bind Node node,
                     @CachedLibrary(limit = "3") InteropLibrary executables,
                     @Cached InlinedBranchProfile exception) throws UnknownIdentifierException, ArityException, UnsupportedTypeException, UnsupportedMessageException {
         Object preBound = findSymbol(symbol);
@@ -138,14 +137,14 @@ final class NFILibrary implements TruffleObject {
 
     @ExportMessage
     @SuppressWarnings("unused")
-    static boolean hasLanguage(NFILibrary lib) {
+    static boolean hasLanguageId(NFILibrary lib) {
         return true;
     }
 
     @ExportMessage
     @SuppressWarnings("unused")
-    static Class<? extends TruffleLanguage<?>> getLanguage(NFILibrary receiver) {
-        return NFILanguage.class;
+    static String getLanguageId(NFILibrary receiver) {
+        return NFILanguage.ID;
     }
 
     @ExportMessage
@@ -196,7 +195,7 @@ final class NFILibrary implements TruffleObject {
 
         @ExportMessage
         Object readArrayElement(long idx,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached InlinedBranchProfile exception) throws InvalidArrayIndexException {
             if (!isArrayElementReadable(idx)) {
                 exception.enter(node);
@@ -206,13 +205,13 @@ final class NFILibrary implements TruffleObject {
         }
 
         @ExportMessage
-        static boolean hasLanguage(@SuppressWarnings("unused") Keys receiver) {
+        static boolean hasLanguageId(@SuppressWarnings("unused") Keys receiver) {
             return true;
         }
 
         @ExportMessage
-        static Class<? extends TruffleLanguage<?>> getLanguage(@SuppressWarnings("unused") Keys receiver) {
-            return NFILanguage.class;
+        static String getLanguageId(@SuppressWarnings("unused") Keys receiver) {
+            return NFILanguage.ID;
         }
 
         @ExportMessage

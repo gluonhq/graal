@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,7 +38,7 @@ public class FormalParamTypeFlow extends TypeFlow<BytecodePosition> {
     protected final int position;
 
     public FormalParamTypeFlow(BytecodePosition sourcePosition, AnalysisType declaredType, int position) {
-        super(sourcePosition, filterUncheckedInterface(declaredType));
+        super(sourcePosition, dropUncheckedInterfaceBound(declaredType));
         this.position = position;
     }
 
@@ -52,8 +52,11 @@ public class FormalParamTypeFlow extends TypeFlow<BytecodePosition> {
         return new FormalParamTypeFlow(this, methodFlows);
     }
 
+    /**
+     * Filters the incoming type state using the declared type.
+     */
     @Override
-    public TypeState filter(PointsToAnalysis bb, TypeState newState) {
+    protected TypeState processInputState(PointsToAnalysis bb, TypeState newState) {
         /*
          * If the type flow constraints are relaxed filter the incoming value using the parameter's
          * declared type.
@@ -69,7 +72,7 @@ public class FormalParamTypeFlow extends TypeFlow<BytecodePosition> {
     public String format(boolean withState, boolean withSource) {
         return "Parameter " + position + " of " + method().format("%H.%n(%p)") +
                         (withSource ? " at " + formatSource() : "") +
-                        (withState ? " with state <" + getState() + ">" : "");
+                        (withState ? " with state <" + getStateDescription() + ">" : "");
     }
 
 }

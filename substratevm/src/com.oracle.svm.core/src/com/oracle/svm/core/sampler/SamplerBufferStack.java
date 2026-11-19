@@ -27,9 +27,9 @@ package com.oracle.svm.core.sampler;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
+import org.graalvm.word.impl.Word;
 
 /**
  * Holds a sequence of native memory buffers.
@@ -71,7 +71,7 @@ public class SamplerBufferStack {
             SamplerBuffer result = head;
             if (result.isNonNull()) {
                 head = head.getNext();
-                result.setNext(WordFactory.nullPointer());
+                result.setNext(Word.nullPointer());
             }
             return result;
         } finally {

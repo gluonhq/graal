@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,26 +25,44 @@
 
 package com.oracle.svm.core.graal.code;
 
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.graal.meta.TypeCheckInfoProvider;
+
 import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
-
-import com.oracle.svm.core.meta.SharedMethod;
-import com.oracle.svm.core.meta.SharedType;
-
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class SubstrateMetaAccessExtensionProvider implements MetaAccessExtensionProvider {
+    /**
+     * Returns this compilation's Native Image type-check policy. It belongs in this extension
+     * because generic compiler lowering does not consume Native Image hub metadata.
+     */
+    public TypeCheckInfoProvider getTypeCheckInfoProvider() {
+        return TypeCheckInfoProvider.DEFAULT;
+    }
 
+    /**
+     * Runtime-loaded bytecode may ask for a storage kind before its referenced type has been
+     * resolved into {@link SharedType} metadata. Keep the descriptor-derived kind in that case
+     * instead of forcing a premature {@link SharedType} cast.
+     */
     @Override
     public JavaKind getStorageKind(JavaType type) {
-        return ((SharedType) type).getStorageKind();
+        if (type instanceof SharedType sharedType) {
+            return sharedType.getStorageKind();
+        }
+        return type.getJavaKind();
     }
 
     @Override
     public boolean canConstantFoldDynamicAllocation(ResolvedJavaType type) {
-        return type != null && ((SharedType) type).getHub().isInstantiated();
+        return type != null && DynamicHubUtils.getHub((SharedType) type).isInstantiated();
     }
 
     @Override
@@ -75,7 +93,22 @@ public class SubstrateMetaAccessExtensionProvider implements MetaAccessExtension
     }
 
     @Override
+    public boolean isLambdaFormCompiled(ResolvedJavaMethod method) {
+        return ((SharedMethod) method).isLambdaFormCompiled();
+    }
+
+    @Override
     public boolean canVirtualize(ResolvedJavaType instanceType) {
         return true;
+    }
+
+    @Override
+    public ResolvedJavaField getStaticFieldForAccess(JavaConstant base, long offset, JavaKind accessKind) {
+        /*
+         * The base of unsafe static field accesses is not constant until low tier for SVM. See
+         * com.oracle.svm.core.StaticFieldsSupport for details on the static field base during
+         * analysis, compilation, and JIT compilation.
+         */
+        return null;
     }
 }

@@ -24,6 +24,7 @@
  */
 package com.oracle.svm.hosted.image;
 
+import java.io.PrintWriter;
 import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -31,17 +32,19 @@ import java.util.Map;
 
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapInstance;
+import com.oracle.graal.pointsto.heap.ImageHeapObjectArray;
 import com.oracle.graal.pointsto.util.AnalysisError;
-import com.oracle.svm.core.c.NonmovableArrays;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.hub.DynamicHubSupport;
+import com.oracle.svm.guest.staging.hub.DynamicHubSupport;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.hosted.HostedConfiguration;
 import com.oracle.svm.hosted.image.NativeImageHeap.ObjectInfo;
 import com.oracle.svm.hosted.meta.HostedField;
-import com.oracle.svm.util.LogUtils;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -53,13 +56,15 @@ public final class ObjectGroupHistogram {
     private final NativeImageHeap heap;
     private final Map<ObjectInfo, String> groups;
     private final Map<String, HeapHistogram> groupHistograms;
+    private final PrintWriter out;
 
-    public static void print(NativeImageHeap heap) {
-        new ObjectGroupHistogram(heap).doPrint();
+    public static void print(NativeImageHeap heap, PrintWriter out) {
+        new ObjectGroupHistogram(heap, out).doPrint();
     }
 
-    private ObjectGroupHistogram(NativeImageHeap heap) {
+    private ObjectGroupHistogram(NativeImageHeap heap, PrintWriter out) {
         this.heap = heap;
+        this.out = out;
         this.groups = new HashMap<>();
         this.groupHistograms = new LinkedHashMap<>();
     }
@@ -102,8 +107,8 @@ public final class ObjectGroupHistogram {
          * order in which types are prcessed matters.
          */
         processType(DynamicHub.class, "DynamicHub", true, null, ObjectGroupHistogram::filterDynamicHubField);
-        processObject(NonmovableArrays.getHostedArray(DynamicHubSupport.getReferenceMapEncoding()), "DynamicHub", true, null, null);
-        processObject(CodeInfoTable.getImageCodeCache(), "ImageCodeInfo", true, ObjectGroupHistogram::filterCodeInfoObjects, null);
+        processObject(DynamicHubSupport.currentLayer().getReferenceMapEncoding(), "DynamicHub", true, null, null);
+        processObject(CodeInfoTable.getCurrentLayerImageCodeCache(), "ImageCodeInfo", true, ObjectGroupHistogram::filterCodeInfoObjects, null);
 
         processObject(readTruffleRuntimeCompilationSupportField("graphEncoding"), "CompressedGraph", true, ObjectGroupHistogram::filterGraalSupportObjects, null);
         processObject(readTruffleRuntimeCompilationSupportField("graphObjects"), "CompressedGraph", true, ObjectGroupHistogram::filterGraalSupportObjects, null);
@@ -121,9 +126,9 @@ public final class ObjectGroupHistogram {
             /* Ignore. When we build an image without Graal support, the class is not present. */
         }
 
-        HeapHistogram totalHistogram = new HeapHistogram();
+        HeapHistogram totalHistogram = new HeapHistogram(out);
         for (ObjectInfo info : heap.getObjects()) {
-            if (info.getConstant().isInBaseLayer()) {
+            if (info.getConstant().isWrittenInPreviousLayer()) {
                 continue;
             }
             totalHistogram.add(info, info.getSize());
@@ -138,12 +143,12 @@ public final class ObjectGroupHistogram {
             entry.getValue().print();
         }
 
-        System.out.println();
-        System.out.println("=== Summary ===");
+        out.println();
+        out.println("=== Summary ===");
         for (Map.Entry<String, HeapHistogram> entry : groupHistograms.entrySet()) {
-            System.out.format("%s; %d; %d%n", entry.getKey(), entry.getValue().getTotalCount(), entry.getValue().getTotalSize());
+            out.format("%s; %d; %d%n", entry.getKey(), entry.getValue().getTotalCount(), entry.getValue().getTotalSize());
         }
-        System.out.format("%s; %d; %d%n", "Total", totalHistogram.getTotalCount(), totalHistogram.getTotalSize());
+        out.format("%s; %d; %d%n", "Total", totalHistogram.getTotalCount(), totalHistogram.getTotalSize());
     }
 
     private static Object readTruffleRuntimeCompilationSupportField(String name) {
@@ -159,7 +164,7 @@ public final class ObjectGroupHistogram {
 
     public void processType(Class<?> clazz, String group, boolean addObject, ObjectFilter objectFilter, FieldFilter fieldFilter) {
         for (ObjectInfo info : heap.getObjects()) {
-            if (!info.getConstant().isInBaseLayer() && clazz.isInstance(info.getObject())) {
+            if (!info.getConstant().isWrittenInPreviousLayer() && clazz.isInstance(info.getObject())) {
                 processObject(info, group, addObject, 1, objectFilter, fieldFilter);
             }
         }
@@ -181,8 +186,9 @@ public final class ObjectGroupHistogram {
 
     private void processObject(ObjectInfo info, String group, boolean addObject, int recursionLevel, ObjectFilter objectFilter, FieldFilter fieldFilter) {
         assert info != null;
-        if (info.getConstant().isInBaseLayer()) {
-            /* Base layer objects don't count towards current layer's statistics. */
+        ImageHeapConstant ihc = info.getConstant();
+        if (ihc.isWrittenInPreviousLayer()) {
+            /* Written base layer objects don't count towards current layer's statistics. */
             return;
         }
         if (objectFilter != null && !objectFilter.test(info, recursionLevel)) {
@@ -193,27 +199,27 @@ public final class ObjectGroupHistogram {
                 return;
             }
         }
-        if (info.getClazz().isInstanceClass()) {
-            JavaConstant con = heap.hUniverse.getSnippetReflection().forObject(info.getObject());
+
+        if (ihc instanceof ImageHeapInstance) {
             for (HostedField field : info.getClazz().getInstanceFields(true)) {
                 if (field.getType().getStorageKind() == JavaKind.Object && !HostedConfiguration.isInlinedField(field) && field.isAccessed()) {
                     if (fieldFilter == null || fieldFilter.test(info, field)) {
-                        JavaConstant fieldValue = heap.hConstantReflection.readFieldValue(field, con);
+                        JavaConstant fieldValue = heap.hConstantReflection.readFieldValue(field, ihc);
                         if (fieldValue.isNonNull()) {
                             processObject(heap.getConstantInfo(fieldValue), group, true, recursionLevel + 1, objectFilter, fieldFilter);
                         }
                     }
                 }
             }
-        } else if (info.getObject() instanceof Object[]) {
-            for (Object element : (Object[]) info.getObject()) {
-                if (element != null) {
-                    ObjectInfo elementInfo = heap.getObjectInfo(heap.aUniverse.replaceObject(element));
+        } else if (ihc instanceof ImageHeapObjectArray) {
+            heap.hConstantReflection.forEachArrayElement(ihc, (element, _) -> {
+                if (element.isNonNull()) {
+                    ObjectInfo elementInfo = heap.getConstantInfo(element);
                     if (elementInfo != null) {
                         processObject(elementInfo, group, true, recursionLevel + 1, objectFilter, fieldFilter);
                     }
                 }
-            }
+            });
         }
     }
 
@@ -222,7 +228,7 @@ public final class ObjectGroupHistogram {
             groups.put(info, group);
             HeapHistogram histogram = groupHistograms.get(group);
             if (histogram == null) {
-                histogram = new HeapHistogram();
+                histogram = new HeapHistogram(out);
                 groupHistograms.put(group, histogram);
             }
             histogram.add(info, info.getSize());

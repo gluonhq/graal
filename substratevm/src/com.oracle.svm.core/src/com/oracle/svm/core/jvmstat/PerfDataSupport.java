@@ -24,14 +24,30 @@
  */
 package com.oracle.svm.core.jvmstat;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CLongPointer;
 
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+import jdk.graal.compiler.api.replacements.Fold;
+
 public interface PerfDataSupport {
-    ByteBuffer attach(int lvmid);
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
+    static PerfDataSupport singleton() {
+        return ImageSingletons.lookup(PerfDataSupport.class);
+    }
+
+    /// Attaches to local or external performance data.
+    ByteBuffer attach(int lvmid) throws IOException;
 
     void detach(ByteBuffer bb);
 
@@ -48,6 +64,7 @@ public interface PerfDataSupport {
     boolean hasLong(String name);
 }
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class NoPerfDataSupport implements PerfDataSupport {
     @Platforms(Platform.HOSTED_ONLY.class)
     NoPerfDataSupport() {

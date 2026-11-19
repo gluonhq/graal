@@ -39,13 +39,14 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.impl.InternalPlatform;
 
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.svm.core.BuildArtifacts;
 import com.oracle.svm.core.BuildArtifacts.ArtifactType;
 import com.oracle.svm.core.LinkerInvocation;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.image.ImageHeapLayoutInfo;
 import com.oracle.svm.core.util.InterruptImageBuilding;
 import com.oracle.svm.hosted.DeadlockWatchdog;
 import com.oracle.svm.hosted.FeatureImpl.BeforeImageWriteAccessImpl;
@@ -55,15 +56,16 @@ import com.oracle.svm.hosted.c.util.FileUtils;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedUniverse;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.Indent;
 
 public abstract class NativeImageViaCC extends NativeImage {
 
-    public NativeImageViaCC(NativeImageKind k, HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap, NativeImageCodeCache codeCache,
-                    List<HostedMethod> entryPoints, ClassLoader imageClassLoader) {
-        super(k, universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, imageClassLoader);
+    public NativeImageViaCC(NativeImageKind k, HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap, ImageHeapLayoutInfo heapLayout,
+                    NativeImageCodeCache codeCache, List<HostedMethod> entryPoints, ClassLoader imageClassLoader) {
+        super(k, universe, metaAccess, nativeLibs, heap, heapLayout, codeCache, entryPoints, imageClassLoader);
     }
 
     private static List<String> diagnoseLinkerFailure(String linkerOutput) {
@@ -76,7 +78,7 @@ public abstract class NativeImageViaCC extends NativeImage {
         Pattern p = Pattern.compile(".*cannot find -l([^\\s]+)\\s.*", Pattern.DOTALL);
         Matcher m = p.matcher(linkerOutput);
         if (m.matches()) {
-            boolean targetWindows = Platform.includedIn(Platform.WINDOWS.class);
+            boolean targetWindows = Platform.includedIn(InternalPlatform.WINDOWS_BASE.class);
             String libPrefix = targetWindows ? "" : "lib";
             String libSuffix = targetWindows ? ".lib" : ".a";
             potentialCauses.add(String.format("It appears as though %s%s%s is missing. Please install it.", libPrefix, m.group(1), libSuffix));
@@ -85,11 +87,11 @@ public abstract class NativeImageViaCC extends NativeImage {
     }
 
     @Override
-    @SuppressWarnings("try")
     public LinkerInvocation write(DebugContext debug, Path outputDirectory, Path tempDirectory, String imageName, BeforeImageWriteAccessImpl config) {
-        try (Indent indent = debug.logAndIndent("Writing native image")) {
-            // 0. Free codecache to make space for writing the objectFile
+        try (Indent _ = debug.logAndIndent("Writing native image")) {
+            /* Release build metadata to make space for writing the object file. */
             codeCache.purge();
+            heap.releaseAfterImageWritePreparation();
 
             // 1. write the relocatable file
             write(debug, tempDirectory.resolve(imageName + ObjectFile.getFilenameSuffix()));
@@ -153,12 +155,15 @@ public abstract class NativeImageViaCC extends NativeImage {
                 String output = String.join(System.lineSeparator(), lines);
                 throw handleLinkerFailure("Linker command exited with " + status, commandLine, output);
             }
+            if (pecoffForwardRefs != null) {
+                inv.verifyLinkerOutput(lines, pecoffForwardRefs.getRecordedForwardReferenceSymbols());
+            }
 
             Path imagePath = inv.getOutputFile();
             imageFileSize = (int) imagePath.toFile().length();
             BuildArtifacts.singleton().add(kind.isExecutable ? ArtifactType.EXECUTABLE : kind.isImageLayer ? ArtifactType.IMAGE_LAYER : ArtifactType.SHARED_LIBRARY, imagePath);
 
-            if (Platform.includedIn(Platform.WINDOWS.class) && !kind.isExecutable) {
+            if (Platform.includedIn(InternalPlatform.WINDOWS_BASE.class) && !kind.isExecutable) {
                 /* Provide an import library for the built shared library. */
                 Path importLib = inv.getTempDirectory().resolve(imageName + ".lib");
                 Path importLibCopy = Files.copy(importLib, imagePath.resolveSibling(importLib.getFileName()), StandardCopyOption.REPLACE_EXISTING);
@@ -167,13 +172,13 @@ public abstract class NativeImageViaCC extends NativeImage {
 
             if (SubstrateOptions.useDebugInfoGeneration()) {
                 BuildArtifacts.singleton().add(ArtifactType.DEBUG_INFO, SubstrateOptions.getDebugInfoSourceCacheRoot());
-                Path svmDebugHelper = Path.of(System.getProperty("java.home"), "lib/svm/debug/gdb-debughelpers.py");
+                Path svmDebugHelper = Path.of(System.getProperty("java.home"), "lib", "svm", "debug", "gdb-debughelpers.py");
                 if (Files.exists(svmDebugHelper)) {
                     Path svmDebugHelperCopy = imagePath.resolveSibling(svmDebugHelper.getFileName());
                     Files.copy(svmDebugHelper, svmDebugHelperCopy, StandardCopyOption.REPLACE_EXISTING);
                     BuildArtifacts.singleton().add(ArtifactType.DEBUG_INFO, svmDebugHelperCopy);
                 }
-                if (Platform.includedIn(Platform.WINDOWS.class)) {
+                if (Platform.includedIn(InternalPlatform.WINDOWS_BASE.class)) {
                     BuildArtifacts.singleton().add(ArtifactType.DEBUG_INFO, imagePath.resolveSibling(imageName + ".pdb"));
                 } else if (!SubstrateOptions.StripDebugInfo.getValue()) {
                     BuildArtifacts.singleton().add(ArtifactType.DEBUG_INFO, imagePath);

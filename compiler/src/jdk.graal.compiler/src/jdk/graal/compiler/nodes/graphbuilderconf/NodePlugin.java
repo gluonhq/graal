@@ -29,6 +29,7 @@ import java.util.function.Supplier;
 import org.graalvm.collections.Pair;
 
 import jdk.graal.compiler.graph.Node.ValueNumberable;
+import jdk.graal.compiler.java.FrameStateBuilder;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.FrameState;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -241,12 +242,19 @@ public interface NodePlugin extends GraphBuilderPlugin {
      * The reason for this constraint is that when this plugin runs, it's inserting instructions
      * into a different block than the one currently being parsed.
      *
+     * Plugins may mutate {@code dispatchState}; those changes become visible to the dispatch target
+     * created after instrumentation, for example when an exception edge needs a branch-local local
+     * value.
+     *
      * @param graph the graph being parsed
+     * @param bci bytecode index of the throwing instruction
      * @param afterExceptionLoaded the last fixed node after loading the exception
+     * @param dispatchState frame state used for creating the exception dispatch target
      * @param frameStateFunction a helper that produces a FrameState suitable for deopt
      * @return the last fixed node after instrumentation
      */
-    default FixedWithNextNode instrumentExceptionDispatch(StructuredGraph graph, FixedWithNextNode afterExceptionLoaded, Supplier<FrameState> frameStateFunction) {
+    default FixedWithNextNode instrumentExceptionDispatch(StructuredGraph graph, int bci, FixedWithNextNode afterExceptionLoaded, FrameStateBuilder dispatchState,
+                    Supplier<FrameState> frameStateFunction) {
         return afterExceptionLoaded;
     }
 

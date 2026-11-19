@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,7 +27,11 @@ package jdk.graal.compiler.core.common;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
+import jdk.graal.compiler.core.common.type.IntegerStamp;
+import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.nodes.NodeView;
+import jdk.graal.compiler.nodes.ValueNode;
 import jdk.vm.ci.code.CodeUtil;
 
 /**
@@ -113,8 +117,15 @@ public class NumUtil {
         return (byte) v;
     }
 
-    public static byte safeToByte(int v) {
+    public static byte safeToByte(long v) {
         assert isByte(v);
+        return (byte) v;
+    }
+
+    public static byte safeToByteAE(long v) {
+        if (!isByte(v)) {
+            throw new ArithmeticException(String.format("%s is not a byte", v));
+        }
         return (byte) v;
     }
 
@@ -123,8 +134,16 @@ public class NumUtil {
         return (short) v;
     }
 
-    public static short safeToShort(int v) {
+    public static short safeToShort(long v) {
         assert isShort(v);
+        return (short) v;
+
+    }
+
+    public static short safeToShortAE(long v) {
+        if (!isShort(v)) {
+            throw new ArithmeticException(String.format("%s is not a short", v));
+        }
         return (short) v;
     }
 
@@ -135,6 +154,13 @@ public class NumUtil {
 
     public static int safeToInt(long v) {
         assert isInt(v);
+        return (int) v;
+    }
+
+    public static int safeToIntAE(long v) {
+        if (!isInt(v)) {
+            throw new ArithmeticException(String.format("%s is not an int", v));
+        }
         return (int) v;
     }
 
@@ -237,6 +263,67 @@ public class NumUtil {
         return b;
     }
 
+    /**
+     * Adds two signed integer values with {@code bits} bits and clamps the mathematical result to
+     * the signed value range.
+     */
+    public static long addSaturatingSigned(int bits, long a, long b) {
+        GraalError.guarantee(bits > 0 && bits <= Long.SIZE, "invalid bit count %s", bits);
+        if (bits == Long.SIZE) {
+            long sum = a + b;
+            if (((a ^ sum) & (b ^ sum)) < 0) {
+                return sum < 0 ? Long.MAX_VALUE : Long.MIN_VALUE;
+            }
+            return sum;
+        }
+        long sum = CodeUtil.signExtend(a, bits) + CodeUtil.signExtend(b, bits);
+        return Math.max(minValue(bits), Math.min(maxValue(bits), sum));
+    }
+
+    /**
+     * Subtracts two signed integer values with {@code bits} bits and clamps the mathematical result
+     * to the signed value range.
+     */
+    public static long subSaturatingSigned(int bits, long a, long b) {
+        GraalError.guarantee(bits > 0 && bits <= Long.SIZE, "invalid bit count %s", bits);
+        if (bits == Long.SIZE) {
+            long diff = a - b;
+            if (((a ^ b) & (a ^ diff)) < 0) {
+                return a < 0 ? Long.MIN_VALUE : Long.MAX_VALUE;
+            }
+            return diff;
+        }
+        long diff = CodeUtil.signExtend(a, bits) - CodeUtil.signExtend(b, bits);
+        return Math.max(minValue(bits), Math.min(maxValue(bits), diff));
+    }
+
+    /**
+     * Adds two unsigned integer values with {@code bits} bits and clamps the mathematical result to
+     * the unsigned value range.
+     */
+    public static long addSaturatingUnsigned(int bits, long a, long b) {
+        GraalError.guarantee(bits > 0 && bits <= Long.SIZE, "invalid bit count %s", bits);
+        if (bits == Long.SIZE) {
+            long sum = a + b;
+            return Long.compareUnsigned(sum, a) < 0 ? -1L : sum;
+        }
+        long x = CodeUtil.zeroExtend(a, bits);
+        long y = CodeUtil.zeroExtend(b, bits);
+        long max = maxValueUnsigned(bits);
+        return Long.compareUnsigned(max - x, y) < 0 ? max : x + y;
+    }
+
+    /**
+     * Subtracts two unsigned integer values with {@code bits} bits and clamps the mathematical
+     * result to the unsigned value range.
+     */
+    public static long subSaturatingUnsigned(int bits, long a, long b) {
+        GraalError.guarantee(bits > 0 && bits <= Long.SIZE, "invalid bit count %s", bits);
+        long x = bits == Long.SIZE ? a : CodeUtil.zeroExtend(a, bits);
+        long y = bits == Long.SIZE ? b : CodeUtil.zeroExtend(b, bits);
+        return Long.compareUnsigned(x, y) < 0 ? 0 : x - y;
+    }
+
     public static boolean sameSign(long a, long b) {
         return a < 0 == b < 0;
     }
@@ -298,16 +385,6 @@ public class NumUtil {
         return new String(hexChars, StandardCharsets.UTF_8);
     }
 
-    public static long addExact(long a, long b, int bits) {
-        if (bits == 32) {
-            return Math.addExact((int) a, (int) b);
-        } else if (bits == 64) {
-            return Math.addExact(a, b);
-        } else {
-            throw GraalError.shouldNotReachHere("Must be one of java's core datatypes int/long but is " + bits);
-        }
-    }
-
     /**
      * Ensure the supplied double is a finite, positive number.
      */
@@ -362,4 +439,121 @@ public class NumUtil {
         return s.substring(0, s.length() - 1) + ", ...]";
     }
 
+    /**
+     * Determines if the absolute value of {@code l} overflows. The bit size is derived from the
+     * {@link Stamp} of {@code v}.
+     */
+    public static boolean absOverflows(long l, ValueNode v) {
+        return absOverflows(l, IntegerStamp.getBits(v.stamp(NodeView.DEFAULT)));
+    }
+
+    /**
+     * Determines if the absolute value of {@code l} overflows.
+     */
+    public static boolean absOverflows(long l, int bits) {
+        if (bits == 8) {
+            final byte b = (byte) l;
+            return b == Byte.MIN_VALUE;
+        } else if (bits == 16) {
+            final short s = (short) l;
+            return s == Short.MIN_VALUE;
+        } else if (bits == 32) {
+            final int i = (int) l;
+            return i == Integer.MIN_VALUE;
+        } else if (bits == 64) {
+            return l == Long.MIN_VALUE;
+        } else {
+            throw GraalError.shouldNotReachHere("Must be one of java's core datatypes but is " + bits);
+        }
+    }
+
+    public static long safeAbs(long l, ValueNode v) throws ArithmeticException {
+        return safeAbs(l, IntegerStamp.getBits(v.stamp(NodeView.DEFAULT)));
+    }
+
+    public static long safeAbs(long l) throws ArithmeticException {
+        return safeAbs(l, 64);
+    }
+
+    public static int safeAbs(int i) throws ArithmeticException {
+        return NumUtil.safeToInt(safeAbs(i, 32));
+    }
+
+    /**
+     * Returns {@link Math#absExact} for {@code l}, throws an {@link ArithmeticException} in case of
+     * overflow.
+     */
+    public static long safeAbs(long l, int bits) throws ArithmeticException {
+        if (bits == 8) {
+            final byte b = (byte) l;
+            if (b == Byte.MIN_VALUE) {
+                throw new ArithmeticException("integer overflow");
+            }
+            return Math.absExact(b);
+        } else if (bits == 16) {
+            final short s = (short) l;
+            if (s == Short.MIN_VALUE) {
+                throw new ArithmeticException("integer overflow");
+            }
+            return Math.absExact(s);
+        } else if (bits == 32) {
+            final int i = (int) l;
+            return Math.absExact(i);
+        } else if (bits == 64) {
+            return Math.absExact(l);
+        } else {
+            throw GraalError.shouldNotReachHere("Must be one of java's core datatypes but is " + bits);
+        }
+    }
+
+    /**
+     * Returns {@link Math#abs} for {@code i}. Does NOT throw an {@link ArithmeticException} in case
+     * of overflow. Only use this method if overflow is handled/accepted by the caller.
+     */
+    public static int unsafeAbs(int i) {
+        return Math.abs(i);
+    }
+
+    /**
+     * Returns {@link Math#abs} for {@code i}. Does NOT throw an {@link ArithmeticException} in case
+     * of overflow. Only use this method if overflow is handled/accepted by the caller.
+     */
+    public static long unsafeAbs(long l) {
+        return Math.abs(l);
+    }
+
+    /**
+     * Converts the double value to unsigned long, rounding toward zero.
+     */
+    public static long toUnsignedLong(double value) {
+        if (value >= 0x1p63) {
+            return (long) (value - 0x1p63) + Long.MIN_VALUE;
+        } else if (value >= 0) {
+            return (long) value;
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     * Converts the unsigned long value to the nearest double value.
+     */
+    public static double unsignedToDouble(long value) {
+        if (value >= 0) {
+            return value;
+        } else {
+            return ((value >>> 1) | (value & 1)) * 2.0;
+        }
+    }
+
+    /**
+     * Converts the unsigned long value to the nearest float value.
+     */
+    public static float unsignedToFloat(long value) {
+        if (value >= 0) {
+            return value;
+        } else {
+            return ((value >>> 1) | (value & 1)) * 2.0f;
+        }
+    }
 }

@@ -4,8 +4,9 @@
   local linux_amd64 = common.linux_amd64,
 
   local javadoc_publisher = {
-    name: 'graal-publish-javadoc-' + utils.prefixed_jdk(self.jdk_version),
+    name: 'graal-publish-javadoc-' + self.jdk_name,
     run+: [
+      ["bash", "-c", "git rev-parse --abbrev-ref HEAD | grep -Eq '^(master|release/)' || { echo 'This job only runs on master or release/* branches'; exit 1; }"],
       ["cd", "./sdk"],
       ["mx", "build"],
       ["mx", "javadoc"],
@@ -20,7 +21,7 @@
       ["zip", "-r", "javadoc.zip", "javadoc"],
       ["cd", "../compiler"],
       ["mx", "build"],
-      ["mx", "javadoc", "--projects", "jdk.graal.compiler", "--packages", "jdk.graal.compiler.graphio,org.graalvm.word,org.graalvm.collections,com.oracle.truffle.compiler"],
+      ["mx", "javadoc", "--projects", "jdk.graal.compiler", "--packages", "jdk.graal.compiler.graphio,jdk.graal.compiler.options,org.graalvm.word,org.graalvm.collections,com.oracle.truffle.compiler,org.graalvm.nativeimage,com.oracle.svm.core.annotate"],
       ["cd", "src/jdk.graal.compiler/"],
       ["zip", "-r", "../../graphio-javadoc.zip", "javadoc"],
       ["cd", "../../.."],
@@ -59,7 +60,8 @@
   },
 
   local all_builds = [
-    common.post_merge + linux_amd64 + common.labsjdk21 + javadoc_publisher,
+    # Should be `ondemand` in release breanches
+    common.daily + linux_amd64 + common.labsjdkLatest + javadoc_publisher,
   ],
   // adds a "defined_in" field to all builds mentioning the location of this current file
   builds:: utils.add_defined_in(all_builds, std.thisFile),

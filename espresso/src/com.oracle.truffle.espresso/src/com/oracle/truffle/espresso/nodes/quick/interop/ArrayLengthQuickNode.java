@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,11 +20,10 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.nodes.quick.interop;
 
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.espresso.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.classfile.bytecode.Bytecodes;
 import com.oracle.truffle.espresso.nodes.EspressoFrame;
 import com.oracle.truffle.espresso.nodes.bytecodes.ArrayLength;
 import com.oracle.truffle.espresso.nodes.bytecodes.ArrayLengthFactory;
@@ -48,7 +47,7 @@ public final class ArrayLengthQuickNode extends QuickNode {
     @Override
     public int execute(VirtualFrame frame, boolean isContinuationResume) {
         StaticObject array = nullCheck(EspressoFrame.popObject(frame, top - 1));
-        EspressoFrame.putInt(frame, top - 1, arrayLength.execute(array));
+        EspressoFrame.putInt(frame, top - 1, arrayLength.executeAsInt(array));
         return stackEffectOf_ARRAYLENGTH;
     }
 }

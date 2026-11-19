@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,22 +44,28 @@ import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.util.Arrays;
 
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+
 public interface ReflectionRegistry {
-    default void register(ConfigurationCondition condition, Class<?>... classes) {
+    default void register(AccessCondition condition, Class<?>... classes) {
         Arrays.stream(classes).forEach(clazz -> register(condition, false, clazz));
     }
 
-    void register(ConfigurationCondition condition, boolean unsafeAllocated, Class<?> clazz);
+    void register(AccessCondition condition, boolean preserved, Class<?> clazz);
 
-    void register(ConfigurationCondition condition, boolean queriedOnly, Executable... methods);
+    default void register(AccessCondition condition, boolean preserved, Executable... methods) {
+        Arrays.stream(methods).forEach(method -> register(condition, preserved, method));
+    }
 
-    void register(ConfigurationCondition condition, boolean finalIsWritable, Field... fields);
+    void register(AccessCondition condition, boolean preserved, Executable methods);
 
-    void registerClassLookup(ConfigurationCondition condition, String typeName);
+    default void register(AccessCondition condition, boolean finalIsWritable, boolean preserved, Field... fields) {
+        Arrays.stream(fields).forEach(field -> register(condition, finalIsWritable, preserved, field));
+    }
 
-    void registerFieldLookup(ConfigurationCondition condition, Class<?> declaringClass, String fieldName);
+    void register(AccessCondition condition, boolean finalIsWritable, boolean preserved, Field fields);
 
-    void registerMethodLookup(ConfigurationCondition condition, Class<?> declaringClass, String methodName, Class<?>... parameterTypes);
+    void registerClassLookup(AccessCondition condition, boolean preserved, String typeName);
 
-    void registerConstructorLookup(ConfigurationCondition condition, Class<?> declaringClass, Class<?>... parameterTypes);
+    void registerFieldLookup(AccessCondition condition, boolean preserved, Class<?> declaringClass, String fieldName);
 }

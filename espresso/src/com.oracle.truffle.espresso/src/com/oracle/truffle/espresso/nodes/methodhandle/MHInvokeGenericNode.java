@@ -26,19 +26,19 @@ import static com.oracle.truffle.espresso.classfile.Constants.REF_invokeVirtual;
 
 import com.oracle.truffle.api.nodes.DirectCallNode;
 import com.oracle.truffle.espresso.EspressoLanguage;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Signature;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Signature;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
 import com.oracle.truffle.espresso.impl.Method;
 import com.oracle.truffle.espresso.impl.ObjectKlass;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 /**
  * Orchestrates the semantics of invoke and invoke exacts, and newer polymorphic signature methods
  * (eg: VarHandle.get(), ...).
- * 
+ *
  * Creating a call site for such a method goes to java code to create an invoker method that
  * implements type checking and the actual invocation of the payload. This node is basically a
  * bridge to the actual work.
@@ -48,17 +48,16 @@ public class MHInvokeGenericNode extends MethodHandleIntrinsicNode {
     private final boolean unbasic;
     @Child private DirectCallNode callNode;
 
-    public MHInvokeGenericNode(Method method, StaticObject memberName, StaticObject appendix) {
+    public MHInvokeGenericNode(Method method, MethodHandleInvoker invoker) {
         super(method);
-        this.appendix = appendix;
-        Method target = (Method) method.getMeta().HIDDEN_VMTARGET.getHiddenObject(memberName);
+        this.appendix = invoker.appendix;
         // Call the invoker java code spun for us.
         if (method.getContext().getEspressoEnv().SplitMethodHandles) {
-            this.callNode = DirectCallNode.create(target.forceSplit().getCallTarget());
+            this.callNode = DirectCallNode.create(invoker.method.forceSplit().getCallTarget());
         } else {
-            this.callNode = DirectCallNode.create(target.getCallTarget());
+            this.callNode = DirectCallNode.create(invoker.method.getCallTarget());
         }
-        this.unbasic = target.getReturnKind() != method.getReturnKind();
+        this.unbasic = invoker.unbasic;
     }
 
     @Override
@@ -69,17 +68,24 @@ public class MHInvokeGenericNode extends MethodHandleIntrinsicNode {
         return callNode.call(args);
     }
 
-    public static MHInvokeGenericNode create(EspressoLanguage language, Meta meta, ObjectKlass accessingKlass, Method method, Symbol<Name> methodName, Symbol<Signature> signature) {
+    public static MHInvokeGenericNode create(Method method, MethodHandleInvoker invoker) {
+        return new MHInvokeGenericNode(method, invoker);
+    }
+
+    public record MethodHandleInvoker(Method method, StaticObject appendix, boolean unbasic) {
+    }
+
+    public static MethodHandleInvoker linkMethod(EspressoLanguage language, Meta meta, ObjectKlass accessingKlass, Method method, Symbol<Name> methodName, Symbol<Signature> signature) {
         ObjectKlass callerKlass = accessingKlass == null ? meta.java_lang_Object : accessingKlass;
         StaticObject appendixBox = StaticObject.createArray(meta.java_lang_Object_array, new StaticObject[1], meta.getContext());
         // Ask java code to spin an invoker for us.
-        StaticObject memberName = (StaticObject) meta.java_lang_invoke_MethodHandleNatives_linkMethod.invokeDirect(
-                        null,
+        StaticObject memberName = (StaticObject) meta.java_lang_invoke_MethodHandleNatives_linkMethod.invokeDirectStatic(
                         callerKlass.mirror(), (int) REF_invokeVirtual,
                         method.getDeclaringKlass().mirror(), meta.toGuestString(methodName), meta.toGuestString(signature),
                         appendixBox);
         StaticObject appendix = appendixBox.get(language, 0);
-        return new MHInvokeGenericNode(method, memberName, appendix);
+        Method target = (Method) method.getMeta().java_lang_invoke_MemberName_0vmTarget.getHiddenObject(memberName);
+        return new MethodHandleInvoker(target, appendix, target.getReturnKind() != method.getReturnKind());
     }
 
     @Override

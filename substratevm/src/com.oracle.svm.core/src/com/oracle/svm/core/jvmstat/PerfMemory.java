@@ -35,18 +35,20 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.LocationIdentity;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.jdk.DirectByteBufferUtil;
 import com.oracle.svm.core.jdk.Target_java_nio_Buffer;
 import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.nmt.NmtCategory;
-
-import jdk.graal.compiler.word.Word;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 /**
  * Provides access to the underlying OS-specific memory that stores the performance data.
@@ -56,6 +58,7 @@ import jdk.graal.compiler.word.Word;
  * performance data counter (i.e., we read the counter value, increment it, and write it back to the
  * same memory location).
  */
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class PerfMemory {
     private static final CGlobalData<Pointer> PERF_DATA_ISOLATE = CGlobalDataFactory.createWord();
 
@@ -112,7 +115,7 @@ public class PerfMemory {
         memoryProvider = m;
         buffer = b;
         capacity = b.capacity();
-        rawMemory = WordFactory.pointer(SubstrateUtil.cast(b, Target_java_nio_Buffer.class).address);
+        rawMemory = Word.pointer(SubstrateUtil.cast(b, Target_java_nio_Buffer.class).address);
 
         assert verifyRawMemoryAccess();
 
@@ -193,7 +196,7 @@ public class PerfMemory {
     public void teardown() {
         if (buffer != null) {
             buffer = null;
-            rawMemory = WordFactory.zero();
+            rawMemory = Word.zero();
             capacity = 0;
             used = 0;
         }
@@ -213,13 +216,13 @@ public class PerfMemory {
 
     private static boolean tryAcquirePerfDataFile() {
         Pointer perfDataIsolatePtr = PERF_DATA_ISOLATE.get();
-        return perfDataIsolatePtr.logicCompareAndSwapWord(0, WordFactory.nullPointer(), CurrentIsolate.getIsolate(), LocationIdentity.ANY_LOCATION);
+        return perfDataIsolatePtr.logicCompareAndSwapWord(0, Word.nullPointer(), CurrentIsolate.getIsolate(), LocationIdentity.ANY_LOCATION);
     }
 
     private static void releasePerfDataFile() {
         Pointer perfDataIsolatePtr = PERF_DATA_ISOLATE.get();
         if (perfDataIsolatePtr.readWord(0) == CurrentIsolate.getIsolate()) {
-            perfDataIsolatePtr.writeWord(0, WordFactory.nullPointer());
+            perfDataIsolatePtr.writeWord(0, Word.nullPointer());
         }
     }
 }

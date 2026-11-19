@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -54,6 +54,8 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Collection;
@@ -64,6 +66,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.interop.HeapIsolationException;
 import org.graalvm.polyglot.HostAccess.MutableTargetMapping;
 import org.graalvm.polyglot.Value;
 
@@ -80,6 +84,7 @@ import com.oracle.truffle.api.dsl.InlineSupport.StateField;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
+import com.oracle.truffle.api.interop.InvalidBufferOffsetException;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.CachedLibrary;
@@ -116,11 +121,12 @@ abstract class HostToTypeNode extends Node {
 
     static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
-    public abstract Object execute(Node node, HostContext context, Object value, Class<?> targetType, Type genericType, boolean useTargetMapping);
+    // Keep the context untyped so primitive conversions can eliminate the caller's context lookup.
+    public abstract Object execute(Node node, Object context, Object value, Class<?> targetType, Type genericType, boolean useTargetMapping);
 
     @SuppressWarnings("unused")
     @Specialization(guards = {"targetType == cachedTargetType"}, limit = "LIMIT")
-    protected static Object doCached(Node node, HostContext context,
+    protected static Object doCached(Node node, Object context,
                     Object operand,
                     Class<?> targetType,
                     Type genericType,
@@ -128,29 +134,36 @@ abstract class HostToTypeNode extends Node {
                     @CachedLibrary("operand") InteropLibrary interop,
                     @Cached("targetType") Class<?> cachedTargetType,
                     @Cached("isPrimitiveOrBigIntegerTarget(context, cachedTargetType)") boolean primitiveOrBigIntegerTarget,
-                    @Cached("allowsImplementation(context, targetType)") boolean allowsImplementation,
+                    @Cached("allowsImplementation(context, cachedTargetType)") boolean allowsImplementation,
+                    @Cached("hasTargetMappings(context, cachedTargetType)") boolean hasTargetMappings,
                     @Cached HostTargetMappingNode targetMapping,
                     @Cached InlinedBranchProfile error) {
-        return convertImpl(node, operand, cachedTargetType, genericType, allowsImplementation, primitiveOrBigIntegerTarget, context, interop, useCustomTargetTypes, targetMapping, error);
+        return convertImpl(node, operand, cachedTargetType, genericType, allowsImplementation, primitiveOrBigIntegerTarget, context, interop,
+                        useCustomTargetTypes && hasTargetMappings, targetMapping, error);
     }
 
     @TruffleBoundary
-    static boolean allowsImplementation(HostContext hostContext, Class<?> type) {
+    static boolean allowsImplementation(Object hostContext, Class<?> type) {
         if (hostContext == null) {
             return false;
         }
         if (!HostInteropReflect.isAbstractType(type)) {
             return false;
         }
-        HostClassDesc classDesc = hostContext.getHostClassCache().forClass(type);
+        HostClassDesc classDesc = ((HostContext) hostContext).getHostClassCache().forClass(type);
         return classDesc.isAllowsImplementation() && classDesc.isAllowedTargetType();
+    }
+
+    @TruffleBoundary
+    static boolean hasTargetMappings(Object context, Class<?> targetType) {
+        return HostTargetMappingNode.getMappings((HostContext) context, targetType).length != 0;
     }
 
     @Specialization(replaces = "doCached")
     @TruffleBoundary
     protected static Object doGeneric(
                     Node node,
-                    HostContext context,
+                    Object context,
                     Object operand,
                     Class<?> targetType, Type genericType,
                     boolean useTargetMapping) {
@@ -168,9 +181,9 @@ abstract class HostToTypeNode extends Node {
     }
 
     private static Object convertImpl(Node node, Object value, Class<?> targetType, Type genericType, boolean allowsImplementation, boolean primitiveOrBigIntegerTargetType,
-                    HostContext context, InteropLibrary interop, boolean useCustomTargetTypes, HostTargetMappingNode targetMapping, InlinedBranchProfile error) {
+                    Object hostContext, InteropLibrary interop, boolean useCustomTargetTypes, HostTargetMappingNode targetMapping, InlinedBranchProfile error) {
         if (useCustomTargetTypes) {
-            Object result = targetMapping.execute(node, value, targetType, context, interop, false, HIGHEST, STRICT);
+            Object result = targetMapping.execute(node, value, targetType, (HostContext) hostContext, interop, false, HIGHEST, STRICT);
             if (result != HostTargetMappingNode.NO_RESULT) {
                 return result;
             }
@@ -182,9 +195,12 @@ abstract class HostToTypeNode extends Node {
                 return convertedValue;
             }
         }
-        HostLanguage language = HostLanguage.get(interop);
-        if (HostObject.isJavaInstance(language, targetType, value)) {
-            return HostObject.valueOf(language, value);
+
+        // Primitive conversion does not need a host context when there are no target mappings.
+        HostContext context = (HostContext) hostContext;
+        Object hostValue;
+        if ((hostValue = toJavaInstance(value, targetType, interop)) != null) {
+            return hostValue;
         }
 
         if (useCustomTargetTypes) {
@@ -200,6 +216,8 @@ abstract class HostToTypeNode extends Node {
                 return convertedValue;
             }
         }
+
+        HostLanguage language = HostLanguage.get(interop);
         if (targetType == language.valueClass && context != null) {
             return language.valueClass.isInstance(value) ? value : context.asValue(interop, value);
         } else if (interop.isNull(value)) {
@@ -208,7 +226,7 @@ abstract class HostToTypeNode extends Node {
             }
             return null;
         } else if (value instanceof TruffleObject) {
-            convertedValue = asJavaObject(node, context, (TruffleObject) value, targetType, genericType, allowsImplementation);
+            convertedValue = asJavaObject(node, context, value, targetType, genericType, allowsImplementation);
             if (convertedValue != null) {
                 return convertedValue;
             }
@@ -254,13 +272,13 @@ abstract class HostToTypeNode extends Node {
             return false;
         }
 
-        HostLanguage language = HostLanguage.get(interop);
+        HostLanguage language = hostContext != null ? HostLanguage.get(interop) : null;
         if (interop.isNull(value)) {
             if (targetType.isPrimitive()) {
                 return false;
             }
             return true;
-        } else if (targetType == language.valueClass && hostContext != null) {
+        } else if (language != null && targetType == language.valueClass && hostContext != null) {
             return true;
         } else if (isPrimitiveOrBigIntegerTarget(hostContext, targetType)) {
             Object convertedValue = HostUtil.convertLossLess(value, targetType, interop);
@@ -268,7 +286,7 @@ abstract class HostToTypeNode extends Node {
                 return true;
             }
         }
-        if (HostObject.isJavaInstance(language, targetType, value)) {
+        if (toJavaInstance(value, targetType, interop) != null) {
             return true;
         }
 
@@ -292,13 +310,15 @@ abstract class HostToTypeNode extends Node {
             return interop.isTime(value);
         } else if (targetType == LocalDateTime.class) {
             return interop.isDate(value) && interop.isTime(value);
-        } else if (targetType == ZonedDateTime.class || targetType == Date.class || targetType == Instant.class) {
+        } else if (targetType == ZonedDateTime.class || targetType == OffsetDateTime.class || targetType == Date.class || targetType == Instant.class) {
             return interop.isInstant(value);
+        } else if (targetType == OffsetTime.class) {
+            return interop.isTime(value) && interop.isTimeZone(value);
         } else if (targetType == ZoneId.class) {
             return interop.isTimeZone(value);
         } else if (targetType == Duration.class) {
             return interop.isDuration(value);
-        } else if (targetType == language.polyglotExceptionClass) {
+        } else if (language != null && targetType == language.polyglotExceptionClass) {
             return interop.isException(value);
         }
 
@@ -316,7 +336,7 @@ abstract class HostToTypeNode extends Node {
         }
 
         if (value instanceof TruffleObject) {
-            if (priority < HOST_PROXY && HostObject.isInstance(language, value)) {
+            if (priority < HOST_PROXY && interop.isHostObject(value)) {
                 return false;
             } else {
                 if (priority >= FUNCTION_PROXY && HostInteropReflect.isFunctionalInterface(targetType) &&
@@ -359,8 +379,8 @@ abstract class HostToTypeNode extends Node {
                         CharSequence.class.isAssignableFrom(clazz);
     }
 
-    static boolean isPrimitiveOrBigIntegerTarget(HostContext context, Class<?> clazz) {
-        return isPrimitiveTarget(clazz) || (isBigIntegerNumberAccess(context) && clazz == BigInteger.class);
+    static boolean isPrimitiveOrBigIntegerTarget(Object context, Class<?> clazz) {
+        return isPrimitiveTarget(clazz) || (isBigIntegerNumberAccess((HostContext) context) && clazz == BigInteger.class);
     }
 
     static boolean isBigIntegerNumberAccess(HostContext context) {
@@ -426,8 +446,9 @@ abstract class HostToTypeNode extends Node {
         InteropLibrary interop = InteropLibrary.getFactory().getUncached(value);
         assert !interop.isNull(value); // already handled
         Object obj;
-        if (HostObject.isJavaInstance(hostContext.language, targetType, value)) {
-            obj = HostObject.valueOf(hostContext.language, value);
+        Object hostObject = toJavaInstance(value, targetType, interop);
+        if (hostObject != null) {
+            obj = hostObject;
         } else if (targetType == Object.class) {
             obj = convertToObject(node, hostContext, value, interop);
         } else if (targetType == List.class || targetType == Collection.class) {
@@ -488,7 +509,7 @@ abstract class HostToTypeNode extends Node {
                 throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must be executable or instantiable.");
             }
         } else if (targetType.isArray()) {
-            if (interop.hasArrayElements(value)) {
+            if (interop.hasArrayElements(value) || (targetType == byte[].class && interop.hasBufferElements(value))) {
                 obj = truffleObjectToArray(hostContext, interop, value, targetType, genericType);
             } else {
                 throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have array elements.");
@@ -496,10 +517,10 @@ abstract class HostToTypeNode extends Node {
         } else if (targetType == hostContext.language.byteSequenceClass) {
             if (interop.hasBufferElements(value)) {
                 try {
-                    if (interop.getBufferSize(value) <= MAX_ARRAY_SIZE) {
+                    if (interop.getBufferSize(value) <= Integer.MAX_VALUE) {
                         obj = hostContext.language.access.toByteSequence(hostContext.internalContext, value);
                     } else {
-                        throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have buffer elements with maximum total size " + MAX_ARRAY_SIZE + " bytes.");
+                        throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have buffer elements with maximum total size " + Integer.MAX_VALUE + " bytes.");
                     }
                 } catch (UnsupportedMessageException e) {
                     throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have buffer elements with known total size.");
@@ -541,7 +562,7 @@ abstract class HostToTypeNode extends Node {
             } else {
                 throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have date and time information.");
             }
-        } else if (targetType == ZonedDateTime.class) {
+        } else if (targetType == ZonedDateTime.class || targetType == OffsetDateTime.class) {
             if (interop.isDate(value) && interop.isTime(value) && interop.isTimeZone(value)) {
                 LocalDate date;
                 LocalTime time;
@@ -553,9 +574,28 @@ abstract class HostToTypeNode extends Node {
                 } catch (UnsupportedMessageException e) {
                     throw shouldNotReachHere(e);
                 }
-                obj = createZonedDateTime(date, time, timeZone);
+                ZonedDateTime zonedDateTime = createZonedDateTime(date, time, timeZone);
+                obj = targetType == OffsetDateTime.class ? zonedDateTime.toOffsetDateTime() : zonedDateTime;
             } else {
                 throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have date, time and time-zone information.");
+            }
+        } else if (targetType == OffsetTime.class) {
+            if (interop.isTime(value) && interop.isTimeZone(value)) {
+                LocalTime time;
+                ZoneId timeZone;
+                try {
+                    time = interop.asTime(value);
+                    timeZone = interop.asTimeZone(value);
+                    if (interop.isDate(value)) {
+                        obj = createZonedDateTime(interop.asDate(value), time, timeZone).toOffsetDateTime().toOffsetTime();
+                    } else {
+                        obj = createOffsetTime(time, timeZone);
+                    }
+                } catch (UnsupportedMessageException e) {
+                    throw shouldNotReachHere(e);
+                }
+            } else {
+                throw HostInteropErrors.cannotConvert(hostContext, value, targetType, "Value must have time and time-zone information.");
             }
         } else if (targetType == ZoneId.class) {
             if (interop.isTimeZone(value)) {
@@ -650,6 +690,22 @@ abstract class HostToTypeNode extends Node {
         return targetType.cast(obj);
     }
 
+    private static Object toJavaInstance(Object value, Class<?> targetType, InteropLibrary interop) {
+        if (interop.isHostObject(value)) {
+            try {
+                Object hostObject = interop.asHostObject(value);
+                if (hostObject != null && targetType.isInstance(hostObject)) {
+                    return hostObject;
+                }
+            } catch (HeapIsolationException e) {
+                return null;
+            } catch (UnsupportedMessageException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+        return null;
+    }
+
     private static Object asPolyglotException(HostContext hostContext, Object value, InteropLibrary interop) {
         try {
             interop.throwException(value);
@@ -671,6 +727,12 @@ abstract class HostToTypeNode extends Node {
     @TruffleBoundary
     private static LocalDateTime createDateTime(LocalDate date, LocalTime time) {
         return LocalDateTime.of(date, time);
+    }
+
+    @TruffleBoundary
+    private static OffsetTime createOffsetTime(LocalTime time, ZoneId timeZone) {
+        assert timeZone.getRules().isFixedOffset();
+        return OffsetTime.of(time, timeZone.getRules().getOffset(Instant.EPOCH));
     }
 
     private static boolean shouldImplementFunction(Object truffleObject, InteropLibrary interop) {
@@ -803,6 +865,22 @@ abstract class HostToTypeNode extends Node {
     }
 
     private static Object truffleObjectToArray(HostContext hostContext, InteropLibrary interop, Object receiver, Class<?> arrayType, Type genericArrayType) {
+        if (arrayType == byte[].class && interop.hasBufferElements(receiver)) {
+            try {
+                long size = interop.getBufferSize(receiver);
+                if (size <= MAX_ARRAY_SIZE) {
+                    byte[] array = new byte[(int) size];
+                    interop.readBuffer(receiver, 0, array, 0, (int) size);
+                    return array;
+                } else {
+                    throw HostInteropErrors.cannotConvert(hostContext, receiver, arrayType, "Value has buffer elements but total size exceeds " + MAX_ARRAY_SIZE + " bytes.");
+                }
+            } catch (UnsupportedMessageException e) {
+                throw HostInteropErrors.cannotConvert(hostContext, receiver, arrayType, "Value has buffer elements but buffer read is unsupported.");
+            } catch (InvalidBufferOffsetException e) {
+                throw HostInteropErrors.cannotConvert(hostContext, receiver, arrayType, "Value has buffer elements but " + e.getMessage());
+            }
+        }
         Class<?> componentType = arrayType.getComponentType();
         long size;
         try {

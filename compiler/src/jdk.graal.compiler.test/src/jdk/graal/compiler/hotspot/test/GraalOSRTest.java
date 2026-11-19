@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,17 +29,17 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import jdk.graal.compiler.api.directives.GraalDirectives;
-import jdk.graal.compiler.bytecode.BytecodeDisassembler;
 import org.junit.Assert;
 import org.junit.Test;
 
+import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.graal.compiler.bytecode.BytecodeDisassembler;
+import jdk.internal.misc.Unsafe;
 import jdk.vm.ci.code.stack.InspectedFrame;
 import jdk.vm.ci.code.stack.InspectedFrameVisitor;
 import jdk.vm.ci.code.stack.StackIntrospection;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
-import sun.misc.Unsafe;
 
 /**
  * Test on-stack-replacement with Graal. The test manually triggers a Graal OSR-compilation which is
@@ -230,7 +230,7 @@ public class GraalOSRTest extends GraalOSRTestBase {
 
         Object[] arr = {"1", "2", "3"};
         testOopMap(arr, new AtomicInteger(4), null);
-        TestOopMapFrameChecker checker = new TestOopMapFrameChecker();
+        TestOopMapFrameChecker checker = new TestOopMapFrameChecker(method);
         Runnable r = () -> {
             stackIntrospection.iterateFrames(null, null, 0, checker);
         };
@@ -243,14 +243,22 @@ public class GraalOSRTest extends GraalOSRTestBase {
     static StackIntrospection stackIntrospection = HotSpotJVMCIRuntime.runtime().getHostJVMCIBackend().getStackIntrospection();
 
     static class TestOopMapFrameChecker implements InspectedFrameVisitor<Object> {
+        private final ResolvedJavaMethod method;
         boolean checked;
+
+        TestOopMapFrameChecker(ResolvedJavaMethod method) {
+            this.method = method;
+        }
 
         @Override
         public Object visitFrame(InspectedFrame frame) {
-            ResolvedJavaMethod method = frame.getMethod();
-            if (!checked && method.getName().equals("testOopMap")) {
+            if (!checked && frame.isMethod(method)) {
                 Assert.assertEquals(5, method.getMaxLocals());
-                Assert.assertNull("local4 should have been cleared by OnStackReplacementPhase", frame.getLocal(4));
+                try {
+                    Assert.assertNull("local4 should have been cleared by OnStackReplacementPhase", frame.getLocal(4));
+                } catch (UnsupportedOperationException expected) {
+                    // Primitive or unavailable storage also proves this slot is not a live object local.
+                }
                 checked = true;
             }
             return null;
@@ -264,6 +272,56 @@ public class GraalOSRTest extends GraalOSRTestBase {
      */
     private static String normalizedDisassembly(String dis) {
         Pattern cpRef = Pattern.compile("#\\d+");
-        return Stream.of(dis.split("\n")).map(line -> cpRef.matcher(line.trim()).replaceAll(mr -> "#__")).collect(Collectors.joining(System.lineSeparator()));
+        return Stream.of(dis.split("\n")).map(line -> cpRef.matcher(line.trim()).replaceAll(_ -> "#__")).collect(Collectors.joining(System.lineSeparator()));
+    }
+
+    private static final int ArrayLength = 10000;
+
+    static ReturnValue testArrayBottom(byte[] aB, int[] aI, int i) {
+        Object a = null;
+        long base = 0;
+        if (i % 2 == 0) {
+            a = aB;
+            base = Unsafe.ARRAY_BYTE_BASE_OFFSET;
+        } else {
+            a = aI;
+            base = Unsafe.ARRAY_INT_BASE_OFFSET;
+        }
+        int res = 0;
+        for (int j = 0; j < ArrayLength; j++) {
+            res += UNSAFE.getByte(a, base + j);
+        }
+        GraalDirectives.sideEffect(res);
+
+        return ReturnValue.SUCCESS;
+    }
+
+    @Test
+    public void testOSR07() {
+        testOSR(getInitialOptions(), "testArrayBottom", null, new byte[ArrayLength], new int[ArrayLength], 10);
+    }
+
+    static ReturnValue testNonNullArrayBottom(int i) {
+        Object a;
+        long base;
+        if (i % 2 == 0) {
+            a = new byte[ArrayLength];
+            base = Unsafe.ARRAY_BYTE_BASE_OFFSET;
+        } else {
+            a = new int[ArrayLength];
+            base = Unsafe.ARRAY_INT_BASE_OFFSET;
+        }
+        int res = 0;
+        for (int j = 0; j < 10000; j++) {
+            res += UNSAFE.getByte(a, base + j);
+        }
+        GraalDirectives.sideEffect(res);
+
+        return ReturnValue.SUCCESS;
+    }
+
+    @Test
+    public void testOSR08() {
+        testOSR(getInitialOptions(), "testNonNullArrayBottom", null, 10);
     }
 }

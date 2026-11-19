@@ -1,0 +1,132 @@
+/*
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted.pltgot;
+
+import java.util.Collections;
+import java.util.List;
+
+import org.graalvm.nativeimage.hosted.Feature;
+
+import com.oracle.objectfile.BasicProgbitsSectionImpl;
+import com.oracle.objectfile.ObjectFile;
+import com.oracle.objectfile.SectionName;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.core.pltgot.IdentityMethodAddressResolver;
+import com.oracle.svm.core.pltgot.MethodAddressResolver;
+import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.hosted.image.AbstractImage;
+import com.oracle.svm.hosted.image.NativeImage;
+import com.oracle.svm.hosted.image.RelocatableBuffer;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+/**
+ * An example dynamic method address resolver implementation.
+ *
+ * The code of all reachable methods is located in the text section of the generated image. This
+ * resolver introduces another section ('.svm_methodtable') that contains absolute addresses of
+ * methods whose address is dynamically resolved. The methodtable section is the same size as the
+ * GOT, and the index of any method is the same in both. This feature registers the
+ * {@link IdentityMethodAddressResolver} resolver that, when a method is called for the first time,
+ * lookups the absolute method address in the above section. This address is then written in the
+ * appropriate GOT entry and is used for subsequent calls of the same method.
+ *
+ */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+public class IdentityMethodAddressResolverFeature implements InternalFeature {
+
+    // Restrict segment names to 16 chars on Mach-O.
+    public static final SectionName SVM_METHODTABLE = new SectionName.ProgbitsSectionName("svm_methodtbl");
+
+    private RelocatableBuffer offsetsSectionBuffer;
+
+    private ObjectFile.ProgbitsSectionImpl offsetsSectionBufferImpl;
+
+    protected class IdentityMethodAddressResolverSupport implements MethodAddressResolutionSupport {
+        @Override
+        public boolean shouldCallViaPLTGOT(@SuppressWarnings("unused") SharedMethod caller, SharedMethod callee) {
+            return HostedPLTGOTConfiguration.canBeCalledViaPLTGOT(callee);
+        }
+
+        @Override
+        public boolean shouldCallViaPLTGOT(SharedMethod callee) {
+            return HostedPLTGOTConfiguration.canBeCalledViaPLTGOT(callee);
+        }
+
+        @Override
+        public void augmentImage(AbstractImage abstractImage) {
+            ObjectFile imageObjectFile = abstractImage.getObjectFile();
+            GOTEntryAllocator gotEntryAllocator = HostedPLTGOTConfiguration.singleton().getGOTEntryAllocator();
+            SharedMethod[] got = gotEntryAllocator.getGOT();
+            int wordSize = SubstrateTarget.getWordSize();
+            HostedPLTGOTConfiguration.GOTSectionExtent methodTableExtent = HostedPLTGOTConfiguration.GOTSectionExtent.forEntries(got.length, wordSize,
+                            imageObjectFile.getFormat());
+            offsetsSectionBuffer = new RelocatableBuffer(methodTableExtent.bufferSize(), imageObjectFile.getByteOrder());
+            offsetsSectionBufferImpl = new BasicProgbitsSectionImpl(offsetsSectionBuffer.getBackingArray());
+            String name = SVM_METHODTABLE.getFormatDependentName(imageObjectFile.getFormat());
+            ObjectFile.Section offsetsSection = imageObjectFile.newProgbitsSection(name, imageObjectFile.getPageSize(), true, false, offsetsSectionBufferImpl);
+
+            ObjectFile.RelocationKind relocationKind = ObjectFile.RelocationKind.getDirect(wordSize);
+            for (int gotEntryNo = 0; gotEntryNo < got.length; ++gotEntryNo) {
+                offsetsSectionBuffer.addRelocationWithoutAddend(gotEntryNo * wordSize, relocationKind, MethodRefSupport.createMethodPointer(got[gotEntryNo], false));
+            }
+
+            imageObjectFile.createDefinedSymbol(offsetsSection.getName(), offsetsSection, 0, 0, false, false, false);
+            boolean internalSymbolsAreGlobal = SubstrateOptions.InternalSymbolsAreGlobal.getValue();
+            imageObjectFile.createDefinedSymbol("__svm_methodtable_begin", offsetsSection, 0, wordSize, false, internalSymbolsAreGlobal, internalSymbolsAreGlobal);
+            imageObjectFile.createDefinedSymbol("__svm_methodtable_end", offsetsSection, methodTableExtent.endOffset(), wordSize, false, internalSymbolsAreGlobal, internalSymbolsAreGlobal);
+        }
+
+        @Override
+        public MethodAddressResolver createMethodAddressResolver() {
+            return new IdentityMethodAddressResolver();
+        }
+    }
+
+    @Override
+    public List<Class<? extends Feature>> getRequiredFeatures() {
+        return Collections.singletonList(PLTGOTFeature.class);
+    }
+
+    @Override
+    public void afterRegistration(AfterRegistrationAccess access) {
+        HostedPLTGOTConfiguration.singleton().initializeMethodAddressResolutionSupport(new IdentityMethodAddressResolverSupport());
+    }
+
+    @Override
+    public void beforeImageWrite(BeforeImageWriteAccess access) {
+        prepareOffsetsSection((NativeImage) ((FeatureImpl.BeforeImageWriteAccessImpl) access).getImage());
+    }
+
+    private void prepareOffsetsSection(NativeImage image) {
+        image.markRelocationSitesFromBuffer(offsetsSectionBuffer, offsetsSectionBufferImpl);
+    }
+}

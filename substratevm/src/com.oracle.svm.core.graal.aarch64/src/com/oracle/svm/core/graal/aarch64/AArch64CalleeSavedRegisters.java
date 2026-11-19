@@ -41,9 +41,13 @@ import org.graalvm.nativeimage.Platforms;
 import com.oracle.svm.core.CalleeSavedRegisters;
 import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateTargetDescription;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.meta.SubstrateRegisterConfig;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.asm.aarch64.AArch64Address;
@@ -52,6 +56,7 @@ import jdk.graal.compiler.core.common.NumUtil;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.code.Register;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 final class AArch64CalleeSavedRegisters extends CalleeSavedRegisters {
 
     @Fold
@@ -61,12 +66,12 @@ final class AArch64CalleeSavedRegisters extends CalleeSavedRegisters {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public static void createAndRegister() {
-        SubstrateTargetDescription target = ConfigurationValues.getTarget();
+        SubstrateTarget target = SubstrateTarget.singleton();
         SubstrateRegisterConfig registerConfig = new SubstrateAArch64RegisterConfig(SubstrateRegisterConfig.ConfigKind.NORMAL, null, target, SubstrateOptions.PreserveFramePointer.getValue());
 
         Register frameRegister = registerConfig.getFrameRegister();
         assert frameRegister.equals(AArch64.sp) : "Unexpected frame register " + frameRegister;
-        List<Register> calleeSavedRegisters = new ArrayList<>(registerConfig.getAllocatableRegisters().asList());
+        List<Register> calleeSavedRegisters = new ArrayList<>(registerConfig.getAllocatableRegisters());
 
         /*
          * Even though lr is an allocatable register, it is not possible for this register to be
@@ -100,7 +105,7 @@ final class AArch64CalleeSavedRegisters extends CalleeSavedRegisters {
         int calleeSavedRegistersSizeInBytes = offset;
 
         int saveAreaOffsetInFrame = -(FrameAccess.returnAddressSize() +
-                        FrameAccess.wordSize() + // slot is always reserved for frame pointer
+                        target.wordSize + // slot is always reserved for frame pointer
                         calleeSavedRegistersSizeInBytes);
 
         if (fpCalleeSaved) {

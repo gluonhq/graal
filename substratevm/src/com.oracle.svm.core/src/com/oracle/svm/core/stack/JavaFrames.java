@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,28 +24,29 @@
  */
 package com.oracle.svm.core.stack;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoDecoder;
 import com.oracle.svm.core.code.CodeInfoQueryResult;
 import com.oracle.svm.core.code.CodeInfoTable;
-import com.oracle.svm.core.code.UntetheredCodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
 import com.oracle.svm.core.deopt.DeoptimizedFrame;
 import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.heap.ReferenceMapIndex;
+import com.oracle.svm.guest.staging.core.heap.ReferenceMapIndex;
+import com.oracle.svm.core.interpreter.InterpreterSupport;
+import com.oracle.svm.shared.Uninterruptible;
 
 public class JavaFrames {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isUnknownFrame(JavaFrame frame) {
-        return frame.getIPCodeInfo().isNull() && Deoptimizer.checkDeoptimized(frame) == null;
+        return frame.getIPCodeInfo().isNull() && Deoptimizer.checkEagerDeoptimized(frame) == null;
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
@@ -54,10 +55,31 @@ public class JavaFrames {
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isInterpreterLeaveStub(JavaFrame frame) {
+        if (!InterpreterSupport.isEnabled()) {
+            return false;
+        }
+        return InterpreterSupport.isInInterpreterLeaveStub(frame.getIP());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isInterpreterNativeDowncallStub(JavaFrame frame) {
+        if (!InterpreterSupport.isEnabled()) {
+            return false;
+        }
+        return InterpreterSupport.isInInterpreterNativeDowncallStub(frame.getIP());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isAnyInterpreterLeaveStub(JavaFrame frame) {
+        return isInterpreterLeaveStub(frame) || isInterpreterNativeDowncallStub(frame);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static UnsignedWord getTotalFrameSize(JavaFrame frame) {
         long size = CodeInfoQueryResult.getTotalFrameSize(frame.getEncodedFrameSize());
         assert size > 0;
-        return WordFactory.unsigned(size);
+        return Word.unsigned(size);
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
@@ -68,28 +90,44 @@ public class JavaFrames {
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static void clearData(JavaFrame frame) {
-        frame.setSP(WordFactory.nullPointer());
-        frame.setIP(WordFactory.nullPointer());
-        frame.setIPCodeInfo(WordFactory.nullPointer());
+        frame.setSP(Word.nullPointer());
+        frame.setIP(Word.nullPointer());
+        frame.setIPCodeInfo(Word.nullPointer());
+        frame.setIsPendingLazyDeopt(false);
 
         frame.setEncodedFrameSize(CodeInfoDecoder.INVALID_SIZE_ENCODING);
         frame.setExceptionOffset(CodeInfoQueryResult.NO_EXCEPTION_OFFSET);
         frame.setReferenceMapIndex(ReferenceMapIndex.NO_REFERENCE_MAP);
+        frame.setFramePointerSaveAreaOffset(CodeInfoQueryResult.NO_FRAME_POINTER_SAVE_AREA_OFFSET);
     }
 
     @Uninterruptible(reason = "Prevent deoptimization and GC.", callerMustBe = true)
     public static void setData(JavaFrame frame, Pointer sp, CodePointer ip) {
         frame.setSP(sp);
         frame.setIP(ip);
+        frame.setIsPendingLazyDeopt(false);
 
-        DeoptimizedFrame deoptimizedFrame = Deoptimizer.checkDeoptimized(frame);
+        DeoptimizedFrame deoptimizedFrame = Deoptimizer.checkEagerDeoptimized(frame);
         if (deoptimizedFrame != null) {
-            frame.setIPCodeInfo(WordFactory.nullPointer());
+            frame.setIPCodeInfo(Word.nullPointer());
             frame.setEncodedFrameSize(deoptimizedFrame.getSourceEncodedFrameSize());
             frame.setExceptionOffset(CodeInfoQueryResult.NO_EXCEPTION_OFFSET);
             frame.setReferenceMapIndex(ReferenceMapIndex.NO_REFERENCE_MAP);
+            frame.setFramePointerSaveAreaOffset(CodeInfoQueryResult.NO_FRAME_POINTER_SAVE_AREA_OFFSET);
         } else {
-            UntetheredCodeInfo untetheredCodeInfo = CodeInfoTable.lookupCodeInfo(ip);
+            CodePointer returnAddress = ip;
+            if (Deoptimizer.checkLazyDeoptimized(ip)) {
+                /*
+                 * For lazily deoptimized frames, the return address is stored in a reserved slot.
+                 * See Deoptimizer.java for details.
+                 */
+                frame.setIsPendingLazyDeopt(true);
+                returnAddress = sp.readWord(0);
+                assert returnAddress.isNonNull();
+                frame.setIP(returnAddress);
+            }
+
+            UntetheredCodeInfo untetheredCodeInfo = CodeInfoTable.lookupCodeInfo(returnAddress);
             frame.setIPCodeInfo(untetheredCodeInfo);
 
             if (untetheredCodeInfo.isNull()) {
@@ -97,12 +135,13 @@ public class JavaFrames {
                 frame.setEncodedFrameSize(CodeInfoDecoder.INVALID_SIZE_ENCODING);
                 frame.setExceptionOffset(CodeInfoQueryResult.NO_EXCEPTION_OFFSET);
                 frame.setReferenceMapIndex(ReferenceMapIndex.NO_REFERENCE_MAP);
+                frame.setFramePointerSaveAreaOffset(CodeInfoQueryResult.NO_FRAME_POINTER_SAVE_AREA_OFFSET);
             } else {
                 /* Encountered a normal Java frame. */
                 Object tether = CodeInfoAccess.acquireTether(untetheredCodeInfo);
                 try {
                     CodeInfo info = CodeInfoAccess.convert(untetheredCodeInfo, tether);
-                    CodeInfoAccess.lookupCodeInfo(info, ip, frame);
+                    CodeInfoAccess.lookupCodeInfo(info, returnAddress, frame);
                 } finally {
                     CodeInfoAccess.releaseTether(untetheredCodeInfo, tether);
                 }

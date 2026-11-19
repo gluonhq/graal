@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,28 +24,31 @@
  */
 package jdk.graal.compiler.core.test;
 
+import static jdk.graal.compiler.debug.PathUtilities.MAX_FILE_NAME_LENGTH;
+import static jdk.graal.compiler.printer.CanonicalStringGraphPrinter.createDumpFileName;
+
 import java.io.IOException;
 import java.util.Arrays;
 
 import org.graalvm.collections.EconomicMap;
+import org.graalvm.word.LocationIdentity;
+import org.junit.Test;
+
 import jdk.graal.compiler.core.common.memory.BarrierType;
 import jdk.graal.compiler.core.common.memory.MemoryOrderMode;
 import jdk.graal.compiler.debug.DebugOptions;
 import jdk.graal.compiler.debug.DebugOptions.PrintGraphTarget;
+import jdk.graal.compiler.debug.TTY;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeCycles;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodeinfo.NodeSize;
-import jdk.graal.compiler.debug.TTY;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.memory.WriteNode;
 import jdk.graal.compiler.nodes.memory.address.AddressNode;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
-import org.graalvm.word.LocationIdentity;
-import org.junit.Test;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -63,18 +66,16 @@ public class GraphDumpingTest extends GraalCompilerTest {
         sideEffect = i;
     }
 
-    @SuppressWarnings("try")
     @Test
     public void testDump() throws IOException {
-        try (TTY.Filter suppressTTY = new TTY.Filter(); TemporaryDirectory temp = new TemporaryDirectory("GraphDumpingTest")) {
+        try (TTY.Filter _ = new TTY.Filter(); TemporaryDirectory temp = new TemporaryDirectory("GraphDumpingTest")) {
             compileWithDumping("snippet01", temp);
         }
     }
 
-    @SuppressWarnings("try")
     @Test
     public void testInvalidNodeProperties() throws IOException {
-        try (TTY.Filter suppressTTY = new TTY.Filter(); TemporaryDirectory temp = new TemporaryDirectory("GraphDumpingTest")) {
+        try (TTY.Filter _ = new TTY.Filter(); TemporaryDirectory temp = new TemporaryDirectory("GraphDumpingTest")) {
             StructuredGraph graph = compileWithDumping("snippet02", temp);
 
             // introduce an invalid node with broken properties
@@ -85,6 +86,14 @@ public class GraphDumpingTest extends GraalCompilerTest {
 
             graph.getDebug().forceDump(graph, "Dump with broken write.");
         }
+    }
+
+    @Test
+    public void testCanonicalStringDumpHandlesLongFileNames() {
+        String fileName = createDumpFileName(7, "Exception: " + "x".repeat(MAX_FILE_NAME_LENGTH));
+        assertTrue(fileName.startsWith("007-Exception"));
+        assertTrue(fileName.endsWith(".txt"));
+        assertTrue(fileName.length() <= MAX_FILE_NAME_LENGTH);
     }
 
     @NodeInfo(nameTemplate = "brokenWrite")
@@ -124,7 +133,7 @@ public class GraphDumpingTest extends GraalCompilerTest {
         overrides.put(DebugOptions.MethodFilter, null);
 
         ResolvedJavaMethod method = getResolvedJavaMethod(methodName);
-        StructuredGraph graph = parseForCompile(method, new OptionValues(getInitialOptions(), overrides));
+        StructuredGraph graph = parseForCompile(method, getInitialOptions().derive(overrides));
         getCode(method, graph);
 
         return graph;

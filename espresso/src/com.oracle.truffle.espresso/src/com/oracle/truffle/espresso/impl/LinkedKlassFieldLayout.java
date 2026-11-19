@@ -22,21 +22,28 @@
  */
 package com.oracle.truffle.espresso.impl;
 
-import static java.util.Map.entry;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_FINAL;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_HIDDEN;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_VOLATILE;
 
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.staticobject.StaticShape;
 import com.oracle.truffle.api.staticobject.StaticShape.Builder;
-import com.oracle.truffle.espresso.classfile.Constants;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
-import com.oracle.truffle.espresso.runtime.JavaVersion;
-import com.oracle.truffle.espresso.runtime.JavaVersion.VersionRange;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.JavaVersion.VersionRange;
+import com.oracle.truffle.espresso.classfile.ParserField;
+import com.oracle.truffle.espresso.classfile.ParserKlass;
+import com.oracle.truffle.espresso.classfile.attributes.Attribute;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject.StaticObjectFactory;
 
@@ -53,18 +60,18 @@ final class LinkedKlassFieldLayout {
 
     final int fieldTableLength;
 
-    LinkedKlassFieldLayout(ContextDescription description, ParserKlass parserKlass, LinkedKlass superKlass) {
-        StaticShape.Builder instanceBuilder = StaticShape.newBuilder(description.language);
-        StaticShape.Builder staticBuilder = StaticShape.newBuilder(description.language);
+    LinkedKlassFieldLayout(EspressoLanguage language, ParserKlass parserKlass, LinkedKlass superKlass) {
+        StaticShape.Builder instanceBuilder = StaticShape.newBuilder(language);
+        StaticShape.Builder staticBuilder = StaticShape.newBuilder(language);
 
-        FieldCounter fieldCounter = new FieldCounter(parserKlass, description.javaVersion);
+        FieldsInfo fieldsInfo = FieldsInfo.create(parserKlass, language);
         int nextInstanceFieldIndex = 0;
         int nextStaticFieldIndex = 0;
         int nextInstanceFieldSlot = superKlass == null ? 0 : superKlass.getFieldTableLength();
         int nextStaticFieldSlot = 0;
 
-        staticFields = new LinkedField[fieldCounter.staticFields];
-        instanceFields = new LinkedField[fieldCounter.instanceFields];
+        staticFields = new LinkedField[fieldsInfo.staticFields];
+        instanceFields = new LinkedField[fieldsInfo.instanceFields];
 
         LinkedField.IdMode idMode = getIdMode(parserKlass);
 
@@ -76,9 +83,9 @@ final class LinkedKlassFieldLayout {
             }
         }
 
-        for (HiddenField hiddenField : fieldCounter.hiddenFieldNames) {
-            if (hiddenField.versionRange.contains(description.javaVersion)) {
-                ParserField hiddenParserField = new ParserField(ParserField.HIDDEN | hiddenField.additionalFlags, hiddenField.name, hiddenField.type, null);
+        for (HiddenField hiddenField : fieldsInfo.hiddenFields) {
+            if (hiddenField.predicate.test(language)) {
+                ParserField hiddenParserField = new ParserField(ACC_HIDDEN | hiddenField.additionalFlags, hiddenField.name, hiddenField.type, Attribute.EMPTY_ARRAY);
                 createAndRegisterLinkedField(parserKlass, hiddenParserField, nextInstanceFieldSlot++, nextInstanceFieldIndex++, idMode, instanceBuilder, instanceFields);
             }
         }
@@ -125,7 +132,7 @@ final class LinkedKlassFieldLayout {
 
     private static void createAndRegisterLinkedField(ParserKlass parserKlass, ParserField parserField, int slot, int index, LinkedField.IdMode idMode, Builder builder, LinkedField[] linkedFields) {
         LinkedField field = new LinkedField(parserField, slot, idMode);
-        builder.property(field, parserField.getPropertyType(), storeAsFinal(parserKlass, parserField));
+        builder.property(field, LinkedField.getPropertyType(parserField), storeAsFinal(parserKlass, parserField));
         linkedFields[index] = field;
     }
 
@@ -136,20 +143,27 @@ final class LinkedKlassFieldLayout {
         // value of one of these fields is stored as final, the corresponding set method has no
         // effect on already compiled methods that folded the read of the field value during
         // compilation.
-        if (klassType == Type.java_lang_System && (fieldName == Name.in || fieldName == Name.out || fieldName == Name.err)) {
+        if (klassType == Types.java_lang_System && (fieldName == Names.in || fieldName == Names.out || fieldName == Names.err)) {
+            return false;
+        }
+        // We're updating the class modifiers during redefinition if they change, so don't allow the
+        // compiler to fold the reads.
+        if (klassType == Types.java_lang_Class && fieldName == Names.modifiers) {
             return false;
         }
         return field.isFinal();
     }
 
-    private static final class FieldCounter {
-        final HiddenField[] hiddenFieldNames;
+    /**
+     * Describes fields defined by a class file plus extra fields to be injected.
+     *
+     * @param hiddenFields the fields to be injected
+     * @param instanceFields number of instance fields (including hidden fields)
+     * @param staticFields number of static fields
+     */
+    private record FieldsInfo(HiddenField[] hiddenFields, int instanceFields, int staticFields) {
 
-        // Includes hidden fields
-        final int instanceFields;
-        final int staticFields;
-
-        FieldCounter(ParserKlass parserKlass, JavaVersion version) {
+        static FieldsInfo create(ParserKlass parserKlass, EspressoLanguage language) {
             int iFields = 0;
             int sFields = 0;
             for (ParserField f : parserKlass.getFields()) {
@@ -159,123 +173,141 @@ final class LinkedKlassFieldLayout {
                     iFields++;
                 }
             }
-            // All hidden fields are of Object kind
-            hiddenFieldNames = HiddenField.getHiddenFields(parserKlass.getType(), version);
-            instanceFields = iFields + hiddenFieldNames.length;
-            staticFields = sFields;
+            HiddenField[] hidden = HiddenField.getHiddenFields(parserKlass.getType(), language);
+            return new FieldsInfo(hidden, iFields + hidden.length, sFields);
         }
     }
 
-    private static class HiddenField {
+    /// Represents a field of a class that is not defined in a class file.
+    /// The fixed set of available injected fields are defined in the [#REGISTRY]. The actual set
+    /// of injected fields is determined by filtering the registry with an [EspressoLanguage] based
+    /// [#predicate] (e.g. [`Thread.interrupted`][Names#HIDDEN_interrupted] is only
+    /// relevant for Java <= 13).
+    ///
+    /// @param predicate determines if the field exists for a given [EspressoLanguage] instance.
+    record HiddenField(Symbol<Name> name,
+                    Symbol<Type> type,
+                    Predicate<EspressoLanguage> predicate,
+                    int additionalFlags) {
+
+        private static final Predicate<EspressoLanguage> NO_PREDICATE = l -> true;
         private static final int NO_ADDITIONAL_FLAGS = 0;
         private static final HiddenField[] EMPTY = new HiddenField[0];
         private static final Map<Symbol<Type>, HiddenField[]> REGISTRY = Map.ofEntries(
-                        entry(Type.java_lang_invoke_MemberName, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_VMTARGET),
-                                        new HiddenField(Name.HIDDEN_VMINDEX)
-                        }),
-                        entry(Type.java_lang_reflect_Method, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_METHOD_RUNTIME_VISIBLE_TYPE_ANNOTATIONS),
-                                        new HiddenField(Name.HIDDEN_METHOD_KEY)
-                        }),
-                        entry(Type.java_lang_reflect_Constructor, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_CONSTRUCTOR_RUNTIME_VISIBLE_TYPE_ANNOTATIONS),
-                                        new HiddenField(Name.HIDDEN_CONSTRUCTOR_KEY)
-                        }),
-                        entry(Type.java_lang_reflect_Field, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_FIELD_RUNTIME_VISIBLE_TYPE_ANNOTATIONS),
-                                        new HiddenField(Name.HIDDEN_FIELD_KEY)
-                        }),
+                        entry(Types.java_lang_Object,
+                                        new HiddenField(Names.HIDDEN_systemHashCode, Types._int, EspressoLanguage::canSetCustomIdentityHashCode, ACC_VOLATILE)),
+                        entry(Types.java_lang_invoke_MemberName,
+                                        new HiddenField(Names.HIDDEN_vmTarget),
+                                        new HiddenField(Names.HIDDEN_vmIndex)),
+                        entry(Types.java_lang_invoke_ResolvedMethodName,
+                                        new HiddenField(Names.HIDDEN_vmMethod, Types.java_lang_Object, VersionRange.VERSION_22_OR_HIGHER, NO_ADDITIONAL_FLAGS)),
+                        entry(Types.java_lang_reflect_Method,
+                                        new HiddenField(Names.HIDDEN_runtimeVisibleTypeAnnotations),
+                                        new HiddenField(Names.HIDDEN_vmMethod)),
+                        entry(Types.java_lang_reflect_Constructor,
+                                        new HiddenField(Names.HIDDEN_runtimeVisibleTypeAnnotations),
+                                        new HiddenField(Names.HIDDEN_vmMethod)),
+                        entry(Types.java_lang_reflect_Field,
+                                        new HiddenField(Names.HIDDEN_runtimeVisibleTypeAnnotations),
+                                        new HiddenField(Names.HIDDEN_vmField)),
                         // All references (including strong) get an extra hidden field, this
                         // simplifies the code for weak/soft/phantom/final references.
-                        entry(Type.java_lang_ref_Reference, new HiddenField[]{
-
-                                        new HiddenField(Name.HIDDEN_HOST_REFERENCE)
-                        }),
-                        entry(Type.java_lang_Throwable, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_FRAMES),
-                                        new HiddenField(Name.HIDDEN_EXCEPTION_WRAPPER)
-                        }),
-                        entry(Type.java_lang_Thread, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_INTERRUPTED, Type._boolean, VersionRange.lower(13), NO_ADDITIONAL_FLAGS),
-                                        new HiddenField(Name.HIDDEN_HOST_THREAD),
-                                        new HiddenField(Name.HIDDEN_ESPRESSO_MANAGED, Type._boolean, VersionRange.ALL, NO_ADDITIONAL_FLAGS),
-                                        new HiddenField(Name.HIDDEN_DEPRECATION_SUPPORT),
-                                        new HiddenField(Name.HIDDEN_THREAD_UNPARK_SIGNALS, Type._int, VersionRange.ALL, Constants.ACC_VOLATILE),
-                                        new HiddenField(Name.HIDDEN_THREAD_PARK_LOCK, Type.java_lang_Object, VersionRange.ALL, Constants.ACC_FINAL),
-                                        new HiddenField(Name.HIDDEN_THREAD_SCOPED_VALUE_CACHE),
+                        entry(Types.java_lang_ref_Reference,
+                                        new HiddenField(Names.HIDDEN_hostReference)),
+                        entry(Types.java_lang_Throwable,
+                                        new HiddenField(Names.HIDDEN_frames),
+                                        new HiddenField(Names.HIDDEN_exceptionWrapper)),
+                        entry(Types.java_lang_Thread,
+                                        new HiddenField(Names.HIDDEN_interrupted, Types._boolean, VersionRange.lower(13), NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_interruptedEvent, Types.java_lang_Object, EspressoLanguage::needsInterruptedEvent, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_hostThread),
+                                        new HiddenField(Names.HIDDEN_espressoManaged, Types._boolean, VersionRange.ALL, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_toNativeLock, Types.java_lang_Object, VersionRange.ALL, ACC_FINAL),
+                                        new HiddenField(Names.HIDDEN_deprecationSupport),
+                                        new HiddenField(Names.HIDDEN_unparkSignals, Types._int, VersionRange.ALL, ACC_VOLATILE),
+                                        new HiddenField(Names.HIDDEN_parkLock, Types.java_lang_Object, VersionRange.ALL, ACC_FINAL),
+                                        new HiddenField(Names.HIDDEN_scopedValueCache),
 
                                         // Only used for j.l.management bookkeeping.
-                                        new HiddenField(Name.HIDDEN_THREAD_PENDING_MONITOR),
-                                        new HiddenField(Name.HIDDEN_THREAD_WAITING_MONITOR),
-                                        new HiddenField(Name.HIDDEN_THREAD_BLOCKED_COUNT),
-                                        new HiddenField(Name.HIDDEN_THREAD_WAITED_COUNT),
-                                        new HiddenField(Name.HIDDEN_THREAD_DEPTH_FIRST_NUMBER),
-                        }),
-                        entry(Type.java_lang_Class, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_SIGNERS),
-                                        new HiddenField(Name.HIDDEN_MIRROR_KLASS, Constants.ACC_FINAL),
-                                        new HiddenField(Name.HIDDEN_PROTECTION_DOMAIN)
-                        }),
-                        entry(Type.java_lang_ClassLoader, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_CLASS_LOADER_REGISTRY)
-                        }),
-                        entry(Type.java_lang_Module, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_MODULE_ENTRY)
-                        }),
-                        entry(Type.java_util_regex_Pattern, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_TREGEX_MATCH),
-                                        new HiddenField(Name.HIDDEN_TREGEX_FULLMATCH),
-                                        new HiddenField(Name.HIDDEN_TREGEX_SEARCH),
-                                        new HiddenField(Name.HIDDEN_TREGEX_UNSUPPORTED)
-                        }),
-                        entry(Type.java_util_regex_Matcher, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_TREGEX_TSTRING),
-                                        new HiddenField(Name.HIDDEN_TREGEX_OLD_LAST_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_MOD_COUNT_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_TRANSPARENT_BOUNDS_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_ANCHORING_BOUNDS_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_FROM_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_TO_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_SEARCH_FROM_BACKUP),
-                                        new HiddenField(Name.HIDDEN_TREGEX_MATCHING_MODE_BACKUP)
-                        }),
-                        entry(Type.org_graalvm_continuations_ContinuationImpl, new HiddenField[]{
-                                        new HiddenField(Name.HIDDEN_CONTINUATION_FRAME_RECORD)
-                        }));
+                                        new HiddenField(Names.HIDDEN_pendingMonitor),
+                                        new HiddenField(Names.HIDDEN_waitingMonitor),
+                                        new HiddenField(Names.HIDDEN_blockedCount),
+                                        new HiddenField(Names.HIDDEN_waitedCount),
+                                        new HiddenField(Names.HIDDEN_depthFirstNumber)),
+                        entry(Types.java_lang_Class,
+                                        new HiddenField(Names.HIDDEN_signers),
+                                        new HiddenField(Names.HIDDEN_klass, ACC_FINAL),
+                                        new HiddenField(Names.HIDDEN_protectionDomain),
+                                        new HiddenField(Names.HIDDEN_jvmciIndy, Types.java_lang_Object, EspressoLanguage::isJVMCIEnabled, NO_ADDITIONAL_FLAGS)),
+                        entry(Types.java_lang_ClassLoader,
+                                        new HiddenField(Names.HIDDEN_registry),
+                                        new HiddenField(Names.HIDDEN_weakSelf)),
+                        entry(Types.java_lang_Module,
+                                        new HiddenField(Names.HIDDEN_entry)),
+                        entry(Types.java_util_regex_Pattern,
+                                        new HiddenField(Names.HIDDEN_match, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_fullMatch, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_search, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_status, Types._int, EspressoLanguage::useTRegex, ACC_VOLATILE)),
+                        entry(Types.java_util_regex_Matcher,
+                                        new HiddenField(Names.HIDDEN_tstring, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_textSync, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_patternSync, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_oldLastBackup, Types._int, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_modCountBackup, Types._int, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_transparentBoundsBackup, Types._boolean, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_anchoringBoundsBackup, Types._boolean, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_fromBackup, Types._int, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_toBackup, Types._int, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_searchFromBackup, Types._int, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS),
+                                        new HiddenField(Names.HIDDEN_matchingModeBackup, Types.java_lang_Object, EspressoLanguage::useTRegex, NO_ADDITIONAL_FLAGS)),
+                        entry(Types.com_oracle_truffle_espresso_polyglot_TypeLiteral,
+                                        new HiddenField(Names.HIDDEN_internalType)),
+                        entry(Types.org_graalvm_continuations_ContinuationImpl,
+                                        new HiddenField(Names.HIDDEN_frameRecord)),
+                        entry(Types.com_oracle_truffle_espresso_jvmci_meta_EspressoResolvedInstanceType,
+                                        new HiddenField(Names.HIDDEN_vmKlass)),
+                        entry(Types.com_oracle_truffle_espresso_jvmci_meta_EspressoResolvedJavaField,
+                                        new HiddenField(Names.HIDDEN_vmField)),
+                        entry(Types.com_oracle_truffle_espresso_jvmci_meta_EspressoResolvedJavaMethod,
+                                        new HiddenField(Names.HIDDEN_vmMethod)),
+                        entry(Types.com_oracle_truffle_espresso_jvmci_meta_EspressoObjectConstant,
+                                        new HiddenField(Names.HIDDEN_object)),
+                        entry(Types.sun_nio_fs_TrufflePath,
+                                        new HiddenField(Names.HIDDEN_file, Types.java_lang_Object, EspressoLanguage::useEspressoLibs, ACC_FINAL)),
+                        entry(Types.sun_nio_fs_TruffleFilteredDirectoryStream$ForeignDirectoryStream,
+                                        new HiddenField(Names.HIDDEN_hostReference, Types.java_lang_Object, EspressoLanguage::useEspressoLibs, ACC_FINAL)),
+                        entry(Types.sun_nio_fs_TruffleFilteredDirectoryStream$ForeignIterator,
+                                        new HiddenField(Names.HIDDEN_hostReference, Types.java_lang_Object, EspressoLanguage::useEspressoLibs, ACC_FINAL)));
 
-        private final Symbol<Name> name;
-        private final Symbol<Type> type;
-        private final VersionRange versionRange;
-        private final int additionalFlags;
+        private static Map.Entry<Symbol<Type>, HiddenField[]> entry(Symbol<Type> declaringClass, HiddenField... fields) {
+            return Map.entry(declaringClass, fields);
+        }
 
         HiddenField(Symbol<Name> name) {
-            this(name, Type.java_lang_Object, VersionRange.ALL, NO_ADDITIONAL_FLAGS);
+            this(name, Types.java_lang_Object, NO_PREDICATE, NO_ADDITIONAL_FLAGS);
         }
 
         HiddenField(Symbol<Name> name, int additionalFlags) {
-            this(name, Type.java_lang_Object, VersionRange.ALL, additionalFlags);
+            this(name, Types.java_lang_Object, NO_PREDICATE, additionalFlags);
         }
 
         HiddenField(Symbol<Name> name, Symbol<Type> type, VersionRange versionRange, int additionalFlags) {
-            this.name = name;
-            this.type = type;
-            this.versionRange = versionRange;
-            this.additionalFlags = additionalFlags;
+            this(name, type, toPredicate(versionRange), additionalFlags);
         }
 
-        private boolean appliesTo(JavaVersion version) {
-            return versionRange.contains(version);
+        private boolean appliesTo(EspressoLanguage language) {
+            return predicate.test(language);
         }
 
-        static HiddenField[] getHiddenFields(Symbol<Type> holder, JavaVersion version) {
-            return applyFilter(getHiddenFieldsFull(holder), version);
+        static HiddenField[] getHiddenFields(Symbol<Type> holder, EspressoLanguage language) {
+            return applyFilter(getHiddenFieldsFull(holder), language);
         }
 
-        private static HiddenField[] applyFilter(HiddenField[] hiddenFields, JavaVersion version) {
+        private static HiddenField[] applyFilter(HiddenField[] hiddenFields, EspressoLanguage language) {
             int filtered = 0;
             for (HiddenField f : hiddenFields) {
-                if (!f.appliesTo(version)) {
+                if (!f.appliesTo(language)) {
                     filtered++;
                 }
             }
@@ -285,7 +317,7 @@ final class LinkedKlassFieldLayout {
             HiddenField[] result = new HiddenField[hiddenFields.length - filtered];
             int pos = 0;
             for (HiddenField f : hiddenFields) {
-                if (f.appliesTo(version)) {
+                if (f.appliesTo(language)) {
                     result[pos++] = f;
                 }
             }
@@ -294,6 +326,10 @@ final class LinkedKlassFieldLayout {
 
         private static HiddenField[] getHiddenFieldsFull(Symbol<Type> holder) {
             return REGISTRY.getOrDefault(holder, EMPTY);
+        }
+
+        private static Predicate<EspressoLanguage> toPredicate(VersionRange range) {
+            return d -> range.contains(d.getJavaVersion());
         }
     }
 }

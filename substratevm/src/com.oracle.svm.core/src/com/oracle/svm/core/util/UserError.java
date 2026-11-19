@@ -29,7 +29,8 @@ import java.util.Collections;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.options.OptionKey;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -42,6 +43,17 @@ import jdk.vm.ci.meta.ResolvedJavaType;
 @Platforms(Platform.HOSTED_ONLY.class)
 @SuppressWarnings("serial")
 public class UserError {
+
+    /**
+     * Stop compilation immediately and report the message to the user.
+     *
+     * @param format format string (must not start with a lowercase letter)
+     * @param args arguments for the format string that are {@link #formatArguments(Object...)
+     *            preprocessed} before being sent to {@link String#format(String, Object...)}
+     */
+    public static UserException abort(String format, Object... args) {
+        throw new UserException(String.format(format, formatArguments(args)));
+    }
 
     /**
      * UserException type for all errors that should be reported to the SVM users.
@@ -72,17 +84,6 @@ public class UserError {
         public Iterable<String> getMessages() {
             return messages;
         }
-    }
-
-    /**
-     * Stop compilation immediately and report the message to the user.
-     *
-     * @param format format string (must not start with a lowercase letter)
-     * @param args arguments for the format string that are {@link #formatArguments(Object...)
-     *            preprocessed} before being sent to {@link String#format(String, Object...)}
-     */
-    public static UserException abort(String format, Object... args) {
-        throw new UserException(String.format(format, formatArguments(args)));
     }
 
     /**

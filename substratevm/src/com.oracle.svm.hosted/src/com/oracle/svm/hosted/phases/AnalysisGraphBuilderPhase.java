@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,14 +28,16 @@ import java.lang.invoke.CallSite;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
 import java.lang.invoke.WrongMethodTypeException;
+import java.lang.reflect.Member;
 import java.util.List;
 
-import com.oracle.graal.pointsto.infrastructure.OriginalMethodProvider;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.bootstrap.BootstrapMethodConfiguration;
 import com.oracle.svm.hosted.SVMHost;
+import com.oracle.svm.hosted.bootstrap.BootstrapMethodConfiguration;
 import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
-import com.oracle.svm.util.ModuleSupport;
+import com.oracle.svm.hosted.dynamicaccessinference.ConstantExpressionRegistry;
+import com.oracle.svm.hosted.lambda.LambdaParser;
+import com.oracle.svm.shared.util.ModuleSupport;
 
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.core.common.type.TypeReference;
@@ -62,6 +64,7 @@ import jdk.graal.compiler.nodes.extended.BoxNode;
 import jdk.graal.compiler.nodes.extended.BranchProbabilityNode;
 import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode.BytecodeExceptionKind;
 import jdk.graal.compiler.nodes.extended.UnboxNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.ClassInitializationPlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import jdk.graal.compiler.nodes.graphbuilderconf.IntrinsicContext;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
@@ -81,6 +84,7 @@ import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.UnresolvedJavaType;
 
 public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
+    private static final String DIRECT_METHOD_HANDLE_STATIC_ACCESSOR_NAME = "java.lang.invoke.DirectMethodHandle$StaticAccessor";
 
     protected final SVMHost hostVM;
 
@@ -104,6 +108,15 @@ public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
                         IntrinsicContext intrinsicContext, SVMHost hostVM, boolean explicitExceptionEdges) {
             super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, explicitExceptionEdges);
             this.hostVM = hostVM;
+        }
+
+        @Override
+        protected void build(FixedWithNextNode startInstruction, FrameStateBuilder startFrameState) {
+            ConstantExpressionRegistry constantExpressionRegistry = hostVM.getConstantExpressionRegistry();
+            if (strictDynamicAccessInferenceIsApplicable() && constantExpressionRegistry != null) {
+                constantExpressionRegistry.inferConstantExpressions(getCode());
+            }
+            super.build(startInstruction, startFrameState);
         }
 
         @Override
@@ -158,9 +171,7 @@ public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
                 return;
             }
             JavaMethod calleeMethod = lookupMethodInPool(cpi, opcode);
-
-            if (bootstrap == null || calleeMethod instanceof ResolvedJavaMethod ||
-                            BootstrapMethodConfiguration.singleton().isIndyAllowedAtBuildTime(OriginalMethodProvider.getJavaMethod(bootstrap.getMethod()))) {
+            if (bootstrap == null || calleeMethod instanceof ResolvedJavaMethod || BootstrapMethodConfiguration.singleton().isIndyAllowedAtBuildTime(bootstrap.getMethod())) {
                 super.genInvokeDynamic(cpi, opcode);
                 return;
             }
@@ -254,7 +265,8 @@ public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
                      */
                     invokeExactArguments[i] = append(BoxNode.create(invokeExactArguments[i], getMetaAccess().lookupJavaType(stackKind.toBoxedJavaClass()), stackKind));
                 }
-                append(new StoreIndexedNode(newArrayNode, ConstantNode.forInt(i, getGraph()), null, null, JavaKind.Object, invokeExactArguments[i]));
+                var storeIndexed = add(new StoreIndexedNode(newArrayNode, ConstantNode.forInt(i, getGraph()), null, null, JavaKind.Object, invokeExactArguments[i]));
+                storeIndexed.stateAfter().invalidateForDeoptimization();
             }
             ValueNode[] invokeArguments = new ValueNode[]{methodHandleNode, newArrayNode};
 
@@ -269,6 +281,49 @@ public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
                 /* If the return type is a primitive, unbox the result of invokeExact. */
                 frameState.push(returnKind, append(UnboxNode.create(getMetaAccess(), getConstantReflection(), frameState.pop(JavaKind.Object), returnKind)));
             }
+        }
+
+        @Override
+        protected void handleDynamicInvokeAppendix(JavaConstant appendix) {
+            maybeEmitStaticAccessorClassInitialization(appendix);
+        }
+
+        /**
+         * Emits the class-initialization check that would be present for a bytecode
+         * {@code getstatic} of the static field behind a linked method-handle accessor.
+         *
+         * A linked {@code invokedynamic} can carry a {@code DirectMethodHandle$StaticAccessor}
+         * appendix. The JDK lambda form for that accessor reads the static field through
+         * {@code staticBase}/{@code staticOffset} and an {@code Unsafe.get*} access. Graal lowers
+         * that unsafe access to a raw memory load, possibly canonicalizing it back to a field load
+         * later. That lowering path does not pass through bytecode {@code getstatic} parsing, where
+         * the {@link ClassInitializationPlugin} would normally emit the required
+         * class-initialization check.
+         *
+         * If the accessor's declaring class still needs runtime initialization, emit the same
+         * class-initialization plugin action before the linked {@code invokedynamic} is lowered.
+         */
+        private void maybeEmitStaticAccessorClassInitialization(JavaConstant appendix) {
+            if (!isDirectMethodHandleStaticAccessor(appendix)) {
+                return;
+            }
+            Member member = LambdaParser.getMemberFromDirectMethodHandleConstant(appendix, getProviders());
+            Class<?> declaringClass = member == null ? null : member.getDeclaringClass();
+            if (declaringClass == null) {
+                return;
+            }
+            ClassInitializationPlugin classInitializationPlugin = graphBuilderConfig.getPlugins().getClassInitializationPlugin();
+            if (classInitializationPlugin != null) {
+                classInitializationPlugin.apply(this, getMetaAccess().lookupJavaType(declaringClass), this::createCurrentFrameState);
+            }
+        }
+
+        private boolean isDirectMethodHandleStaticAccessor(JavaConstant appendix) {
+            if (appendix == null) {
+                return false;
+            }
+            ResolvedJavaType appendixType = getMetaAccess().lookupJavaType(appendix);
+            return appendixType != null && DIRECT_METHOD_HANDLE_STATIC_ACCESSOR_NAME.equals(appendixType.toJavaName());
         }
 
         private void createBytecodeExceptionCheck(int bci, LogicNode logicNode, BytecodeExceptionKind exception, boolean passingOnTrue, ValueNode... arguments) {
@@ -302,6 +357,10 @@ public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
                 clearNonLiveLocals(dispatchState, dispatchBlock, true);
             }
             return dispatchState;
+        }
+
+        protected boolean strictDynamicAccessInferenceIsApplicable() {
+            return true;
         }
     }
 }

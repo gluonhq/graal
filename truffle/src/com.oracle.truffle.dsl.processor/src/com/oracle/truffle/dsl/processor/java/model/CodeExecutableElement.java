@@ -278,4 +278,25 @@ public class CodeExecutableElement extends CodeElement<Element> implements Execu
             ((CodeVariableElement) getParameters().get(i)).setType(args[i]);
         }
     }
+
+    public void removeParameters(String... searchNames) {
+        List<VariableElement> elements = new ArrayList<>();
+        for (VariableElement v : getParameters()) {
+            for (String searchName : searchNames) {
+                if (v.getSimpleName().contentEquals(searchName)) {
+                    elements.add(v);
+                }
+            }
+        }
+        getParameters().removeAll(elements);
+    }
+
+    public CodeVariableElement findParameter(String searchName) {
+        for (VariableElement v : getParameters()) {
+            if (v.getSimpleName().contentEquals(searchName)) {
+                return (CodeVariableElement) v;
+            }
+        }
+        return null;
+    }
 }

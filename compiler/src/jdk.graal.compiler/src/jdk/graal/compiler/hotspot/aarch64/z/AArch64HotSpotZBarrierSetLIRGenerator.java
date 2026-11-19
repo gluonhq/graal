@@ -48,7 +48,6 @@ import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.hotspot.GraalHotSpotVMConfig;
 import jdk.graal.compiler.hotspot.HotSpotMarkId;
 import jdk.graal.compiler.hotspot.ZWriteBarrierSetLIRGeneratorTool;
-import jdk.graal.compiler.hotspot.aarch64.AArch64HotSpotBackend;
 import jdk.graal.compiler.hotspot.meta.HotSpotProviders;
 import jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil;
 import jdk.graal.compiler.lir.LIRFrameState;
@@ -57,7 +56,6 @@ import jdk.graal.compiler.lir.SyncPort;
 import jdk.graal.compiler.lir.Variable;
 import jdk.graal.compiler.lir.aarch64.AArch64AddressValue;
 import jdk.graal.compiler.lir.aarch64.AArch64Call;
-import jdk.graal.compiler.lir.aarch64.AArch64FrameMap;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
 import jdk.vm.ci.aarch64.AArch64;
@@ -92,7 +90,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
     /**
      * Convert a normal oop into a colored pointer.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/z_aarch64.ad#L36-L41", sha1 = "ee0780117d2ff7f782c4f3e2ae79b55a3c8dd523")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/z_aarch64.ad#L36-L41", sha1 = "ee0780117d2ff7f782c4f3e2ae79b55a3c8dd523")
     static void zColor(CompilationResultBuilder crb, AArch64MacroAssembler masm, GraalHotSpotVMConfig config, Register dst, Register src) {
         Assembler.guaranteeDifferentRegisters(src, dst);
         crb.recordMark(HotSpotMarkId.Z_BARRIER_RELOCATION_FORMAT_STORE_GOOD_BEFORE_MOV);
@@ -103,7 +101,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
     /**
      * Convert a colored pointer into normal oop.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/z_aarch64.ad#L43-L45", sha1 = "3c53528425bc5609e9c5fc3588bbed0c01cd63a6")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/z_aarch64.ad#L43-L45", sha1 = "3c53528425bc5609e9c5fc3588bbed0c01cd63a6")
     static void zUncolor(AArch64MacroAssembler masm, GraalHotSpotVMConfig config, Register ref) {
         masm.lsr(64, ref, ref, config.zPointerLoadShift);
     }
@@ -115,14 +113,14 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
      * isn't needed by this code otherwise and in some cases the destination register for the zColor
      * must be customized.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L167-L225", sha1 = "101b4c83516738a04bf6fb3f17bfc78f58ac5784")
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L310-L371", sha1 = "755eb5d52e1ad8c30c9aa9c5f009d35f8c52bb78")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L166-L224", sha1 = "101b4c83516738a04bf6fb3f17bfc78f58ac5784")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L309-L370", sha1 = "755eb5d52e1ad8c30c9aa9c5f009d35f8c52bb78")
     static void emitStoreBarrier(CompilationResultBuilder crb,
                     AArch64MacroAssembler masm,
                     LIRInstruction op,
                     GraalHotSpotVMConfig config,
                     AArch64Address address,
-                    Register result,
+                    Register tmp,
                     StoreKind storeKind,
                     ForeignCallLinkage callTarget,
                     LIRFrameState state) {
@@ -132,9 +130,9 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
             Register rscratch1 = sc1.getRegister();
             Register rscratch2 = sc2.getRegister();
 
-            Assembler.guaranteeDifferentRegisters(address.getBase(), result, rscratch1);
-            Assembler.guaranteeDifferentRegisters(address.getOffset(), result, rscratch1);
-            Assembler.guaranteeDifferentRegisters(result, rscratch1);
+            Assembler.guaranteeDifferentRegisters(address.getBase(), tmp, rscratch1);
+            Assembler.guaranteeDifferentRegisters(address.getOffset(), tmp, rscratch1);
+            Assembler.guaranteeDifferentRegisters(tmp, rscratch1);
 
             if (storeKind == StoreKind.Atomic) {
                 if (state != null) {
@@ -184,7 +182,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
                 storeBarrierMedium(crb, masm, config,
                                 address,
                                 rscratch2,
-                                result,
+                                tmp,
                                 rscratch1,
                                 storeKind,
                                 continuation,
@@ -200,7 +198,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
                 masm.loadAddress(rscratch1, address);
                 masm.str(64, rscratch1, cArg0);
 
-                AArch64Call.directCall(crb, masm, callTarget, AArch64Call.isNearCall(callTarget) ? null : rscratch1, null);
+                AArch64Call.directCall(crb, masm, callTarget, AArch64Call.isNearCall(callTarget, crb.getCodeCache()) ? null : rscratch1, null);
                 assert cc.getReturn().equals(Value.ILLEGAL) : cc + " " + callTarget;
 
                 masm.jmp(slowContinuation);
@@ -211,7 +209,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
     /**
      * Try to perform any local store barrier fixups or dispatch to the slow path.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L259-L308", sha1 = "061eaf13b97f69aee4f687ce51e500ac3b37071a")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L258-L307", sha1 = "061eaf13b97f69aee4f687ce51e500ac3b37071a")
     static void storeBarrierMedium(CompilationResultBuilder crb,
                     AArch64MacroAssembler masm,
                     GraalHotSpotVMConfig config,
@@ -278,7 +276,7 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
     /**
      * Add a value to the store buffer.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L227-L257", sha1 = "b52bb540cf136f455dfac53fece3cc029a240bf2")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L226-L256", sha1 = "b52bb540cf136f455dfac53fece3cc029a240bf2")
     static void storeBarrierBufferAdd(AArch64MacroAssembler masm,
                     GraalHotSpotVMConfig config,
                     AArch64Address refAddr,
@@ -320,13 +318,11 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
 
     /**
      * Emits the basic Z read barrier pattern with some customization. Normally this code is used
-     * from a {@link LIRInstruction} where the frame has already been set up. If an
-     * {@link AArch64FrameMap} is passed then a frame will be setup and torn down around the call.
-     * The call itself is done with a special stack-only calling convention that saves and restores
-     * all registers around the call. This simplifies the code generation as no extra registers are
-     * required.
+     * from a {@link LIRInstruction} where the frame has already been set up. The call itself is
+     * done with a special stack-only calling convention that saves and restores all registers
+     * around the call. This simplifies the code generation as no extra registers are required.
      */
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/4acafb809c66589fbbfee9c9a4ba7820f848f0e4/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L105-L165", sha1 = "2b500d0e7769c719aca0eb4d1707ac0cbf476727")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/gc/z/zBarrierSetAssembler_aarch64.cpp#L104-L164", sha1 = "2b500d0e7769c719aca0eb4d1707ac0cbf476727")
     public static void emitLoadBarrier(CompilationResultBuilder crb,
                     AArch64MacroAssembler masm,
                     GraalHotSpotVMConfig config,
@@ -334,7 +330,6 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
                     ForeignCallLinkage callTarget,
                     AArch64Address address,
                     LIRInstruction op,
-                    AArch64FrameMap frameMap,
                     boolean elided,
                     boolean isNotStrong) {
         if (elided) {
@@ -374,10 +369,6 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
             crb.getLIR().addSlowPath(op, () -> {
                 masm.bind(entry);
 
-                if (frameMap != null) {
-                    AArch64HotSpotBackend.rawEnter(crb, frameMap, masm, config, false);
-                }
-
                 CallingConvention cc = callTarget.getOutgoingCallingConvention();
                 AArch64Address cArg0 = (AArch64Address) crb.asAddress(cc.getArgument(0));
                 AArch64Address cArg1 = (AArch64Address) crb.asAddress(cc.getArgument(1));
@@ -392,12 +383,8 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
                     masm.loadAddress(ref, address);
                 }
                 masm.str(64, addressReg, cArg1);
-                AArch64Call.directCall(crb, masm, callTarget, AArch64Call.isNearCall(callTarget) ? null : scratch1, null);
+                AArch64Call.directCall(crb, masm, callTarget, AArch64Call.isNearCall(callTarget, crb.getCodeCache()) ? null : scratch1, null);
                 masm.ldr(64, ref, cArg0);
-
-                if (frameMap != null) {
-                    AArch64HotSpotBackend.rawLeave(crb, config);
-                }
 
                 masm.jmp(continuation);
             });
@@ -436,10 +423,11 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
                     AllocatableValue allocatableNewValue,
                     BarrierType barrierType) {
         ForeignCallLinkage callTarget = getWriteBarrierStub(barrierType, StoreKind.Atomic);
-        AllocatableValue temp = tool.newVariable(tool.toRegisterKind(LIRKind.value(memKind)));
+        AllocatableValue tmp = tool.newVariable(tool.toRegisterKind(LIRKind.value(memKind)));
+        AllocatableValue tmp2 = tool.newVariable(tool.toRegisterKind(LIRKind.value(memKind)));
         tool.getResult().getFrameMapBuilder().callsMethod(callTarget.getOutgoingCallingConvention());
         tool.append(new AArch64HotSpotZCompareAndSwapOp(isLogicVariant, memKind, memoryOrder, isLogicVariant, result,
-                        allocatableExpectedValue, allocatableNewValue, tool.asAllocatable(address), config, callTarget, temp));
+                        allocatableExpectedValue, allocatableNewValue, tool.asAllocatable(address), config, callTarget, tmp, tmp2));
     }
 
     @Override
@@ -476,8 +464,11 @@ public class AArch64HotSpotZBarrierSetLIRGenerator implements AArch64ReadBarrier
         GraalError.guarantee(kind == AArch64Kind.QWORD, "unexpected kind for ZGC");
         ForeignCallLinkage callTarget = getWriteBarrierStub(barrierType, storeKind);
         tool.getResult().getFrameMapBuilder().callsMethod(callTarget.getOutgoingCallingConvention());
+        boolean emitPreWriteBarrier = !locationIdentity.isInit() || barrierType == BarrierType.POST_INIT_WRITE;
         tool.append(new AArch64HotSpotZPreWriteBarrierOp(tool.asAllocatable(value), addressValue, tmp, tmp2, config, callTarget, result, storeKind,
-                        locationIdentity.isInit() && barrierType != BarrierType.POST_INIT_WRITE, state));
-        tool.getArithmetic().emitStore(lirKind, address, result, state, memoryOrder);
+                        emitPreWriteBarrier, state));
+        // If the pre barrier is emitted then any required null check is performed by it, so pass
+        // null for the state here. Otherwise, two ops end up using the same LIRFrameState.
+        tool.getArithmetic().emitStore(lirKind, address, result, emitPreWriteBarrier ? null : state, memoryOrder);
     }
 }

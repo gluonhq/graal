@@ -24,20 +24,36 @@
  */
 package com.oracle.svm.core.graal;
 
+import java.util.List;
+
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 
+import com.oracle.svm.core.code.RuntimeCodeInstallationCanaryFeature;
 import com.oracle.svm.core.deopt.DeoptimizationCanaryFeature;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 /**
  * The purpose of this feature is to indicate whether JIT compilation is enabled in an image. It is
  * registered as a dependency of {@code RuntimeCompilationFeature} and so its object will be added
  * to {@link ImageSingletons} even before {@link Feature#afterRegistration}. Support for JIT
- * compilation implies that {@linkplain DeoptimizationCanaryFeature deoptimization} is also
- * supported.
+ * compilation implies that runtime code installation and
+ * {@linkplain DeoptimizationCanaryFeature deoptimization} are also supported.
  *
  * @see RuntimeCompilation#isEnabled()
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class RuntimeCompilationCanaryFeature implements InternalFeature {
+    @Override
+    public List<Class<? extends Feature>> getRequiredFeatures() {
+        return List.of(RuntimeCodeInstallationCanaryFeature.class);
+    }
+
+    @Override
+    public void onRegistration(OnRegistrationAccess access) {
+        ImageSingletons.add(RuntimeCompilationCanaryFeature.class, this);
+    }
 }

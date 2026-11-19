@@ -32,21 +32,27 @@ import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 
 /**
- * Represents a conversion between primitive types.
+ * Represents a conversion from one value domain into another.
  */
 public interface ConvertNode extends ValueNodeInterface {
 
+    /** Returns the value to be converted. */
     ValueNode getValue();
 
+    /**
+     * Applies this node's conversion to a constant from the input domain of {@link #getValue()}.
+     */
     Constant convert(Constant c, ConstantReflectionProvider constantReflection);
 
+    /**
+     * Attempts to map a constant from this node's output domain back into the input domain of
+     * {@link #getValue()}. May return {@code null} when no suitable constant is known.
+     */
     Constant reverse(Constant c, ConstantReflectionProvider constantReflection);
 
     /**
      * Checks whether a null check may skip the conversion. This is true only if the conversion does
-     * not impact the result of the isNullNode, i.e., isNull(input) === isNull(convert(input)).
-     *
-     * @return whether a null check may skip the conversion
+     * not impact the result of the null check, i.e., isNull(input) === isNull(convert(input)).
      */
     boolean mayNullCheckSkipConversion();
 

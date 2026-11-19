@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,7 +34,7 @@ import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
-public class FieldTypeFlow extends TypeFlow<AnalysisField> {
+public class FieldTypeFlow extends TypeFlow<AnalysisField> implements GlobalFlow {
 
     private static final AtomicReferenceFieldUpdater<FieldTypeFlow, FieldFilterTypeFlow> FILTER_FLOW_UPDATER = AtomicReferenceFieldUpdater.newUpdater(FieldTypeFlow.class, FieldFilterTypeFlow.class,
                     "filterFlow");
@@ -49,8 +49,12 @@ public class FieldTypeFlow extends TypeFlow<AnalysisField> {
         this(field, type, null);
     }
 
+    /**
+     * Stores the effective value bound after dropping unchecked interface constraints. The field's
+     * original declaration remains available through {@link AnalysisField#getType()}.
+     */
     public FieldTypeFlow(AnalysisField field, AnalysisType type, AnalysisObject object) {
-        super(field, filterUncheckedInterface(type), TypeState.forEmpty());
+        super(field, dropUncheckedInterfaceBound(type), TypeState.forEmpty());
         this.object = object;
     }
 
@@ -65,17 +69,28 @@ public class FieldTypeFlow extends TypeFlow<AnalysisField> {
     }
 
     @Override
-    public boolean canSaturate() {
-        return false;
+    public boolean canSaturate(PointsToAnalysis bb) {
+        /*
+         * Object fields with a closed effective value bound retain finite type information. A
+         * saturated input is replaced with all instantiated types assignable to that bound.
+         */
+        return !bb.getExtensionPolicy().isTypeClosed(declaredType);
     }
 
     @Override
     protected void onInputSaturated(PointsToAnalysis bb, TypeFlow<?> input) {
-        /*
-         * When a field store is saturated conservatively assume that the field state can contain
-         * any subtype of its declared type or any primitive value for primitive fields.
-         */
-        getDeclaredType().getTypeFlow(bb, true).addUse(bb, this);
+        /* The field input, which is usually a field-store, is saturated. */
+        if (bb.getExtensionPolicy().isTypeClosed(declaredType)) {
+            /*
+             * Recover all instantiated types under the effective bound, or any primitive value.
+             * The effective bound drops unchecked interface constraints from the declaration.
+             * A saturated reference input does not establish an additional array-element write.
+             */
+            source.injectFieldValueBound();
+        } else {
+            /* Otherwise, propagate saturation stamp through the field flow. */
+            super.onInputSaturated(bb, input);
+        }
     }
 
     /** The filter flow is used for unsafe writes and initialized on demand. */
@@ -98,7 +113,7 @@ public class FieldTypeFlow extends TypeFlow<AnalysisField> {
 
     @Override
     public String toString() {
-        return "FieldFlow<" + source.format("%h.%n") + System.lineSeparator() + getState() + ">";
+        return "FieldFlow<" + source.format("%h.%n") + System.lineSeparator() + getStateDescription() + ">";
     }
 
 }

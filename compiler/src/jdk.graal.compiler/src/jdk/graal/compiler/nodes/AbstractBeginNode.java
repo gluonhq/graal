@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -46,8 +46,6 @@ public abstract class AbstractBeginNode extends FixedWithNextNode implements LIR
 
     public static final NodeClass<AbstractBeginNode> TYPE = NodeClass.create(AbstractBeginNode.class);
 
-    private boolean hasSpeculationFence;
-
     protected AbstractBeginNode(NodeClass<? extends AbstractBeginNode> c) {
         this(c, StampFactory.forVoid());
     }
@@ -93,9 +91,7 @@ public abstract class AbstractBeginNode extends FixedWithNextNode implements LIR
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
-        if (hasSpeculationFence) {
-            gen.getLIRGeneratorTool().emitSpeculationFence();
-        }
+        // Begin nodes do not emit code by themselves.
     }
 
     public boolean isUsedAsGuardInput() {
@@ -134,15 +130,11 @@ public abstract class AbstractBeginNode extends FixedWithNextNode implements LIR
     }
 
     /**
-     * Set this begin node to be a speculation fence. This will prevent speculative execution of
-     * this block.
+     * Determines if the optimizer is allowed to move guards from the current begin to earlier
+     * points in control flow.
      */
-    public void setHasSpeculationFence() {
-        this.hasSpeculationFence = true;
-    }
-
-    public boolean hasSpeculationFence() {
-        return hasSpeculationFence;
+    public boolean mustNotMoveAttachedGuards() {
+        return false;
     }
 
     private static class BlockNodeIterator implements Iterator<FixedNode> {

@@ -50,43 +50,34 @@ import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.espresso.EspressoLanguage;
-import com.oracle.truffle.espresso.ffi.Buffer;
+import com.oracle.truffle.espresso.classfile.perf.DebugCounter;
 import com.oracle.truffle.espresso.ffi.NativeAccess;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
 import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.Pointer;
-import com.oracle.truffle.espresso.ffi.RawPointer;
 import com.oracle.truffle.espresso.ffi.SignatureCallNode;
-import com.oracle.truffle.espresso.ffi.TruffleByteBuffer;
+import com.oracle.truffle.espresso.ffi.memory.NativeMemory;
+import com.oracle.truffle.espresso.ffi.memory.UnsafeNativeMemory;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.perf.DebugCounter;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.substitutions.Collect;
-import com.oracle.truffle.espresso.vm.UnsafeAccess;
 import com.oracle.truffle.nfi.api.SignatureLibrary;
-
-import sun.misc.Unsafe;
 
 /**
  * Espresso native interface implementation based on TruffleNFI, this class is fully functional on
  * its own (nfi-native backend) and also serves as base for other NFI backends.
  */
 public class NFINativeAccess implements NativeAccess {
-
-    private static final Unsafe UNSAFE = UnsafeAccess.get();
-
+    protected static final TruffleLogger LOGGER = TruffleLogger.getLogger(EspressoLanguage.ID, NFINativeAccess.class);
+    protected static final InteropLibrary UNCACHED_INTEROP = InteropLibrary.getUncached();
+    protected static final SignatureLibrary UNCACHED_SIGNATURE = SignatureLibrary.getUncached();
     private static final boolean CACHE_SIGNATURES = "true".equals(System.getProperty("espresso.nfi.cache_signatures", "true"));
+    private static final DebugCounter NFI_SIGNATURES_CREATED = DebugCounter.create("NFI signatures created");
 
-    private final DebugCounter nfiSignaturesCreated = DebugCounter.create("NFI signatures created");
-
-    private final Map<NativeSignature, Object> nativeSignatureCache;
-    private final Map<NativeSignature, Object> javaSignatureCache;
-
-    protected final InteropLibrary uncachedInterop = InteropLibrary.getUncached();
-    protected final SignatureLibrary uncachedSignature = SignatureLibrary.getUncached();
-    private final TruffleLogger logger = TruffleLogger.getLogger(EspressoLanguage.ID, NFINativeAccess.class);
-
+    private final Map<Object, Object> signatureCache;
     protected final TruffleLanguage.Env env;
+
+    protected final NativeMemory nativeMemory;
 
     protected static String nfiType(NativeType nativeType) {
         // @formatter:off
@@ -109,7 +100,7 @@ public class NFINativeAccess implements NativeAccess {
         // @formatter:on
     }
 
-    protected String nfiStringSignature(NativeSignature nativeSignature, @SuppressWarnings("unused") boolean fromJava) {
+    protected String nfiStringSignature(NativeSignature nativeSignature, @SuppressWarnings("unused") boolean forFallbackSymbol) {
         StringBuilder sb = new StringBuilder(64);
         sb.append('(');
         boolean isFirst = true;
@@ -129,31 +120,37 @@ public class NFINativeAccess implements NativeAccess {
         return sb.toString();
     }
 
-    protected final TruffleLogger getLogger() {
-        return logger;
-    }
-
-    protected Object createNFISignature(NativeSignature nativeSignature, boolean fromJava) {
-        nfiSignaturesCreated.inc();
-        Source source = Source.newBuilder("nfi",
-                        nfiStringSignature(nativeSignature, fromJava), "signature").build();
+    protected Object createNFISignature(NativeSignature nativeSignature, boolean forFallbackSymbol) {
+        NFI_SIGNATURES_CREATED.inc();
+        Source source = Source.newBuilder("nfi", nfiStringSignature(nativeSignature, forFallbackSymbol), "signature").build();
         CallTarget target = env.parseInternal(source);
         return target.call();
     }
 
-    protected final Object getOrCreateNFISignature(NativeSignature nativeSignature, boolean fromJava) {
-        return CACHE_SIGNATURES
-                        ? (fromJava ? javaSignatureCache.computeIfAbsent(nativeSignature, sig -> createNFISignature(nativeSignature, true))
-                                        : nativeSignatureCache.computeIfAbsent(nativeSignature, sig -> createNFISignature(nativeSignature, false)))
-                        : createNFISignature(nativeSignature, fromJava);
+    private record ClassifiedSignature(NativeSignature signature, boolean forFallbackSymbol) {
+    }
+
+    protected final Object getOrCreateNFISignature(NativeSignature nativeSignature, boolean forFallbackSymbol) {
+        if (!CACHE_SIGNATURES) {
+            return createNFISignature(nativeSignature, forFallbackSymbol);
+        }
+        Object key;
+        if (hasFallbackSymbols()) {
+            key = new ClassifiedSignature(nativeSignature, forFallbackSymbol);
+        } else {
+            key = nativeSignature;
+        }
+        return signatureCache.computeIfAbsent(key, k -> createNFISignature(nativeSignature, forFallbackSymbol));
     }
 
     NFINativeAccess(TruffleLanguage.Env env) {
+        this(env, new UnsafeNativeMemory());
+    }
+
+    NFINativeAccess(TruffleLanguage.Env env, NativeMemory nativeMemory) {
         this.env = env;
-        javaSignatureCache = CACHE_SIGNATURES
-                        ? new ConcurrentHashMap<>()
-                        : null;
-        nativeSignatureCache = CACHE_SIGNATURES
+        this.nativeMemory = nativeMemory;
+        signatureCache = CACHE_SIGNATURES
                         ? new ConcurrentHashMap<>()
                         : null;
     }
@@ -190,13 +187,13 @@ public class NFINativeAccess implements NativeAccess {
             return (TruffleObject) target.call();
         } catch (IllegalArgumentException e) {
             CompilerDirectives.transferToInterpreterAndInvalidate();
-            getLogger().log(Level.SEVERE, "TruffleNFI native library isolation is not supported", e);
+            LOGGER.log(Level.SEVERE, "TruffleNFI native library isolation is not supported", e);
             throw EspressoError.shouldNotReachHere(e);
         } catch (AbstractTruffleException e) {
             // TODO(peterssen): Remove assert once GR-27045 reaches a definitive consensus.
             assert isExpectedException(e);
             // AbstractTruffleException is treated as if it were an UnsatisfiedLinkError.
-            getLogger().fine("AbstractTruffleException while loading library though NFI (" + nfiSource + ") : " + e.getMessage());
+            LOGGER.fine("AbstractTruffleException while loading library though NFI (" + nfiSource + ") : " + e.getMessage());
             return null;
         }
     }
@@ -204,13 +201,13 @@ public class NFINativeAccess implements NativeAccess {
     @Override
     public void unloadLibrary(@Pointer TruffleObject library) {
         // TODO(peterssen): NFI does not support unloading libraries eagerly.
-        getLogger().fine(String.format("JVM_UnloadLibrary: %x was not unloaded!", NativeUtils.interopAsPointer(library)));
+        LOGGER.fine(String.format("JVM_UnloadLibrary: %x was not unloaded!", NativeUtils.interopAsPointer(library)));
     }
 
     @Override
     public @Pointer TruffleObject lookupSymbol(@Pointer TruffleObject library, String symbolName) {
         try {
-            TruffleObject symbol = (TruffleObject) uncachedInterop.readMember(library, symbolName);
+            TruffleObject symbol = (TruffleObject) UNCACHED_INTEROP.readMember(library, symbolName);
             if (InteropLibrary.getUncached().isNull(symbol)) {
                 return null;
             }
@@ -322,18 +319,18 @@ public class NFINativeAccess implements NativeAccess {
 
     @Override
     public @Pointer TruffleObject bindSymbol(@Pointer TruffleObject symbol, NativeSignature nativeSignature) {
-        if (uncachedInterop.isNull(symbol)) {
+        if (UNCACHED_INTEROP.isNull(symbol)) {
             return null; // LD_DEBUG=unused makes non-existing symbols to be NULL.
         }
-        TruffleObject executable = (TruffleObject) uncachedSignature.bind(getCallableSignature(nativeSignature, true), symbol);
-        assert uncachedInterop.isExecutable(executable);
+        TruffleObject executable = (TruffleObject) UNCACHED_SIGNATURE.bind(getCallableSignature(nativeSignature, isFallbackSymbol(symbol)), symbol);
+        assert UNCACHED_INTEROP.isExecutable(executable);
         return new NativeToJavaWrapper(executable, nativeSignature);
     }
 
     @Override
     @TruffleBoundary
-    public Object getCallableSignature(NativeSignature nativeSignature, boolean fromJava) {
-        return getOrCreateNFISignature(nativeSignature, fromJava);
+    public Object getCallableSignature(NativeSignature nativeSignature, boolean forFallbackSymbol) {
+        return getOrCreateNFISignature(nativeSignature, forFallbackSymbol);
     }
 
     @Override
@@ -342,16 +339,34 @@ public class NFINativeAccess implements NativeAccess {
     }
 
     @Override
-    public SignatureCallNode createSignatureCall(NativeSignature nativeSignature, boolean fromJava) {
-        return NFISignatureCallNode.create(getCallableSignature(nativeSignature, fromJava));
+    public boolean hasFallbackSymbols() {
+        return false;
+    }
+
+    @Override
+    public boolean isFallbackSymbol(TruffleObject symbol) {
+        return false;
+    }
+
+    @Override
+    public NativeAccess getFallbackAccess() {
+        return null;
+    }
+
+    @Override
+    public SignatureCallNode createSignatureCall(NativeSignature nativeSignature) {
+        assert !hasFallbackSymbols();
+        return NFISignatureCallNode.create(getCallableSignature(nativeSignature, false));
     }
 
     @Override
     public @Pointer TruffleObject createNativeClosure(TruffleObject executable, NativeSignature nativeSignature) {
-        assert uncachedInterop.isExecutable(executable);
+        assert UNCACHED_INTEROP.isExecutable(executable);
         TruffleObject wrappedExecutable = new JavaToNativeWrapper(executable, nativeSignature);
-        TruffleObject nativeFn = (TruffleObject) uncachedSignature.createClosure(getCallableSignature(nativeSignature, false), wrappedExecutable);
-        assert uncachedInterop.isPointer(nativeFn);
+        // always create a "fallback" signature for native closure so that they can always be
+        // converted to pointers
+        TruffleObject nativeFn = (TruffleObject) UNCACHED_SIGNATURE.createClosure(getCallableSignature(nativeSignature, true), wrappedExecutable);
+        assert UNCACHED_INTEROP.isPointer(nativeFn);
         return nativeFn;
     }
 
@@ -454,49 +469,6 @@ public class NFINativeAccess implements NativeAccess {
         // nop
     }
 
-    @Override
-    public @Buffer TruffleObject allocateMemory(long size) {
-        long address = 0L;
-        try {
-            address = UNSAFE.allocateMemory(size);
-        } catch (OutOfMemoryError e) {
-            return null;
-        }
-        return TruffleByteBuffer.wrap(RawPointer.create(address), Math.toIntExact(size));
-    }
-
-    @Override
-    public @Buffer TruffleObject reallocateMemory(@Pointer TruffleObject buffer, long newSize) {
-        assert InteropLibrary.getUncached().isPointer(buffer);
-        long oldAddress = 0L;
-        try {
-            oldAddress = InteropLibrary.getUncached().asPointer(buffer);
-        } catch (UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            throw EspressoError.shouldNotReachHere(e);
-        }
-        long newAddress = 0L;
-        try {
-            newAddress = UNSAFE.reallocateMemory(oldAddress, newSize);
-        } catch (OutOfMemoryError e) {
-            return null;
-        }
-        return TruffleByteBuffer.wrap(RawPointer.create(newAddress), Math.toIntExact(newSize));
-    }
-
-    @Override
-    public void freeMemory(@Pointer TruffleObject buffer) {
-        assert InteropLibrary.getUncached().isPointer(buffer);
-        long address = 0L;
-        try {
-            address = InteropLibrary.getUncached().asPointer(buffer);
-        } catch (UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            throw EspressoError.shouldNotReachHere(e);
-        }
-        UNSAFE.freeMemory(address);
-    }
-
     @Collect(NativeAccess.class)
     public static final class Provider implements NativeAccess.Provider {
 
@@ -513,4 +485,8 @@ public class NFINativeAccess implements NativeAccess {
         }
     }
 
+    @Override
+    public NativeMemory nativeMemory() {
+        return nativeMemory;
+    }
 }

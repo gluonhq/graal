@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -53,9 +53,6 @@ class BuildStepsGraalVMStrategy(BuildSteps):
     _mx_path = mx._mx_path
     _jdk_home = None
     _tmp_dir = None
-
-    def __init__(self):
-        BuildSteps.__init__(self)
 
     # create specified copies of repo for parallel cmd execution
     def clone_repo(self, process_number=1):
@@ -119,22 +116,17 @@ class BuildStepsGraalVMStrategy(BuildSteps):
             paths[i] = os.path.join(path, cloned_path[0], cloned_path[1])
             os.mkdir(path)
             copy_cmd = ["cp", "-aR", cloned_repo, path]
-            proc = subprocess.Popen(copy_cmd)
+            subprocess.run(copy_cmd, check=True)
             mx_dir = os.path.dirname(self._mx_path)
             copy_cmd = ["cp", "-aR", mx_dir, path]
-            subprocess.Popen(copy_cmd)
-        proc.communicate()
+            subprocess.run(copy_cmd, check=True)
         return paths
 
     def _forceimports(self, paths):
         new_env = os.environ.copy()
-        arr = [None] * len(paths)
-        for i in range(len(paths)):
-            new_env['MX_PRIMARY_SUITE_PATH'] = paths[i]
-            proc = subprocess.Popen([self._mx_path, 'sforceimports'], env=new_env, cwd=paths[i])
-            arr[i] = proc
-        for proc in arr:
-            proc.communicate()
+        for path in paths:
+            new_env['MX_PRIMARY_SUITE_PATH'] = path
+            subprocess.run([self._mx_path, 'sforceimports'], env=new_env, cwd=path, check=True)
 
     def _fetch_jdk(self, jdk_id, paths):
         if not self._mx_path:
@@ -142,14 +134,14 @@ class BuildStepsGraalVMStrategy(BuildSteps):
         old_quiet = mx._opts.quiet
         mx._opts.quiet = True
         _, repo_path = VC.get_vc_root(paths[0])
+        old_cwd = os.getcwd()
         try:
             # Change directory so that fetch-jdk finds common.json and jdk-binaries.json in repo_path
-            old_cwd = os.getcwd()
             os.chdir(repo_path)
-            jdk_home = mx_fetchjdk.fetch_jdk(['--to', tempfile.gettempdir(), '--jdk-id', jdk_id, ''])
+            jdk_home = mx_fetchjdk.fetch_jdk(['--to', tempfile.gettempdir(), '--jdk-id', jdk_id])
             self._jdk_home = jdk_home
             os.environ['JAVA_HOME'] = jdk_home
-        except (OSError, IOError) as err:
+        except OSError as err:
             mx.log(str(err))
             self._jdk_home = mx.get_jdk().home
         finally:

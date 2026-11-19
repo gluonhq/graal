@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@ package jdk.graal.compiler.replacements.nodes;
 
 import static jdk.vm.ci.code.BytecodeFrame.isPlaceholderBci;
 
+import jdk.graal.compiler.core.common.type.ObjectStamp;
 import jdk.graal.compiler.core.common.type.StampPair;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.DebugContext;
@@ -67,27 +68,16 @@ public interface MacroInvokable extends Invokable, Lowerable, StateSplit, Single
     StampPair getReturnStamp();
 
     /**
-     * Access to the original arguments for a MethodHandle invoke call site. See
-     * {@link ResolvedMethodHandleCallTargetNode}.
-     */
-    NodeInputList<ValueNode> getOriginalArguments();
-
-    /**
-     * Access to the original target methods for a MethodHandle invoke call site. See
-     * {@link ResolvedMethodHandleCallTargetNode}.
-     */
-    ResolvedJavaMethod getOriginalTargetMethod();
-
-    /**
-     * Access to the original return stamp for a MethodHandle invoke call site. See
-     * {@link ResolvedMethodHandleCallTargetNode}.
-     */
-    StampPair getOriginalReturnStamp();
-
-    /**
      * Gets the arguments for this macro node.
      */
     NodeInputList<ValueNode> getArguments();
+
+    /**
+     * Gets {@linkplain #getArguments() the arguments} for this macro node as an array.
+     */
+    default ValueNode[] toArgumentArray() {
+        return getArguments().toArray(ValueNode.EMPTY_ARRAY);
+    }
 
     /**
      * @see #getArguments()
@@ -177,24 +167,27 @@ public interface MacroInvokable extends Invokable, Lowerable, StateSplit, Single
     }
 
     /**
-     * Create the call target when converting this node back into a normal {@link Invoke}. For a
-     * method handle invoke site this will be a {@link ResolvedMethodHandleCallTargetNode}.
+     * Create the call target when converting this node back into a normal {@link Invoke}.
      */
     default MethodCallTargetNode createCallTarget() {
         ValueNode[] arguments = getArguments().toArray(new ValueNode[getArguments().size()]);
-        if (getOriginalTargetMethod() != null) {
-            ValueNode[] originalArguments = getOriginalArguments().toArray(new ValueNode[getOriginalArguments().size()]);
-            return asNode().graph().add(ResolvedMethodHandleCallTargetNode.create(getInvokeKind(), getTargetMethod(), arguments, getReturnStamp(), getOriginalTargetMethod(), originalArguments,
-                            getOriginalReturnStamp()));
-
-        } else {
-            return asNode().graph().add(new MethodCallTargetNode(getInvokeKind(), getTargetMethod(), arguments, getReturnStamp(), null));
-        }
+        return asNode().graph().add(new MethodCallTargetNode(getInvokeKind(), getTargetMethod(), arguments, getReturnStamp(), null));
     }
 
     /**
-     * Captures the method handle information so that it can be properly lowered back to an
-     * {@link Invoke} later.
+     * Build a new copy of the {@link MacroNode.MacroParams} stored in this node.
      */
-    void addMethodHandleInfo(ResolvedMethodHandleCallTargetNode methodHandle);
+    default MacroNode.MacroParams copyParams() {
+        return new MacroNode.MacroParams(getInvokeKind(), getContextMethod(), getTargetMethod(), bci(), getReturnStamp(), toArgumentArray());
+    }
+
+    /**
+     * Builds a new copy of this node's macro parameters, but with the return stamp replaced by the
+     * trusted {@code newStamp}.
+     */
+    default MacroNode.MacroParams copyParamsWithImprovedStamp(ObjectStamp newStamp) {
+        GraalError.guarantee(newStamp.join(getReturnStamp().getTrustedStamp()).equals(newStamp), "stamp should improve from %s to %s", getReturnStamp(), newStamp);
+        StampPair improvedReturnStamp = StampPair.createSingle(newStamp);
+        return new MacroNode.MacroParams(getInvokeKind(), getContextMethod(), getTargetMethod(), bci(), improvedReturnStamp, toArgumentArray());
+    }
 }

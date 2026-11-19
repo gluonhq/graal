@@ -24,15 +24,21 @@
  */
 package com.oracle.svm.core.identityhashcode;
 
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.meta.SubstrateForeignCallsProvider;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 
 @AutomaticallyRegisteredFeature
 final class SubstrateIdentityHashCodeFeature implements InternalFeature {
 
     @Override
     public void registerForeignCalls(SubstrateForeignCallsProvider foreignCalls) {
-        foreignCalls.register(SubstrateIdentityHashCodeSnippets.GENERATE_IDENTITY_HASH_CODE);
+        ObjectLayout ol = ObjectLayout.singleton();
+        if (ol.isIdentityHashFieldOptional()) {
+            foreignCalls.register(SubstrateIdentityHashCodeSnippets.COMPUTE_ABSENT_IDENTITY_HASH_CODE);
+        } else {
+            foreignCalls.register(SubstrateIdentityHashCodeSnippets.GENERATE_IDENTITY_HASH_CODE);
+        }
     }
 }

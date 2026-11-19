@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,9 +26,15 @@ package jdk.graal.compiler.core.test;
 
 import java.util.ArrayList;
 
+import org.junit.Assert;
+import org.junit.Ignore;
+import org.junit.Test;
+
 import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.loop.phases.LoopFullUnrollPhase;
 import jdk.graal.compiler.nodes.IfNode;
+import jdk.graal.compiler.nodes.LoopBeginNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.StructuredGraph.AllowAssumptions;
 import jdk.graal.compiler.nodes.extended.BoxNode;
@@ -39,10 +45,6 @@ import jdk.graal.compiler.phases.common.BoxNodeOptimizationPhase;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
 import jdk.graal.compiler.phases.common.DisableOverflownCountedLoopsPhase;
 import jdk.graal.compiler.phases.util.GraphOrder;
-import org.junit.Assert;
-import org.junit.Ignore;
-import org.junit.Test;
-
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.code.InvalidInstalledCodeException;
 
@@ -268,6 +270,94 @@ public class OptimizedBoxNodeTest extends GraalCompilerTest {
             resCompiled[i + 200] = (int) code.executeVarargs(i);
         }
         Assert.assertArrayEquals(res, resCompiled);
+    }
+
+    static int snippetManySameValueBoxes(int a) {
+        for (int i = 0; i < 1000; i++) {
+            Integer box0 = a;
+            S = box0;
+            Integer box1 = a;
+            S = box1;
+            Integer box2 = a;
+            S = box2;
+            Integer box3 = a;
+            S = box3;
+            Integer box4 = a;
+            S = box4;
+            Integer box5 = a;
+            S = box5;
+            Integer box6 = a;
+            S = box6;
+            Integer box7 = a;
+            S = box7;
+        }
+        return 0;
+    }
+
+    static int snippetManySameValueBoxClusters(int a) {
+        int v0 = a;
+        int v1 = a + 1;
+        int v2 = a + 2;
+        int v3 = a + 3;
+        int v4 = a + 4;
+        int v5 = a + 5;
+        int v6 = a + 6;
+        int v7 = a + 7;
+        for (int i = 0; i < 1000; i++) {
+            Integer box0 = v0;
+            S = box0;
+            Integer box1 = v1;
+            S = box1;
+            Integer box2 = v2;
+            S = box2;
+            Integer box3 = v3;
+            S = box3;
+            Integer box4 = v4;
+            S = box4;
+            Integer box5 = v5;
+            S = box5;
+            Integer box6 = v6;
+            S = box6;
+            Integer box7 = v7;
+            S = box7;
+        }
+        return 0;
+    }
+
+    private StructuredGraph parseAndFullyUnrollBoxStressGraph(String snippet, CanonicalizerPhase canonicalizer) {
+        final OptionValues testOptions = new OptionValues(getInitialOptions(),
+                        DefaultLoopPolicies.Options.FullUnrollMaxIterations, 1500,
+                        DefaultLoopPolicies.Options.FullUnrollMaxNodes, 100000,
+                        DefaultLoopPolicies.Options.ExactFullUnrollMaxNodes, 100000,
+                        GraalOptions.MaximumDesiredSize, 150000);
+        StructuredGraph g = parseEager(getResolvedJavaMethod(snippet), AllowAssumptions.NO, testOptions);
+        new DisableOverflownCountedLoopsPhase().apply(g);
+        canonicalizer.apply(g, getDefaultHighTierContext());
+        Assert.assertEquals("Test precondition failed: expected one counted loop before unrolling", 1, g.getNodes(LoopBeginNode.TYPE).count());
+        new LoopFullUnrollPhase(createCanonicalizerPhase(), new DefaultLoopPolicies()).apply(g, getDefaultHighTierContext());
+        canonicalizer.apply(g, getDefaultHighTierContext());
+        Assert.assertEquals("Test precondition failed: loop should be fully unrolled", 0, g.getNodes(LoopBeginNode.TYPE).count());
+        return g;
+    }
+
+    @Test
+    public void testManySameValueBoxes() {
+        CanonicalizerPhase canonicalizer = CanonicalizerPhase.create();
+        StructuredGraph g = parseAndFullyUnrollBoxStressGraph("snippetManySameValueBoxes", canonicalizer);
+        long boxCountBefore = g.getNodes().filter(BoxNode.class).count();
+        Assert.assertTrue("Test precondition failed: expected at least 8000 boxes before box optimization, found " + boxCountBefore, boxCountBefore >= 8000);
+        new BoxNodeOptimizationPhase(canonicalizer).apply(g, getDefaultHighTierContext());
+        Assert.assertEquals("All same-value boxes should collapse to one dominating box", 1, g.getNodes().filter(BoxNode.class).count());
+    }
+
+    @Test
+    public void testManySameValueBoxClusters() {
+        CanonicalizerPhase canonicalizer = CanonicalizerPhase.create();
+        StructuredGraph g = parseAndFullyUnrollBoxStressGraph("snippetManySameValueBoxClusters", canonicalizer);
+        long boxCountBefore = g.getNodes().filter(BoxNode.class).count();
+        Assert.assertTrue("Test precondition failed: expected at least 8000 boxes before box optimization, found " + boxCountBefore, boxCountBefore >= 8000);
+        new BoxNodeOptimizationPhase(canonicalizer).apply(g, getDefaultHighTierContext());
+        Assert.assertEquals("Each same-value box cluster should collapse to one dominating box", 8, g.getNodes().filter(BoxNode.class).count());
     }
 
     static int testPEASnippet() {

@@ -28,46 +28,54 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
 
 import com.oracle.truffle.api.profiles.InlinedConditionProfile;
 
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.graphbuilderconf.InlineInvokePlugin;
 import jdk.graal.compiler.replacements.nodes.CalcStringAttributesNode;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-@RunWith(Parameterized.class)
 public class TStringOpsCalcStringAttributesUTF8ConstantTest extends TStringOpsConstantTest<CalcStringAttributesNode> {
 
-    @Parameters(name = "{index}: args: {1}, {2}")
     public static List<Object[]> data() {
         return reduceTestData(TStringOpsCalcStringAttributesUTF8Test.data(), 2, 1, 16);
     }
 
-    public TStringOpsCalcStringAttributesUTF8ConstantTest(byte[] array, int offset, int length) {
-        super(CalcStringAttributesNode.class, array, offset, length);
+    public TStringOpsCalcStringAttributesUTF8ConstantTest() {
+        super(CalcStringAttributesNode.class);
     }
 
     @Test
     public void testUtf8Valid() {
+        testParameterized(data(), this::testUtf8ValidCase);
+    }
+
+    private void testUtf8ValidCase(Object[] args) {
+        setTestCase(args);
         setConstantArgs(DUMMY_LOCATION, arrayA, offsetA, lengthA, true, false, InlinedConditionProfile.getUncached());
-        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", Object.class, int.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
+        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", byte[].class, long.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
         test(method, null, DUMMY_LOCATION, arrayA, offsetA, lengthA, true, false, InlinedConditionProfile.getUncached());
     }
 
     @Test
     public void testUtf8Unknown() {
+        testParameterized(data(), this::testUtf8UnknownCase);
+    }
+
+    private void testUtf8UnknownCase(Object[] args) {
+        setTestCase(args);
         setConstantArgs(DUMMY_LOCATION, arrayA, offsetA, lengthA, false, false, InlinedConditionProfile.getUncached());
-        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", Object.class, int.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
+        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", byte[].class, long.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
         test(method, null, DUMMY_LOCATION, arrayA, offsetA, lengthA, false, false, InlinedConditionProfile.getUncached());
     }
 
     @Override
     protected void checkLowTierGraph(StructuredGraph graph) {
-        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", Object.class, int.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
+        ResolvedJavaMethod method = getTStringOpsMethod("calcStringAttributesUTF8", byte[].class, long.class, int.class, boolean.class, boolean.class, InlinedConditionProfile.class);
         try {
             long ret = (long) invoke(method, null, constantArgs);
             if ((ret & 0xff) != LIRGeneratorTool.CalcStringAttributesEncoding.CR_BROKEN_MULTIBYTE) {
@@ -76,5 +84,13 @@ public class TStringOpsCalcStringAttributesUTF8ConstantTest extends TStringOpsCo
         } catch (IllegalAccessException | InvocationTargetException | InstantiationException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    @Override
+    protected InlineInvokePlugin.InlineInfo bytecodeParserShouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
+        if (method.getName().equals("calcStringAttributesUTF8Invalid")) {
+            return InlineInvokePlugin.InlineInfo.createStandardInlineInfo(method);
+        }
+        return super.bytecodeParserShouldInlineInvoke(b, method, args);
     }
 }

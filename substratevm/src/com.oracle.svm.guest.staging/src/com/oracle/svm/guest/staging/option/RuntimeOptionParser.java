@@ -1,0 +1,955 @@
+/*
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.guest.staging.option;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.MapCursor;
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.guest.staging.ArgsSupport;
+import com.oracle.svm.guest.staging.GuestStagingDependencyBridge;
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.guest.staging.SubstrateGuestOptions;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.util.AbstractImageHeapList;
+import com.oracle.svm.guest.staging.util.ImageHeapList;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
+import com.oracle.svm.shared.imagelayer.LayeredGuestFoldResolver;
+import com.oracle.svm.shared.meta.GuaranteeFolded;
+import com.oracle.svm.shared.meta.GuestFold;
+import com.oracle.svm.shared.option.CommonOptionParser.BooleanOptionFormat;
+import com.oracle.svm.shared.option.CommonOptionParser.OptionParseResult;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+
+import jdk.graal.compiler.options.OptionDescriptor;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+
+/**
+ * Option parser to be used by an application that runs on Substrate VM. The list of options that
+ * are available is collected during native image generation.
+ *
+ * There is no requirement to use this class, you can also implement your own option parsing and
+ * then set the values of options manually.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public final class RuntimeOptionParser {
+
+    /**
+     * The suggested prefix for all VM options available in an application based on Substrate VM.
+     */
+    private static final String NORMAL_OPTION_PREFIX = "-XX:";
+
+    /**
+     * The prefix for Graal style options available in an application based on Substrate VM.
+     */
+    private static final String GRAAL_OPTION_PREFIX = "-Djdk.graal.";
+
+    /**
+     * The legacy prefix for Graal style options available in an application based on Substrate VM.
+     */
+    private static final String LEGACY_GRAAL_OPTION_PREFIX = "-Dgraal.";
+
+    /**
+     * The prefix for XOptions available in an application based on Substrate VM.
+     */
+    public static final String X_OPTION_PREFIX = "-X";
+
+    private static final String PROPERTY_PREFIX = "-D";
+    private static final String JAVA_ENDORSED_DIRS_PROPERTY = "java.endorsed.dirs";
+    private static final String JAVA_EXT_DIRS_PROPERTY = "java.ext.dirs";
+    private static final String BOOT_CLASS_PATH_APPEND_PROPERTY = "jdk.boot.class.path.append";
+    private static final String MODULE_PROPERTY_PREFIX = "jdk.module.";
+    private static final String[] RESERVED_INTERNAL_MODULE_PROPERTY_SUFFIXES = {
+                    "patch",
+                    "limitmods",
+                    "upgrade.path",
+                    "illegal.native.access",
+                    "addexports",
+                    "addopens",
+                    "addreads",
+                    "path",
+                    "addmods",
+                    "enable.native.access"
+    };
+
+    private static final String ENABLE_PREVIEW_OPTION = "--enable-preview";
+    private static final String FINALIZATION_OPTION_PREFIX = "--finalization=";
+    private static final String ILLEGAL_NATIVE_ACCESS_OPTION_PREFIX = "--illegal-native-access=";
+    private static final String SUN_MISC_UNSAFE_MEMORY_ACCESS_OPTION_PREFIX = "--sun-misc-unsafe-memory-access=";
+    private static final String X_BOOTCLASSPATH_APPEND_OPTION_PREFIX = X_OPTION_PREFIX + "bootclasspath/a:";
+    private static final String XLOG_OPTION_PREFIX = "-Xlog:";
+    private static final String JAVA_AGENT_OPTION_PREFIX = "-javaagent:";
+    private static final String AGENT_LIB_OPTION_PREFIX = "-agentlib:";
+    private static final String AGENT_PATH_OPTION_PREFIX = "-agentpath:";
+    private static final String LOG_FILE_OPTION = "LogFile";
+    private static final String LOG_FILE_OPTION_PREFIX = NORMAL_OPTION_PREFIX + LOG_FILE_OPTION + "=";
+    @GuaranteeFolded private static final String HOTSPOT_OPTION_COMPATIBILITY_NAME = "CREMA_HOTSPOT_OPTION_COMPATIBILITY";
+    private static final String PATCH_MODULE_OPTION = "--patch-module";
+    private static final String RESERVED_INTERNAL_MODULE_PROPERTY_WARNING = "Ignoring system property options whose names match '-Djdk.module.*', which is reserved for internal use.";
+    private static final String VERIFY_NONE_WARNING = "Options -Xverify:none and -noverify were deprecated in JDK 13 and will likely be removed in a future release.";
+    private static final String RISTRETTO_JIT_ENABLE_COMPILATION_OPTION = "JITEnableCompilation";
+    private static final String RISTRETTO_XBATCH_OPTION = "JITXBatch";
+    private static final String RISTRETTO_XCOMP_OPTION = "JITXComp";
+
+    private static final Set<String> SYSTEM_ASSERTION_OPTIONS = Set.of(
+                    "-esa",
+                    "-dsa",
+                    "-enablesystemassertions",
+                    "-disablesystemassertions");
+
+    /// Lists HotSpot boolean `-XX` options ignored with a warning when
+    /// `CREMA_HOTSPOT_OPTION_COMPATIBILITY` is enabled.
+    @GuaranteeFolded private static final Set<String> RECOGNIZED_BOOLEAN_HOTSPOT_COMPATIBILITY_OPTIONS = Set.of(
+                    "UnlockExperimentalVMOptions",
+                    "TieredCompilation",
+                    "UseCompressedOops",
+                    "VerifyDependencies",
+                    "CreateCoredumpOnCrash",
+                    "DisplayVMOutput",
+                    "LogVMOutput");
+
+    /// Lists HotSpot value `-XX` options ignored with a warning when
+    /// `CREMA_HOTSPOT_OPTION_COMPATIBILITY` is enabled.
+    @GuaranteeFolded private static final Set<String> RECOGNIZED_VALUE_HOTSPOT_COMPATIBILITY_OPTIONS = Set.of(
+                    "ReservedCodeCacheSize",
+                    "TieredStopAtLevel",
+                    "MaxRAMPercentage",
+                    "DisableIntrinsic",
+                    "CompileThresholdScaling");
+
+    /// Lists exact options ignored with a warning in `CREMA_HOTSPOT_OPTION_COMPATIBILITY` mode if
+    /// strict Java option parsing or Ristretto compilation mode parsing has not consumed them first.
+    private static final Set<String> IGNORED_COMPATIBILITY_OPTIONS = Set.of(
+                    "-ea",
+                    "-esa",
+                    "-Xcomp",
+                    "-Xbatch",
+                    "-Xint",
+                    "-Xmixed",
+                    "-Xverify:all");
+
+    /// Lists compilation mode options retained when Ristretto is available, including when
+    /// `CREMA_HOTSPOT_OPTION_COMPATIBILITY` is enabled. Ristretto maps them to its runtime options.
+    private static final Set<String> RISTRETTO_COMPILATION_MODE_OPTIONS = Set.of(
+                    "-Xint",
+                    "-Xmixed",
+                    "-Xbatch",
+                    "-Xcomp");
+
+    /// Lists exact `-X` options rejected when `StrictRuntimeJavaOptions` is enabled and no earlier
+    /// parser has implemented them. Ristretto consumes its compilation modes before this check.
+    private static final Set<String> EXACT_RECOGNIZED_X_OPTIONS = Set.of(
+                    "-Xnoclassgc",
+                    "-Xbatch",
+                    "-Xrs",
+                    "-Xprof",
+                    "-Xint",
+                    "-Xmixed",
+                    "-Xcomp",
+                    "-Xshare:dump",
+                    "-Xshare:on",
+                    "-Xshare:auto",
+                    "-Xshare:off",
+                    "-Xdebug",
+                    "-Xcheck:jni");
+
+    /// Lists `-verbose:` components rejected when `StrictRuntimeJavaOptions` is enabled because
+    /// their behavior is not implemented. The `class` component is handled separately.
+    private static final Set<String> UNIMPLEMENTED_VERBOSE_OPTIONS = Set.of(
+                    "gc",
+                    "jni",
+                    "module");
+
+    /// HotSpot-style runtime compilation modes that map to Ristretto runtime options.
+    private enum RistrettoCompilationMode {
+        INTERPRETED,
+        MIXED,
+        COMPILE_ONLY
+    }
+
+    /** All reachable options. */
+    private final EconomicMap<String, OptionDescriptor> options = ImageHeapMap.createNonLayeredMap();
+    /** Reachable options that require validation after parsing. */
+    @SuppressWarnings("unchecked") //
+    private final AbstractImageHeapList<RuntimeOptionKey<?>> optionsWithAfterParsingValidation = (AbstractImageHeapList<RuntimeOptionKey<?>>) ImageHeapList.createGeneric(RuntimeOptionKey.class);
+
+    /**
+     * Returns the singleton instance that is created during native image generation and stored in
+     * the {@link ImageSingletons}.
+     */
+    @GuestFold(resolver = LayeredGuestFoldResolver.INITIAL_LAYER)
+    public static RuntimeOptionParser singleton() {
+        return ImageSingletons.lookup(RuntimeOptionParser.class);
+    }
+
+    /// Folds the strict Java option policy so unsupported parsing paths are omitted from the image.
+    @GuestFold
+    private static boolean strictRuntimeJavaOptions() {
+        return GuestStagingDependencyBridge.singleton().strictRuntimeJavaOptions();
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void addDescriptor(OptionDescriptor optionDescriptor) {
+        if (options.putIfAbsent(optionDescriptor.getName(), optionDescriptor) == null &&
+                        optionDescriptor.getOptionKey() instanceof RuntimeOptionKey<?> runtimeOptionKey &&
+                        runtimeOptionKey.hasAfterParsingValidation()) {
+            optionsWithAfterParsingValidation.add(runtimeOptionKey);
+        }
+    }
+
+    public Optional<OptionDescriptor> getDescriptor(String optionName) {
+        return Optional.ofNullable(options.get(optionName));
+    }
+
+    public Iterable<OptionDescriptor> getDescriptors() {
+        return options.getValues();
+    }
+
+    /** Runs validations that require the complete run-time option configuration. */
+    public void validateOptionsAfterParsing() {
+        for (RuntimeOptionKey<?> runtimeOptionKey : optionsWithAfterParsingValidation) {
+            runtimeOptionKey.validateAfterParsing();
+        }
+    }
+
+    /// Parse and consume all standard options and system properties supported by Substrate VM. The
+    /// returned array contains all arguments that were not consumed, i.e., were not recognized as
+    /// options.
+    ///
+    /// Note that the logic of whether to parse options must be in sync with the isolate argument
+    /// parser. [GuestStagingDependencyBridge#shouldParseRuntimeOptions] provides that policy here.
+    public static String[] parseAndConsumeAllOptions(String[] initialArgs, boolean ignoreUnrecognized) {
+        if (!GuestStagingDependencyBridge.singleton().shouldParseRuntimeOptions(IsolateArgumentParser.isCompilationIsolate())) {
+            return initialArgs;
+        }
+
+        ParseContext context = new ParseContext();
+        String[] args = parseJavaVMOptions(initialArgs, context);
+        args = consumeCompatibilityOptions(args);
+        args = singleton().parse(args, ignoreUnrecognized || shouldIgnoreUnrecognizedJavaOptions(args));
+        if (strictRuntimeJavaOptions()) {
+            rejectRecognizedUnimplementedJavaOptions(args);
+        }
+        configureLogFile(context.logFile);
+        GuestStagingDependencyBridge.singleton().endOfParsing();
+        return args;
+    }
+
+    /**
+     * Parses runtime options for a Java main image and returns the application main arguments.
+     * The {@code initialArgs} array must not be modified because management APIs and
+     * {@code VM.getRuntimeArguments()} use it to report the original arguments.
+     */
+    public static String[] parseAndConsumeJavaMainOptions(String[] initialArgs, boolean ignoreUnrecognized) {
+        if (!strictRuntimeJavaOptions()) {
+            return parseAndConsumeAllOptions(initialArgs.clone(), ignoreUnrecognized);
+        }
+
+        int separatorIndex = ArgsSupport.firstEndOfOptionsMarkerIndex(initialArgs);
+        if (separatorIndex == -1) {
+            return parseAndConsumeAllOptions(initialArgs.clone(), ignoreUnrecognized);
+        }
+
+        String[] remainingArgs = parseAndConsumeAllOptions(Arrays.copyOf(initialArgs, separatorIndex), ignoreUnrecognized);
+        if (!ignoreUnrecognized && remainingArgs.length != 0) {
+            throw new IllegalArgumentException("Unrecognized option: " + remainingArgs[0]);
+        }
+
+        return Arrays.copyOfRange(initialArgs, separatorIndex + 1, initialArgs.length);
+    }
+
+    /// Prints a sorted snapshot of the current runtime option values without exiting.
+    ///
+    /// This lists the options registered in the image and labels every entry `{native image}`.
+    /// It reports configured values; effective values computed by subsystems can differ. For example,
+    /// `MaxHeapSize` can remain `0` while the GC computes its actual limit separately. Origins are
+    /// limited to `{default}`, `{build-time}`, `{command line}`, and `{runtime}`. Runtime arguments
+    /// from all entry points, including JNI VM creation, use `{command line}`.
+    ///
+    /// Output uses [Log#log()], normally standard error, with Native Image log-file and callback
+    /// routing.
+    public void printFinalFlags() {
+        List<OptionDescriptor> sorted = new ArrayList<>();
+        for (OptionDescriptor descriptor : options.getValues()) {
+            sorted.add(descriptor);
+        }
+        sorted.sort(Comparator.comparing(OptionDescriptor::getName));
+        RuntimeOptionValues.Snapshot snapshot = RuntimeOptionValues.singleton().getSnapshot();
+        OptionValues values = snapshot.values();
+        Log out = Log.log();
+        out.string("[Global flags]").newline();
+        for (OptionDescriptor descriptor : sorted) {
+            OptionKey<?> key = descriptor.getOptionKey();
+            Class<?> valueType = descriptor.getOptionValueType();
+            String type;
+            if (valueType == Boolean.class) {
+                type = "bool";
+            } else if (valueType == Integer.class) {
+                type = "int";
+            } else if (valueType == Long.class) {
+                type = "intx";
+            } else if (valueType == Double.class) {
+                type = "double";
+            } else {
+                type = "ccstr";
+            }
+            String origin = snapshot.origin(key).toString();
+            out.string(formatFinalFlag(type, descriptor.getName(), key.getValue(values), origin)).newline();
+        }
+        out.flush();
+    }
+
+    /// Formats Native Image flag values using HotSpot's column positions and alignment.
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+36/src/hotspot/share/runtime/flags/jvmFlag.cpp#L139-L324")
+    private static String formatFinalFlag(String type, String name, Object value, String origin) {
+        StringBuilder line = new StringBuilder();
+        line.append(" ".repeat(9 - type.length())).append(type);
+        appendFinalFlagField(line, 10, name);
+        appendFinalFlagField(line, 50, " =");
+        appendFinalFlagField(line, 53, String.valueOf(value));
+        String kind = "{native image}";
+        appendFinalFlagField(line, 84, " ".repeat(20 - kind.length()) + kind);
+        appendFinalFlagField(line, 105, "{" + origin + "}");
+        return line.toString();
+    }
+
+    /// Starts a field at `column`, keeping a separator when the preceding field exceeds its width.
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+36/src/hotspot/share/runtime/flags/jvmFlag.cpp#L131-L137")
+    private static void appendFinalFlagField(StringBuilder line, int column, String value) {
+        line.append(" ".repeat(Math.max(1, column - line.length()))).append(value);
+    }
+
+    /// Configures the low level log file after all runtime options have been parsed.
+    private static void configureLogFile(String logFile) {
+        if (logFile != null) {
+            GuestStagingDependencyBridge.singleton().configureLogFile(LOG_FILE_OPTION_PREFIX, logFile);
+        }
+    }
+
+    /// Determines the unknown-option policy before general parsing because a later flag can control
+    /// how earlier options are handled. The last explicit setting takes precedence over the current
+    /// option value.
+    private static boolean shouldIgnoreUnrecognizedJavaOptions(String[] args) {
+        for (int i = args.length - 1; i >= 0; i--) {
+            String arg = args[i];
+            if (arg.equals("-XX:+IgnoreUnrecognizedVMOptions")) {
+                return true;
+            } else if (arg.equals("-XX:-IgnoreUnrecognizedVMOptions")) {
+                return false;
+            }
+        }
+        return SubstrateGuestOptions.IgnoreUnrecognizedVMOptions.getValue();
+    }
+
+    /// Parses `args` and updates runtime option values for recognized options.
+    ///
+    /// @param args arguments to be parsed
+    /// @param ignoreUnrecognized whether unrecognized options starting with `-` are discarded.
+    /// Invalid values of recognized options remain errors. In strict mode, recognized
+    /// but unsupported Java VM options also remain errors.
+    /// @return arguments that were not consumed
+    /// @throws IllegalArgumentException if an argument cannot be parsed under the selected policy.
+    /// The parse error is described by [Throwable#getMessage()].
+    private String[] parse(String[] args, boolean ignoreUnrecognized) {
+        int newIdx = 0;
+        EconomicMap<OptionKey<?>, Object> values = OptionValues.newOptionMap();
+        boolean compilationFailureActionAvailable = options.containsKey("CompilationFailureAction");
+        // A negative flag only reverses an active positive flag from this argument list.
+        boolean abortOptionActive = false;
+        for (int oldIdx = 0; oldIdx < args.length; oldIdx++) {
+            String arg = args[oldIdx];
+            // Images without the compiler use the normal unrecognized-option policy for aliases.
+            if (compilationFailureActionAvailable && arg.equals("-XX:+AbortVMOnCompilationFailure")) {
+                abortOptionActive = true;
+                arg = "-Djdk.graal.CompilationFailureAction=ExitVM";
+            } else if (compilationFailureActionAvailable && arg.equals("-XX:-AbortVMOnCompilationFailure")) {
+                if (!abortOptionActive) {
+                    continue;
+                }
+                abortOptionActive = false;
+                arg = "-Djdk.graal.CompilationFailureAction=Silent";
+            } else if (arg.startsWith("-Djdk.graal.CompilationFailureAction=") ||
+                            arg.startsWith("-Dgraal.CompilationFailureAction=") ||
+                            arg.startsWith("-XX:CompilationFailureAction=")) {
+                abortOptionActive = false;
+            }
+            if (arg.startsWith(NORMAL_OPTION_PREFIX)) {
+                parseOptionAtRuntime(arg, NORMAL_OPTION_PREFIX, BooleanOptionFormat.PLUS_MINUS, values, ignoreUnrecognized);
+            } else if (arg.startsWith(GRAAL_OPTION_PREFIX)) {
+                parseOptionAtRuntime(arg, GRAAL_OPTION_PREFIX, BooleanOptionFormat.NAME_VALUE, values, ignoreUnrecognized);
+            } else if (arg.startsWith(LEGACY_GRAAL_OPTION_PREFIX)) {
+                parseOptionAtRuntime(arg, LEGACY_GRAAL_OPTION_PREFIX, BooleanOptionFormat.NAME_VALUE, values, ignoreUnrecognized);
+            } else if (isRistrettoCompilationModeOption(arg)) {
+                parseRistrettoCompilationModeOption(values, arg);
+            } else if (arg.startsWith(X_OPTION_PREFIX) && XOptions.parse(arg.substring(X_OPTION_PREFIX.length()), values)) {
+                // option value was already parsed and added to the map
+            } else if (ignoreUnrecognized && arg.startsWith("-")) {
+                // Strict mode still rejects recognized options whose behavior is unsupported.
+                if (GuestStagingDependencyBridge.singleton().strictRuntimeJavaOptions()) {
+                    rejectRecognizedUnimplementedJavaOptions(new String[]{arg});
+                }
+            } else {
+                assert newIdx <= oldIdx;
+                args[newIdx] = arg;
+                newIdx += 1;
+            }
+        }
+
+        if (!values.isEmpty()) {
+            RuntimeOptionValues.singleton().update(values, RuntimeOptionValues.Origin.CommandLine);
+        }
+        if (newIdx == args.length) {
+            /* We can be allocation free and just return the original arguments. */
+            return args;
+        } else {
+            return Arrays.copyOf(args, newIdx);
+        }
+    }
+
+    /**
+     * Keeps mode constants behind the Ristretto guard so analysis of other images does not read
+     * their enum fields while parsing the caller.
+     */
+    private void parseRistrettoCompilationModeOption(EconomicMap<OptionKey<?>, Object> values, String arg) {
+        switch (arg) {
+            case "-Xint" -> setRistrettoCompilationModeOptions(values, RistrettoCompilationMode.INTERPRETED);
+            case "-Xmixed" -> setRistrettoCompilationModeOptions(values, RistrettoCompilationMode.MIXED);
+            case "-Xbatch" -> setBooleanRuntimeOption(values, RISTRETTO_XBATCH_OPTION, true);
+            case "-Xcomp" -> setRistrettoCompilationModeOptions(values, RistrettoCompilationMode.COMPILE_ONLY);
+            default -> throw new IllegalStateException("Unexpected Ristretto compilation mode option: " + arg);
+        }
+    }
+
+    /// Applies a HotSpot-style compilation mode after all earlier arguments have been consumed.
+    private void setRistrettoCompilationModeOptions(EconomicMap<OptionKey<?>, Object> values, RistrettoCompilationMode compilationMode) {
+        boolean enableCompilation = compilationMode != RistrettoCompilationMode.INTERPRETED;
+        boolean compileOnly = compilationMode == RistrettoCompilationMode.COMPILE_ONLY;
+        setBooleanRuntimeOption(values, RISTRETTO_JIT_ENABLE_COMPILATION_OPTION, enableCompilation);
+        setBooleanRuntimeOption(values, RISTRETTO_XCOMP_OPTION, compileOnly);
+    }
+
+    private void setBooleanRuntimeOption(EconomicMap<OptionKey<?>, Object> values, String optionName, boolean value) {
+        OptionDescriptor descriptor = getDescriptor(optionName).orElseThrow(() -> new IllegalStateException("Missing Ristretto runtime option descriptor: " + optionName));
+        if (descriptor.getOptionValueType() != Boolean.class) {
+            throw new IllegalStateException("Ristretto runtime option must be Boolean: " + optionName);
+        }
+        descriptor.getOptionKey().update(values, value);
+    }
+
+    /**
+     * Parse one option at runtime and set its value.
+     *
+     * @param arg argument to be parsed
+     * @param optionPrefix prefix for the runtime option
+     * @throws IllegalArgumentException if {@code arg} is invalid. The parse error is described by
+     *             {@link Throwable#getMessage()}.
+     */
+    public void parseOptionAtRuntime(String arg, String optionPrefix, BooleanOptionFormat booleanOptionFormat, EconomicMap<OptionKey<?>, Object> values, boolean ignoreUnrecognized) {
+        Predicate<OptionKey<?>> isHosted = optionKey -> false;
+        OptionParseResult parseResult = SubstrateOptionsParser.parseOption(options, isHosted, arg.substring(optionPrefix.length()), values, optionPrefix, booleanOptionFormat);
+        if (parseResult.printFlags() || parseResult.printFlagsWithExtraHelp()) {
+            SubstrateOptionsParser.printFlags(d -> parseResult.matchesFlags(d, d.getOptionKey() instanceof RuntimeOptionKey),
+                            options, optionPrefix, Log.logStream(), parseResult.printFlagsWithExtraHelp());
+            System.exit(0);
+        }
+        if (!parseResult.isValid()) {
+            if (parseResult.optionUnrecognized() && ignoreUnrecognized) {
+                return;
+            }
+            throw new IllegalArgumentException(parseResult.getError());
+        }
+
+        // Print a warning if the option is deprecated.
+        OptionKey<?> option = parseResult.getOptionKey();
+        OptionDescriptor descriptor = option.getDescriptor();
+        if (descriptor != null && descriptor.isDeprecated()) {
+            Log log = Log.log();
+            // Checkstyle: Allow raw info or warning printing - begin
+            log.string("Warning: Option '").string(descriptor.getName()).string("' is deprecated and might be removed from future versions");
+            // Checkstyle: Allow raw info or warning printing - end
+            String deprecationMessage = descriptor.getDeprecationMessage();
+            if (deprecationMessage != null && !deprecationMessage.isEmpty()) {
+                log.string(": ").string(deprecationMessage);
+            }
+            log.newline();
+        }
+    }
+
+    /// Parses the Java VM options that HotSpot handles in `arguments.cpp`. This parser phase is
+    /// entry-point agnostic: it receives options from `CreateJavaVM`, `graal_create_isolate`, and
+    /// native image `main` startup after any entry-point-specific preprocessing has completed. It
+    /// consumes only implemented Java VM options and leaves every other option in the returned
+    /// array so the caller can apply the appropriate unknown-option policy for the entry point.
+    ///
+    /// When options originate from the `java` launcher, the launcher performs normalization before
+    /// the VM sees them. For example, the launcher forms:
+    ///
+    /// - `-p mod1.jar:mod2.jar`
+    /// - `--module-path mod1.jar:mod2.jar`
+    /// - `--module-path=mod1.jar:mod2.jar`
+    ///
+    /// all reach this parser phase as `--module-path=mod1.jar:mod2.jar`.
+    ///
+    /// Some documented `java --help` and `java -X` options are handled entirely by the launcher and
+    /// do not reach VM-side option parsing. These include:
+    ///
+    /// - application-selection and path options: `-cp`, `-classpath`, `--class-path`, `-jar`, `-m`,
+    /// `--module`, `--source`, `-d`, `--describe-module`
+    /// - informational, validation, and dry-run options: `--list-modules`, `--dry-run`,
+    /// `--validate-modules`, `--show-module-resolution`
+    /// - help and version options: `-?`, `-h`, `-help`, `--help`, `-X`, `--help-extra`, `-version`,
+    /// `--version`, `-showversion`, `--show-version`, `-fullversion`, `--full-version`
+    /// - launcher-specific `-X` options: `-XshowSettings`, `-XshowSettings:<sub-option>`, `-Xdiag`
+    /// - other launcher-only options: `-splash:<imagepath>`, `--disable-@files`
+    ///
+    /// See GR-75297 for work to implement the currently unimplemented options.
+    ///
+    /// @return the entries in `args` that were not consumed
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jvmci-25.2-b20/src/hotspot/share/runtime/arguments.cpp")
+    private static String[] parseJavaVMOptions(String[] args, ParseContext context) {
+        int newIdx = 0;
+        for (int oldIdx = 0; oldIdx < args.length; oldIdx++) {
+            String arg = args[oldIdx];
+            if (arg.startsWith(LOG_FILE_OPTION_PREFIX)) {
+                context.logFile = arg.substring(LOG_FILE_OPTION_PREFIX.length());
+                if (context.logFile.isEmpty()) {
+                    throw new IllegalArgumentException("The " + LOG_FILE_OPTION + " option requires a non-empty path");
+                }
+                continue;
+            }
+            if (parseProperty(arg, context) ||
+                            (strictRuntimeJavaOptions() && (parseModuleOption(arg, context) ||
+                                            parsePreviewOption(arg) ||
+                                            parseVerifyOption(arg) ||
+                                            parseXBootClasspathAppendOption(arg, context) ||
+                                            parseRecognizedJavaOption(arg)))) {
+                continue;
+            }
+            args[newIdx] = arg;
+            newIdx++;
+        }
+        /*
+         * In strict mode, validate obsolete directory properties before installing them during
+         * launcher or JNI startup. Initialize all system properties before later option value
+         * updates can execute JDK code and cache stale values.
+         */
+        if (strictRuntimeJavaOptions()) {
+            rejectUnsupportedObsoleteDirectoryProperties(context.properties);
+        }
+        initializeProperties(context.properties);
+
+        return newIdx == args.length ? args : Arrays.copyOf(args, newIdx);
+    }
+
+    private static void rejectUnsupportedObsoleteDirectoryProperties(EconomicMap<String, String> properties) {
+        rejectUnsupportedObsoleteDirectoryProperty(properties, JAVA_ENDORSED_DIRS_PROPERTY,
+                        "Endorsed standards and standalone APIs" + System.lineSeparator() +
+                                        "in modular form will be supported via the concept of upgradeable modules.");
+        rejectUnsupportedObsoleteDirectoryProperty(properties, JAVA_EXT_DIRS_PROPERTY, "Use -classpath instead.");
+    }
+
+    private static void rejectUnsupportedObsoleteDirectoryProperty(EconomicMap<String, String> properties, String property, String explanation) {
+        String value = properties.get(property);
+        if (value != null && !value.isEmpty() && !value.equals("\"\"")) {
+            throw new IllegalArgumentException("-D" + property + "=" + value + " is not supported. " + explanation);
+        }
+    }
+
+    private static boolean parseVerifyOption(String arg) {
+        if (!arg.equals("-Xverify") && !arg.startsWith("-Xverify:")) {
+            return false;
+        }
+        String mode = switch (arg.substring("-Xverify".length())) {
+            case "", ":all" -> "ALL";
+            case ":remote" -> "REMOTE";
+            case ":none" -> {
+                Log.log().string("Substrate VM warning: ").string(VERIFY_NONE_WARNING).newline();
+                yield "NONE";
+            }
+            default -> throw new IllegalArgumentException("Invalid option '" + arg + "'. Expected -Xverify, -Xverify:all, -Xverify:remote, or -Xverify:none.");
+        };
+        GuestStagingDependencyBridge.singleton().setVerifyMode(mode);
+        return true;
+    }
+
+    /// Initializes system properties derived from recognized Java VM options.
+    ///
+    /// @param properties the VM option-derived system properties to initialize
+    private static void initializeProperties(EconomicMap<String, String> properties) {
+        MapCursor<String, String> cursor = properties.getEntries();
+        while (cursor.advance()) {
+            GuestStagingDependencyBridge.singleton().initializeSystemProperty(cursor.getKey(), cursor.getValue());
+        }
+    }
+
+    /// Parses a non-Graal `-Dkey` or `-Dkey=value` property and records it if valid.
+    private static boolean parseProperty(String arg, ParseContext context) {
+        if (!arg.startsWith(PROPERTY_PREFIX) || hasPrefix(arg, GRAAL_OPTION_PREFIX) || hasPrefix(arg, LEGACY_GRAAL_OPTION_PREFIX)) {
+            return false;
+        }
+        if (strictRuntimeJavaOptions() && isReservedInternalModuleProperty(arg)) {
+            if (!context.warnedInternalModuleProperty) {
+                Log.log().string("Substrate VM warning: ").string(RESERVED_INTERNAL_MODULE_PROPERTY_WARNING).newline();
+                context.warnedInternalModuleProperty = true;
+            }
+            return true;
+        }
+        String property = arg.substring(PROPERTY_PREFIX.length());
+        int splitIndex = property.indexOf('=');
+        if (splitIndex == -1) {
+            context.properties.put(property, "");
+            return true;
+        }
+        String key = property.substring(0, splitIndex);
+        String value = property.substring(splitIndex + 1);
+        context.properties.put(key, value);
+        return true;
+    }
+
+    /// Returns `true` if `arg` names one of the reserved `jdk.module.*` properties.
+    private static boolean isReservedInternalModuleProperty(String arg) {
+        if (!arg.startsWith(PROPERTY_PREFIX + MODULE_PROPERTY_PREFIX)) {
+            return false;
+        }
+        int splitIndex = arg.indexOf('=');
+        int propertyNameEnd = splitIndex == -1 ? arg.length() : splitIndex;
+        String propertyName = arg.substring(PROPERTY_PREFIX.length(), propertyNameEnd);
+        String propertySuffix = propertyName.substring(MODULE_PROPERTY_PREFIX.length());
+        for (String reservedSuffix : RESERVED_INTERNAL_MODULE_PROPERTY_SUFFIXES) {
+            if (propertySuffix.equals(reservedSuffix) || propertySuffix.startsWith(reservedSuffix + ".")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Consumes compatibility options commonly passed by jtreg and the JDK test harness.
+    private static String[] consumeCompatibilityOptions(String[] inArgs) {
+        if (!Boolean.getBoolean(HOTSPOT_OPTION_COMPATIBILITY_NAME)) {
+            return inArgs;
+        }
+        List<String> remainingArgs = new ArrayList<>();
+        for (String arg : inArgs) {
+            if (!parseCompatibilityOption(arg)) {
+                remainingArgs.add(arg);
+            }
+        }
+        return remainingArgs.toArray(new String[0]);
+    }
+
+    /// Parses HotSpot compatibility options commonly passed by jtreg and the JDK test harness.
+    private static boolean parseCompatibilityOption(String arg) {
+        if (parseCompatibilityBooleanOption(arg) || parseCompatibilityValueOption(arg)) {
+            return true;
+        }
+        if (isRistrettoCompilationModeOption(arg)) {
+            return false;
+        }
+        if (IGNORED_COMPATIBILITY_OPTIONS.contains(arg) ||
+                        arg.startsWith(XLOG_OPTION_PREFIX) ||
+                        arg.startsWith(JAVA_AGENT_OPTION_PREFIX) ||
+                        arg.startsWith(AGENT_LIB_OPTION_PREFIX) ||
+                        arg.startsWith(AGENT_PATH_OPTION_PREFIX)) {
+            warnIgnoredCompatibilityOption(arg);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Retains X-mode aliases for Ristretto images even when HotSpot compatibility mode is enabled.
+     * Other images continue to consume these aliases through the compatibility path.
+     */
+    private static boolean isRistrettoCompilationModeOption(String arg) {
+        return GuestStagingDependencyBridge.singleton().useRistretto() && RISTRETTO_COMPILATION_MODE_OPTIONS.contains(arg);
+    }
+
+    /// Parses a HotSpot `-XX:+name` or `-XX:-name` compatibility option.
+    private static boolean parseCompatibilityBooleanOption(String arg) {
+        if (!arg.startsWith(NORMAL_OPTION_PREFIX) || arg.length() <= NORMAL_OPTION_PREFIX.length()) {
+            return false;
+        }
+        char sign = arg.charAt(NORMAL_OPTION_PREFIX.length());
+        if (sign != '+' && sign != '-') {
+            return false;
+        }
+        String name = arg.substring(NORMAL_OPTION_PREFIX.length() + 1);
+        if (!RECOGNIZED_BOOLEAN_HOTSPOT_COMPATIBILITY_OPTIONS.contains(name)) {
+            return false;
+        }
+        warnIgnoredCompatibilityOption(arg);
+        return true;
+    }
+
+    /// Parses a HotSpot `-XX:name=value` compatibility option.
+    private static boolean parseCompatibilityValueOption(String arg) {
+        if (!arg.startsWith(NORMAL_OPTION_PREFIX)) {
+            return false;
+        }
+        int equalsIndex = arg.indexOf('=', NORMAL_OPTION_PREFIX.length());
+        if (equalsIndex == -1) {
+            return false;
+        }
+        String name = arg.substring(NORMAL_OPTION_PREFIX.length(), equalsIndex);
+        if (!RECOGNIZED_VALUE_HOTSPOT_COMPATIBILITY_OPTIONS.contains(name)) {
+            return false;
+        }
+        warnIgnoredCompatibilityOption(arg);
+        return true;
+    }
+
+    /// Emits a HotSpot compatibility warning for options accepted without runtime effect.
+    private static void warnIgnoredCompatibilityOption(String arg) {
+        Log.log().string("Substrate VM warning: ignoring Java VM option ").string(arg).newline();
+    }
+
+    /// Throws an exception for `arg` unless runtime class loading is supported.
+    private static void enforceRuntimeClassLoadingSupported(String arg) {
+        if (!GuestStagingDependencyBridge.singleton().isRuntimeClassLoadingSupported()) {
+            throw new IllegalArgumentException("The option '" + arg + "' is not supported by Native Image without runtime class loading");
+        }
+    }
+
+    /// Parses module options that SVM applies to the runtime boot layer into the normalized
+    /// `jdk.module.*` property scheme.
+    private static boolean parseModuleOption(String arg, ParseContext context) {
+        if (arg.startsWith(PATCH_MODULE_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.PATCH_MODULE_PROPERTY_PREFIX + context.patchModuleIndex++, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.MODULE_PATH_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.MODULE_PATH_PROPERTY, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.UPGRADE_MODULE_PATH_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.UPGRADE_MODULE_PATH_PROPERTY, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.ADD_MODULES_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.ADD_MODULES_PROPERTY_PREFIX + context.addModulesIndex++, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.ADD_READS_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.ADD_READS_PROPERTY_PREFIX + context.addReadsIndex++, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.ADD_EXPORTS_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.ADD_EXPORTS_PROPERTY_PREFIX + context.addExportsIndex++, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.ADD_OPENS_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.ADD_OPENS_PROPERTY_PREFIX + context.addOpensIndex++, optionValue(arg));
+        } else if (arg.startsWith(RuntimeBootModuleLayerOptions.ENABLE_NATIVE_ACCESS_OPTION + "=")) {
+            context.properties.put(RuntimeBootModuleLayerOptions.ENABLE_NATIVE_ACCESS_PROPERTY_PREFIX + context.enableNativeAccessIndex++, optionValue(arg));
+        } else {
+            return false;
+        }
+        enforceRuntimeClassLoadingSupported(arg);
+        return true;
+    }
+
+    /// Parses `--enable-preview` and enables the runtime preview-feature flag consulted by
+    /// `jdk.internal.misc.PreviewFeatures`.
+    private static boolean parsePreviewOption(String arg) {
+        if (!arg.equals(ENABLE_PREVIEW_OPTION)) {
+            return false;
+        }
+        GuestStagingDependencyBridge.singleton().enablePreviewFeatures();
+        return true;
+    }
+
+    /// Extracts the substring after the first `=` in a launcher-normalized option.
+    private static String optionValue(String arg) {
+        return arg.substring(arg.indexOf('=') + 1);
+    }
+
+    /// Parses `-Xbootclasspath/a:` on the VM side of the launcher boundary.
+    private static boolean parseXBootClasspathAppendOption(String arg, ParseContext context) {
+        if (!arg.startsWith(X_BOOTCLASSPATH_APPEND_OPTION_PREFIX)) {
+            return false;
+        }
+
+        enforceRuntimeClassLoadingSupported(arg);
+
+        // Buffer the property read by jdk.internal.loader.ClassLoaders.<clinit>.
+        String value = arg.substring(X_BOOTCLASSPATH_APPEND_OPTION_PREFIX.length());
+        if (!value.isEmpty()) {
+            String currentValue = context.properties.get(BOOT_CLASS_PATH_APPEND_PROPERTY);
+            String result = currentValue != null ? currentValue + File.pathSeparator + value : value;
+            context.properties.put(BOOT_CLASS_PATH_APPEND_PROPERTY, result);
+        }
+        return true;
+    }
+
+    /// Parses known and implemented Java VM options.
+    private static boolean parseRecognizedJavaOption(String arg) {
+        if (isEnableAssertionsOption(arg)) {
+            GuestStagingDependencyBridge.singleton().updateRuntimeAssertionStatus(assertionOptionTarget(arg), true);
+            return true;
+        }
+        if (isDisableAssertionsOption(arg)) {
+            GuestStagingDependencyBridge.singleton().updateRuntimeAssertionStatus(assertionOptionTarget(arg), false);
+            return true;
+        }
+        if (SYSTEM_ASSERTION_OPTIONS.contains(arg)) {
+            boolean enable = arg.equals("-esa") || arg.equals("-enablesystemassertions");
+            GuestStagingDependencyBridge.singleton().updateRuntimeSystemAssertionStatus(enable);
+            return true;
+        }
+        if (arg.equals("-verbose") || arg.equals("-verbose:class")) {
+            GuestStagingDependencyBridge.singleton().enableTraceClassLoading();
+            return true;
+        }
+        if (arg.startsWith("-verbose:")) {
+            String component = arg.substring("-verbose:".length());
+            if (UNIMPLEMENTED_VERBOSE_OPTIONS.contains(component)) {
+                // Will be handled in `isRecognizedUnimplementedJavaOption`
+                return false;
+            }
+            // Accept any `-verbose:foo`, as they are implemented by doing nothing.
+            return true;
+        }
+        return false;
+    }
+
+    /// Rejects recognized Java VM options that remain in `args` because this parser does not
+    /// implement their runtime behavior yet. Unknown options are left to the caller's
+    /// entry-point-specific policy.
+    private static void rejectRecognizedUnimplementedJavaOptions(String[] args) {
+        for (String arg : args) {
+            if (isRecognizedUnimplementedJavaOption(arg)) {
+                throw unsupportedOption(arg);
+            }
+        }
+    }
+
+    /// Returns whether `arg` is a recognized but unimplemented VM option.
+    private static boolean isRecognizedUnimplementedJavaOption(String arg) {
+        if (arg.startsWith(FINALIZATION_OPTION_PREFIX)) {
+            return true;
+        }
+        if (arg.startsWith("-agentlib:")) {
+            return true;
+        }
+        if (arg.startsWith("-agentpath:")) {
+            return true;
+        }
+        if (arg.startsWith("-javaagent:")) {
+            return true;
+        }
+        if (arg.startsWith("-verbose:")) {
+            String component = arg.substring("-verbose:".length());
+            if (UNIMPLEMENTED_VERBOSE_OPTIONS.contains(component)) {
+                return true;
+            }
+        }
+        if (arg.startsWith(ILLEGAL_NATIVE_ACCESS_OPTION_PREFIX)) {
+            return true;
+        }
+        if (arg.startsWith(SUN_MISC_UNSAFE_MEMORY_ACCESS_OPTION_PREFIX)) {
+            return true;
+        }
+        if (arg.startsWith("--limit-modules=")) {
+            return true;
+        }
+        if (arg.equals("-Xlog") || arg.startsWith("-Xlog:")) {
+            return true;
+        }
+        if (arg.startsWith("-Xloggc:")) {
+            return true;
+        }
+        return EXACT_RECOGNIZED_X_OPTIONS.contains(arg) || isRecognizedXShareOption(arg) || isRecognizedXVerifyOption(arg);
+    }
+
+    /// Returns whether `arg` selects the enable-assertions family, including `:<target>` forms.
+    private static boolean isEnableAssertionsOption(String arg) {
+        return arg.equals("-ea") || arg.equals("-enableassertions") || arg.startsWith("-ea:") || arg.startsWith("-enableassertions:");
+    }
+
+    /// Returns whether `arg` selects the disable-assertions family, including `:<target>` forms.
+    private static boolean isDisableAssertionsOption(String arg) {
+        return arg.equals("-da") || arg.equals("-disableassertions") || arg.startsWith("-da:") || arg.startsWith("-disableassertions:");
+    }
+
+    /// Extracts the optional class or package target from an assertion option.
+    private static String assertionOptionTarget(String arg) {
+        int separatorIndex = arg.indexOf(':');
+        return separatorIndex == -1 ? "" : arg.substring(separatorIndex + 1);
+    }
+
+    /// Returns whether `arg` is a recognized `-Xshare` mode.
+    private static boolean isRecognizedXShareOption(String arg) {
+        return arg.equals("-Xshare:dump") || arg.equals("-Xshare:on") || arg.equals("-Xshare:auto") || arg.equals("-Xshare:off");
+    }
+
+    /// Returns whether `arg` is a recognized `-Xverify` mode.
+    private static boolean isRecognizedXVerifyOption(String arg) {
+        return arg.equals("-Xverify") || arg.equals("-Xverify:all") || arg.equals("-Xverify:remote") || arg.equals("-Xverify:none");
+    }
+
+    /// Returns whether `arg` starts with `prefix`, treating a null prefix as absent.
+    private static boolean hasPrefix(String arg, String prefix) {
+        return prefix != null && arg.startsWith(prefix);
+    }
+
+    /// Creates the exception used for Java VM options that are recognized but not yet implemented.
+    private static IllegalArgumentException unsupportedOption(String arg) {
+        return new IllegalArgumentException("The option '" + arg + "' is not supported by Native Image");
+    }
+
+    private static final class ParseContext {
+        /// Collects system properties to initialize after recognized options are parsed.
+        final EconomicMap<String, String> properties = EconomicMap.create();
+
+        /// Next numbered-property slot for decoded `--add-modules` options.
+        int addModulesIndex;
+
+        /// Next numbered-property slot for decoded `--patch-module` options.
+        int patchModuleIndex;
+
+        /// Next numbered-property slot for decoded `--add-reads` options.
+        int addReadsIndex;
+
+        /// Next numbered-property slot for decoded `--add-exports` options.
+        int addExportsIndex;
+
+        /// Next numbered-property slot for decoded `--add-opens` options.
+        int addOpensIndex;
+
+        /// Next numbered-property slot for decoded `--enable-native-access` options.
+        int enableNativeAccessIndex;
+
+        /// Whether parsing already warned about an ignored reserved internal module property.
+        boolean warnedInternalModuleProperty;
+
+        /// Value parsed for `-XX:LogFile=<path>`.
+        String logFile;
+    }
+}

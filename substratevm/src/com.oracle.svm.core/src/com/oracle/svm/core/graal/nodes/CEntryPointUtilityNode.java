@@ -39,7 +39,7 @@ import jdk.graal.compiler.nodes.spi.Lowerable;
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
 
 import jdk.vm.ci.meta.JavaKind;
 

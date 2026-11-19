@@ -32,23 +32,24 @@ import org.graalvm.collections.UnmodifiableMapCursor;
 import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.util.ImageHeapMap;
-import com.oracle.svm.core.util.VMError;
-
-import jdk.vm.ci.meta.MetaUtil;
+import com.oracle.svm.configure.ClassNameSupport;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Information on a class that can be looked up and accessed via JNI.
  */
-public final class JNIAccessibleClass {
+public final class JNIAccessibleClass implements PreservableJNIElement {
     private final Class<?> classObject;
     private EconomicMap<JNIAccessibleMethodDescriptor, JNIAccessibleMethod> methods;
     private EconomicMap<CharSequence, JNIAccessibleField> fields;
+    private boolean preserved;
 
     @Platforms(HOSTED_ONLY.class)
-    public JNIAccessibleClass(Class<?> clazz) {
+    public JNIAccessibleClass(Class<?> clazz, boolean preserved) {
         assert clazz != null;
         this.classObject = clazz;
+        this.preserved = preserved;
     }
 
     @Platforms(HOSTED_ONLY.class)
@@ -74,22 +75,30 @@ public final class JNIAccessibleClass {
     }
 
     @Platforms(HOSTED_ONLY.class)
-    public void addFieldIfAbsent(String name, Function<String, JNIAccessibleField> mappingFunction) {
+    public void addOrUpdateField(String name, boolean updatedPreserved, Function<String, JNIAccessibleField> mappingFunction) {
         if (fields == null) {
-            fields = ImageHeapMap.create(JNIReflectionDictionary.WRAPPED_CSTRING_EQUIVALENCE);
+            fields = ImageHeapMap.createNonLayeredMap(JNIReflectionDictionary.WRAPPED_CSTRING_EQUIVALENCE);
+            JNIReflectionDictionary.currentLayer().rescanFieldsField(this);
         }
-        if (!fields.containsKey(name)) {
+        JNIAccessibleField existing = fields.get(name);
+        if (existing == null) {
             fields.put(name, mappingFunction.apply(name));
+        } else if (!updatedPreserved) {
+            existing.setNotPreserved();
         }
     }
 
     @Platforms(HOSTED_ONLY.class)
-    public void addMethodIfAbsent(JNIAccessibleMethodDescriptor descriptor, Function<JNIAccessibleMethodDescriptor, JNIAccessibleMethod> mappingFunction) {
+    public void addOrUpdateMethod(JNIAccessibleMethodDescriptor descriptor, boolean updatedPreserved, Function<JNIAccessibleMethodDescriptor, JNIAccessibleMethod> mappingFunction) {
         if (methods == null) {
-            methods = ImageHeapMap.create();
+            methods = ImageHeapMap.createNonLayeredMap();
+            JNIReflectionDictionary.currentLayer().rescanMethodsField(this);
         }
-        if (!methods.containsKey(descriptor)) {
+        JNIAccessibleMethod existing = methods.get(descriptor);
+        if (existing == null) {
             methods.put(descriptor, mappingFunction.apply(descriptor));
+        } else if (!updatedPreserved) {
+            existing.setNotPreserved();
         }
     }
 
@@ -117,7 +126,17 @@ public final class JNIAccessibleClass {
         return method;
     }
 
-    String getInternalName() {
-        return MetaUtil.toInternalName(classObject.getName());
+    String getJNIName() {
+        return ClassNameSupport.reflectionNameToJNIName(classObject.getName());
+    }
+
+    @Override
+    public boolean isPreserved() {
+        return preserved;
+    }
+
+    @Override
+    public void setNotPreserved() {
+        preserved = false;
     }
 }

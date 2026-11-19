@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -64,7 +64,7 @@ public class InductionVariableHelper {
              *      value = previousOp = AddNode, offset = negative 1
              */
             // @formatter:on
-            previousIv = new DerivedOffsetInductionVariable(start.getLoop(), start, start.rawStride(), previousOp);
+            previousIv = new DerivedOffsetInductionVariable(start.getLoop(), start, start.rawStride(), previousOp, false);
             start.getLoop().getInductionVariables().put(previousOp, previousIv);
         }
         return previousIv;
@@ -100,7 +100,7 @@ public class InductionVariableHelper {
         }
         InductionVariable nextIv = start.getLoop().getInductionVariables().get(nextOp);
         if (nextIv == null) {
-            nextIv = new DerivedOffsetInductionVariable(start.getLoop(), start, start.rawStride(), nextOp);
+            nextIv = new DerivedOffsetInductionVariable(start.getLoop(), start, start.rawStride(), nextOp, false);
             start.getLoop().getInductionVariables().put(nextOp, nextIv);
         }
         return nextIv;

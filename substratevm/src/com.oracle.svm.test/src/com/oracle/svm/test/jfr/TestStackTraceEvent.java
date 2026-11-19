@@ -30,11 +30,10 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import jdk.jfr.consumer.RecordedThread;
+import org.graalvm.collections.EconomicSet;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -53,7 +52,6 @@ public class TestStackTraceEvent extends JfrRecordingTest {
 
     private static final JfrSeenMethod junitTest = new JfrSeenMethod("test", "()V", 1);
     private static final JfrSeenMethod svmJunitMain = new JfrSeenMethod("main", "([Ljava/lang/String;)V", 9);
-    private static final JfrSeenMethod javaMainRun = new JfrSeenMethod("doRun", "(ILorg/graalvm/nativeimage/c/type/CCharPointerPointer;)I", 10);
 
     @Test
     public void test() throws Throwable {
@@ -83,7 +81,7 @@ public class TestStackTraceEvent extends JfrRecordingTest {
         List<RecordedFrame> frames = stackTrace.getFrames();
         assertFalse(frames.isEmpty());
 
-        Set<JfrSeenMethod> seenMethod = new HashSet<>();
+        EconomicSet<JfrSeenMethod> seenMethod = EconomicSet.create();
         for (RecordedFrame frame : frames) {
             RecordedMethod method = frame.getMethod();
             assertNotNull(method);
@@ -103,7 +101,10 @@ public class TestStackTraceEvent extends JfrRecordingTest {
         }
 
         Assert.assertTrue(seenMethod.contains(junitTest));
-        Assert.assertTrue(seenMethod.contains(javaMainRun));
+        /*
+         * JavaMainWrapper helper frames may be inlined differently across libc and static-image
+         * configurations. The native JUnit main frame is the stable lower frame for this test.
+         */
         Assert.assertTrue(seenMethod.contains(svmJunitMain));
     }
 

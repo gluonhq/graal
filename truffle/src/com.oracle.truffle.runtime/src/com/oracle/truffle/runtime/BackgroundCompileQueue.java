@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,9 +45,13 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -57,6 +61,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+
+import com.oracle.truffle.runtime.CompilationTask.ExecutorServiceWrapper;
 
 /**
  * The compilation queue accepts compilation requests, and schedules compilations.
@@ -72,8 +78,7 @@ public class BackgroundCompileQueue {
 
     protected final OptimizedTruffleRuntime runtime;
     private final AtomicLong idCounter;
-    private volatile ThreadPoolExecutor compilationExecutorService;
-    private volatile BlockingQueue<Runnable> compilationQueue;
+    private volatile TruffleThreadPoolExecutor executor;
     private boolean shutdown = false;
     private long delayMillis;
 
@@ -89,12 +94,13 @@ public class BackgroundCompileQueue {
     }
 
     private ExecutorService getExecutorService(OptimizedCallTarget callTarget) {
-        ExecutorService service = this.compilationExecutorService;
+        ExecutorService service = this.executor;
         if (service != null) {
             return service;
         }
+
         synchronized (this) {
-            service = this.compilationExecutorService;
+            service = this.executor;
             if (service != null) {
                 return service;
             }
@@ -107,6 +113,7 @@ public class BackgroundCompileQueue {
 
             // NOTE: the value from the first Engine compiling wins for now
             int threads = callTarget.getOptionValue(OptimizedRuntimeOptions.CompilerThreads);
+            long compilerThreadStackSize = callTarget.getOptionValue(OptimizedRuntimeOptions.CompilerThreadStackSize);
             if (threads == 0) {
                 // Old behavior, use either 1 or 2 compiler threads.
                 int availableProcessors = Runtime.getRuntime().availableProcessors();
@@ -139,21 +146,31 @@ public class BackgroundCompileQueue {
             }
             threads = Math.max(1, threads);
 
-            ThreadFactory factory = newThreadFactory("TruffleCompilerThread", callTarget);
+            ThreadFactory factory = newThreadFactory("TruffleCompilerThread", callTarget, compilerThreadStackSize);
 
             long compilerIdleDelay = runtime.getCompilerIdleDelay(callTarget);
             long keepAliveTime = compilerIdleDelay >= 0 ? compilerIdleDelay : 0;
 
-            this.compilationQueue = createQueue(callTarget, threads);
-            ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(threads, threads,
-                            keepAliveTime, TimeUnit.MILLISECONDS,
-                            compilationQueue, factory) {
-                @Override
-                @SuppressWarnings({"unchecked"})
-                protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
-                    return (RunnableFuture<T>) new CompilationTask.ExecutorServiceWrapper((CompilationTask) callable);
+            BlockingQueue<Runnable> queue;
+            if (callTarget.getOptionValue(OptimizedRuntimeOptions.TraversingCompilationQueue)) {
+                queue = new TraversingBlockingQueue(new IdlingLinkedBlockingDeque<>());
+            } else {
+                queue = new IdlingPriorityBlockingQueue<>();
+            }
+
+            DynamicCompilationThresholds dynamicCompilationThresholds = null;
+            if (callTarget.getOptionValue(OptimizedRuntimeOptions.TraversingCompilationQueue)) {
+                if (callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholds) && callTarget.getOptionValue(OptimizedRuntimeOptions.BackgroundCompilation)) {
+                    double minScale = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMinScale);
+                    int minNormalLoad = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMinNormalLoad);
+                    int maxNormalLoad = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMaxNormalLoad);
+                    double highLoadSlope = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsHighLoadSlope);
+                    dynamicCompilationThresholds = new DynamicCompilationThresholds(threads, minScale, minNormalLoad, maxNormalLoad, highLoadSlope);
                 }
-            };
+            }
+            TruffleThreadPoolExecutor threadPoolExecutor = new TruffleThreadPoolExecutor(threads, threads,
+                            keepAliveTime, TimeUnit.MILLISECONDS,
+                            queue, factory, dynamicCompilationThresholds);
 
             if (compilerIdleDelay > 0) {
                 // There are two mechanisms to signal idleness: if core threads can timeout, then
@@ -162,53 +179,51 @@ public class BackgroundCompileQueue {
                 threadPoolExecutor.allowCoreThreadTimeOut(true);
             }
 
-            return compilationExecutorService = threadPoolExecutor;
-        }
-    }
-
-    private BlockingQueue<Runnable> createQueue(OptimizedCallTarget callTarget, int threads) {
-        if (callTarget.getOptionValue(OptimizedRuntimeOptions.TraversingCompilationQueue)) {
-            if (callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholds) && callTarget.getOptionValue(OptimizedRuntimeOptions.BackgroundCompilation)) {
-                double minScale = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMinScale);
-                int minNormalLoad = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMinNormalLoad);
-                int maxNormalLoad = callTarget.getOptionValue(OptimizedRuntimeOptions.DynamicCompilationThresholdsMaxNormalLoad);
-                return new DynamicThresholdsQueue(threads, minScale, minNormalLoad, maxNormalLoad, new IdlingLinkedBlockingDeque<>());
-            } else {
-                return new TraversingBlockingQueue(new IdlingLinkedBlockingDeque<>());
-            }
-        } else {
-            return new IdlingPriorityBlockingQueue<>();
+            return executor = threadPoolExecutor;
         }
     }
 
     @SuppressWarnings("unused")
-    protected ThreadFactory newThreadFactory(String threadNamePrefix, OptimizedCallTarget callTarget) {
-        return new TruffleCompilerThreadFactory(threadNamePrefix, runtime);
+    protected ThreadFactory newThreadFactory(String threadNamePrefix, OptimizedCallTarget callTarget, long compilerThreadStackSize) {
+        return new TruffleCompilerThreadFactory(threadNamePrefix, runtime, compilerThreadStackSize);
     }
 
-    private CompilationTask submitTask(CompilationTask compilationTask) {
-        compilationTask.setFuture(getExecutorService(compilationTask.targetRef.get()).submit(compilationTask));
+    private CompilationTask submitTask(CompilationTask compilationTask, OptimizedCallTarget target) {
+        ExecutorService e = getExecutorService(target);
+        compilationTask.setFuture(e.submit(compilationTask));
         return compilationTask;
     }
 
-    public CompilationTask submitCompilation(Priority priority, OptimizedCallTarget target) {
+    public CompilationTask submitCompilation(Priority priority, OptimizedCallTarget target, CompilationTask.SubmissionReason submissionReason) {
         final WeakReference<OptimizedCallTarget> targetReference = new WeakReference<>(target);
-        CompilationTask compilationTask = CompilationTask.createCompilationTask(priority, targetReference, nextId());
-        return submitTask(compilationTask);
+        CompilationTask compilationTask = CompilationTask.createCompilationTask(priority, targetReference, nextId(), submissionReason);
+        return submitTask(compilationTask, target);
     }
 
     public CompilationTask submitInitialization(OptimizedCallTarget target, Consumer<CompilationTask> action) {
         final WeakReference<OptimizedCallTarget> targetReference = new WeakReference<>(target);
         CompilationTask initializationTask = CompilationTask.createInitializationTask(targetReference, action);
-        return submitTask(initializationTask);
+        return submitTask(initializationTask, target);
     }
 
     private long nextId() {
         return idCounter.getAndIncrement();
     }
 
+    /**
+     * Flushes and cancels all compilations in the queue at the next opportunity. This also includes
+     * currently active compilations.
+     */
+    public final void flush(EngineData engine) {
+        TruffleThreadPoolExecutor e = this.executor;
+        if (e == null) {
+            return;
+        }
+        e.flush(engine);
+    }
+
     public int getQueueSize() {
-        final ThreadPoolExecutor threadPool = compilationExecutorService;
+        final ThreadPoolExecutor threadPool = executor;
         if (threadPool != null) {
             return threadPool.getQueue().size();
         } else {
@@ -218,40 +233,65 @@ public class BackgroundCompileQueue {
 
     /**
      * Return call targets waiting in queue. This does not include call targets currently being
-     * compiled.
+     * compiled. If {@code engine} is {@code null}, the call targets for all engines are returned,
+     * otherwise only the call targets belonging to {@code engine} will be returned.
      */
     public Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {
-        BlockingQueue<Runnable> queue = this.compilationQueue;
-        if (queue == null) {
-            // queue not initialized
-            return Collections.emptyList();
+        TruffleThreadPoolExecutor e = this.executor;
+        if (e == null) {
+            return List.of();
         }
-        List<OptimizedCallTarget> queuedTargets = new ArrayList<>();
-        CompilationTask.ExecutorServiceWrapper[] array = queue.toArray(new CompilationTask.ExecutorServiceWrapper[0]);
-        for (CompilationTask.ExecutorServiceWrapper wrapper : array) {
-            OptimizedCallTarget target = wrapper.compileTask.targetRef.get();
-            if (target != null && target.engine == engine) {
-                queuedTargets.add(target);
-            }
-        }
-        return Collections.unmodifiableCollection(queuedTargets);
+        return e.getQueuedTargets(engine);
     }
 
+    /**
+     * Return all call targets currently active or in the queue. This does also include all call
+     * targets being compiled. This method guarantees that all call targets either active or queued
+     * are returned and no targets are missed that are currently about to be compiled. If
+     * {@code engine} is {@code null}, the call targets for all engines are returned, otherwise only
+     * the call targets belonging to {@code engine} will be returned.
+     */
+    public Collection<OptimizedCallTarget> getAllTargets(EngineData engine) {
+        TruffleThreadPoolExecutor e = this.executor;
+        if (e == null) {
+            return List.of();
+        }
+        return e.getAllTargets(engine);
+    }
+
+    /**
+     * Flushes all compilations, shuts the compilation queue down and awaits its termination with
+     * the given timeout.
+     */
     public void shutdownAndAwaitTermination(long timeout) {
-        final ExecutorService threadPool;
-        synchronized (this) {
-            threadPool = compilationExecutorService;
-            if (threadPool == null) {
-                shutdown = true;
-                return;
+        flush(null);
+        shutdownNow();
+        awaitTermination(timeout);
+    }
+
+    private void shutdownNow() {
+        TruffleThreadPoolExecutor e = this.executor;
+        if (e == null) {
+            synchronized (this) {
+                e = executor;
+                if (e == null) {
+                    shutdown = true;
+                    return;
+                }
             }
         }
+        e.shutdownNow();
+    }
 
-        threadPool.shutdownNow();
+    private void awaitTermination(long timeout) {
+        TruffleThreadPoolExecutor e = this.executor;
+        if (e == null) {
+            return;
+        }
         try {
-            threadPool.awaitTermination(timeout, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            throw new RuntimeException("Could not terminate compiler threads. Check if there are runaway compilations that don't handle Thread#interrupt.", e);
+            e.awaitTermination(timeout, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ex) {
+            throw new RuntimeException("Waiting for compiler threads was interrupted.", ex);
         }
     }
 
@@ -262,7 +302,7 @@ public class BackgroundCompileQueue {
         // nop
     }
 
-    static class Priority {
+    static final class Priority {
 
         public static final Priority INITIALIZATION = new Priority(0, Tier.INITIALIZATION);
         final Tier tier;
@@ -281,19 +321,127 @@ public class BackgroundCompileQueue {
 
     }
 
-    private final class TruffleCompilerThreadFactory implements ThreadFactory {
+    private static final class TruffleThreadPoolExecutor extends ThreadPoolExecutor {
+
+        /*
+         * Its somehow wasteful to store all compilations in another set, but since the executor is
+         * in charge of polling the queue, it is difficult to otherwise see a consistent view of all
+         * queued and active compilations without duplicates and misses.
+         */
+        private final Set<CompilationTask.ExecutorServiceWrapper> allTargets = ConcurrentHashMap.newKeySet();
+        private final DynamicCompilationThresholds dynamicCompilationThresholds;
+
+        private TruffleThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory,
+                        DynamicCompilationThresholds dynamicCompilationThresholds) {
+            super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
+            this.dynamicCompilationThresholds = dynamicCompilationThresholds;
+            if (workQueue instanceof TraversingBlockingQueue traversingQueue) {
+                traversingQueue.onDiscard = this::taskFinished;
+            }
+        }
+
+        void flush(EngineData engine) {
+            for (OptimizedCallTarget target : getAllTargets(engine)) {
+                target.cancelCompilation("Polyglot engine was closed.");
+            }
+        }
+
+        Collection<OptimizedCallTarget> getQueuedTargets(EngineData engine) {
+            return extractTargets(engine, getQueue().toArray(CompilationTask.ExecutorServiceWrapper[]::new));
+        }
+
+        Collection<OptimizedCallTarget> getAllTargets(EngineData engine) {
+            return extractTargets(engine, allTargets.toArray(CompilationTask.ExecutorServiceWrapper[]::new));
+        }
+
+        private static Collection<OptimizedCallTarget> extractTargets(EngineData engine, CompilationTask.ExecutorServiceWrapper[] serviceWrappers) {
+            List<OptimizedCallTarget> queuedTargets = new ArrayList<>();
+            for (CompilationTask.ExecutorServiceWrapper wrapper : serviceWrappers) {
+                OptimizedCallTarget target = wrapper.compileTask.targetRef.get();
+                if (target != null && (engine == null || target.engine == engine)) {
+                    queuedTargets.add(target);
+                }
+            }
+            return Collections.unmodifiableCollection(queuedTargets);
+        }
+
+        @Override
+        @SuppressWarnings({"unchecked"})
+        protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+            ExecutorServiceWrapper wrapper = new ExecutorServiceWrapper((CompilationTask) callable);
+            allTargets.add(wrapper);
+            return (RunnableFuture<T>) wrapper;
+        }
+
+        @Override
+        public boolean remove(Runnable task) {
+            allTargets.remove(task);
+            return super.remove(task);
+        }
+
+        @Override
+        public <T> Future<T> submit(Callable<T> task) {
+            Future<T> future = super.submit(task);
+            scaleThresholds();
+            return future;
+        }
+
+        private void scaleThresholds() {
+            if (dynamicCompilationThresholds != null) {
+                dynamicCompilationThresholds.scaleThresholds();
+            }
+        }
+
+        @Override
+        protected void beforeExecute(Thread t, Runnable r) {
+            scaleThresholds();
+        }
+
+        @Override
+        protected void afterExecute(Runnable r, Throwable t) {
+            super.afterExecute(r, t);
+            taskFinished(r);
+        }
+
+        private void taskFinished(Runnable task) {
+            allTargets.remove(task);
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            ThreadFactory threadFactory = getThreadFactory();
+            if (threadFactory instanceof JoinableThreadFactory) {
+                return ((JoinableThreadFactory) threadFactory).joinOtherThreads(timeout, unit);
+            } else {
+                return super.awaitTermination(timeout, unit);
+            }
+        }
+    }
+
+    public interface JoinableThreadFactory extends ThreadFactory {
+        /**
+         * Join all but the current thread. If the current thread belongs to this thread factory,
+         * its interrupted status is just cleared instead of joining it.
+         */
+        boolean joinOtherThreads(long timeout, TimeUnit unit) throws InterruptedException;
+    }
+
+    private final class TruffleCompilerThreadFactory implements JoinableThreadFactory {
         private final String namePrefix;
         private final OptimizedTruffleRuntime runtime;
+        private final long compilerThreadStackSize;
+        private final Set<Thread> threads = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
-        TruffleCompilerThreadFactory(final String namePrefix, OptimizedTruffleRuntime runtime) {
+        TruffleCompilerThreadFactory(final String namePrefix, OptimizedTruffleRuntime runtime, long compilerThreadStackSize) {
             this.namePrefix = namePrefix;
             this.runtime = runtime;
+            this.compilerThreadStackSize = compilerThreadStackSize;
         }
 
         @SuppressWarnings("deprecation")
         @Override
         public Thread newThread(Runnable r) {
-            final Thread t = new Thread(r) {
+            final Thread t = new Thread(null, r, namePrefix, compilerThreadStackSize) {
                 @SuppressWarnings("try")
                 @Override
                 public void run() {
@@ -301,7 +449,7 @@ public class BackgroundCompileQueue {
                     try (AutoCloseable compilerThreadScope = runtime.openCompilerThreadScope();
                                     AutoCloseable polyglotThreadScope = OptimizedRuntimeAccessor.ENGINE.createPolyglotThreadScope()) {
                         super.run();
-                        if (compilationExecutorService.allowsCoreThreadTimeOut()) {
+                        if (executor.allowsCoreThreadTimeOut()) {
                             // If core threads are always kept alive (no timeout), the
                             // IdlingPriorityBlockingQueue.take mechanism is used instead.
                             notifyIdleCompilerThread();
@@ -314,7 +462,32 @@ public class BackgroundCompileQueue {
             t.setName(namePrefix + "-" + t.getId());
             t.setPriority(Thread.MAX_PRIORITY);
             t.setDaemon(true);
+            threads.add(t);
             return t;
+        }
+
+        @Override
+        public boolean joinOtherThreads(long timeout, TimeUnit unit) throws InterruptedException {
+            long timeoutNanos = unit.toNanos(timeout);
+            synchronized (threads) {
+                if (threads.contains(Thread.currentThread())) {
+                    // clear interrupt status
+                    Thread.interrupted();
+                }
+                for (Thread thread : threads) {
+                    if (thread == Thread.currentThread()) {
+                        continue;
+                    }
+                    long joinStart = System.nanoTime();
+                    TimeUnit.NANOSECONDS.timedJoin(thread, timeoutNanos);
+                    long joinEnd = System.nanoTime();
+                    timeoutNanos -= (joinEnd - joinStart);
+                    if (timeoutNanos <= 0) {
+                        return false;
+                    }
+                }
+                return true;
+            }
         }
     }
 
@@ -333,7 +506,7 @@ public class BackgroundCompileQueue {
     private final class IdlingPriorityBlockingQueue<E> extends PriorityBlockingQueue<E> {
         @Override
         public E take() throws InterruptedException {
-            while (!compilationExecutorService.allowsCoreThreadTimeOut()) {
+            while (!executor.allowsCoreThreadTimeOut()) {
                 E elem = poll(delayMillis, TimeUnit.MILLISECONDS);
                 if (elem == null) {
                     notifyIdleCompilerThread();
@@ -361,7 +534,7 @@ public class BackgroundCompileQueue {
     private final class IdlingLinkedBlockingDeque<E> extends LinkedBlockingDeque<E> {
         @Override
         public E takeFirst() throws InterruptedException {
-            while (!compilationExecutorService.allowsCoreThreadTimeOut()) {
+            while (!executor.allowsCoreThreadTimeOut()) {
                 E elem = poll(delayMillis, TimeUnit.MILLISECONDS);
                 if (elem == null) {
                     notifyIdleCompilerThread();
@@ -389,6 +562,43 @@ public class BackgroundCompileQueue {
                 timeoutMillis -= delayMillis;
             }
             return super.pollFirst(timeoutMillis, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private final class DynamicCompilationThresholds {
+        private final int threads;
+        private final double minScale;
+        private final int minNormalLoad;
+        private final int maxNormalLoad;
+        private final double lowLoadSlope;
+        private final double highLoadSlope;
+
+        DynamicCompilationThresholds(int threads, double minScale, int minNormalLoad, int maxNormalLoad, double highLoadSlope) {
+            this.threads = threads;
+            this.minScale = minScale;
+            this.minNormalLoad = minNormalLoad;
+            this.maxNormalLoad = maxNormalLoad;
+            this.lowLoadSlope = minNormalLoad == 0 ? 0 : (1 - minScale) / minNormalLoad;
+            this.highLoadSlope = highLoadSlope;
+        }
+
+        private double load() {
+            return (double) getQueueSize() / threads;
+        }
+
+        private double scale() {
+            double x = load();
+            if (minNormalLoad <= x && x <= maxNormalLoad) {
+                return 1;
+            }
+            if (x < minNormalLoad) {
+                return lowLoadSlope * x + minScale;
+            }
+            return highLoadSlope * (x - maxNormalLoad) + 1;
+        }
+
+        private void scaleThresholds() {
+            OptimizedTruffleRuntime.getRuntime().setCompilationThresholdScale(FixedPointMath.toFixedPoint(scale()));
         }
     }
 }

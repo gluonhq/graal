@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,36 +24,40 @@
  */
 package com.oracle.svm.core.heap;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.LogHandler;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.impl.InternalPlatform;
-
-import com.oracle.svm.core.SubstrateGCOptions;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.VMInspectionOptions;
 import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.core.heap.dump.HeapDumpMetadata;
 import com.oracle.svm.core.heap.dump.HeapDumping;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jdk.JDKUtils;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.jfr.HasJfrSupport;
+import com.oracle.svm.core.jfr.SubstrateJVM;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * This class must be used for {@link OutOfMemoryError}s that are thrown because the VM is out of
- * Java heap memory. Other {@link OutOfMemoryError}s (e.g., when we run out of native memory) can be
- * thrown directly.
+ * Java heap memory. Other {@link OutOfMemoryError}s (e.g., when we run out of native memory) should
+ * be thrown directly.
  */
 public class OutOfMemoryUtil {
-    private static final OutOfMemoryError OUT_OF_MEMORY_ERROR = new OutOfMemoryError("Garbage-collected heap size exceeded. Consider increasing the maximum Java heap size, for example with '-Xmx'.");
+    private static final OutOfMemoryError OUT_OF_MEMORY_ERROR = PreallocatedExceptions.createOutOfMemoryError(
+                    "Garbage-collected heap size exceeded. Consider increasing the maximum Java heap size, for example with '-Xmx'.");
 
+    @NeverInline("Keep error reporting out of allocation slow paths.")
     @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Can't allocate when out of memory.")
     public static OutOfMemoryError heapSizeExceeded() {
         return reportOutOfMemoryError(OUT_OF_MEMORY_ERROR);
     }
 
-    @Uninterruptible(reason = "Not uninterruptible but it doesn't matter for the callers.", calleeMustBe = false)
+    @NeverInline("Error reporting is always a slowpath.")
     @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Can't allocate while out of memory.")
     public static OutOfMemoryError reportOutOfMemoryError(OutOfMemoryError error) {
         StackOverflowCheck.singleton().makeYellowZoneAvailable();
@@ -65,12 +69,16 @@ public class OutOfMemoryUtil {
         throw error;
     }
 
-    @Uninterruptible(reason = "Not uninterruptible but it doesn't matter for the callers.", calleeMustBe = false)
     private static void reportOutOfMemoryError0(OutOfMemoryError error) {
-        if (VMInspectionOptions.hasHeapDumpSupport() && SubstrateOptions.HeapDumpOnOutOfMemoryError.getValue()) {
-            HeapDumping.singleton().dumpHeapOnOutOfMemoryError();
+        if (VMOperation.isGCInProgress()) {
+            /* If a GC is in progress, then we can't execute the more complex logic below. */
+            return;
         }
 
+        if (VMInspectionOptions.hasHeapDumpSupport() && SubstrateOptions.HeapDumpOnOutOfMemoryError.getValue() &&
+                        (!ImageLayerBuildingSupport.buildingImageLayer() || HeapDumpMetadata.isLayeredMetadataAvailable())) {
+            HeapDumping.singleton().dumpHeapOnOutOfMemoryError();
+        }
         if (SubstrateGCOptions.ExitOnOutOfMemoryError.getValue()) {
             if (LibC.isSupported()) {
                 Log.log().string("Terminating due to java.lang.OutOfMemoryError: ").string(JDKUtils.getRawMessage(error)).newline();
@@ -81,12 +89,15 @@ public class OutOfMemoryUtil {
         }
 
         if (SubstrateGCOptions.ReportFatalErrorOnOutOfMemoryError.getValue()) {
-            if (Platform.includedIn(InternalPlatform.NATIVE_ONLY.class)) {
-                Log.log().string("Reporting Fatal Error due to java.lang.OutOfMemoryError: ").exception(error);
-            } else {
-                Log.log().string("Reporting Fatal Error due to java.lang.OutOfMemoryError").newline();
-            }
-            ImageSingletons.lookup(LogHandler.class).fatalError();
+            dumpJfrOnOutOfMemoryError();
+            throw VMError.shouldNotReachHere("reporting due to java.lang.OutOfMemoryError");
+        }
+    }
+
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Can't allocate while out of memory.")
+    private static void dumpJfrOnOutOfMemoryError() {
+        if (HasJfrSupport.get()) {
+            SubstrateJVM.get().dumpOnOutOfMemoryError();
         }
     }
 }

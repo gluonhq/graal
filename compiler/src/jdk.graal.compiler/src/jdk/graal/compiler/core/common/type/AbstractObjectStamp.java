@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -272,7 +272,7 @@ public abstract class AbstractObjectStamp extends AbstractPointerStamp {
                 }
             }
         }
-        if (joinAlwaysArray && joinType != null && !joinType.isArray() && (joinExactType || !joinType.isJavaLangObject())) {
+        if (joinAlwaysArray && joinType != null && !joinType.isArray() && (joinExactType || !isArraySupertype(joinType))) {
             joinAlwaysNull = true;
             /* If we now have joinNonNull && joinAlwaysNull, it is converted to "empty" below. */
         }
@@ -299,6 +299,12 @@ public abstract class AbstractObjectStamp extends AbstractPointerStamp {
         }
     }
 
+    /// Returns whether `type` is a non-array supertype shared by all Java array classes.
+    private static boolean isArraySupertype(ResolvedJavaType type) {
+        // Arrays implement exactly these two interfaces, regardless of their component type.
+        return type.isJavaLangObject() || type.getName().equals("Ljava/lang/Cloneable;") || type.getName().equals("Ljava/io/Serializable;");
+    }
+
     private static boolean isInterfaceOrArrayOfInterface(ResolvedJavaType t) {
         return t.isInterface() || (t.isArray() && t.getElementalType().isInterface());
     }
@@ -313,46 +319,53 @@ public abstract class AbstractObjectStamp extends AbstractPointerStamp {
         } else if (a == null || b == null) {
             return null;
         } else {
-            // The `meetTypes` operation must be commutative. One way to achieve this is to totally
-            // order the types and always call `meetOrderedNonNullTypes` in the same order. We
-            // establish the order by first comparing the hash-codes for performance reasons, and
-            // then comparing the internal names of the types.
-            int hashA = a.getName().hashCode();
-            int hashB = b.getName().hashCode();
-            if (hashA < hashB) {
-                return meetOrderedNonNullTypes(a, b);
-            } else if (hashB < hashA) {
-                return meetOrderedNonNullTypes(b, a);
-            } else {
-                int diff = a.getName().compareTo(b.getName());
-                if (diff <= 0) {
-                    return meetOrderedNonNullTypes(a, b);
-                } else {
-                    return meetOrderedNonNullTypes(b, a);
-                }
+            ResolvedJavaType result = a.findLeastCommonAncestor(b);
+            if (result.isJavaLangObject() && a.isInterface() && b.isInterface()) {
+                return meetIncompatibleInterfaceTypes(a, b, result);
             }
+            return result;
         }
     }
 
-    private static ResolvedJavaType meetOrderedNonNullTypes(ResolvedJavaType a, ResolvedJavaType b) {
-        ResolvedJavaType result = a.findLeastCommonAncestor(b);
-        if (result.isJavaLangObject() && a.isInterface() && b.isInterface()) {
-            // Both types are incompatible interfaces => search for first possible common
-            // ancestor match among super interfaces.
-            ResolvedJavaType[] interfacesA = a.getInterfaces();
-            ResolvedJavaType[] interfacesB = b.getInterfaces();
-            for (int i = 0; i < interfacesA.length; ++i) {
-                ResolvedJavaType interface1 = interfacesA[i];
-                for (int j = 0; j < interfacesB.length; ++j) {
-                    ResolvedJavaType interface2 = interfacesB[j];
-                    ResolvedJavaType leastCommon = meetTypes(interface1, interface2);
-                    if (leastCommon.isInterface()) {
-                        return leastCommon;
-                    }
+    private static ResolvedJavaType meetIncompatibleInterfaceTypes(ResolvedJavaType a, ResolvedJavaType b, ResolvedJavaType objectType) {
+        /*
+         * The interface fallback can find more than one possible common super interface. Preserve
+         * commutativity by imposing the same deterministic order as the old implementation, but
+         * only after the cheap least-common-ancestor check proved that this uncommon path is
+         * needed.
+         */
+        ResolvedJavaType type1;
+        ResolvedJavaType type2;
+        if (compareTypeNames(a, b) > 0) {
+            type1 = b;
+            type2 = a;
+        } else {
+            type1 = a;
+            type2 = b;
+        }
+
+        ResolvedJavaType[] interfaces1 = type1.getInterfaces();
+        ResolvedJavaType[] interfaces2 = type2.getInterfaces();
+        for (ResolvedJavaType interface1 : interfaces1) {
+            for (ResolvedJavaType interface2 : interfaces2) {
+                ResolvedJavaType leastCommon = meetTypes(interface1, interface2);
+                if (leastCommon.isInterface()) {
+                    return leastCommon;
                 }
             }
         }
-        return result;
+        return objectType;
+    }
+
+    private static int compareTypeNames(ResolvedJavaType a, ResolvedJavaType b) {
+        String nameA = a.getName();
+        String nameB = b.getName();
+        int hashA = nameA.hashCode();
+        int hashB = nameB.hashCode();
+        if (hashA != hashB) {
+            return hashA < hashB ? -1 : 1;
+        }
+        return nameA.compareTo(nameB);
     }
 
     @Override

@@ -25,8 +25,6 @@
 
 package com.oracle.svm.core.jfr;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
-
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
@@ -34,18 +32,20 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoQueryResult;
 import com.oracle.svm.core.code.CodeInfoTable;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.code.RuntimeCodeCache;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
+import com.oracle.svm.core.code.UntetheredCodeInfoAccess;
 import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.sampler.SamplerSampleWriter;
 import com.oracle.svm.core.sampler.SamplerSampleWriterData;
 import com.oracle.svm.core.sampler.SamplerSampleWriterDataAccess;
@@ -57,17 +57,29 @@ import com.oracle.svm.core.stack.JavaStackWalk;
 import com.oracle.svm.core.stack.JavaStackWalker;
 import com.oracle.svm.core.thread.VMThreads;
 import com.oracle.svm.core.util.PointerUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Does a stack walk and records the instruction pointers of the physical Java frames that it
  * encounters. Note that this class knows a lot of details about stack walking, so it needs to be in
  * sync with {@link JavaStackWalker}.
- *
+ * <p>
  * The code parts that are used for the async sampler need to be implemented in a very defensive way
  * as the async sampler may encounter unexpected stack states. For this reason, this class may only
  * use the unsafe methods of {@link FrameAccess} to read the return address. Otherwise, the
  * validation in {@link FrameAccess} could fail.
+ * <p>
+ * When recording JFR stack traces, we store only the encountered IPs. The IPs are decoded into
+ * Java-level stack traces at a later point in time. With runtime compilation and deoptimization,
+ * this can be unsafe because an IP may refer to code that has since been invalidated or no longer
+ * maps to the expected method. For now, we therefore skip stack traces that contain
+ * runtime-compiled code, see GR-43686.
+ * <p>
+ * If the async sampler is used, skipping run-time compiled is unsafe and therefore not supported.
+ * The stack walking code can still be shared between the samplers because the validation in
+ * {@link JfrOptions} guarantees that the async sampler is never used if the
+ * {@link RuntimeCodeCache} is non-empty.
  */
 public final class JfrStackWalker {
     /** A stack trace was recorded. */
@@ -78,28 +90,38 @@ public final class JfrStackWalker {
     public static final int UNPARSEABLE_STACK = 2;
     /** No stack trace was recorded because it did not fit into the buffer. */
     public static final int BUFFER_SIZE_EXCEEDED = 3;
+    /** No stack trace was recorded (e.g., the stack contains runtime-compiled code). */
+    public static final int SKIPPED = 4;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     private JfrStackWalker() {
     }
 
     @Uninterruptible(reason = "The method executes during signal handling.", callerMustBe = true)
-    public static void walkCurrentThread(CodePointer initialIP, Pointer initialSP, boolean isAsync) {
+    public static boolean walkCurrentThread(CodePointer initialIP, Pointer initialSP, boolean isAsync) {
         SamplerSampleWriterData data = UnsafeStackValue.get(SamplerSampleWriterData.class);
         if (SamplerSampleWriterDataAccess.initialize(data, 0, false)) {
             SamplerSampleWriter.begin(data);
             int result = walkCurrentThread(data, initialIP, initialSP, isAsync);
 
             switch (result) {
-                case NO_ERROR, TRUNCATED -> SamplerSampleWriter.end(data, SamplerSampleWriter.EXECUTION_SAMPLE_END);
+                case NO_ERROR, TRUNCATED -> {
+                    SamplerSampleWriter.end(data, SamplerSampleWriter.EXECUTION_SAMPLE_END);
+                    return true;
+                }
                 case UNPARSEABLE_STACK -> {
                     VMError.guarantee(isAsync, "Only the async sampler may encounter an unparseable stack.");
                     JfrThreadLocal.increaseUnparseableStacks();
+                    return false;
                 }
-                case BUFFER_SIZE_EXCEEDED -> JfrThreadLocal.increaseMissedSamples();
+                case BUFFER_SIZE_EXCEEDED, SKIPPED -> {
+                    JfrThreadLocal.increaseMissedSamples();
+                    return false;
+                }
                 default -> throw VMError.shouldNotReachHere("Unexpected return value");
             }
         }
+        return false;
     }
 
     @Uninterruptible(reason = "The method executes during signal handling.", callerMustBe = true)
@@ -113,8 +135,14 @@ public final class JfrStackWalker {
                 return UNPARSEABLE_STACK;
             }
 
-            CodeInfo codeInfo = CodeInfoTable.lookupImageCodeInfo(ip);
-            if (codeInfo.isNonNull()) {
+            UntetheredCodeInfo untetheredCodeInfo = CodeInfoTable.lookupCodeInfo(ip);
+            if (untetheredCodeInfo.isNonNull()) {
+                if (!UntetheredCodeInfoAccess.isAOTImageCode(untetheredCodeInfo)) {
+                    return SKIPPED;
+                }
+                /* Now, we know that we point into AOT-compiled code. So, a direct cast is safe. */
+                CodeInfo codeInfo = CodeInfoAccess.unsafeConvert(untetheredCodeInfo);
+
                 /*
                  * We are in Java code, so the IP is accurate, and we can record it. However, it is
                  * possible that the IP is for a method that is usually not visible in a stack walk
@@ -155,17 +183,18 @@ public final class JfrStackWalker {
                     anchor = anchor.getPreviousAnchor();
                 } else {
                     /* Both the top frame and its caller are probably Java frames. */
+                    int wordSize = SubstrateTarget.getWordSize();
                     if (isSPAligned(sp)) {
-                        UnsignedWord topFrameSize = WordFactory.unsigned(CodeInfoQueryResult.getTotalFrameSize(topFrameEncodedSize));
-                        if (SubstrateOptions.hasFramePointer() && !hasValidCaller(sp, topFrameSize, topFrameIsEntryPoint, anchor)) {
+                        UnsignedWord topFrameSize = Word.unsigned(CodeInfoQueryResult.getTotalFrameSize(topFrameEncodedSize));
+                        if (SubstrateOptions.hasFramePointerSlot() && !hasValidCaller(sp, topFrameSize, topFrameIsEntryPoint, anchor)) {
                             /*
-                             * If we have a frame pointer, then the stack pointer can be aligned
+                             * If we have a frame pointer slot, the stack pointer can be aligned
                              * while we are in the method prologue/epilogue (i.e., the frame pointer
-                             * and the return address are on top of the stack, but the actual stack
+                             * slot and return address are on top of the stack, but the actual stack
                              * frame is missing). We should reach the caller if we skip the
-                             * incomplete top frame (frame pointer and return address).
+                             * incomplete top frame (frame pointer slot and return address).
                              */
-                            sp = sp.add(FrameAccess.wordSize() * 2);
+                            sp = sp.add(wordSize * 2);
                         } else {
                             /*
                              * Stack looks walkable - skip the top frame as we already recorded the
@@ -180,7 +209,7 @@ public final class JfrStackWalker {
                          * likely, there is a valid return address at the top of the stack that we
                          * can just skip.
                          */
-                        sp = sp.add(FrameAccess.wordSize());
+                        sp = sp.add(wordSize);
                     }
 
                     /* Do a basic sanity check and decide if it makes sense to continue. */
@@ -231,8 +260,8 @@ public final class JfrStackWalker {
 
     /**
      * When this method is called, we know that SP points into the stack of the current thread and
-     * IP points into AOT compiled code.
-     *
+     * IP points into compiled Java code.
+     * <p>
      * If the async sampler is used, both values can still be incorrect though (i.e., they might
      * just be sane enough so that we did not detect any obvious issues). Therefore, it can happen
      * that we encounter invalid stack frames in the middle of the stack walk. We abort the stack
@@ -249,11 +278,12 @@ public final class JfrStackWalker {
 
         while (JavaStackWalker.advance(walk, thread)) {
             JavaFrame frame = JavaStackWalker.getCurrentFrame(walk);
-            VMError.guarantee(Deoptimizer.checkDeoptimized(frame) == null, "JIT compilation is not supported");
 
             if (JavaFrames.isUnknownFrame(frame) || isAsync && !hasValidCaller(walk, frame)) {
                 /* Most likely, the stack walk already started with a wrong SP or IP. */
                 return UNPARSEABLE_STACK;
+            } else if (Deoptimizer.checkIsDeoptimized(frame) || !UntetheredCodeInfoAccess.isAOTImageCode(frame.getIPCodeInfo())) {
+                return SKIPPED;
             }
 
             int result = recordIp(data, frame.getIP());
@@ -268,13 +298,12 @@ public final class JfrStackWalker {
     @Uninterruptible(reason = "The method executes during signal handling.", callerMustBe = true)
     private static int recordIp(SamplerSampleWriterData data, CodePointer ip) {
         assert data.isNonNull();
+        assert CodeInfoTable.isInAOTImageCode(ip);
 
         /* Increment the number of seen frames. */
         data.setSeenFrames(data.getSeenFrames() + 1);
 
-        if (shouldSkipFrame(data)) {
-            return NO_ERROR;
-        } else if (shouldTruncate(data)) {
+        if (shouldTruncate(data)) {
             return TRUNCATED;
         }
 
@@ -288,15 +317,10 @@ public final class JfrStackWalker {
         return BUFFER_SIZE_EXCEEDED;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    private static boolean shouldSkipFrame(SamplerSampleWriterData data) {
-        return data.getSeenFrames() <= data.getSkipCount();
-    }
-
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean shouldTruncate(SamplerSampleWriterData data) {
-        int numFrames = data.getSeenFrames() - data.getSkipCount();
-        if (numFrames > data.getMaxDepth()) {
+        int maxFrames = data.getMaxDepth() + data.getSkipCount();
+        if (data.getSeenFrames() > maxFrames) {
             /* The stack size exceeds given depth. Stop walk! */
             data.setTruncated(true);
             return true;
@@ -304,13 +328,13 @@ public final class JfrStackWalker {
         return false;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static int computeHash(int oldHash, long ip) {
         int hash = (int) (ip ^ (ip >>> 32));
         return 31 * oldHash + hash;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static JavaFrameAnchor filterTopFrameAnchorIfIncomplete(JavaFrameAnchor anchor) {
         if (anchor.isNonNull() && (anchor.getLastJavaSP().isNull() || anchor.getLastJavaIP().isNull())) {
             /* We are probably in the middle of pushing a frame anchor, so filter the top anchor. */
@@ -319,12 +343,12 @@ public final class JfrStackWalker {
         return anchor;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean hasValidCaller(JavaStackWalk walk, JavaFrame frame) {
         return hasValidCaller(frame.getSP(), JavaFrames.getTotalFrameSize(frame), JavaFrames.isEntryPoint(frame), JavaStackWalker.getFrameAnchor(walk));
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean hasValidCaller(Pointer currentSP, UnsignedWord currentFrameSize, boolean currentFrameIsEntryPoint, JavaFrameAnchor anchor) {
         if (currentFrameIsEntryPoint) {
             /*
@@ -332,7 +356,7 @@ public final class JfrStackWalker {
              * return address points into native code because AOT-compiled code may be called via
              * a @CFunction call as well. So, we only do a basic sanity check of the frame anchor.
              */
-            return anchor.isNull() || anchor.getLastJavaSP().aboveThan(currentSP) && CodeInfoTable.isInAOTImageCode(anchor.getLastJavaIP());
+            return anchor.isNull() || anchor.getLastJavaSP().aboveThan(currentSP) && CodeInfoTable.lookupCodeInfo(anchor.getLastJavaIP()).isNonNull();
         } else {
             /* The caller frame should belong to Java code. */
             Pointer callerSP = currentSP.add(currentFrameSize);
@@ -340,9 +364,9 @@ public final class JfrStackWalker {
                 return false;
             }
 
-            /* Check if the return address points into AOT-compiled Java code. */
+            /* Check if the return address points into compiled Java code. */
             CodePointer ip = FrameAccess.singleton().unsafeReadReturnAddress(callerSP);
-            return CodeInfoTable.isInAOTImageCode(ip);
+            return CodeInfoTable.lookupCodeInfo(ip).isNonNull();
         }
     }
 
@@ -350,7 +374,7 @@ public final class JfrStackWalker {
      * Check whether the given caller stack pointer (and the corresponding return address) are
      * within the currently used part of the current thread's stack.
      */
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean isCallerSPValid(Pointer currentSP, Pointer callerSP) {
         UnsignedWord stackEnd = VMThreads.StackEnd.get();
         UnsignedWord stackBase = VMThreads.StackBase.get();
@@ -370,13 +394,13 @@ public final class JfrStackWalker {
         return false;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean isSPAligned(Pointer sp) {
-        return PointerUtils.isAMultiple(sp, WordFactory.unsigned(ConfigurationValues.getTarget().stackAlignment));
+        return PointerUtils.isAMultiple(sp, Word.unsigned(SubstrateTarget.singleton().stackAlignment));
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "The method executes during signal handling.")
     private static boolean isCallerValid(Pointer currentSP, Pointer callerSP, CodePointer callerIP) {
-        return CodeInfoTable.isInAOTImageCode(callerIP) && isCallerSPValid(currentSP, callerSP);
+        return CodeInfoTable.lookupCodeInfo(callerIP).isNonNull() && isCallerSPValid(currentSP, callerSP);
     }
 }

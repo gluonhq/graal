@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,13 +31,14 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Base64.Decoder;
 import java.util.Base64.Encoder;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
+
+import jdk.graal.compiler.util.EconomicHashSet;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -210,7 +211,7 @@ public class Base64SubstitutionsTest extends GraalOSRTestBase {
         final byte[] illegals;
 
         IllegalBase64CharSupplier(boolean url) {
-            Set<Byte> set = new HashSet<>();
+            Set<Byte> set = new EconomicHashSet<>();
             for (int val = 0; val < 256; val++) {
                 if ((val >= 'A' && val <= 'Z') ||
                                 (val >= 'a' && val <= 'z') ||
@@ -297,6 +298,23 @@ public class Base64SubstitutionsTest extends GraalOSRTestBase {
                 assertByteArraysEqual(suffix, actualSuffix);
             }
         }
+    }
+
+    @Test
+    public void testDecodeIncompleteQuantumDoesNotOverwriteOutput() {
+        byte[] srcBytes = new byte[65];
+        Arrays.fill(srcBytes, 0, 64, (byte) 'A');
+        srcBytes[64] = '=';
+
+        byte[] initialOutput = new byte[128];
+        Arrays.fill(initialOutput, (byte) 0x7f);
+        ByteArraySupplier bas = new ByteArraySupplier(0, initialOutput);
+        ResolvedJavaMethod m = getResolvedJavaMethod(Decoder.class, "decode", byte[].class, byte[].class);
+        test(m, Base64.getDecoder(), srcBytes, bas);
+
+        Assert.assertTrue(lastResults.actual.exception instanceof IllegalArgumentException);
+        Assert.assertEquals(2, bas.supplied.size());
+        assertByteArraysEqual(bas.supplied.get(0), bas.supplied.get(1));
     }
 
     public static byte[] decodeByteBufferSnippet(Decoder decoder, ByteBuffer srcBuf) {

@@ -27,6 +27,7 @@ package com.oracle.svm.core.jdk;
 import java.lang.reflect.Method;
 import java.util.Collection;
 import java.util.Currency;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,15 +35,19 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Alias;
+import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Inject;
+import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
+
+import jdk.internal.util.SystemProps;
 
 /*
  * Lazily initialized cache fields of collection classes need to be reset. They are not needed in
@@ -150,6 +155,46 @@ final class Target_java_util_concurrent_ConcurrentHashMap {
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset)//
     Target_java_util_concurrent_ConcurrentHashMap_EntrySetView entrySet;
 
+    @Alias @InjectAccessors(NCPUAccessor.class) //
+    private static int NCPU;
+}
+
+final class NCPUAccessor {
+    private static int cachedNCPU = -1;
+
+    static int get() {
+        if (cachedNCPU != -1) {
+            return cachedNCPU;
+        }
+        return initializeNCPU();
+    }
+
+    private static synchronized int initializeNCPU() {
+        if (cachedNCPU != -1) {
+            return cachedNCPU;
+        }
+
+        cachedNCPU = Runtime.getRuntime().availableProcessors();
+        return cachedNCPU;
+    }
+
+    static synchronized void set(int value) {
+        cachedNCPU = value;
+    }
+}
+
+@TargetClass(java.util.concurrent.Phaser.class)
+final class Target_java_util_concurrent_Phaser {
+
+    @Alias @InjectAccessors(NCPUAccessor.class) //
+    private static int NCPU;
+}
+
+@TargetClass(className = "java.util.concurrent.atomic.Striped64")
+final class Target_java_util_concurrent_atomic_Striped64 {
+
+    @Alias @InjectAccessors(NCPUAccessor.class) //
+    private static int NCPU;
 }
 
 @TargetClass(value = java.util.concurrent.ConcurrentHashMap.class, innerClass = "KeySetView")
@@ -286,6 +331,60 @@ class JavaLoggingModule {
         public boolean getAsBoolean() {
             return isPresent();
         }
+    }
+}
+
+@TargetClass(className = "java.util.concurrent.LinkedTransferQueue", innerClass = "DualNode")
+final class Target_java_util_concurrent_LinkedTransferQueue_DualNode {
+
+    @Alias @InjectAccessors(LinkedTransferQueueDualNodeIsUniprocessorAccessor.class) //
+    private static boolean isUniprocessor;
+}
+
+final class LinkedTransferQueueDualNodeIsUniprocessorAccessor {
+    private static Boolean cachedIsUniprocessor = null;
+
+    static boolean get() {
+        if (cachedIsUniprocessor != null) {
+            return cachedIsUniprocessor;
+        }
+        return initializeIsUniprocessor();
+    }
+
+    static void set(boolean value) {
+        cachedIsUniprocessor = value;
+    }
+
+    private static synchronized boolean initializeIsUniprocessor() {
+        if (cachedIsUniprocessor != null) {
+            return cachedIsUniprocessor;
+        }
+
+        cachedIsUniprocessor = Runtime.getRuntime().availableProcessors() == 1;
+        return cachedIsUniprocessor;
+    }
+}
+
+/**
+ * Currently unsupported in Native Image because our system-property support works completely
+ * differently than the one in HotSpot.
+ */
+@TargetClass(value = SystemProps.Raw.class)
+final class Target_jdk_internal_util_SystemProps_Raw {
+    @Delete
+    private static native String[] vmProperties();
+
+    @Delete
+    private static native String[] platformProperties();
+}
+
+@TargetClass(value = SystemProps.class)
+final class Target_jdk_internal_util_SystemProps {
+
+    @Substitute
+    public static Map<String, String> initProperties() {
+        // SystemProps initialization depends on the deleted raw VM/platform property accessors.
+        throw VMError.unsupportedFeature("SystemProps.initProperties()");
     }
 }
 

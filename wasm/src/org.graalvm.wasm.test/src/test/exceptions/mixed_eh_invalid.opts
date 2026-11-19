@@ -1,0 +1,2 @@
+wasm.Exceptions=true
+wasm.LegacyExceptions=true

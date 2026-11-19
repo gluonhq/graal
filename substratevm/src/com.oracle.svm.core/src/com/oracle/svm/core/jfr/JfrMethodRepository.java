@@ -27,14 +27,15 @@ package com.oracle.svm.core.jfr;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.StackValue;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.code.FrameSourceInfo;
 import com.oracle.svm.core.jdk.StackTraceUtils;
-import com.oracle.svm.core.jfr.traceid.JfrTraceIdEpoch;
+import com.oracle.svm.core.jfr.traceid.JfrEpoch;
 import com.oracle.svm.core.jfr.utils.JfrVisited;
 import com.oracle.svm.core.jfr.utils.JfrVisitedTable;
 import com.oracle.svm.core.locks.VMMutex;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * Repository that collects and writes used methods.
@@ -57,8 +58,13 @@ public class JfrMethodRepository implements JfrRepository {
         epochData1.teardown();
     }
 
+    public void reset() {
+        epochData0.clear(false);
+        epochData1.clear(false);
+    }
+
     @Uninterruptible(reason = "Locking without transition and result is only valid until epoch changes.", callerMustBe = true)
-    public long getMethodId(Class<?> clazz, String methodName, String methodSignature, int methodId, int methodModifier) {
+    public long getMethodId(Class<?> clazz, String methodName, String methodSignature, int methodId, int methodFlags) {
         assert clazz != null;
         assert methodName != null;
         assert methodId > 0;
@@ -88,8 +94,8 @@ public class JfrMethodRepository implements JfrRepository {
             JfrNativeEventWriter.putLong(data, typeRepo.getClassId(clazz));
             JfrNativeEventWriter.putLong(data, symbolRepo.getSymbolId(methodName, false));
             JfrNativeEventWriter.putLong(data, symbolRepo.getSymbolId(methodSignature, false));
-            JfrNativeEventWriter.putInt(data, methodModifier);
-            JfrNativeEventWriter.putBoolean(data, !StackTraceUtils.shouldShowFrame(clazz, methodName));
+            JfrNativeEventWriter.putInt(data, FrameSourceInfo.MethodFlags.getMethodModifiers(methodFlags));
+            JfrNativeEventWriter.putBoolean(data, !StackTraceUtils.shouldShowFrame(clazz, methodName, methodFlags));
             if (!JfrNativeEventWriter.commit(data)) {
                 return methodId;
             }
@@ -124,7 +130,7 @@ public class JfrMethodRepository implements JfrRepository {
 
     @Uninterruptible(reason = "Prevent epoch change.", callerMustBe = true)
     private JfrMethodEpochData getEpochData(boolean previousEpoch) {
-        boolean epoch = previousEpoch ? JfrTraceIdEpoch.getInstance().previousEpoch() : JfrTraceIdEpoch.getInstance().currentEpoch();
+        boolean epoch = previousEpoch ? JfrEpoch.getInstance().previousEpoch() : JfrEpoch.getInstance().currentEpoch();
         return epoch ? epochData0 : epochData1;
     }
 
@@ -148,12 +154,12 @@ public class JfrMethodRepository implements JfrRepository {
             JfrBufferAccess.reinitialize(buffer);
         }
 
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+        @Uninterruptible(reason = "May free current epoch data.")
         void teardown() {
             table.teardown();
             unflushedEntries = 0;
             JfrBufferAccess.free(buffer);
-            buffer = WordFactory.nullPointer();
+            buffer = Word.nullPointer();
         }
     }
 }

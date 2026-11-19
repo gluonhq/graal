@@ -24,46 +24,49 @@
  */
 package com.oracle.svm.hosted.lambda;
 
-import java.util.HashSet;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import com.oracle.graal.pointsto.BigBang;
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.nativeimage.ImageSingletons;
+
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.meta.BaseLayerType;
-import com.oracle.graal.pointsto.phases.NoClassInitializationPlugin;
-import com.oracle.graal.pointsto.util.GraalAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.OriginalClassProvider;
 
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.debug.DebugContext.Builder;
 import jdk.graal.compiler.java.LambdaUtils;
-import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.phases.OptimisticOptimizations;
-import jdk.graal.compiler.phases.util.Providers;
-import jdk.graal.compiler.printer.GraalDebugHandlersFactory;
+import jdk.graal.compiler.util.Digest;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * This substitution replaces all lambda proxy types with types that have a stable names. The name
- * is formed from the signature of the target method that the lambda is calling.
+ * is formed from the lambda capture site. If no capture site can be found or resolved, for example
+ * for a lambda created by explicitly invoking a lambda metafactory, the name uses the signature of
+ * the target method instead.
  * <p>
- * NOTE: there is a particular case in which names are not stable. If multiple lambda proxies have a
- * same target in a same class they are indistinguishable in bytecode. Then their stable names get
- * appended with a unique number for that class. To make this corner case truly stable, analysis
- * must be run in the single-threaded mode.
+ * NOTE: if multiple lambda proxies have the same capture-site hash or fallback signature, a unique
+ * number is appended for that class. To make this conflict case truly stable, analysis must be run
+ * in the single-threaded mode.
  */
-
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class LambdaProxyRenamingSubstitutionProcessor extends SubstitutionProcessor {
 
-    private final BigBang bb;
-
     private final ConcurrentHashMap<ResolvedJavaType, LambdaSubstitutionType> typeSubstitutions;
-    private final Set<String> uniqueLambdaProxyNames;
+    private final EconomicSet<String> uniqueLambdaProxyNames;
 
-    LambdaProxyRenamingSubstitutionProcessor(BigBang bb) {
+    LambdaProxyRenamingSubstitutionProcessor() {
         this.typeSubstitutions = new ConcurrentHashMap<>();
-        this.uniqueLambdaProxyNames = new HashSet<>();
-        this.bb = bb;
+        this.uniqueLambdaProxyNames = EconomicSet.create();
+    }
+
+    public static LambdaProxyRenamingSubstitutionProcessor singleton() {
+        if (!ImageSingletons.contains(LambdaProxyRenamingSubstitutionProcessor.class)) {
+            throw VMError.shouldNotReachHere("Lambda proxy renaming accessed before LambdaProxyRenamingSubstitutionProcessor was installed during setup");
+        }
+        return ImageSingletons.lookup(LambdaProxyRenamingSubstitutionProcessor.class);
     }
 
     @Override
@@ -77,20 +80,27 @@ public class LambdaProxyRenamingSubstitutionProcessor extends SubstitutionProces
 
     private LambdaSubstitutionType getSubstitution(ResolvedJavaType original) {
         return typeSubstitutions.computeIfAbsent(original, (key) -> {
-            OptionValues options = bb.getOptions();
-            DebugContext debug = new Builder(options, new GraalDebugHandlersFactory(bb.getSnippetReflectionProvider())).build();
-
-            Providers providers = GraalAccess.getOriginalProviders();
-            String lambdaTargetName = LambdaUtils.findStableLambdaName(new NoClassInitializationPlugin(), providers, key, options, debug, this,
-                            config -> new LambdaSubstrateGraphBuilderPhase.LambdaSubstrateGraphBuilderInstance(providers, config, OptimisticOptimizations.NONE, null));
+            String captureSite = LambdaParser.findLambdaCaptureSite(OriginalClassProvider.getJavaClass(key));
+            String lambdaTargetName = captureSite == null ? LambdaUtils.findStableLambdaName(key) : withCaptureSite(key.getName(), captureSite);
             return new LambdaSubstitutionType(key, findUniqueLambdaProxyName(lambdaTargetName));
         });
     }
 
+    private static String withCaptureSite(String lambdaTargetName, String captureSite) {
+        int startIndexOfLambdaName = lambdaTargetName.indexOf(LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING);
+        int endIndexOfLambdaName = lambdaTargetName.indexOf(';', startIndexOfLambdaName);
+        String siteSpecificSignature = Digest.digestAsHex(captureSite);
+        return lambdaTargetName.substring(0, startIndexOfLambdaName) + LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING + LambdaUtils.ADDRESS_PREFIX + siteSpecificSignature +
+                        lambdaTargetName.substring(endIndexOfLambdaName);
+    }
+
     /**
-     * Finds a unique name for a lambda proxies with a same target originating from the same class.
-     *
-     * NOTE: the name truly stable only in a single threaded build.
+     * Finds a unique name for lambda proxies with the same base name. To create unique names when
+     * conflicts are found the naming scheme uses a counter: first a 0 is added to the end of the
+     * generated lambda name, and it is incremented until a unique name is found. This also means
+     * that a conflicting name is truly stable only in a single threaded build, i.e., when conflicts
+     * are discovered in the same order. Since the conflict counter doesn't have an upper limit the
+     * generated lambda name length can vary but the base hash is always 32 hex digits long.
      */
     private String findUniqueLambdaProxyName(String lambdaTargetName) {
         synchronized (uniqueLambdaProxyNames) {
@@ -108,7 +118,22 @@ public class LambdaProxyRenamingSubstitutionProcessor extends SubstitutionProces
         }
     }
 
+    /**
+     * Find the base name by subtracting the counter injected by
+     * {@link #findUniqueLambdaProxyName(String)}. Note that the counter can be on multiple digits
+     * but the base hash is always 32 hex digits long.
+     */
+    private static String getBaseName(String lambdaTargetName) {
+        int startIndexOfHash = lambdaTargetName.indexOf(LambdaUtils.ADDRESS_PREFIX) + LambdaUtils.ADDRESS_PREFIX.length();
+        return lambdaTargetName.substring(0, startIndexOfHash + 32);
+    }
+
+    /**
+     * Check if this lambda's name conflicted with any other entries, i.e., if the conflict counter
+     * ever got to 1.
+     */
     public boolean isNameAlwaysStable(String lambdaTargetName) {
-        return !uniqueLambdaProxyNames.contains(lambdaTargetName.substring(0, lambdaTargetName.length() - 1) + "1;");
+        String baseName = getBaseName(lambdaTargetName);
+        return !uniqueLambdaProxyNames.contains(baseName + "1;");
     }
 }

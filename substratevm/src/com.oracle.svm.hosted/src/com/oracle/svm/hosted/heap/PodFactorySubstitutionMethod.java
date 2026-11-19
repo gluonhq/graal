@@ -24,32 +24,32 @@
  */
 package com.oracle.svm.hosted.heap;
 
+import com.oracle.svm.hosted.PodFactoryGuestValue;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-
-import org.graalvm.nativeimage.AnnotationAccess;
 
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.common.meta.MultiMethod;
 import com.oracle.svm.core.deopt.DeoptTest;
 import com.oracle.svm.core.graal.nodes.DeoptEntryBeginNode;
 import com.oracle.svm.core.graal.nodes.DeoptEntryNode;
 import com.oracle.svm.core.graal.nodes.DeoptProxyAnchorNode;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
 import com.oracle.svm.core.graal.nodes.NewPodInstanceNode;
+import com.oracle.svm.core.graal.nodes.TestDeoptimizeNode;
 import com.oracle.svm.core.heap.Pod;
 import com.oracle.svm.core.heap.Pod.RuntimeSupport.PodFactory;
 import com.oracle.svm.hosted.annotation.CustomSubstitutionMethod;
 import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
 import com.oracle.svm.hosted.nodes.DeoptProxyNode;
-import com.oracle.svm.hosted.nodes.TestDeoptimizeNode;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.debug.DebugContext;
@@ -70,25 +70,12 @@ import jdk.graal.compiler.nodes.java.ExceptionObjectNode;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-final class PodFactorySubstitutionProcessor extends SubstitutionProcessor {
-    private final ConcurrentMap<ResolvedJavaMethod, PodFactorySubstitutionMethod> substitutions = new ConcurrentHashMap<>();
-
-    @Override
-    public ResolvedJavaMethod lookup(ResolvedJavaMethod method) {
-        if (method.isSynthetic() && AnnotationAccess.isAnnotationPresent(method.getDeclaringClass(), PodFactory.class) && !method.isConstructor()) {
-            assert !(method instanceof CustomSubstitutionMethod);
-            return substitutions.computeIfAbsent(method, PodFactorySubstitutionMethod::new);
-        }
-        return method;
-    }
-}
-
 final class PodFactorySubstitutionMethod extends CustomSubstitutionMethod {
 
     private static class DeoptInfoProvider {
-        final MultiMethod method;
+        final MethodVariant method;
 
-        DeoptInfoProvider(MultiMethod method) {
+        DeoptInfoProvider(MethodVariant method) {
             this.method = method;
         }
 
@@ -120,8 +107,8 @@ final class PodFactorySubstitutionMethod extends CustomSubstitutionMethod {
         }
 
         AnalysisType factoryType = method.getDeclaringClass();
-        PodFactory annotation = factoryType.getAnnotation(PodFactory.class);
-        AnalysisType podConcreteType = kit.getMetaAccess().lookupJavaType(annotation.podClass());
+        PodFactoryGuestValue annotation = PodFactoryGuestValue.get(factoryType);
+        AnalysisType podConcreteType = kit.getMetaAccess().getUniverse().lookup(annotation.podClass());
         AnalysisMethod targetCtor = findMatchingConstructor(method, podConcreteType.getSuperclass());
 
         /*
@@ -132,8 +119,10 @@ final class PodFactorySubstitutionMethod extends CustomSubstitutionMethod {
         int instanceLocal = kit.getFrameState().localsSize() - 1; // reserved when generating class
         int nextDeoptIndex = startMethod(kit, deoptInfo, 0);
         instantiatePod(kit, factoryType, podConcreteType, instanceLocal);
-        if (isAnnotationPresent(DeoptTest.class)) {
-            kit.append(new TestDeoptimizeNode());
+        if (GuestAnnotationAccess.isAnnotationPresent(this, DeoptTest.class)) {
+            if (!SubstrateCompilationDirectives.isDeoptTarget(method)) {
+                kit.append(new TestDeoptimizeNode());
+            }
         }
         nextDeoptIndex = invokeConstructor(kit, deoptInfo, nextDeoptIndex, targetCtor, instanceLocal);
 
@@ -307,5 +296,18 @@ final class PodFactorySubstitutionMethod extends CustomSubstitutionMethod {
             }
         }
         throw GraalError.shouldNotReachHere("Required field " + name + " not found in " + type); // ExcludeFromJacocoGeneratedReport
+    }
+}
+
+final class PodFactorySubstitutionProcessor extends SubstitutionProcessor {
+    private final ConcurrentMap<ResolvedJavaMethod, PodFactorySubstitutionMethod> substitutions = new ConcurrentHashMap<>();
+
+    @Override
+    public ResolvedJavaMethod lookup(ResolvedJavaMethod method) {
+        if (method.isSynthetic() && GuestAnnotationAccess.isAnnotationPresent(method.getDeclaringClass(), PodFactory.class) && !method.isConstructor()) {
+            assert !(method instanceof CustomSubstitutionMethod);
+            return substitutions.computeIfAbsent(method, PodFactorySubstitutionMethod::new);
+        }
+        return method;
     }
 }

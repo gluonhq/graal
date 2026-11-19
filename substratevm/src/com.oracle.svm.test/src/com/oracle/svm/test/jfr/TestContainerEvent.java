@@ -30,11 +30,10 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.List;
 
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 import org.junit.Assume;
 import org.junit.Test;
 
-import com.oracle.svm.core.OS;
+import com.oracle.svm.core.container.Container;
 import com.oracle.svm.test.jfr.events.ThreadEvent;
 
 import jdk.jfr.Recording;
@@ -46,7 +45,8 @@ import jdk.jfr.consumer.RecordedEvent;
 public class TestContainerEvent extends JfrRecordingTest {
     @Test
     public void test() throws Throwable {
-        Assume.assumeTrue("Container support is limited to Linux", OS.LINUX.isCurrent());
+        Assume.assumeTrue("Container support not enabled or available", Container.isSupported());
+        Assume.assumeTrue("Test assumes running containerized", Container.singleton().isContainerized());
 
         String[] events = new String[]{"jdk.ContainerConfiguration"};
         Recording recording = startRecording(events);
@@ -67,9 +67,7 @@ public class TestContainerEvent extends JfrRecordingTest {
         long hostTotalMem = re.getValue("hostTotalMemory");
         assertTrue(hostTotalMem > 0);
 
-        if (JavaVersionUtil.JAVA_SPEC >= 23) {
-            long hostTotalSwap = re.getValue("hostTotalSwapMemory");
-            assertTrue("Host swap not implemented", hostTotalSwap < 0);
-        }
+        long hostTotalSwap = re.getValue("hostTotalSwapMemory");
+        assertTrue("Host swap not implemented", hostTotalSwap < 0);
     }
 }

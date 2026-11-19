@@ -30,7 +30,7 @@ import java.util.List;
 
 import org.graalvm.nativeimage.Platform;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.hosted.NativeImageOptions;
 
 public interface CPUType {
@@ -80,7 +80,7 @@ public interface CPUType {
         } else if (Platform.includedIn(Platform.AMD64.class)) {
             return CPUTypeAMD64.getDefaultName(false);
         } else if (Platform.includedIn(Platform.AARCH64.class)) {
-            return CPUTypeAArch64.getDefaultName();
+            return CPUTypeAArch64.getDefaultName(false);
         } else if (Platform.includedIn(Platform.RISCV64.class)) {
             return CPUTypeRISCV64.getDefaultName();
         } else {

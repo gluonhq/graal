@@ -24,16 +24,22 @@
  */
 package com.oracle.svm.core.image;
 
-import jdk.vm.ci.meta.JavaConstant;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 public interface ImageHeapObject {
     long getSize();
+
+    Object getWrapped();
 
     Object getObject();
 
     Class<?> getObjectClass();
 
-    JavaConstant getConstant();
+    @Platforms(Platform.HOSTED_ONLY.class)
+    ResolvedJavaType getObjectType();
 
     void setHeapPartition(ImageHeapPartition value);
 

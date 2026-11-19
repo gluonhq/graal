@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2020, 2022, Oracle and/or its affiliates.
+# Copyright (c) 2020, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -48,8 +48,8 @@ def _run_fuzz_tool(tool_name, tool_args, *args, **kwargs):
     dist = 'SULONG_TOOLS'
     tool = os.path.join(mx.dependency(dist, fatalIfMissing=True).get_output(), 'bin', tool_name)
     if not os.path.exists(tool):
-        msg = "The executable {} does not exist: {}{}".format(tool_name, tool, os.linesep)
-        msg += "This might be solved by running: mx build --dependencies={}".format(dist)
+        msg = f"The executable {tool_name} does not exist: {tool}{os.linesep}"
+        msg += f"This might be solved by running: mx build --dependencies={dist}"
         mx.abort(msg)
     return mx.run([tool] + tool_args, *args, **kwargs)
 
@@ -100,9 +100,9 @@ def fuzz(args=None, out=None):
                 mx_sulong.llvm_tool(["clang", "-O0", "-Wno-everything", "-S", "-emit-llvm", "-I" + csmith_headers, "-o", tmp_ll, tmp_c])
                 gen.append((tmp_c, 'autogen.c'))
             timeout = parsed_args.timeout
-            with open(tmp_sulong_out, 'w') as o, open(tmp_sulong_err, 'w') as e:
+            with open(tmp_sulong_out, 'w', encoding='utf-8') as o, open(tmp_sulong_err, 'w', encoding='utf-8') as e:
                 mx_sulong.lli(['--llvm.llDebug', '--log.llvm.TraceIR.level=FINER', '--log.llvm.LLDebug.level=OFF', '--experimental-options', '--engine.WarnInterpreterOnly=false', tmp_out], timeout=timeout, nonZeroIsFatal=False, out=o, err=e)
-            with open(tmp_bin_out, 'w') as o, open(tmp_bin_err, 'w') as e:
+            with open(tmp_bin_out, 'w', encoding='utf-8') as o, open(tmp_bin_err, 'w', encoding='utf-8') as e:
                 try:
                     mx.run([tmp_out], timeout=timeout, out=o, err=e)
                 except SystemExit:
@@ -130,8 +130,8 @@ def fuzz(args=None, out=None):
         if tmp_dir:
             shutil.rmtree(tmp_dir)
     mx.log("Test report")
-    mx.log("total testcases: {} seed: {}".format(parsed_args.nrtestcases, parsed_args.seed))
-    mx.log("interesting testcases: {} invalid testcases: {}".format(parsed_args.nrtestcases-invalid-passed, invalid))
+    mx.log(f"total testcases: {parsed_args.nrtestcases} seed: {parsed_args.seed}")
+    mx.log(f"interesting testcases: {parsed_args.nrtestcases-invalid-passed} invalid testcases: {invalid}")
 
 
 @mx.command("sulong", "ll-reduce")
@@ -149,7 +149,7 @@ def ll_reduce(args=None, out=None):
 
     mx.log("Running ll-reduce with the following configuration:")
     for k, v in vars(parsed_args).items():
-        mx.log("{:>30}: {}".format(k, v))
+        mx.log(f"{k:>30}: {v}")
 
     tmp_dir = None
     nrmutations = 4
@@ -170,7 +170,7 @@ def ll_reduce(args=None, out=None):
 
         def count_lines(file_name):
             i = 0
-            with open(file_name) as f:
+            with open(file_name, encoding='utf-8') as f:
                 for i, _ in enumerate(f, 1):
                     pass
             return i
@@ -179,7 +179,7 @@ def ll_reduce(args=None, out=None):
             additional_clang_input = [mx_subst.path_substitutions.substitute(ci) for ci in parsed_args.clang_input or []]
             toolchain_clang = mx_sulong._get_toolchain_tool("native,CC")
             mx_sulong.llvm_tool([toolchain_clang, "-O0", "-Wno-everything", "-o", tmp_out, input_f] + additional_clang_input)
-            with open(out_f, 'w') as o, open(err_f, 'w') as e:
+            with open(out_f, 'w', encoding='utf-8') as o, open(err_f, 'w', encoding='utf-8') as e:
                 mx.command_function('lli')(parsed_args.lli_arg + [tmp_out], timeout=lli_timeout, nonZeroIsFatal=False, out=o, err=e)
 
         def run_interestingness_test(interestingness_test, input_file):
@@ -197,7 +197,7 @@ def ll_reduce(args=None, out=None):
                 _run_fuzz_tool("llvm-reduce", args, out=reduce_out, err=reduce_out)
             except SystemExit as se:
                 mx.log_error(reduce_out.data)
-                mx.abort("Error executing llvm-reduce: {}".format(se))
+                mx.abort(f"Error executing llvm-reduce: {se}")
 
         shutil.copy(parsed_args.input, tmp_ll)
 
@@ -215,7 +215,7 @@ def ll_reduce(args=None, out=None):
                 mx.log("Result stabilized (no more progress)")
                 break
             mx_sulong.llvm_tool(["llvm-as", "-o", tmp_bc, tmp_ll])
-            mx.log("nrmutations: {} filesize: {} bytes (bc), number of lines {} (ll)".format(nrmutations, os.path.getsize(tmp_bc), count_lines(tmp_ll)))
+            mx.log(f"nrmutations: {nrmutations} filesize: {os.path.getsize(tmp_bc)} bytes (bc), number of lines {count_lines(tmp_ll)} (ll)")
             run_llvm_reduce(nrmutations, tmp_bc, tmp_ll_reduced)
             reduced_interesting = run_interestingness_test(parsed_args.interestingness_test, tmp_ll_reduced)
             if reduced_interesting:
@@ -227,13 +227,12 @@ def ll_reduce(args=None, out=None):
                 mx.log("Reduced file is identical to input file!")
             if nrmutations > 1:
                 nrmutations //= 2
-            else:
-                if not starttime_stabilized:
-                    starttime_stabilized = time.time()
+            elif not starttime_stabilized:
+                starttime_stabilized = time.time()
     finally:
         if tmp_ll and os.path.isfile(tmp_ll):
             result = parsed_args.output or (os.path.splitext(parsed_args.input)[0] + ".reduced.ll")
-            mx.log("Writing reduced ll file to {}".format(result))
+            mx.log(f"Writing reduced ll file to {result}")
             shutil.copy(tmp_ll, result)
         if tmp_dir:
             shutil.rmtree(tmp_dir)
@@ -249,16 +248,16 @@ def check_interesting(args=None, out=None):
 
     def _not_interesting(msg=None):
         if msg:
-            mx.logv(mx.colorize("mx check-interesting: no ({})".format(msg), color="blue"))
+            mx.logv(mx.colorize(f"mx check-interesting: no ({msg})", color="blue"))
         sys.exit(0)
 
     def _interesting(msg=None):
         if msg:
-            mx.logv(mx.colorize("mx check-interesting: yes ({})".format(msg), color="cyan"))
+            mx.logv(mx.colorize(f"mx check-interesting: yes ({msg})", color="cyan"))
         sys.exit(1)
 
     def _files_match_pattern(prefix, out_file, err_file):
-        with open(out_file, 'r') as o, open(err_file, 'r') as e:
+        with open(out_file, encoding='utf-8') as o, open(err_file, encoding='utf-8') as e:
             if not any(fl.startswith(prefix) for fl in (next(o, ""), next(e, ""))):
                 return False
         return True
@@ -280,14 +279,14 @@ def check_interesting(args=None, out=None):
             mx.run([toolchain_clang, "-O3", "-Wno-everything", "-o", tmp_out_o3, parsed_args.input])
         except SystemExit:
             _not_interesting("Compiling the input file failed!")
-        with open(tmp_sulong_out, 'w') as o, open(tmp_sulong_err, 'w') as e:
+        with open(tmp_sulong_out, 'w', encoding='utf-8') as o, open(tmp_sulong_err, 'w', encoding='utf-8') as e:
             mx_sulong.lli([tmp_out], timeout=10, nonZeroIsFatal=False, out=o, err=e)
-        with open(tmp_bin_out, 'w') as o, open(tmp_bin_err, 'w') as e:
+        with open(tmp_bin_out, 'w', encoding='utf-8') as o, open(tmp_bin_err, 'w', encoding='utf-8') as e:
             try:
                 mx.run([tmp_out], timeout=10, out=o, err=e)
             except SystemExit:
                 _not_interesting("Running the O0 compiled input files natively failed!")
-        with open(tmp_bin_out_o3, 'w') as o, open(tmp_bin_err_o3, 'w') as e:
+        with open(tmp_bin_out_o3, 'w', encoding='utf-8') as o, open(tmp_bin_err_o3, 'w', encoding='utf-8') as e:
             try:
                 mx.run([tmp_out_o3], timeout=10, out=o, err=e)
             except SystemExit:
@@ -323,7 +322,7 @@ def bugpoint(args=None, out=None):
         mx_sulong.llvm_extra_tool(['bugpoint', '--help'])
         return
 
-    class ClosedExecutableTempFile(object):
+    class ClosedExecutableTempFile:
         def __init__(self, content, *args, **kwargs):
             self.content = content
             self.args = args
@@ -346,7 +345,7 @@ def bugpoint(args=None, out=None):
     script_content = "#!/bin/bash\n"
     compile_command = parsed_args.compile_command
     if compile_command.startswith("mx "):
-        compile_command = mx_sulong.get_mx_exe() + " -p {} ".format(mx_sulong._suite.dir) + compile_command[3:]
+        compile_command = mx_sulong.get_mx_exe() + f" -p {mx_sulong._suite.dir} " + compile_command[3:]
     script_content += compile_command + " $@\n"
 
     with ClosedExecutableTempFile(script_content, prefix="bugpoint-compile-command-", suffix=".sh") as compile_script:

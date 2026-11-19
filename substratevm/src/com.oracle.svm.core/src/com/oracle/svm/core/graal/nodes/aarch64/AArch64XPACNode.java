@@ -24,10 +24,14 @@
  */
 package com.oracle.svm.core.graal.nodes.aarch64;
 
-import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.graal.compiler.lir.LIRInstruction.OperandFlag.REG;
 import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_1;
 import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_1;
+import static jdk.vm.ci.code.ValueUtil.asRegister;
+
+import org.graalvm.nativeimage.c.function.CodePointer;
+
+import com.oracle.svm.core.SubstrateTarget;
 
 import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
 import jdk.graal.compiler.core.common.LIRKind;
@@ -43,10 +47,6 @@ import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
-import org.graalvm.nativeimage.c.function.CodePointer;
-
-import com.oracle.svm.core.FrameAccess;
-
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.aarch64.AArch64Kind;
 import jdk.vm.ci.code.Register;
@@ -60,7 +60,7 @@ public class AArch64XPACNode extends FixedWithNextNode implements LIRLowerable {
     @Input ValueNode address;
 
     public AArch64XPACNode(ValueNode address) {
-        super(TYPE, FrameAccess.getWordStamp());
+        super(TYPE, SubstrateTarget.getWordStamp());
         this.address = address;
     }
 

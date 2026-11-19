@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -48,7 +48,7 @@ import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory.FrameState;
 import com.oracle.truffle.dsl.processor.java.model.CodeTree;
 import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
 
-class MultiBitSet {
+public class MultiBitSet {
 
     private final List<BitSet> sets;
 
@@ -66,6 +66,21 @@ class MultiBitSet {
             length += a.getBitCount();
         }
         return length;
+    }
+
+    public CodeTree createContainsAll(FrameState frameState, StateQuery elements) {
+        CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
+        String sep = "";
+        for (BitSet set : sets) {
+            StateQuery selected = set.filter(elements);
+            if (!selected.isEmpty()) {
+                CodeTree containsAll = set.createIs(frameState, selected, selected);
+                builder.string(sep);
+                builder.tree(containsAll);
+                sep = " && ";
+            }
+        }
+        return builder.build();
     }
 
     public CodeTree createContains(FrameState frameState, StateQuery elements) {
@@ -118,6 +133,27 @@ class MultiBitSet {
         }
         return builder.build();
 
+    }
+
+    /**
+     * Applies the transaction updates and persists only state words that changed. The comparison
+     * uses the already loaded state locals and does not reload state from the node.
+     */
+    public CodeTree persistTransactionIfChanged(FrameState frameState, StateTransaction transaction, CodeTree updates) {
+        CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
+        for (BitSet set : transaction.modified) {
+            if (!set.hasLocal(frameState)) {
+                throw new AssertionError("Cannot persist transaction state local without a local variable in the frame state.");
+            }
+            builder.declaration(set.getType(), set.getName() + "_previous", set.createReference(frameState));
+        }
+        builder.tree(updates);
+        for (BitSet set : transaction.modified) {
+            builder.startIf().string(set.getName(), "_previous != ").tree(set.createReference(frameState)).end().startBlock();
+            builder.tree(set.createSet(frameState, null, null, true));
+            builder.end();
+        }
+        return builder.build();
     }
 
     public CodeTree createSet(FrameState frameState, StateTransaction transaction, StateQuery query, boolean value, boolean persist) {
@@ -202,12 +238,20 @@ class MultiBitSet {
     }
 
     public CodeTree createExtractInteger(FrameState frameState, StateQuery element) {
+        BitSet set = findSet(element);
+        if (set == null) {
+            throw new AssertionError("element not contained");
+        }
+        return set.createExtractInteger(frameState, element);
+    }
+
+    public BitSet findSet(StateQuery element) {
         for (BitSet set : sets) {
             if (set.contains(element)) {
-                return set.createExtractInteger(frameState, element);
+                return set;
             }
         }
-        throw new AssertionError("element not contained");
+        return null;
     }
 
     public CodeTree createNotContains(FrameState frameState, StateQuery elements) {

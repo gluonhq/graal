@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,13 +26,17 @@ package jdk.graal.compiler.nodes.spi;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.BiConsumer;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.MapCursor;
 
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.debug.TTY;
+import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.JavaMethodProfile;
@@ -48,6 +52,17 @@ import jdk.vm.ci.meta.UnresolvedJavaType;
  * same answer for the entire compilation. This can improve the consistency of compilation results.
  */
 public class StableProfileProvider implements ProfileProvider {
+
+    private static final Class<?> TRANSLATED_EXCEPTION;
+    static {
+        Class<?> clz;
+        try {
+            clz = Class.forName("jdk.internal.vm.TranslatedException");
+        } catch (ClassNotFoundException cnf) {
+            clz = null;
+        }
+        TRANSLATED_EXCEPTION = clz;
+    }
 
     private final TypeResolver resolver;
 
@@ -67,6 +82,19 @@ public class StableProfileProvider implements ProfileProvider {
          * @return a {@link ResolvedJavaType} if the type can be resolved, null otherwise
          */
         ResolvedJavaType resolve(ResolvedJavaMethod method, ProfilingInfo realProfile, int bci, ResolvedJavaType loadingIssuingType, String typeName);
+    }
+
+    private static boolean isTranslatedNoClassDefFound(Throwable e) {
+        Throwable effectiveException = e;
+        if (TRANSLATED_EXCEPTION != null && TRANSLATED_EXCEPTION.isInstance(e)) {
+            /*
+             * As of JDK 24 (JDK-8335553), a translated exception is boxed in a TranslatedException.
+             * Unbox a translated unchecked exception to get the real one.
+             */
+            Throwable cause = e.getCause();
+            effectiveException = cause;
+        }
+        return effectiveException instanceof NoClassDefFoundError;
     }
 
     /**
@@ -97,8 +125,12 @@ public class StableProfileProvider implements ProfileProvider {
             if (actualType == null) {
                 try {
                     actualType = UnresolvedJavaType.create(typeName).resolve(method.getDeclaringClass());
-                } catch (NoClassDefFoundError ncdfe) {
-                    // do nothing
+                } catch (Throwable t) {
+                    if (isTranslatedNoClassDefFound(t)) {
+                        // do nothing
+                    } else {
+                        throw t;
+                    }
                 }
             }
 
@@ -106,8 +138,12 @@ public class StableProfileProvider implements ProfileProvider {
                 // try using the original type issuing the load operation of this profile
                 try {
                     actualType = UnresolvedJavaType.create(typeName).resolve(loadingIssuingType);
-                } catch (NoClassDefFoundError ncdfe) {
-                    // do nothing
+                } catch (Throwable t) {
+                    if (isTranslatedNoClassDefFound(t)) {
+                        // do nothing
+                    } else {
+                        throw t;
+                    }
                 }
             }
             if (actualType == null) {
@@ -115,8 +151,12 @@ public class StableProfileProvider implements ProfileProvider {
                     for (JavaTypeProfile.ProfiledType actual : actualProfile.getTypes()) {
                         try {
                             actualType = UnresolvedJavaType.create(typeName).resolve(actual.getType());
-                        } catch (NoClassDefFoundError ncdfe) {
-                            // do nothing
+                        } catch (Throwable t) {
+                            if (isTranslatedNoClassDefFound(t)) {
+                                // do nothing
+                            } else {
+                                throw t;
+                            }
                         }
                         if (actualType != null) {
                             break;
@@ -150,24 +190,42 @@ public class StableProfileProvider implements ProfileProvider {
     /**
      * Lazy loaded profiles from disk.
      */
-    private EconomicMap<String, CachingProfilingInfo> loaded;
+    private EconomicMap<LoadedProfileKey, CachingProfilingInfo> loaded;
     private boolean frozen;
     private boolean warnNonCachedLoadAccess;
 
-    @Override
-    public ProfilingInfo getProfilingInfo(ResolvedJavaMethod method) {
-        return getProfilingInfo(method, true, true);
+    /** Nullable flags preserve legacy captures, which supplied one view for both normal and OSR queries. */
+    private record LoadedProfileKey(String method, Boolean includeNormal, Boolean includeOSR) {
     }
 
-    static class ProfileKey {
+    private CachingProfilingInfo findLoadedProfile(String signature, boolean includeNormal, boolean includeOSR) {
+        CachingProfilingInfo profile = loaded.get(new LoadedProfileKey(signature, includeNormal, includeOSR));
+        return profile != null ? profile : loaded.get(new LoadedProfileKey(signature, null, null));
+    }
+
+    public static class ProfileKey {
         final ResolvedJavaMethod method;
         final boolean includeNormal;
         final boolean includeOSR;
+        final NodeSourcePosition context;
 
-        ProfileKey(ResolvedJavaMethod method, boolean includeNormal, boolean includeOSR) {
+        ProfileKey(ResolvedJavaMethod method, NodeSourcePosition context, boolean includeNormal, boolean includeOSR) {
             this.method = method;
+            this.context = context;
             this.includeNormal = includeNormal;
             this.includeOSR = includeOSR;
+        }
+
+        public ResolvedJavaMethod method() {
+            return method;
+        }
+
+        public boolean includeNormal() {
+            return includeNormal;
+        }
+
+        public boolean includeOSR() {
+            return includeOSR;
         }
 
         @Override
@@ -179,30 +237,61 @@ public class StableProfileProvider implements ProfileProvider {
                 return false;
             }
             ProfileKey that = (ProfileKey) o;
-            return includeNormal == that.includeNormal && includeOSR == that.includeOSR && method.equals(that.method);
+            return Objects.equals(context, that.context) && includeNormal == that.includeNormal && includeOSR == that.includeOSR && method.equals(that.method);
         }
 
         @Override
         public int hashCode() {
-            return method.hashCode() + (includeNormal ? 1 : 0) + (includeOSR ? 2 : 0);
+            return method.hashCode() + (context != null ? context.hashCode() : 0) + (includeNormal ? 1 : 0) + (includeOSR ? 2 : 0);
         }
     }
 
+    /**
+     * Note: This method only exists so implementations have a fast path to decide whether the
+     * context parameter of {@link #getProfilingInfo(NodeSourcePosition, ResolvedJavaMethod)} can be
+     * safely ignored. It is a mere performance optimization.
+     *
+     * @return {@code true} if this profile provider can return calling context-sensitive view on
+     *         profiling data for methods
+     *
+     * @see #deriveForContext(NodeSourcePosition, ResolvedJavaMethod, boolean, boolean)
+     */
+    public boolean supportsContext() {
+        return false;
+    }
+
+    public ProfilingInfo deriveForContext(@SuppressWarnings("unused") NodeSourcePosition callingContext, ResolvedJavaMethod callee, boolean includeNormal, boolean includeOSR) {
+        /*
+         * The default implementation of the stable profile provider does not preserve any context,
+         * however it can properly cache with context. So it is a matter of implementing
+         * deriveContext for StableProfileProvider to return context-sensitive results.
+         */
+        return callee.getProfilingInfo(includeNormal, includeOSR);
+    }
+
     @Override
-    public ProfilingInfo getProfilingInfo(ResolvedJavaMethod method, boolean includeNormal, boolean includeOSR) {
+    public ProfilingInfo getProfilingInfo(NodeSourcePosition callingContext, ResolvedJavaMethod method) {
+        return getProfilingInfo(callingContext, method, true, true);
+    }
+
+    @Override
+    public ProfilingInfo getProfilingInfo(NodeSourcePosition callingContext, ResolvedJavaMethod method, boolean includeNormal, boolean includeOSR) {
+
         // In the normal case true is passed for both arguments but the root method of the compile
         // will pass true for only one of these flags.
-        ProfileKey key = new ProfileKey(method, includeNormal, includeOSR);
+
+        // we only use context keys if the provider supports them
+        ProfileKey key = new ProfileKey(method, supportsContext() ? callingContext : null, includeNormal, includeOSR);
 
         CachingProfilingInfo profile = profiles.get(key);
         if (profile == null && loaded != null) {
-            profile = loaded.get(method.format(METHOD_FORMAT));
+            profile = findLoadedProfile(method.format(METHOD_FORMAT), includeNormal, includeOSR);
             if (profile != null) {
                 profile.materialize(method);
             } else {
                 if (loadingLambdaNameFormatter != null) {
                     // try to find it as a lambda method
-                    profile = loaded.get(loadingLambdaNameFormatter.formatLamdaName(method));
+                    profile = findLoadedProfile(loadingLambdaNameFormatter.formatLamdaName(method), includeNormal, includeOSR);
                     if (profile != null) {
                         profile.materialize(method);
                     }
@@ -217,7 +306,7 @@ public class StableProfileProvider implements ProfileProvider {
                     TTY.printf("Requesting not cached profile for %s%n", method.format(METHOD_FORMAT));
                 }
             }
-            profile = new CachingProfilingInfo(method, includeNormal, includeOSR);
+            profile = new CachingProfilingInfo(this, callingContext, method, includeNormal, includeOSR);
             profiles.put(key, profile);
         }
         return profile;
@@ -254,7 +343,8 @@ public class StableProfileProvider implements ProfileProvider {
                 branchTakenProbability = (Double) bciData.get("branchTakenProbability");
                 List<?> probs = (List<?>) bciData.get("switchProbabilities");
                 if (probs != null) {
-                    switchProbabilities = new double[probs.size()];
+                    // The recorder serializes the null sentinel as an empty list.
+                    switchProbabilities = probs.isEmpty() ? NULL_SWITCH_PROBABILITIES : new double[probs.size()];
                     for (int i = 0; i < probs.size(); i++) {
                         switchProbabilities[i] = (double) probs.get(i);
                     }
@@ -312,6 +402,8 @@ public class StableProfileProvider implements ProfileProvider {
 
         private Integer compilerIRSize;
 
+        private EnumMap<DeoptimizationReason, Integer> deoptimizationCounts;
+
         /**
          * Per bci profiles.
          */
@@ -325,9 +417,9 @@ public class StableProfileProvider implements ProfileProvider {
 
         private boolean materialized;
 
-        CachingProfilingInfo(ResolvedJavaMethod method, boolean includeNormal, boolean includeOSR) {
-            this.method = method;
-            this.realProfile = method.getProfilingInfo(includeNormal, includeOSR);
+        CachingProfilingInfo(StableProfileProvider provider, NodeSourcePosition callerContext, ResolvedJavaMethod callee, boolean includeNormal, boolean includeOSR) {
+            this.method = callee;
+            this.realProfile = provider.deriveForContext(callerContext, callee, includeNormal, includeOSR);
             this.bytecodeProfiles = EconomicMap.create();
         }
 
@@ -336,6 +428,14 @@ public class StableProfileProvider implements ProfileProvider {
             isMature = (Boolean) map.get("isMature");
             compilerIRSize = (Integer) map.get("compilerIRSize");
             bytecodeProfiles = EconomicMap.create();
+            EconomicMap<String, Object> counts = (EconomicMap<String, Object>) map.get("deoptimizationCounts");
+            if (counts != null) {
+                deoptimizationCounts = new EnumMap<>(DeoptimizationReason.class);
+                MapCursor<String, Object> entries = counts.getEntries();
+                while (entries.advance()) {
+                    deoptimizationCounts.put(DeoptimizationReason.valueOf(entries.getKey()), (Integer) entries.getValue());
+                }
+            }
             List<?> data = (List<?>) map.get("data");
             if (data != null) {
                 for (Object d : data) {
@@ -347,7 +447,7 @@ public class StableProfileProvider implements ProfileProvider {
 
         private void checkFrozen(int bci, String caller) {
             if (frozen) {
-                throw new InternalError("Profile is frozen and profiling information was requested for " + method + "@" + bci);
+                throw new InternalError("Profile is frozen and profiling information was requested for " + method + "@" + bci + " in " + caller);
             } else {
                 if (loaded != null && warnNonCachedLoadAccess) {
                     TTY.printf("Requesting uncached profile for bci %d in %s method %s%n", bci, method.format(METHOD_FORMAT), caller);
@@ -449,7 +549,16 @@ public class StableProfileProvider implements ProfileProvider {
 
         @Override
         public int getDeoptimizationCount(DeoptimizationReason reason) {
-            return realProfile.getDeoptimizationCount(reason);
+            Integer count = deoptimizationCounts == null ? null : deoptimizationCounts.get(reason);
+            if (count == null) {
+                checkFrozen(-1, "getDeoptimizationCount(" + reason + ")");
+                count = realProfile.getDeoptimizationCount(reason);
+                if (deoptimizationCounts == null) {
+                    deoptimizationCounts = new EnumMap<>(DeoptimizationReason.class);
+                }
+                deoptimizationCounts.put(reason, count);
+            }
+            return count;
         }
 
         @Override
@@ -487,18 +596,31 @@ public class StableProfileProvider implements ProfileProvider {
 
         private EconomicMap<String, Object> asMap(Object signature, TypeFilter filter, LambdaNameFormatter lambdaFormatter) {
             EconomicMap<String, Object> profileRecord = EconomicMap.create();
-            if (signature instanceof String) {
-                profileRecord.put("method", signature);
+            if (signature instanceof LoadedProfileKey key) {
+                profileRecord.put("method", key.method());
+                if (key.includeNormal() != null && key.includeOSR() != null) {
+                    profileRecord.put("includeNormal", key.includeNormal());
+                    profileRecord.put("includeOSR", key.includeOSR());
+                }
             } else {
                 ProfileKey key = (ProfileKey) signature;
                 ResolvedJavaMethod m = key.method;
-                if (lambdaFormatter.isLambda(m)) {
+                if (lambdaFormatter != null && lambdaFormatter.isLambda(m)) {
                     profileRecord.put("stableLambdaName", lambdaFormatter.formatLamdaName(m));
                 }
                 profileRecord.put("method", m.format(METHOD_FORMAT));
+                profileRecord.put("includeNormal", key.includeNormal);
+                profileRecord.put("includeOSR", key.includeOSR);
             }
             profileRecord.put("isMature", this.isMature == null ? false : this.isMature);
             profileRecord.put("compilerIRSize", compilerIRSize == null ? -1 : compilerIRSize);
+            if (deoptimizationCounts != null) {
+                EconomicMap<String, Object> counts = EconomicMap.create();
+                for (DeoptimizationReason reason : deoptimizationCounts.keySet()) {
+                    counts.put(reason.name(), deoptimizationCounts.get(reason));
+                }
+                profileRecord.put("deoptimizationCounts", counts);
+            }
             ArrayList<EconomicMap<String, Object>> bciData = new ArrayList<>();
             for (BytecodeProfile data : bytecodeProfiles.getValues()) {
                 EconomicMap<String, Object> v = EconomicMap.create();
@@ -532,7 +654,7 @@ public class StableProfileProvider implements ProfileProvider {
                     typeProfile.put("types", types);
                     double effectiveNotRecorded = data.typeProfile.getNotRecordedProbability();
                     for (JavaTypeProfile.ProfiledType ptype : data.typeProfile.getTypes()) {
-                        if (filter == null || lambdaFormatter.isLambda(method) || filter.includeType(ptype.getType())) {
+                        if (filter == null || lambdaFormatter != null && lambdaFormatter.isLambda(method) || filter.includeType(ptype.getType())) {
                             EconomicMap<String, Object> ptypeMap = EconomicMap.create();
                             ptypeMap.put("type", ptype.getType().getName());
                             ptypeMap.put("probability", ptype.getProbability());
@@ -595,11 +717,13 @@ public class StableProfileProvider implements ProfileProvider {
             String signature = (String) methodMap.get("method");
             CachingProfilingInfo info = new CachingProfilingInfo(methodMap);
             info.loadingIssuingType = loadingIssuingType;
-            loaded.put(signature, info);
+            Boolean includeNormal = (Boolean) methodMap.get("includeNormal");
+            Boolean includeOSR = (Boolean) methodMap.get("includeOSR");
+            loaded.put(new LoadedProfileKey(signature, includeNormal, includeOSR), info);
             if (methodMap.containsKey("stableLambdaName")) {
                 // record another entry based on the stable lambda name
                 String signatureStableLambda = (String) methodMap.get("stableLambdaName");
-                loaded.put(signatureStableLambda, info);
+                loaded.put(new LoadedProfileKey(signatureStableLambda, includeNormal, includeOSR), info);
             }
         }
         this.loadingLambdaNameFormatter = lambdaFormatter;
@@ -620,13 +744,19 @@ public class StableProfileProvider implements ProfileProvider {
         return TriState.valueOf(exceptionSeen);
     }
 
+    /// Records queried profiles; a {@code null} lambda formatter applies the type filter to every
+    /// method holder and receiver type without lambda exemptions.
     public EconomicMap<String, Object> recordProfiles(EconomicMap<String, Object> map, TypeFilter typeFilter, LambdaNameFormatter lambdaFormatter) {
         ArrayList<Object> methods = new ArrayList<>();
         map.put("profiles", methods);
         if (loaded != null) {
-            MapCursor<String, CachingProfilingInfo> entries = loaded.getEntries();
+            MapCursor<LoadedProfileKey, CachingProfilingInfo> entries = loaded.getEntries();
             while (entries.advance()) {
                 ResolvedJavaMethod method = entries.getValue().method;
+                if (method == null) {
+                    // This loaded view was not queried during the current compilation.
+                    continue;
+                }
                 ResolvedJavaType declaringType = method.getDeclaringClass();
                 if (typeFilter == null || lambdaFormatter != null && lambdaFormatter.isLambda(method) || typeFilter.includeType(declaringType)) {
                     methods.add(entries.getValue().asMap(entries.getKey(), typeFilter, lambdaFormatter));
@@ -643,5 +773,19 @@ public class StableProfileProvider implements ProfileProvider {
             }
         }
         return map;
+    }
+
+    /**
+     * Iterates over all queried profiles and invokes the provided consumer for each pair of
+     * {@link ProfileKey} and corresponding {@link ProfilingInfo}.
+     *
+     * @param consumer a callback function that accepts a {@link ProfileKey} and a
+     *            {@link ProfilingInfo} as input parameters
+     */
+    public void forQueriedProfiles(BiConsumer<ProfileKey, ProfilingInfo> consumer) {
+        var cursor = profiles.getEntries();
+        while (cursor.advance()) {
+            consumer.accept(cursor.getKey(), cursor.getValue());
+        }
     }
 }

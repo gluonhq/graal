@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,6 +47,7 @@ import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -58,7 +59,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -85,8 +85,6 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.stream.Collectors;
 
-import com.oracle.truffle.api.InternalResource;
-import com.oracle.truffle.api.test.ReflectionUtils;
 import org.graalvm.collections.Pair;
 import org.graalvm.options.OptionCategory;
 import org.graalvm.options.OptionDescriptor;
@@ -117,6 +115,7 @@ import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.ContextLocal;
 import com.oracle.truffle.api.ContextThreadLocal;
 import com.oracle.truffle.api.InstrumentInfo;
+import com.oracle.truffle.api.InternalResource;
 import com.oracle.truffle.api.Option;
 import com.oracle.truffle.api.ThreadLocalAction;
 import com.oracle.truffle.api.TruffleContext;
@@ -124,17 +123,22 @@ import com.oracle.truffle.api.TruffleFile;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.TruffleLogger;
+import com.oracle.truffle.api.TruffleStackTrace;
+import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.ContextsListener;
 import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.ThreadsActivationListener;
 import com.oracle.truffle.api.instrumentation.ThreadsListener;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
+import com.oracle.truffle.api.interop.InteropLibrary;
+import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.test.ReflectionUtils;
 import com.oracle.truffle.api.test.TestAPIAccessor;
-import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 import com.oracle.truffle.api.test.polyglot.InternalResourceTest.TemporaryResourceCacheRoot;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class ContextPreInitializationTest {
 
@@ -185,7 +189,6 @@ public class ContextPreInitializationTest {
         ContextPreInitializationFirstInstrument.actions = null;
         BaseLanguage.actions.clear();
         resetSystemPropertiesOptions();
-        resetLanguageHomes();
         patchableLanguages.clear();
         emittedContexts.clear();
         NEXT_ORDER_INDEX.set(0);
@@ -944,28 +947,6 @@ public class ContextPreInitializationTest {
     }
 
     @Test
-    public void testLanguageHome() throws Exception {
-        setPatchable(FIRST);
-        String expectedPath = Paths.get(String.format("/compile-graalvm/languages/%s", FIRST)).toString();
-        System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), expectedPath);
-        doContextPreinitialize(FIRST);
-        List<CountingContext> contexts = new ArrayList<>(emittedContexts);
-        assertEquals(1, contexts.size());
-        final CountingContext firstLangCtx = findContext(FIRST, contexts);
-        Assert.assertEquals(expectedPath, firstLangCtx.languageHome);
-
-        expectedPath = Paths.get(String.format("/run-graalvm/languages/%s", FIRST)).toString();
-        System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), expectedPath);
-        try (Context ctx = Context.newBuilder().build()) {
-            Value res = ctx.eval(Source.create(FIRST, "test"));
-            assertEquals("test", res.asString());
-            contexts = new ArrayList<>(emittedContexts);
-            assertEquals(1, contexts.size());
-            Assert.assertEquals(expectedPath, firstLangCtx.languageHome);
-        }
-    }
-
-    @Test
     public void testTemporaryEngine() throws Exception {
         setPatchable(FIRST);
         doContextPreinitialize(FIRST);
@@ -1284,55 +1265,6 @@ public class ContextPreInitializationTest {
     }
 
     @Test
-    public void testFileSystemSwitch() throws Exception {
-        setPatchable(FIRST);
-        Path tmpDir = Files.createTempDirectory("testFileSystemSwitch").toRealPath();
-        Path buildHome = tmpDir.resolve("build");
-        Path execHome = tmpDir.resolve("exec");
-        Files.createDirectories(buildHome);
-        Files.createDirectories(execHome);
-        Path buildFile = write(buildHome.resolve("test"), "build");
-        Path execFile = write(execHome.resolve("test"), "exec");
-        Path noLangHomeFile = write(tmpDir.resolve("test"), "abs");
-
-        try {
-            List<TruffleFile> files = new ArrayList<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
-                TruffleFile f = env.getPublicTruffleFile(buildFile.toString());
-                files.add(f);
-                f = env.getPublicTruffleFile(noLangHomeFile.toString());
-                files.add(f);
-                f = env.getPublicTruffleFile("relative_file");
-                files.add(f);
-            });
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_PATCH_CONTEXT, (env) -> {
-                try {
-                    assertTrue(files.get(0).isAbsolute());
-                    assertEquals(execFile.toString(), files.get(0).getPath());
-                    assertEquals("exec", read(files.get(0)).trim());
-                    assertTrue(files.get(1).isAbsolute());
-                    assertEquals(noLangHomeFile.toString(), files.get(1).getPath());
-                    assertEquals("abs", read(files.get(1)).trim());
-                    assertFalse(files.get(2).isAbsolute());
-                    assertEquals("relative_file", files.get(2).getPath());
-                } catch (IOException ioe) {
-                    throw new RuntimeException(ioe);
-                }
-            });
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), buildHome.toString());
-            doContextPreinitialize(FIRST);
-            assertFalse(files.isEmpty());
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), execHome.toString());
-            try (Context ctx = Context.newBuilder().allowIO(IOAccess.ALL).build()) {
-                Value res = ctx.eval(Source.create(FIRST, "test"));
-                assertEquals("test", res.asString());
-            }
-        } finally {
-            delete(tmpDir);
-        }
-    }
-
-    @Test
     public void testServiceLookupSuccessfulPatch() throws Exception {
         setPatchable(FIRST, SECOND);
         ContextPreInitializationTestSecondLanguage.lookupService = true;
@@ -1385,11 +1317,8 @@ public class ContextPreInitializationTest {
         assertEquals(0, firstLangCtx.initializeContextCount);
         assertEquals(1, firstLangCtx.patchContextCount);
         assertEquals(1, firstLangCtx.disposeContextCount);
-        assertEquals(0, firstLangCtx.initializeThreadCount);    // initializeThread is called only
-                                                                // on TruffleLanguages with
-                                                                // initialized contexts
-        assertEquals(1, firstLangCtx.disposeThreadCount);       // disposeThread is called on all
-                                                                // TruffleLanguages
+        assertEquals(0, firstLangCtx.initializeThreadCount);
+        assertEquals(0, firstLangCtx.disposeThreadCount);
     }
 
     @Test
@@ -1439,7 +1368,7 @@ public class ContextPreInitializationTest {
         assertEquals(1, firstLangCtx.patchContextCount);
         assertEquals(1, firstLangCtx.disposeContextCount);
         assertEquals(0, firstLangCtx.initializeThreadCount);
-        assertEquals(1, firstLangCtx.disposeThreadCount);
+        assertEquals(0, firstLangCtx.disposeThreadCount);
 
         assertEquals(1, secondLangCtx2.createContextCount);
         assertEquals(1, secondLangCtx2.initializeContextCount);
@@ -1467,7 +1396,7 @@ public class ContextPreInitializationTest {
         assertEquals(1, firstLangCtx.patchContextCount);
         assertEquals(1, firstLangCtx.disposeContextCount);
         assertEquals(0, firstLangCtx.initializeThreadCount);
-        assertEquals(1, firstLangCtx.disposeThreadCount);
+        assertEquals(0, firstLangCtx.disposeThreadCount);
         assertEquals(1, secondLangCtx2.createContextCount);
         assertEquals(1, secondLangCtx2.initializeContextCount);
         assertEquals(0, secondLangCtx2.patchContextCount);
@@ -1479,7 +1408,7 @@ public class ContextPreInitializationTest {
         assertEquals(0, firstLangCtx2.patchContextCount);
         assertEquals(1, firstLangCtx2.disposeContextCount);
         assertEquals(0, firstLangCtx2.initializeThreadCount);
-        assertEquals(1, firstLangCtx2.disposeThreadCount);
+        assertEquals(0, firstLangCtx2.disposeThreadCount);
     }
 
     @Test
@@ -1579,6 +1508,125 @@ public class ContextPreInitializationTest {
     }
 
     @Test
+    public void testPreInitializationWithoutTempDirectoryAccess() throws Exception {
+        setPatchable(FIRST);
+        BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
+            assertNotNull(env.getPublicTruffleFile("relative").getAbsoluteFile());
+            assertNotNull(env.getInternalTruffleFile("relative").getAbsoluteFile());
+        });
+        Properties originalProperties = System.getProperties();
+        System.setProperties(new PreInitializationProperties(originalProperties));
+        try {
+            doContextPreinitialize(FIRST);
+            assertEquals(1, emittedContexts.size());
+            assertEquals(1, findContext(FIRST, emittedContexts).initializeContextCount);
+        } finally {
+            System.setProperties(originalProperties);
+        }
+        try (Context context = Context.create(FIRST)) {
+            context.initialize(FIRST);
+            assertEquals(1, findContext(FIRST, emittedContexts).patchContextCount);
+        }
+    }
+
+    @Test
+    public void testCodeSharingPreInitializationWithoutTempDirectoryAccess() throws Exception {
+        try (Engine engine = Engine.create()) {
+            try (Context context = Context.newBuilder().engine(engine).build()) {
+                context.initialize(SHARED);
+            }
+            emittedContexts.clear();
+            Properties originalProperties = System.getProperties();
+            System.setProperties(new PreInitializationProperties(originalProperties));
+            try {
+                triggerPreinitialization(engine);
+                assertEquals(1, emittedContexts.size());
+                assertEquals(1, findContext(SHARED, emittedContexts).initializeContextCount);
+            } finally {
+                System.setProperties(originalProperties);
+            }
+            try (Context context = Context.newBuilder().engine(engine).build()) {
+                context.initialize(SHARED);
+                assertEquals(1, findContext(SHARED, emittedContexts).patchContextCount);
+            }
+        }
+    }
+
+    @Test
+    public void testPreInitializationLazyTempDirectoryAccess() throws Exception {
+        setPatchable(FIRST);
+        Path preInitializationTempDirectory = Files.createTempDirectory("preinit-temp").toRealPath();
+        Path runtimeTempDirectory = Files.createTempDirectory("runtime-temp").toRealPath();
+        Properties originalProperties = System.getProperties();
+        PreInitializationProperties properties = new PreInitializationProperties(originalProperties);
+        properties.setProperty("java.io.tmpdir", preInitializationTempDirectory.toString());
+        BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
+            assertEquals(0, properties.tempDirectoryReads);
+            properties.allowTempDirectoryAccess = true;
+            try {
+                TruffleFile directory = env.createTempDirectory(null, "directory");
+                TruffleFile file = env.createTempFile(null, "file", ".tmp");
+                assertEquals(preInitializationTempDirectory.toString(), directory.getParent().getPath());
+                assertEquals(preInitializationTempDirectory.toString(), file.getParent().getPath());
+                assertEquals(1, properties.tempDirectoryReads);
+                file.delete();
+                directory.delete();
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        });
+        BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_PATCH_CONTEXT, (env) -> {
+            try {
+                TruffleFile file = env.createTempFile(null, "file", ".tmp");
+                assertEquals(runtimeTempDirectory.toString(), file.getParent().getPath());
+                file.delete();
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        });
+        try {
+            System.setProperties(properties);
+            try {
+                doContextPreinitialize(FIRST);
+            } finally {
+                System.setProperties(originalProperties);
+            }
+            FileSystem runtimeFileSystem = new FileSystemsTest.ForwardingFileSystem(FileSystem.newDefaultFileSystem()) {
+                @Override
+                public Path getTempDirectory() {
+                    return runtimeTempDirectory;
+                }
+            };
+            try (Context context = Context.newBuilder(FIRST).allowIO(IOAccess.newBuilder().fileSystem(runtimeFileSystem).build()).build()) {
+                context.initialize(FIRST);
+                assertEquals(1, findContext(FIRST, emittedContexts).patchContextCount);
+            }
+        } finally {
+            delete(preInitializationTempDirectory);
+            delete(runtimeTempDirectory);
+        }
+    }
+
+    private static final class PreInitializationProperties extends Properties {
+        private static final long serialVersionUID = 1L;
+        boolean allowTempDirectoryAccess;
+        int tempDirectoryReads;
+
+        PreInitializationProperties(Properties originalProperties) {
+            putAll(originalProperties);
+        }
+
+        @Override
+        public String getProperty(String key) {
+            if (key.equals("java.io.tmpdir")) {
+                assertTrue("Unexpected temporary-directory access during preinitialization", allowTempDirectoryAccess);
+                tempDirectoryReads++;
+            }
+            return super.getProperty(key);
+        }
+    }
+
+    @Test
     public void testSetCurrentWorkingDirectory() throws Exception {
         setPatchable(FIRST);
         Path newCwd = Files.createTempDirectory("testSetCWD");
@@ -1610,128 +1658,6 @@ public class ContextPreInitializationTest {
         } finally {
             delete(newCwd);
             delete(absoluteFolder);
-        }
-    }
-
-    @Test
-    @SuppressWarnings("try")
-    public void testSourceInLanguageHome() throws Exception {
-        setPatchable(FIRST);
-        Path testFolder = Files.createTempDirectory("testSources").toRealPath();
-        try {
-            Path buildtimeHome = Files.createDirectories(testFolder.resolve("build").resolve(FIRST));
-            Path buildtimeResource = Files.write(buildtimeHome.resolve("testSourceInLanguageHome.test"), Collections.singleton("test"));
-            Path runtimeHome = Files.createDirectories(testFolder.resolve("exec").resolve(FIRST));
-            Path runtimeResource = Files.copy(buildtimeResource, runtimeHome.resolve(buildtimeResource.getFileName()));
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), buildtimeHome.toString());
-            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeCachedSource = new AtomicReference<>();
-            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeUnCachedSource = new AtomicReference<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
-                buildtimeCachedSource.set(createSource(env, buildtimeResource, true));
-                buildtimeUnCachedSource.set(createSource(env, buildtimeResource, false));
-                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
-            });
-            doContextPreinitialize(FIRST);
-            List<CountingContext> contexts = new ArrayList<>(emittedContexts);
-            assertEquals(1, contexts.size());
-            CountingContext firstLangCtx = findContext(FIRST, contexts);
-            assertEquals(1, firstLangCtx.initializeContextCount);
-            assertNotNull(buildtimeCachedSource.get());
-            assertNotNull(buildtimeUnCachedSource.get());
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), runtimeHome.toString());
-            AtomicReference<com.oracle.truffle.api.source.Source> runtimeCachedSource = new AtomicReference<>();
-            AtomicReference<com.oracle.truffle.api.source.Source> runtimeUnCachedSource = new AtomicReference<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_PATCH_CONTEXT, (env) -> {
-                runtimeCachedSource.set(createSource(env, runtimeResource, true));
-                runtimeUnCachedSource.set(createSource(env, runtimeResource, false));
-                assertFalse(runtimeCachedSource.get() == runtimeUnCachedSource.get());
-            });
-            try (Context ctx = Context.create()) {
-                assertEquals(1, firstLangCtx.patchContextCount);
-                assertEquals(runtimeResource, Paths.get(buildtimeCachedSource.get().getPath()));
-                assertEquals(runtimeResource, Paths.get(buildtimeUnCachedSource.get().getPath()));
-                assertEquals(runtimeResource, Paths.get(runtimeUnCachedSource.get().getPath()));
-                assertSame(buildtimeCachedSource.get(), runtimeCachedSource.get());
-                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
-                assertFalse(buildtimeCachedSource.get() == runtimeUnCachedSource.get());
-                assertFalse(buildtimeUnCachedSource.get() == runtimeUnCachedSource.get());
-            }
-        } finally {
-            delete(testFolder);
-        }
-    }
-
-    @Test
-    @SuppressWarnings("try")
-    public void testSourceOutsideLanguageHome() throws Exception {
-        setPatchable(FIRST);
-        Path testFolder = Files.createTempDirectory("testSources").toRealPath();
-        try {
-            Path buildtimeHome = Files.createDirectories(testFolder.resolve("build").resolve(FIRST));
-            Path runtimeHome = Files.createDirectories(testFolder.resolve("exec").resolve(FIRST));
-            Path resource = Files.write(testFolder.resolve("testSourceOutsideLanguageHome.test"), Collections.singleton("test"));
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), buildtimeHome.toString());
-            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeCachedSource = new AtomicReference<>();
-            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeUnCachedSource = new AtomicReference<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
-                buildtimeCachedSource.set(createSource(env, resource, true));
-                buildtimeUnCachedSource.set(createSource(env, resource, false));
-                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
-            });
-            doContextPreinitialize(FIRST);
-            List<CountingContext> contexts = new ArrayList<>(emittedContexts);
-            assertEquals(1, contexts.size());
-            CountingContext firstLangCtx = findContext(FIRST, contexts);
-            assertEquals(1, firstLangCtx.initializeContextCount);
-            assertNotNull(buildtimeCachedSource.get());
-            assertNotNull(buildtimeUnCachedSource.get());
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), runtimeHome.toString());
-            AtomicReference<com.oracle.truffle.api.source.Source> runtimeCachedSource = new AtomicReference<>();
-            AtomicReference<com.oracle.truffle.api.source.Source> runtimeUnCachedSource = new AtomicReference<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_PATCH_CONTEXT, (env) -> {
-                runtimeCachedSource.set(createSource(env, resource, true));
-                runtimeUnCachedSource.set(createSource(env, resource, false));
-            });
-            try (Context ctx = Context.newBuilder().allowAllAccess(true).build()) {
-                assertEquals(1, firstLangCtx.patchContextCount);
-                assertEquals(resource, Paths.get(buildtimeCachedSource.get().getPath()));
-                assertEquals(resource, Paths.get(buildtimeUnCachedSource.get().getPath()));
-                assertEquals(resource, Paths.get(runtimeUnCachedSource.get().getPath()));
-                assertSame(buildtimeCachedSource.get(), runtimeCachedSource.get());
-                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
-                assertFalse(buildtimeCachedSource.get() == runtimeUnCachedSource.get());
-                assertFalse(buildtimeUnCachedSource.get() == runtimeUnCachedSource.get());
-            }
-        } finally {
-            delete(testFolder);
-        }
-    }
-
-    @Test
-    @SuppressWarnings("try")
-    public void testSourceNotPatchedContext() throws Exception {
-        setPatchable(FIRST);
-        Path testFolder = Files.createTempDirectory("testSources").toRealPath();
-        try {
-            Path buildtimeHome = Files.createDirectories(testFolder.resolve("build").resolve(FIRST));
-            Path buildtimeResource = Files.write(buildtimeHome.resolve("testSourceNotPatchedContext.test"), Collections.singleton("test"));
-            Path runtimeHome = Files.createDirectories(testFolder.resolve("exec").resolve(FIRST));
-            Path runtimeResource = Files.copy(buildtimeResource, runtimeHome.resolve(buildtimeResource.getFileName()));
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), buildtimeHome.toString());
-            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeSource = new AtomicReference<>();
-            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
-                buildtimeSource.set(createSource(env, buildtimeResource, true));
-            });
-            doContextPreinitialize(FIRST);
-            List<CountingContext> contexts = new ArrayList<>(emittedContexts);
-            assertEquals(1, contexts.size());
-            CountingContext firstLangCtx = findContext(FIRST, contexts);
-            assertEquals(1, firstLangCtx.initializeContextCount);
-            assertNotNull(buildtimeSource.get());
-            System.setProperty(String.format("org.graalvm.language.%s.home", FIRST), runtimeHome.toString());
-            Source.newBuilder(FIRST, runtimeResource.toFile()).build();
-        } finally {
-            delete(testFolder);
         }
     }
 
@@ -2739,6 +2665,48 @@ public class ContextPreInitializationTest {
 
     @Test
     @SuppressWarnings("try")
+    public void testSourcesOutsideInternalResources() throws Exception {
+        setPatchable(FIRST);
+        Path testFolder = Files.createTempDirectory("testSources").toRealPath();
+        try {
+            Path resource = Files.write(testFolder.resolve("testSourceOutsideLanguageHome.test"), Collections.singleton("test"));
+            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeCachedSource = new AtomicReference<>();
+            AtomicReference<com.oracle.truffle.api.source.Source> buildtimeUnCachedSource = new AtomicReference<>();
+            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
+                buildtimeCachedSource.set(createSource(env, resource, true));
+                buildtimeUnCachedSource.set(createSource(env, resource, false));
+                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
+            });
+            doContextPreinitialize(FIRST);
+            List<CountingContext> contexts = new ArrayList<>(emittedContexts);
+            assertEquals(1, contexts.size());
+            CountingContext firstLangCtx = findContext(FIRST, contexts);
+            assertEquals(1, firstLangCtx.initializeContextCount);
+            assertNotNull(buildtimeCachedSource.get());
+            assertNotNull(buildtimeUnCachedSource.get());
+            AtomicReference<com.oracle.truffle.api.source.Source> runtimeCachedSource = new AtomicReference<>();
+            AtomicReference<com.oracle.truffle.api.source.Source> runtimeUnCachedSource = new AtomicReference<>();
+            BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_PATCH_CONTEXT, (env) -> {
+                runtimeCachedSource.set(createSource(env, resource, true));
+                runtimeUnCachedSource.set(createSource(env, resource, false));
+            });
+            try (Context ctx = Context.newBuilder().allowAllAccess(true).build()) {
+                assertEquals(1, firstLangCtx.patchContextCount);
+                assertEquals(resource, Paths.get(buildtimeCachedSource.get().getPath()));
+                assertEquals(resource, Paths.get(buildtimeUnCachedSource.get().getPath()));
+                assertEquals(resource, Paths.get(runtimeUnCachedSource.get().getPath()));
+                assertSame(buildtimeCachedSource.get(), runtimeCachedSource.get());
+                assertFalse(buildtimeCachedSource.get() == buildtimeUnCachedSource.get());
+                assertFalse(buildtimeCachedSource.get() == runtimeUnCachedSource.get());
+                assertFalse(buildtimeUnCachedSource.get() == runtimeUnCachedSource.get());
+            }
+        } finally {
+            delete(testFolder);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
     public void testInstrumentInternalResources() throws Exception {
         TruffleTestAssumptions.assumeNotAOT();
         setPatchable(FIRST);
@@ -2907,6 +2875,44 @@ public class ContextPreInitializationTest {
         }
     }
 
+    @Test
+    public void testGR57292() throws Exception {
+        String message = "Test exception";
+        BaseLanguage.registerAction(ContextPreInitializationTestFirstLanguage.class, ActionKind.ON_INITIALIZE_CONTEXT, (env) -> {
+            if (env.getContext().getParent() == null) {
+                try (TruffleContext innerContext = env.newInnerContextBuilder(FIRST).build()) {
+                    try {
+                        innerContext.evalPublic(null, com.oracle.truffle.api.source.Source.newBuilder(FIRST, "", "test").build());
+                        fail("Should not reach here.");
+                    } catch (Exception e) {
+                        InteropLibrary exceptions = InteropLibrary.getUncached();
+                        assertTrue(exceptions.isException(e));
+                        try {
+                            assertEquals(message, exceptions.asString(exceptions.getExceptionMessage(e)));
+                        } catch (UnsupportedMessageException um) {
+                            throw CompilerDirectives.shouldNotReachHere(um);
+                        }
+                    }
+                }
+            } else {
+                TruffleExceptionImpl truffleException = new TruffleExceptionImpl(message);
+                TruffleStackTrace.fillIn(truffleException);
+                throw truffleException;
+            }
+        });
+        setPatchable(FIRST);
+        doContextPreinitialize(FIRST);
+        Context.create(FIRST).close();
+    }
+
+    @SuppressWarnings("serial")
+    private static final class TruffleExceptionImpl extends AbstractTruffleException {
+
+        TruffleExceptionImpl(String message) {
+            super(message);
+        }
+    }
+
     private static boolean executedWithXCompOptions() {
         Properties props = System.getProperties();
         return props.containsKey("polyglot.engine.CompileImmediately") || props.containsKey("polyglot.engine.BackgroundCompilation");
@@ -2972,26 +2978,10 @@ public class ContextPreInitializationTest {
         Files.delete(file);
     }
 
-    private static Path write(Path path, CharSequence... lines) throws IOException {
-        Files.write(path, Arrays.asList(lines), StandardOpenOption.WRITE, StandardOpenOption.CREATE);
-        return path;
-    }
-
-    private static String read(TruffleFile file) throws IOException {
-        return new String(file.readAllBytes());
-    }
-
     private static void resetSystemPropertiesOptions() {
         System.clearProperty("polyglot.image-build-time.PreinitializeContexts");
         System.clearProperty(SYS_OPTION1_KEY);
         System.clearProperty(SYS_OPTION2_KEY);
-    }
-
-    private static void resetLanguageHomes() throws ReflectiveOperationException {
-        Class<?> languageCache = Class.forName("com.oracle.truffle.polyglot.LanguageCache");
-        Method reset = languageCache.getDeclaredMethod("resetNativeImageCacheLanguageHomes");
-        ReflectionUtils.setAccessible(reset, true);
-        reset.invoke(null);
     }
 
     private static void doContextPreinitialize(String... languages) throws ReflectiveOperationException {
@@ -3087,7 +3077,6 @@ public class ContextPreInitializationTest {
         int disposeThreadOrder = -1;
         final Map<OptionKey<Boolean>, Boolean> optionValues;
         final List<String> arguments;
-        String languageHome;
         boolean preInitialized;
         final BaseLanguage language;
         private final Map<Class<?>, Object> lookupItems = new HashMap<>();
@@ -3159,7 +3148,6 @@ public class ContextPreInitializationTest {
             final CountingContext ctx = new CountingContext(languageId, env, this);
             ctx.createContextCount++;
             ctx.createContextOrder = nextId();
-            ctx.languageHome = getLanguageHome();
             Collections.addAll(ctx.arguments, env.getApplicationArguments());
             ctx.preInitialized = env.isPreInitialization();
             emittedContexts.add(ctx);
@@ -3180,7 +3168,6 @@ public class ContextPreInitializationTest {
             assertFalse(context.env.isPreInitialization());
             context.patchContextCount++;
             context.patchContextOrder = nextId();
-            context.languageHome = getLanguageHome();
             boolean patchable = patchableLanguages.contains(context.getLanguageId());
             if (patchable) {
                 context.environment(newEnv);

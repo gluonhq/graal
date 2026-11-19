@@ -1,0 +1,5 @@
+[[rule]]
+files = ["CInterfaceEnumTool.java", "CInterfaceInvocationPlugin.java"]
+all = [
+    "christian.haeubl@oracle.com",
+]

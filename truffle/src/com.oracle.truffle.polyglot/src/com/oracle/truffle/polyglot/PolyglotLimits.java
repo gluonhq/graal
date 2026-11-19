@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -73,6 +73,11 @@ final class PolyglotLimits {
         this.onEvent = onEvent;
     }
 
+    @Override
+    public String toString() {
+        return "ResourceLimits[statementLimit=" + statementLimit + ", sourceFilter=" + statementLimitSourcePredicate + ", onLimit=" + onEvent + "]";
+    }
+
     static void reset(PolyglotContextImpl context) {
         synchronized (context) {
             context.statementCounter = context.statementLimit;
@@ -93,6 +98,7 @@ final class PolyglotLimits {
         final EventContext eventContext;
         final PolyglotEngineImpl engine;
         @CompilationFinal private boolean seenInnerContext;
+        @CompilationFinal private boolean seenOverflow;
 
         StatementIncrementNode(EventContext context, EngineLimits limits) {
             this.limits = limits;
@@ -110,7 +116,18 @@ final class PolyglotLimits {
                 count = currentContext.volatileStatementCounter.decrementAndGet();
             }
             if (count < 0) { // overflowed
-                CompilerDirectives.transferToInterpreterAndInvalidate();
+                /*
+                 * The following if statement could be replaced by just
+                 * CompilerDirectives.transferToInterpreterAndInvalidate(), but that would cause a
+                 * deoptimization loop if the same code hit the statement limit at the same spot
+                 * repeatedly.
+                 */
+                if (!seenOverflow) {
+                    CompilerDirectives.transferToInterpreterAndInvalidate();
+                    seenOverflow = true;
+                } else {
+                    CompilerDirectives.transferToInterpreter();
+                }
                 notifyStatementLimitReached(currentContext, currentContext.statementLimit - count, currentContext.statementLimit);
             }
         }
@@ -256,7 +273,7 @@ final class PolyglotLimits {
             if (onEvent == null) {
                 return null;
             }
-            Object event = engine.getImpl().getAPIAccess().newResourceLimitsEvent(context.api);
+            Object event = engine.getImpl().getAPIAccess().newResourceLimitsEvent(context.getContextAPI());
             try {
                 onEvent.accept(event);
             } catch (Throwable t) {

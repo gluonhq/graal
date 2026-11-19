@@ -33,10 +33,12 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.graal.pointsto.ObjectScanner;
+import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.AnalysisFuture;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.graal.compiler.core.common.type.CompressibleConstant;
 import jdk.vm.ci.meta.JavaConstant;
@@ -48,13 +50,22 @@ import jdk.vm.ci.meta.VMConstant;
  * object replacers on the original hosted object, and the instance field values or array elements
  * of this object. The field values are stored as JavaConstant to also encode primitive values.
  * ImageHeapObject are created only after an object is processed through the object replacers.
+ * <p>
+ * A snapshot can be created, have its hosted-value reader installed by
+ * {@link #ensureReaderInstalled()}, and be traversed by {@link HeapSnapshotVerifier} without being
+ * marked reachable by {@link ImageHeapScanner#markReachable}. Marking it reachable causes
+ * {@link ImageHeapScanner#onObjectReachable} to validate the hosted object, execute its reachability
+ * callbacks, register its type with the analysis, and follow its contents. Speculative snapshots may
+ * remain unreachable, but every object retained by a final runtime-heap edge must be marked
+ * reachable.
  */
 @Platforms(Platform.HOSTED_ONLY.class)
 public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, CompressibleConstant, VMConstant {
 
-    private static final AtomicInteger currentId = new AtomicInteger(0);
+    private static final AtomicInteger currentId = new AtomicInteger(1);
 
     public static final VarHandle isReachableHandle = ReflectionUtil.unreflectField(ConstantData.class, "isReachable", MethodHandles.lookup());
+    public static final VarHandle originHandle = ReflectionUtil.unreflectField(ConstantData.class, "origin", MethodHandles.lookup());
 
     abstract static class ConstantData {
         /**
@@ -91,12 +102,21 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
          */
         @SuppressWarnings("unused") private volatile Object isReachable;
         /**
-         * A boolean allowing to distinguish a constant that was persisted from a base layer and a
+         * A boolean allowing to distinguish a constant that was persisted from a shared layer and a
          * constant created in the current layer.
          */
-        private boolean isInBaseLayer;
+        private boolean isInSharedLayer;
+        /**
+         * A boolean telling if the constant was written in the image heap of the shared layer.
+         */
+        private boolean writtenInPreviousLayer;
+        /**
+         * An object representing a way to retrieve the value of the constant in the hosted
+         * universe.
+         */
+        @SuppressWarnings("unused") private volatile AnalysisField origin;
 
-        ConstantData(AnalysisType type, JavaConstant hostedObject, int identityHashCode) {
+        ConstantData(AnalysisType type, JavaConstant hostedObject, int identityHashCode, int id) {
             Objects.requireNonNull(type);
             this.type = type;
             this.hostedObject = CompressibleConstant.uncompress(hostedObject);
@@ -117,7 +137,7 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
                 /* This value must never be used later on. */
                 this.identityHashCode = -1;
             }
-            this.id = currentId.getAndIncrement();
+            this.id = id == -1 ? currentId.getAndIncrement() : id;
         }
 
         @Override
@@ -138,6 +158,11 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
         return constantData;
     }
 
+    /**
+     * Materializes the tasks that read this object's hosted fields or array elements, if necessary.
+     * This does not mark the constant reachable and does not execute object validation or
+     * reachability callbacks.
+     */
     public void ensureReaderInstalled() {
         if (constantData.hostedValuesReader != null) {
             constantData.hostedValuesReader.ensureDone();
@@ -167,6 +192,14 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
         return isReachableHandle.get(constantData) != null;
     }
 
+    public boolean setOrigin(AnalysisField origin) {
+        return originHandle.compareAndSet(constantData, null, origin);
+    }
+
+    public AnalysisField getOrigin() {
+        return constantData.origin;
+    }
+
     public boolean allowConstantFolding() {
         /*
          * An object whose type is initialized at run time does not have hosted field values. Only
@@ -189,12 +222,21 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
         return constantData.identityHashCode;
     }
 
-    public void markInBaseLayer() {
-        constantData.isInBaseLayer = true;
+    public void markInSharedLayer() {
+        constantData.isInSharedLayer = true;
     }
 
-    public boolean isInBaseLayer() {
-        return constantData.isInBaseLayer;
+    public boolean isInSharedLayer() {
+        return constantData.isInSharedLayer;
+    }
+
+    public void markWrittenInPreviousLayer() {
+        AnalysisError.guarantee(isInSharedLayer(), "Constant must be in base layer to be marked as written in the base layer.");
+        constantData.writtenInPreviousLayer = true;
+    }
+
+    public boolean isWrittenInPreviousLayer() {
+        return constantData.writtenInPreviousLayer;
     }
 
     public JavaConstant getHostedObject() {
@@ -204,6 +246,14 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
 
     public boolean isBackedByHostedObject() {
         return constantData.hostedObject != null;
+    }
+
+    public static int getCurrentId() {
+        return currentId.get();
+    }
+
+    public static void setCurrentId(int id) {
+        currentId.set(id);
     }
 
     public static int getConstantID(ImageHeapConstant constant) {
@@ -267,7 +317,7 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
 
     @Override
     public String toValueString() {
-        if (constantData.type.getJavaClass() == String.class && constantData.hostedObject != null) {
+        if (constantData.type.getWrapped().equals(GuestAccess.elements().java_lang_String) && constantData.hostedObject != null) {
             String valueString = constantData.hostedObject.toValueString();
             /* HotSpotObjectConstantImpl.toValueString() puts the string between quotes. */
             return valueString.substring(1, valueString.length() - 1);
@@ -304,6 +354,6 @@ public abstract class ImageHeapConstant implements JavaConstant, TypedConstant, 
     @Override
     public String toString() {
         return "ImageHeapConstant<" + constantData.type.toJavaName() + ", reachable: " + isReachable() + ", reader installed: " + isReaderInstalled() +
-                        ", compressed: " + compressed + ", backed: " + isBackedByHostedObject() + ">";
+                        ", compressed: " + compressed + ", backed: " + isBackedByHostedObject() + ", id: " + constantData.id + ">";
     }
 }

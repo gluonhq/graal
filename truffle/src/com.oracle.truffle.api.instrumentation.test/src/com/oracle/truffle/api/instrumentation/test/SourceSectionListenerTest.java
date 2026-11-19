@@ -346,7 +346,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         mainThreadLatch2.await();
         /*
          * Wait for the third thread to stop on trying to acquire the AST lock. This should be
-         * fairly reliable because mainThreadLatch2 guarantees the the third thread is already
+         * fairly reliable because mainThreadLatch2 guarantees the third thread is already
          * running.
          */
         Thread.sleep(1000);
@@ -373,7 +373,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         }
     };
 
-    private static class TestLoadSourceSectionExceptionClass extends RuntimeException {
+    private static final class TestLoadSourceSectionExceptionClass extends RuntimeException {
 
         private static final long serialVersionUID = 1L;
 

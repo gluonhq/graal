@@ -35,12 +35,15 @@ import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.InvokeInfo;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.typestate.TypeState;
-import com.oracle.svm.common.meta.MultiMethod;
-import com.oracle.svm.common.meta.MultiMethod.MultiMethodKey;
+import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.common.meta.MethodVariant.MethodVariantKey;
 
 import jdk.vm.ci.code.BytecodePosition;
 
 public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implements InvokeInfo {
+
+    private static final TypeFlow<?>[] EMPTY_ACTUAL_PARAMETERS = new TypeFlow<?>[0];
 
     /**
      * Actual parameters passed to the callee.
@@ -56,12 +59,21 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
 
     protected final AnalysisType receiverType;
     protected final PointsToAnalysisMethod targetMethod;
+
+    /**
+     * Whether this is a global invoke shared by call sites for the same target method, invoke kind
+     * (virtual or special), and caller method variant. Such invokes replace call-site-specific
+     * virtual invokes after receiver saturation and also model instance root methods. Their
+     * receiver is the {@link AllInstantiatedTypeFlow all-instantiated type flow} of the target
+     * method's declaring class. This flag identifies the shared invoke independently of the analysis
+     * context-sensitivity policy.
+     */
     protected boolean isContextInsensitive;
 
     /**
-     * The multi-method key for the method which contains this invoke type flow.
+     * The method variant key for the method which contains this invoke type flow.
      */
-    protected final MultiMethodKey callerMultiMethodKey;
+    protected final MethodVariant.MethodVariantKey callerMethodVariantKey;
 
     /**
      * Flag to monitor whether all callees are original or not. This is used to optimize
@@ -71,14 +83,14 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
 
     @SuppressWarnings("this-escape")
     protected InvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey) {
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariantKey callerMethodVariantKey) {
         super(invokeLocation, null);
         this.originalInvoke = null;
         this.receiverType = receiverType;
         this.targetMethod = targetMethod;
-        this.actualParameters = actualParameters;
+        this.actualParameters = actualParameters.length == 0 ? EMPTY_ACTUAL_PARAMETERS : actualParameters;
         this.actualReturn = actualReturn;
-        this.callerMultiMethodKey = callerMultiMethodKey;
+        this.callerMethodVariantKey = callerMethodVariantKey;
 
         getTargetMethod().registerAsInvoked(this);
     }
@@ -89,11 +101,11 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
         this.originalInvoke = original;
         this.receiverType = original.receiverType;
         this.targetMethod = original.targetMethod;
-        this.callerMultiMethodKey = original.callerMultiMethodKey;
+        this.callerMethodVariantKey = original.callerMethodVariantKey;
 
         actualReturn = original.getActualReturn() != null ? (ActualReturnTypeFlow) methodFlows.lookupCloneOf(bb, original.getActualReturn()) : null;
 
-        actualParameters = new TypeFlow<?>[original.actualParameters.length];
+        actualParameters = createActualParameters(original.actualParameters.length);
         for (int i = 0; i < original.actualParameters.length; i++) {
             if (original.getActualParameter(i) != null) {
                 actualParameters[i] = methodFlows.lookupCloneOf(bb, original.getActualParameter(i));
@@ -101,14 +113,27 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
         }
     }
 
+    static TypeFlow<?>[] createActualParameters(int length) {
+        return length == 0 ? EMPTY_ACTUAL_PARAMETERS : new TypeFlow<?>[length];
+    }
+
     public boolean linksOnlyOriginalCallees() {
         return allOriginalCallees;
     }
 
+    /**
+     * Marks this as the shared global invoke described by {@link #isContextInsensitive}. This only
+     * sets the flag; replacing and relinking call-site-specific invokes happens separately.
+     */
     public void markAsContextInsensitive() {
         isContextInsensitive = true;
     }
 
+    /**
+     * Returns whether this is the shared global invoke described by {@link #isContextInsensitive}.
+     * An ordinary call-site-specific invoke returns {@code false} even when the analysis itself is
+     * context insensitive.
+     */
     @Override
     public boolean isContextInsensitive() {
         return isContextInsensitive;
@@ -121,6 +146,13 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
     @Override
     public PointsToAnalysisMethod getTargetMethod() {
         return targetMethod;
+    }
+
+    /**
+     * Returns the bytecode index of this invoke within its declaring method.
+     */
+    public int getBci() {
+        return getSource().getBCI();
     }
 
     public int actualParametersCount() {
@@ -203,16 +235,16 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
     }
 
     protected void updateReceiver(PointsToAnalysis bb, MethodFlowsGraphInfo calleeFlows, TypeState receiverTypeState) {
-        var analysisPolicy = bb.getHostVM().getMultiMethodAnalysisPolicy();
-        var calleeKey = calleeFlows.getMethod().getMultiMethodKey();
-        if (analysisPolicy.performParameterLinking(callerMultiMethodKey, calleeKey)) {
+        var analysisPolicy = bb.getHostVM().getMethodVariantsAnalysisPolicy();
+        var calleeKey = calleeFlows.getMethod().getMethodVariantKey();
+        if (analysisPolicy.performParameterLinking(callerMethodVariantKey, calleeKey)) {
             FormalReceiverTypeFlow formalReceiverFlow = calleeFlows.getFormalReceiver();
             if (formalReceiverFlow != null) {
                 formalReceiverFlow.addReceiverState(bb, receiverTypeState);
             }
         }
 
-        if (analysisPolicy.performReturnLinking(callerMultiMethodKey, calleeKey) && !analysisPolicy.unknownReturnValue(bb, callerMultiMethodKey, calleeFlows.getMethod())) {
+        if (analysisPolicy.performReturnLinking(callerMethodVariantKey, calleeKey) && !analysisPolicy.unknownReturnValue(bb, callerMethodVariantKey, calleeFlows.getMethod())) {
             if (bb.optimizeReturnedParameter()) {
                 int paramIndex = calleeFlows.getMethod().getTypeFlow().getReturnedParameterIndex();
                 if (actualReturn != null && paramIndex == 0) {
@@ -229,7 +261,7 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
 
     protected void linkCallee(PointsToAnalysis bb, boolean isStatic, MethodFlowsGraphInfo calleeFlows) {
 
-        if (bb.getHostVM().getMultiMethodAnalysisPolicy().performParameterLinking(callerMultiMethodKey, calleeFlows.getMethod().getMultiMethodKey())) {
+        if (bb.getHostVM().getMethodVariantsAnalysisPolicy().performParameterLinking(callerMethodVariantKey, calleeFlows.getMethod().getMethodVariantKey())) {
             // iterate over the actual parameters in caller context
             for (int i = 0; i < actualParameters.length; i++) {
                 TypeFlow<?> actualParam = actualParameters[i];
@@ -259,7 +291,11 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
                     // (formalParam, callerContext) -> (actualParam, calleeContext)
                     // Note: the callerContext is an implicit property of the current InvokeTypeFlow
                     // clone
-                    actualParam.addUse(bb, formalParam);
+                    if (actualParam.addUse(bb, formalParam)) {
+                        if (i == 0 && !isStatic) {
+                            maybeSaturateFormalReceiver(bb, actualParam, formalParam);
+                        }
+                    }
                 }
             }
         }
@@ -273,6 +309,37 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
         if (!calleeFlows.isStub()) {
             bb.analysisPolicy().registerAsImplementationInvoked(this, calleeFlows.getMethod());
         }
+
+        if (calleeFlows.getMethod().isDelayed()) {
+            saturateForOpenTypeWorld(bb);
+        }
+    }
+
+    /**
+     * In the open type world, propagate actual receiver saturation to the formal receiver even
+     * after the saturated virtual invoke was replaced by the shared context insensitive variant.
+     * The shared invoke uses an {@link AllInstantiatedTypeFlow all-instantiated type flow} as its
+     * receiver, which is not itself saturated, so linking a callee must explicitly notify its formal
+     * receiver of saturation.
+     * <p>
+     * This notification also applies to special invokes whose receiver can be unknown in the open
+     * type world. A special invoke retains its call-site-specific invoke flow but replaces its
+     * saturated receiver with an all-instantiated type flow. Its statically known callee can execute
+     * on an extension-defined receiver even when that replacement flow is empty. Propagating
+     * saturation to the formal receiver preserves this possibility inside the callee, including
+     * through further private calls, independently of whether the callee's external entry is closed.
+     */
+    private void maybeSaturateFormalReceiver(PointsToAnalysis bb, TypeFlow<?> actualParam, TypeFlow<?> formalParam) {
+        if (!bb.getHostVM().isClosedTypeWorld() && hasSaturatedReceiver()) {
+            AnalysisError.guarantee((actualParam.isSaturated() || actualParam instanceof AllInstantiatedTypeFlow) && formalParam instanceof FormalReceiverTypeFlow);
+            /* The actual receiver may already have been replaced by an unsaturated flow. */
+            actualParam.notifyUseOfSaturation(bb, formalParam);
+        }
+    }
+
+    /** Whether receiver saturation must be preserved after replacing the actual receiver flow. */
+    protected boolean hasSaturatedReceiver() {
+        return isContextInsensitive();
     }
 
     public void linkReturn(PointsToAnalysis bb, boolean isStatic, MethodFlowsGraphInfo calleeFlows) {
@@ -280,8 +347,8 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
          * If actualReturn is null, then there is no linking necessary. Later, if a typeflow is
          * created for the return, then {@code setActualReturn} will perform all necessary linking.
          */
-        if (actualReturn != null && bb.getHostVM().getMultiMethodAnalysisPolicy().performReturnLinking(callerMultiMethodKey, calleeFlows.getMethod().getMultiMethodKey())) {
-            if (bb.getHostVM().getMultiMethodAnalysisPolicy().unknownReturnValue(bb, callerMultiMethodKey, calleeFlows.getMethod())) {
+        if (actualReturn != null && bb.getHostVM().getMethodVariantsAnalysisPolicy().performReturnLinking(callerMethodVariantKey, calleeFlows.getMethod().getMethodVariantKey())) {
+            if (bb.getHostVM().getMethodVariantsAnalysisPolicy().unknownReturnValue(bb, callerMethodVariantKey, calleeFlows.getMethod())) {
                 /*
                  * When there is an unknown return value we must be conservative.
                  */
@@ -400,11 +467,22 @@ public abstract class InvokeTypeFlow extends TypeFlow<BytecodePosition> implemen
      * Returns the context sensitive method flows for the callees resolved for the invoke type flow
      * which are not still in stub form. That means that for each callee only those method flows
      * corresponding to contexts reached from this invoke are returned. Note that callee flows in
-     * this list can have a MultiMethodKey different from {@link MultiMethod#ORIGINAL_METHOD}.
+     * this list can have a MethodVariantKey different from {@link MethodVariant#ORIGINAL_METHOD}.
      */
     public abstract Collection<MethodFlowsGraph> getAllNonStubCalleesFlows(PointsToAnalysis bb);
 
-    public MultiMethodKey getCallerMultiMethodKey() {
-        return callerMultiMethodKey;
+    public MethodVariantKey getCallerMethodVariantKey() {
+        return callerMethodVariantKey;
+    }
+
+    /**
+     * Saturates the actual return of the invoke type flow to ensure that the type state represents
+     * all the types that could exist in the open world.
+     */
+    public void saturateForOpenTypeWorld(PointsToAnalysis bb) {
+        if (actualReturn != null) {
+            actualReturn.enableFlow(bb);
+            actualReturn.onSaturated(bb);
+        }
     }
 }

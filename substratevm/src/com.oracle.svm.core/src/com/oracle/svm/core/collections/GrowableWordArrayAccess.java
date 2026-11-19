@@ -26,15 +26,12 @@ package com.oracle.svm.core.collections;
 
 import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
 import com.oracle.svm.core.memory.NullableNativeMemory;
 import com.oracle.svm.core.nmt.NmtCategory;
-
-import jdk.graal.compiler.api.replacements.Fold;
-import jdk.graal.compiler.word.Word;
 
 public class GrowableWordArrayAccess {
     private static final int INITIAL_CAPACITY = 10;
@@ -42,7 +39,12 @@ public class GrowableWordArrayAccess {
     public static void initialize(GrowableWordArray array) {
         array.setSize(0);
         array.setCapacity(0);
-        array.setData(WordFactory.nullPointer());
+        array.setData(Word.nullPointer());
+    }
+
+    public static void set(GrowableWordArray array, int i, Word value) {
+        assert i >= 0 && i < array.getSize();
+        array.getData().addressOf(i).write(value);
     }
 
     public static Word get(GrowableWordArray array, int i) {
@@ -63,7 +65,7 @@ public class GrowableWordArrayAccess {
     public static void freeData(GrowableWordArray array) {
         if (array.isNonNull()) {
             NullableNativeMemory.free(array.getData());
-            array.setData(WordFactory.nullPointer());
+            array.setData(Word.nullPointer());
             array.setSize(0);
             array.setCapacity(0);
         }
@@ -78,12 +80,13 @@ public class GrowableWordArrayAccess {
 
         assert newCapacity >= INITIAL_CAPACITY;
         WordPointer oldData = array.getData();
-        WordPointer newData = NullableNativeMemory.malloc(WordFactory.unsigned(newCapacity).multiply(wordSize()), nmtCategory);
+        int wordSize = SubstrateTarget.getWordSize();
+        WordPointer newData = NullableNativeMemory.malloc(Word.unsigned(newCapacity).multiply(wordSize), nmtCategory);
         if (newData.isNull()) {
             return false;
         }
 
-        UnmanagedMemoryUtil.copyForward((Pointer) oldData, (Pointer) newData, WordFactory.unsigned(array.getSize()).multiply(wordSize()));
+        UnmanagedMemoryUtil.copyForward((Pointer) oldData, (Pointer) newData, Word.unsigned(array.getSize()).multiply(wordSize));
         NullableNativeMemory.free(oldData);
 
         array.setData(newData);
@@ -100,8 +103,37 @@ public class GrowableWordArrayAccess {
         }
     }
 
-    @Fold
-    static int wordSize() {
-        return ConfigurationValues.getTarget().wordSize;
+    public static void qsort(GrowableWordArray array, int low, int high, Comparator c) {
+        if (low < high) {
+            int pivotIndex = partition(array, low, high, c);
+            qsort(array, low, pivotIndex - 1, c);
+            qsort(array, pivotIndex + 1, high, c);
+        }
+    }
+
+    private static int partition(GrowableWordArray array, int low, int high, Comparator c) {
+        Word pivot = get(array, high);
+        int i = low - 1;
+        for (int j = low; j < high; j++) {
+            if (c.compare(get(array, j), pivot) <= 0) {
+                i++;
+                // Swap i and j
+                Word temp = get(array, i);
+                set(array, i, get(array, j));
+                set(array, j, temp);
+            }
+        }
+        // Swap the pivot with i+1
+        Word temp = get(array, i + 1);
+        set(array, i + 1, get(array, high));
+        set(array, high, temp);
+
+        // Return the partition index
+        return i + 1;
+    }
+
+    @FunctionalInterface
+    public interface Comparator {
+        int compare(Word a, Word b);
     }
 }

@@ -24,41 +24,48 @@
  */
 package com.oracle.svm.core.fieldvaluetransformer;
 
-import java.lang.reflect.Field;
-
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.core.StaticFieldsSupport;
+import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.graal.nodes.FieldOffsetNode;
 import com.oracle.svm.core.reflect.target.ReflectionSubstitutionSupport;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaField;
 
-public final class FieldOffsetFieldValueTransformer extends BoxingTransformer implements FieldValueTransformerWithAvailability {
-    private final Field targetField;
+/**
+ * Implements the field value transformation semantics of {@link Kind#FieldOffset}.
+ */
+public record FieldOffsetFieldValueTransformer(ResolvedJavaField targetField, JavaKind returnKind) implements JVMCIFieldValueTransformerWithAvailability {
 
-    public FieldOffsetFieldValueTransformer(Field targetField, JavaKind returnKind) {
-        super(returnKind);
-        this.targetField = targetField;
+    @Override
+    public boolean isAvailable() {
+        return BuildPhaseProvider.isHostedUniverseBuilt();
     }
 
     @Override
-    public ValueAvailability valueAvailability() {
-        return ValueAvailability.AfterAnalysis;
-    }
-
-    @Override
-    public Object transform(Object receiver, Object originalValue) {
+    public JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
         int offset = ReflectionSubstitutionSupport.singleton().getFieldOffset(targetField, true);
         if (offset <= 0) {
             throw VMError.shouldNotReachHere("Field is not marked as unsafe accessed: " + targetField);
         }
-        return box(offset);
+        return constant(returnKind, offset);
+    }
+
+    static JavaConstant constant(JavaKind returnKind, int value) {
+        return switch (returnKind) {
+            case Int -> JavaConstant.forInt(value);
+            case Long -> JavaConstant.forLong(value);
+            default -> throw VMError.shouldNotReachHere("Unexpected kind: " + returnKind);
+        };
     }
 
     @Override
     public ValueNode intrinsify(CoreProviders providers, JavaConstant receiver) {
-        return FieldOffsetNode.create(returnKind, providers.getMetaAccess().lookupJavaField(targetField));
+        return FieldOffsetNode.create(returnKind, StaticFieldsSupport.toUniverseField(providers.getMetaAccess(), targetField));
     }
 }

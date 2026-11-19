@@ -25,11 +25,11 @@
 
 package com.oracle.svm.hosted.image;
 
-import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.oracle.svm.core.image.ImageHeapLayoutInfo;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
 import com.oracle.svm.hosted.meta.HostedMethod;
@@ -37,13 +37,13 @@ import com.oracle.svm.hosted.meta.HostedUniverse;
 
 public class ExecutableImageViaCC extends NativeImageViaCC {
 
-    public ExecutableImageViaCC(AbstractImage.NativeImageKind k, HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap,
-                    NativeImageCodeCache codeCache, List<HostedMethod> entryPoints, ClassLoader classLoader) {
-        super(k, universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
+    public ExecutableImageViaCC(NativeImageKind k, HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap,
+                    ImageHeapLayoutInfo heapLayout, NativeImageCodeCache codeCache, List<HostedMethod> entryPoints, ClassLoader classLoader) {
+        super(k, universe, metaAccess, nativeLibs, heap, heapLayout, codeCache, entryPoints, classLoader);
     }
 
     @Override
-    public String[] makeLaunchCommand(AbstractImage.NativeImageKind k, String imageName, Path binPath, Path workPath, Method method) {
+    public String[] makeLaunchCommand(AbstractImage.NativeImageKind k, String imageName, Path binPath, Path workPath) {
         ArrayList<String> cmd = new ArrayList<>();
         cmd.add(workPath.relativize(binPath.resolve("./" + imageName)).normalize().toString());
 

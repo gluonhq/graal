@@ -36,19 +36,23 @@ import java.util.concurrent.ForkJoinPool;
 import org.graalvm.collections.EconomicMap;
 
 import com.oracle.graal.pointsto.reports.ReportUtils;
+import com.oracle.svm.core.FutureDefaultsOptions;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.option.APIOption;
-import com.oracle.svm.core.option.BundleMember;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.AccumulatingLocatableMultiOptionValue;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.core.util.InterruptImageBuilding;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationOptions;
+import com.oracle.svm.hosted.image.PreserveOptionsSupport;
 import com.oracle.svm.hosted.util.CPUType;
-import com.oracle.svm.util.LogUtils;
-import com.oracle.svm.util.StringUtil;
+import com.oracle.svm.shared.option.APIOption;
+import com.oracle.svm.shared.option.AccumulatingLocatableMultiOptionValue;
+import com.oracle.svm.shared.option.BundleMember;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.option.OptionOrigin;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.StringUtil;
 
+import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionStability;
@@ -56,8 +60,6 @@ import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.serviceprovider.GraalServices;
 
 public class NativeImageOptions {
-
-    public static final int DEFAULT_MAX_ANALYSIS_SCALING = 16;
 
     @Option(help = "Comma separated list of CPU features that will be enabled while building the " +
                     "target executable, irrespective of whether they are supported by the hosted " +
@@ -88,7 +90,7 @@ public class NativeImageOptions {
     public static final String MICRO_ARCHITECTURE_LIST = "list";
 
     @APIOption(name = "-march")//
-    @Option(help = "Generate instructions for a specific machine type. Defaults to 'x86-64-v3' on AMD64 and 'armv8-a' on AArch64. " +
+    @Option(help = "Generate instructions for a specific machine type. Defaults to 'x86-64-v3' on AMD64 and 'armv8.1-a' on AArch64. " +
                     "Use -march=" + MICRO_ARCHITECTURE_COMPATIBILITY + " for best compatibility, or -march=" + MICRO_ARCHITECTURE_NATIVE +
                     " for best performance if the native executable is deployed on the same machine or on a machine with the same CPU features. " +
                     "To list all available machine types, use -march=" + MICRO_ARCHITECTURE_LIST + ".", type = User)//
@@ -187,54 +189,48 @@ public class NativeImageOptions {
         }
     }
 
+    private static int availableProcessors() {
+        return Runtime.getRuntime().availableProcessors();
+    }
+
     /**
-     * Configures the number of threads of the common pool (see driver).
+     * Configures the number of threads of the common pool.
      */
     private static final String PARALLELISM_OPTION_NAME = "parallelism";
     @APIOption(name = PARALLELISM_OPTION_NAME)//
-    @Option(help = "The maximum number of threads to use concurrently during native image generation.")//
-    public static final HostedOptionKey<Integer> NumberOfThreads = new HostedOptionKey<>(Math.max(1, Math.min(Runtime.getRuntime().availableProcessors(), 32)), key -> {
+    @Option(help = "The maximum number of threads the build process is allowed to use.")//
+    public static final HostedOptionKey<Integer> NumberOfThreads = new HostedOptionKey<>(Math.min(availableProcessors(), 32), key -> {
         int numberOfThreads = key.getValue();
         if (numberOfThreads < 1) {
             throw UserError.abort("The number of threads was set to %s. Please set the '--%s' option to at least 1.", numberOfThreads, PARALLELISM_OPTION_NAME);
         }
+        int numAvailableProcessors = availableProcessors();
+        if (numberOfThreads > numAvailableProcessors) {
+            LogUtils.warning("Specified parallelism exceeds the number of available processors (%d).", numAvailableProcessors);
+        }
     });
 
     public static int getActualNumberOfThreads() {
-        int commonThreadParallelism = ForkJoinPool.getCommonPoolParallelism();
-        if (NumberOfThreads.getValue() == 1) {
-            assert commonThreadParallelism == 1 : "Disabled common pool expected to report parallelism of 1";
-            commonThreadParallelism = 0; /* A disabled common pool has no actual threads */
+        String commonParallelismProperty = System.getProperty("java.util.concurrent.ForkJoinPool.common.parallelism");
+        if (commonParallelismProperty != null) {
+            return Integer.parseInt(commonParallelismProperty);
+        } else {
+            return NumberOfThreads.getValue();
         }
-        /*
-         * Main thread plus common pool threads. setCommonPoolParallelism() asserts that this number
-         * matches NumberOfThreads.
-         */
-        return 1 + commonThreadParallelism;
     }
 
     public static void setCommonPoolParallelism(OptionValues optionValues) {
-        if (NativeImageOptions.NumberOfThreads.hasBeenSet(optionValues)) {
-            /*
-             * The main thread always helps to process tasks submitted to the common pool (e.g., see
-             * ForkJoinPool#awaitTermination()), so subtract one from the number of threads. The
-             * common pool can be disabled "by setting the parallelism property to zero" (see
-             * ForkJoinPool's javadoc).
-             */
-            int numberOfCommonPoolThreads = NativeImageOptions.NumberOfThreads.getValue(optionValues) - 1;
-            String commonPoolParallelismProperty = "java.util.concurrent.ForkJoinPool.common.parallelism";
-            assert System.getProperty(commonPoolParallelismProperty) == null : commonPoolParallelismProperty + " already set";
-            System.setProperty(commonPoolParallelismProperty, "" + numberOfCommonPoolThreads);
-            int actualCommonPoolParallelism = ForkJoinPool.commonPool().getParallelism();
-            /*
-             * getParallelism() returns at least 1, even in single-threaded mode where common pool
-             * is disabled.
-             */
-            boolean isSingleThreadedMode = numberOfCommonPoolThreads == 0 && actualCommonPoolParallelism == 1;
-            if (!isSingleThreadedMode && actualCommonPoolParallelism != numberOfCommonPoolThreads) {
-                String warning = "Failed to set parallelism of common pool (actual parallelism is %s).".formatted(actualCommonPoolParallelism);
-                assert false : warning;
-                LogUtils.warning(warning);
+        int targetParallelism = Math.max(1, NumberOfThreads.getValue(optionValues) - 1);
+        if (ForkJoinPool.commonPool().getParallelism() == targetParallelism) {
+            /* Nothing to do. */
+            return;
+        }
+
+        try {
+            ForkJoinPool.commonPool().setParallelism(targetParallelism);
+        } catch (UnsupportedOperationException e) {
+            if (NumberOfThreads.hasBeenSet(optionValues)) {
+                LogUtils.warning("Could not apply the '--parallelism' option due to the `java.util.concurrent.ForkJoinPool.common.parallelism` system property being set as the same time.");
             }
         }
     }
@@ -262,8 +258,6 @@ public class NativeImageOptions {
 
     /**
      * Inspired by HotSpot's hs_err_<pid>.log files and for build-time errors (err_b).
-     *
-     * Keep in sync with the {@code catch_files} array in {@code ci/common.jsonnet}.
      */
     private static final String DEFAULT_ERROR_FILE_NAME = "svm_err_b_%t_pid%p.md";
 
@@ -309,4 +303,45 @@ public class NativeImageOptions {
             }
         }
     };
+
+    @Option(help = """
+                    This mode disables all Native Image features that allow users to diverge from original program semantics.
+                    It disables build-time initialization for classes on the classpath, native-image system properties, user-defined substitutions, and user-defined features, while enabling all future defaults.
+
+                    This mode does not modify key Native Image restrictions related to dynamic access (reachability metadata) and runtime class loading as those are accepted limitations of native image.
+
+                    To overcome restrictions related to dynamic access (reachability metadata) and runtime class loading, and achieve the same semantics behavior as the original program, it is recommended to use this flag with:
+
+                      native-image -H:+CompatibilityMode -H:Preserve=all -H:+RuntimeClassLoading App
+
+                    And run the executable with:
+
+                      ./app -Djava.home=<path-to-java-home> -Djava.class.path=<cp> -Djdk.module.path=<module-path> <args>
+                    """, stability = OptionStability.EXPERIMENTAL)//
+    public static final HostedOptionKey<Boolean> CompatibilityMode = new HostedOptionKey<>(false, NativeImageOptions::validateCompatibilityMode) {
+        @Override
+        protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
+            super.onValueUpdate(values, oldValue, newValue);
+            if (!newValue) {
+                throw UserError.abort("CompatibilityMode can not be unset. Please remove " + SubstrateOptionsParser.commandArgument(NativeImageOptions.CompatibilityMode, "-", true, false));
+            }
+
+            FutureDefaultsOptions.FutureDefaults.update(values, "all");
+            PreserveOptionsSupport.enableAllJDKFeatures(values);
+        }
+    };
+
+    private static void validateCompatibilityMode(HostedOptionKey<Boolean> compatibilityMode) {
+        OptionOrigin lastOrigin = compatibilityMode.getLastOrigin();
+        if (lastOrigin != null && !lastOrigin.commandLineLike()) {
+            String optionArgument = SubstrateOptionsParser.commandArgument(NativeImageOptions.CompatibilityMode, "+", true, false);
+            throw UserError.abort("Using %s is only allowed on command line. The option was used from %s", optionArgument, NativeImageOptions.CompatibilityMode.getLastOrigin());
+        }
+    }
+
+    @Fold
+    public static boolean compatibilityMode() {
+        return CompatibilityMode.getValue();
+    }
+
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,6 +32,9 @@ package com.oracle.truffle.llvm.toolchain.launchers.common;
 import org.graalvm.home.HomeFinder;
 import org.graalvm.home.Version;
 
+import com.oracle.truffle.llvm.toolchain.launchers.AbstractToolchainWrapper;
+import com.oracle.truffle.llvm.toolchain.launchers.AbstractToolchainWrapper.ToolchainWrapperConfig;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -40,16 +43,23 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 public class Driver {
 
     protected final String exe;
     protected final boolean isBundledTool;
+    private final String toolName;
 
-    public Driver(String exe, boolean inLLVMDir) {
+    public Driver(String toolName, String exe, boolean inLLVMDir) {
+        this.toolName = String.format("%s:%s", getClass().getSimpleName(), toolName);
         this.exe = inLLVMDir ? getLLVMExecutable(exe).toString() : exe;
         this.isBundledTool = inLLVMDir;
+    }
+
+    public Driver(String exe, boolean inLLVMDir) {
+        this(Objects.toString(Paths.get(exe).getFileName(), ""), exe, inLLVMDir);
     }
 
     public Driver(String exe) {
@@ -113,30 +123,37 @@ public class Driver {
         }
     }
 
-    private static Path getRuntimeDir() {
-        Path runtimeDir = HomeFinder.getInstance().getHomeFolder();
-        if (runtimeDir == null) {
-            throw new IllegalStateException("Could not find GraalVM home");
-        }
-        return runtimeDir;
-    }
-
     public static Path getLLVMBinDir() {
+        // allow manually overriding custom LLVM path
         final String property = System.getProperty("llvm.bin.dir");
         if (property != null) {
             return Paths.get(property);
         }
 
-        // TODO (GR-18389): Set only for standalones currently
+        // look up LLVM path relative to the toolchain wrapper
+        ToolchainWrapperConfig config = AbstractToolchainWrapper.getConfig();
+        if (config != null) {
+            return config.llvmPath().resolve("bin");
+        }
+
+        // TODO (GR-18389): Set only for old-style standalones
         Path toolchainHome = HomeFinder.getInstance().getLanguageHomes().get("llvm-toolchain");
         if (toolchainHome != null) {
             return toolchainHome.resolve("bin");
         }
 
-        return getRuntimeDir().resolve("lib").resolve("llvm").resolve("bin");
+        // TODO: Set only for old-style monolithic GraalVM builds
+        return HomeFinder.getInstance().getHomeFolder().resolve("lib").resolve("llvm").resolve("bin");
     }
 
     public static Path getSulongHome() {
+        ToolchainWrapperConfig config = AbstractToolchainWrapper.getConfig();
+        if (config != null) {
+            // the toolchain root is <sulong_home>/native
+            return config.toolchainPath().getParent();
+        }
+
+        // TODO (GR-18389): Set only for old-style standalones
         final Path sulongHome = HomeFinder.getInstance().getLanguageHomes().get("llvm");
         if (sulongHome != null) {
             return sulongHome;
@@ -164,7 +181,7 @@ public class Driver {
         } catch (IOException e) {
             System.exit(1);
         } catch (Exception e) {
-            System.err.println("Exception: " + e);
+            log("Exception: %s", e);
             System.exit(1);
         }
     }
@@ -200,7 +217,7 @@ public class Driver {
             // set exit code
             int exitCode = p.exitValue();
             if (verbose) {
-                System.out.println("exit code: " + exitCode);
+                log("exit code: %s", exitCode);
             }
             return exitCode;
         } catch (IOException ioe) {
@@ -233,16 +250,16 @@ public class Driver {
         return pb.inheritIO();
     }
 
-    public static void printMissingToolMessage(String llvmRoot) {
-        System.err.println("Tool execution failed. Are you sure the toolchain is available at " + llvmRoot);
-        System.err.println();
-        System.err.println("More infos: https://www.graalvm.org/docs/reference-manual/languages/llvm/");
+    public void printMissingToolMessage(String llvmRoot) {
+        log("Tool execution failed. Are you sure the toolchain is available at %s", llvmRoot);
+        log();
+        log("More infos: https://www.graalvm.org/docs/reference-manual/languages/llvm/");
     }
 
     private void printInfos(boolean verbose, boolean help, boolean earlyExit, ArrayList<String> toolArgs) {
         if (help) {
             System.out.println("##################################################");
-            System.out.println("This it the the GraalVM wrapper script for " + getTool());
+            System.out.println("This it the GraalVM wrapper script for " + getTool());
             System.out.println();
             System.out.println("Its purpose is to make it easy to compile native projects to be used with");
             System.out.println("GraalVM's LLVM IR engine (bin/lli).");
@@ -251,9 +268,9 @@ public class Driver {
             System.out.println("GraalVM version: " + getVersion());
         }
         if (verbose) {
-            System.out.println("GraalVM wrapper script for " + getTool());
-            System.out.println("GraalVM version: " + getVersion());
-            System.out.println("running: " + String.join(" ", toolArgs));
+            log("GraalVM wrapper script for %s", getTool());
+            log("GraalVM version: %s", getVersion());
+            log("running: %s", String.join(" ", toolArgs));
         }
         if (help) {
             if (!earlyExit) {
@@ -270,5 +287,17 @@ public class Driver {
 
     public static Path getLLVMExecutable(String tool) {
         return getLLVMBinDir().resolve(tool);
+    }
+
+    public final void log() {
+        System.err.printf("[%s]\n", toolName);
+    }
+
+    public final void log(String msg) {
+        System.err.printf("[%s] %s\n", toolName, msg);
+    }
+
+    public final void log(String format, Object... args) {
+        log(String.format(format, args));
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,6 +52,7 @@ import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompileOnly;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.FirstTierCompilationThreshold;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.FirstTierMinInvokeThreshold;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.LastTierCompilationThreshold;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.MaximumCompilations;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.MinInvokeThreshold;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.Mode;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.MultiTier;
@@ -68,6 +69,7 @@ import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingGrowth
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxCalleeSize;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingMaxPropagationDepth;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.SplittingTraceEvents;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.StoppedCompilationRetryDelay;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilation;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceCompilationDetails;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceDeoptimizeFrame;
@@ -76,21 +78,29 @@ import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceSplittingS
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraceTransferToInterpreter;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueFirstTierBonus;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueFirstTierPriority;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueInvalidatedBonus;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueOSRBonus;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueRateHalfLife;
+import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueStaleTaskDelay;
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.TraversingQueueWeightingBothTiers;
 import static com.oracle.truffle.runtime.OptimizedTruffleRuntime.getRuntime;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.nio.ByteBuffer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.logging.Level;
 
 import org.graalvm.collections.Pair;
 import org.graalvm.options.OptionValues;
+import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.SandboxPolicy;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
@@ -108,8 +118,6 @@ import com.oracle.truffle.runtime.debug.StatisticsListener;
  * engine. One-to-one relationship with a polyglot Engine instance.
  */
 public final class EngineData {
-
-    private static final AtomicLong engineCounter = new AtomicLong();
 
     int splitLimit;
     int splitCount;
@@ -151,14 +159,20 @@ public final class EngineData {
     @CompilationFinal public boolean traceDeoptimizeFrame;
     @CompilationFinal public boolean compileAOTOnCreate;
     @CompilationFinal public boolean firstTierOnly;
+    @CompilationFinal public long stoppedCompilationRetryDelay;
 
     // compilation queue options
     @CompilationFinal public boolean priorityQueue;
     @CompilationFinal public boolean weightingBothTiers;
     @CompilationFinal public boolean traversingFirstTierPriority;
     @CompilationFinal public double traversingFirstTierBonus;
+    @CompilationFinal public double traversingInvalidatedBonus;
+    @CompilationFinal public double traversingOSRBonus;
+    @CompilationFinal public long traversingRateHalfLifeNs;
+    @CompilationFinal public long traversingStaleTaskMaxNoActivityNs;
     @CompilationFinal public boolean propagateCallAndLoopCount;
     @CompilationFinal public int propagateCallAndLoopCountMaxDepth;
+    @CompilationFinal public int maximumCompilations;
 
     // computed fields.
     @CompilationFinal public int callThresholdInInterpreter;
@@ -166,12 +180,16 @@ public final class EngineData {
     @CompilationFinal public int callThresholdInFirstTier;
     @CompilationFinal public int callAndLoopThresholdInFirstTier;
     @CompilationFinal public long interpreterCallStackHeadRoom;
+    volatile long patchEpochNanos;
+
+    public BooleanSupplier cancelledPredicate;
 
     // Cached parsed CompileOnly includes and excludes
     private volatile Pair<List<String>, List<String>> parsedCompileOnly;
     private Map<String, String> compilerOptions;
 
     private volatile Object polyglotEngine;
+    private volatile boolean closed;
 
     /*
      * Extension data for dynamically bound engine extensions.
@@ -182,7 +200,7 @@ public final class EngineData {
         Objects.requireNonNull(polyglotEngine);
         Objects.requireNonNull(runtimeOptions);
         this.polyglotEngine = polyglotEngine;
-        this.id = engineCounter.incrementAndGet();
+        this.id = OptimizedRuntimeAccessor.ENGINE.getEngineId(polyglotEngine);
         this.loggerFactory = loggerFactory;
         this.loadOptions(runtimeOptions, sandboxPolicy);
 
@@ -190,27 +208,28 @@ public final class EngineData {
         this.splittingStatistics = new TruffleSplittingStrategy.SplitStatisticsData();
     }
 
-    public static IllegalArgumentException sandboxPolicyException(SandboxPolicy sandboxPolicy, String reason, String fix) {
-        Objects.requireNonNull(sandboxPolicy);
-        Objects.requireNonNull(reason);
-        Objects.requireNonNull(fix);
-        String spawnIsolateHelp;
-        if (sandboxPolicy.isStricterOrEqual(SandboxPolicy.ISOLATED)) {
-            spawnIsolateHelp = " If you switch to a less strict sandbox policy you can still spawn an isolate with an isolated heap using Builder.option(\"engine.SpawnIsolate\",\"true\").";
-        } else {
-            spawnIsolateHelp = "";
-        }
-        String message = String.format("The validation for the given sandbox policy %s failed. %s " +
-                        "In order to resolve this %s or switch to a less strict sandbox policy using Builder.sandbox(SandboxPolicy).%s", sandboxPolicy, reason, fix, spawnIsolateHelp);
-        return new IllegalArgumentException(message);
+    public void ensureClosed() {
+        this.closed = true;
+    }
+
+    public boolean isClosed() {
+        return this.closed;
+    }
+
+    void onEnginePatchSuccess() {
+        patchEpochNanos = System.nanoTime();
     }
 
     public void preinitializeContext() {
         OptimizedRuntimeAccessor.ENGINE.preinitializeContext(this.polyglotEngine);
     }
 
-    public void finalizeStore() {
-        OptimizedRuntimeAccessor.ENGINE.finalizeStore(this.polyglotEngine);
+    public Object finalizeStore() {
+        return OptimizedRuntimeAccessor.ENGINE.finalizeStore(this.polyglotEngine);
+    }
+
+    public void restoreStore(Object finalizationResult) {
+        OptimizedRuntimeAccessor.ENGINE.restoreStore(this.polyglotEngine, finalizationResult);
     }
 
     public Object getEngineLock() {
@@ -256,12 +275,14 @@ public final class EngineData {
 
     void onEngineCreated(Object engine) {
         assert this.polyglotEngine == engine;
+        getRuntime().onEngineCreated(this);
         getRuntime().getEngineCacheSupport().onEngineCreated(this);
     }
 
     void onEnginePatch(OptionValues newRuntimeOptions, Function<String, TruffleLogger> newLoggerFactory, SandboxPolicy sandboxPolicy) {
         this.loggerFactory = newLoggerFactory;
         loadOptions(newRuntimeOptions, sandboxPolicy);
+        getRuntime().onEngineCreated(this);
         getRuntime().getEngineCacheSupport().onEnginePatch(this);
     }
 
@@ -281,6 +302,14 @@ public final class EngineData {
          * reset disables logging.
          */
         this.polyglotEngine = null;
+    }
+
+    public boolean onStoreCache(Path targetPath, long cancelledWord) {
+        return getRuntime().getEngineCacheSupport().onStoreCache(this, targetPath, cancelledWord);
+    }
+
+    public ByteBuffer persistCache(Engine.CancellationCallback callback) {
+        return getRuntime().getEngineCacheSupport().persistCache(this, callback);
     }
 
     private void loadOptions(OptionValues options, SandboxPolicy sandboxPolicy) {
@@ -306,6 +335,7 @@ public final class EngineData {
         this.firstTierOnly = options.get(Mode) == EngineModeEnum.LATENCY;
         this.propagateCallAndLoopCount = options.get(PropagateLoopCountToLexicalSingleCaller);
         this.propagateCallAndLoopCountMaxDepth = options.get(PropagateLoopCountToLexicalSingleCallerMaxDepth);
+        this.stoppedCompilationRetryDelay = options.get(StoppedCompilationRetryDelay);
 
         // compilation queue options
         priorityQueue = options.get(PriorityQueue);
@@ -313,12 +343,17 @@ public final class EngineData {
         traversingFirstTierPriority = options.get(TraversingQueueFirstTierPriority);
         // See usage of traversingFirstTierBonus for explanation of this formula.
         traversingFirstTierBonus = options.get(TraversingQueueFirstTierBonus) * options.get(LastTierCompilationThreshold) / options.get(FirstTierCompilationThreshold);
+        maximumCompilations = options.get(MaximumCompilations);
+        traversingInvalidatedBonus = options.get(TraversingQueueInvalidatedBonus);
+        traversingOSRBonus = options.get(TraversingQueueOSRBonus);
+        traversingRateHalfLifeNs = options.get(TraversingQueueRateHalfLife) * 1_000_000;
 
         this.returnTypeSpeculation = options.get(ReturnTypeSpeculation);
         this.argumentTypeSpeculation = options.get(ArgumentTypeSpeculation);
         this.traceCompilation = options.get(TraceCompilation);
         this.traceCompilationDetails = options.get(TraceCompilationDetails);
         this.backgroundCompilation = options.get(BackgroundCompilation) && !compileAOTOnCreate;
+        traversingStaleTaskMaxNoActivityNs = backgroundCompilation ? options.get(TraversingQueueStaleTaskDelay) * 1_000_000 : 0;
         this.callThresholdInInterpreter = computeCallThresholdInInterpreter(options);
         this.callAndLoopThresholdInInterpreter = computeCallAndLoopThresholdInInterpreter(options);
         this.callThresholdInFirstTier = computeCallThresholdInFirstTier(options);
@@ -441,7 +476,8 @@ public final class EngineData {
     private void validateOptions(SandboxPolicy sandboxPolicy) {
         if (sandboxPolicy.isStricterOrEqual(SandboxPolicy.CONSTRAINED) && compilationFailureAction != ExceptionAction.Silent && compilationFailureAction != ExceptionAction.Print) {
             throw OptimizedRuntimeAccessor.ENGINE.createPolyglotEngineException(
-                            sandboxPolicyException(sandboxPolicy, "The engine.CompilationFailureAction option is set to " + compilationFailureAction.name() + ", but must be set to Silent or Print.",
+                            OptimizedRuntimeAccessor.ENGINE.sandboxPolicyException(sandboxPolicy,
+                                            "The engine.CompilationFailureAction option is set to " + compilationFailureAction.name() + ", but must be set to Silent or Print.",
                                             "use the default value (Silent) by removing Builder.option(\"engine.CompilationFailureAction\", ...) or set it to Print"));
         }
         if (compilationFailureAction == ExceptionAction.Throw && backgroundCompilation) {
@@ -491,6 +527,16 @@ public final class EngineData {
 
     public TruffleLogger getLogger(String loggerId) {
         return polyglotEngine != null ? loggerFactory.apply(loggerId) : null;
+    }
+
+    private final AtomicBoolean logShutdownCompilations = new AtomicBoolean(true);
+
+    /**
+     * Only log compilation shutdowns (see {@code OptimizedCallTarget.isCompilationStopped()}) once
+     * per engine.
+     */
+    public AtomicBoolean logShutdownCompilations() {
+        return logShutdownCompilations;
     }
 
     @SuppressWarnings("static-method")

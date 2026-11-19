@@ -26,17 +26,23 @@ package com.oracle.svm.core.jvmstat;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.thread.VMOperationListener;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.JavaMainWrapper;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.core.Isolates;
+import com.oracle.svm.core.attach.AttachApiSupport;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.jdk.SystemPropertiesSupport;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.core.thread.VMOperationListener;
+import com.oracle.svm.guest.staging.JavaMainSupport;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 import com.sun.management.OperatingSystemMXBean;
 
 /**
@@ -52,6 +58,7 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
     private final PerfLongConstant frequency;
     private final PerfLongConstant loadedClasses;
     private final PerfLongConstant processors;
+    private final PerfStringConstant jvmCapabilities;
 
     // Exported system properties.
     private final PerfStringConstant tempDir;
@@ -80,7 +87,10 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     SystemCounters(PerfManager perfManager) {
-        boolean hasJavaMainSupport = ImageSingletons.contains(JavaMainWrapper.JavaMainSupport.class);
+        /*
+         * In layered images we currently assume there will always be java main support.
+         */
+        boolean hasJavaMainSupport = ImageLayerBuildingSupport.buildingImageLayer() || ImageSingletons.contains(JavaMainSupport.class);
         initDoneTime = perfManager.createLongConstant("sun.rt.vmInitDoneTime", PerfUnit.TICKS);
         javaCommand = hasJavaMainSupport ? perfManager.createStringConstant("sun.rt.javaCommand") : null;
         vmArgs = hasJavaMainSupport ? perfManager.createStringConstant("java.rt.vmArgs") : null;
@@ -98,6 +108,7 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
         osName = perfManager.createStringConstant("java.property.os.name");
         userDir = perfManager.createStringConstant("java.property.user.dir");
         userName = perfManager.createStringConstant("java.property.user.name");
+        jvmCapabilities = perfManager.createStringConstant("sun.rt.jvmCapabilities");
 
         gcInProgress = perfManager.createLongVariable("com.oracle.svm.gcInProgress", PerfUnit.NONE);
 
@@ -114,7 +125,7 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
         osMXBean = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         threadMXBean = ManagementFactory.getThreadMXBean();
 
-        if (ImageSingletons.contains(JavaMainWrapper.JavaMainSupport.class)) {
+        if (ImageSingletons.contains(JavaMainSupport.class)) {
             javaCommand.allocate(getJavaCommand());
             vmArgs.allocate(getVmArgs());
         }
@@ -123,15 +134,17 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
         loadedClasses.allocate(numberOfLoadedClasses());
         processors.allocate(getAvailableProcessors());
 
-        tempDir.allocate(getSystemProperty("java.io.tmpdir"));
-        javaVersion.allocate(getSystemProperty("java.version"));
-        vmName.allocate(getSystemProperty("java.vm.name"));
-        vmVendor.allocate(getSystemProperty("java.vm.vendor"));
-        vmVersion.allocate(getSystemProperty("java.vm.version"));
-        osArch.allocate(getSystemProperty("os.arch"));
-        osName.allocate(getSystemProperty("os.name"));
-        userDir.allocate(getSystemProperty("user.dir"));
-        userName.allocate(getSystemProperty("user.name"));
+        SystemPropertiesSupport properties = SystemPropertiesSupport.singleton();
+        tempDir.allocate(properties.getInitialProperty("java.io.tmpdir"));
+        javaVersion.allocate(properties.getInitialProperty("java.version"));
+        vmName.allocate(properties.getInitialProperty("java.vm.name"));
+        vmVendor.allocate(properties.getInitialProperty("java.vm.vendor"));
+        vmVersion.allocate(properties.getInitialProperty("java.vm.version"));
+        osArch.allocate(properties.getInitialProperty("os.arch"));
+        osName.allocate(properties.getInitialProperty("os.name"));
+        userDir.allocate(properties.getInitialProperty("user.dir"));
+        userName.allocate(properties.getInitialProperty("user.name"));
+        jvmCapabilities.allocate(getJvmCapabilities());
 
         gcInProgress.allocate();
 
@@ -142,16 +155,19 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
         daemonThreads.allocate();
         processCPUTimeCounter.allocate();
 
-        initDoneTime.allocate(System.currentTimeMillis());
+        initDoneTime.allocate(Isolates.getInitDoneTimeMillis());
     }
 
-    private static String getSystemProperty(String s) {
-        /* Certain system properties (e.g., "user.dir"), may throw an exception. */
-        try {
-            return System.getProperty(s);
-        } catch (Throwable e) {
-            return "";
-        }
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+18/src/hotspot/share/services/runtimeService.cpp#L68-L77") //
+    private static String getJvmCapabilities() {
+        /*
+         * The capabilities are encoded as a string with 64 characters, where each character
+         * represent one specific capability. The first character is the attach API support.
+         */
+        String attachApiSupport = AttachApiSupport.isPresent() ? "1" : "0";
+        String result = attachApiSupport + "000000000000000000000000000000000000000000000000000000000000000";
+        assert result.length() == 64;
+        return result;
     }
 
     @Override
@@ -187,15 +203,14 @@ class SystemCounters implements PerfDataHolder, VMOperationListener {
     }
 
     private static String getJavaCommand() {
-        JavaMainWrapper.JavaMainSupport support = ImageSingletons.lookup(JavaMainWrapper.JavaMainSupport.class);
-        return support.getJavaCommand();
+        JavaMainSupport support = ImageSingletons.lookup(JavaMainSupport.class);
+        return Objects.requireNonNullElse(support.getJavaCommand(), "");
     }
 
     private static String getVmArgs() {
-        JavaMainWrapper.JavaMainSupport support = ImageSingletons.lookup(JavaMainWrapper.JavaMainSupport.class);
         StringBuilder vmArgs = new StringBuilder();
 
-        for (String arg : support.getInputArguments()) {
+        for (String arg : ImageSingletons.lookup(JavaMainSupport.class).getInputArguments()) {
             vmArgs.append(arg).append(' ');
         }
         return vmArgs.toString().trim();

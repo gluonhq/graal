@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,39 +24,55 @@
  */
 package com.oracle.svm.hosted.analysis;
 
-import java.lang.reflect.Field;
+import static com.oracle.svm.core.classinitialization.ClassInitializationInfo.InitState.FullyInitialized;
+import static com.oracle.svm.core.classinitialization.ClassInitializationInfo.InitState.InitializationError;
+
 import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.oracle.svm.core.hub.DynamicHubCompanion;
+import com.oracle.svm.core.hub.crema.CremaSupport;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.ObjectScanner.OtherReason;
+import com.oracle.graal.pointsto.ObjectScanner.ScanReason;
 import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.BaseLayerType;
 import com.oracle.graal.pointsto.util.AnalysisError;
-import com.oracle.svm.core.BuildPhaseProvider;
+import com.oracle.svm.shared.BuildPhaseProvider;
 import com.oracle.svm.core.classinitialization.ClassInitializationInfo;
+import com.oracle.svm.core.encoder.IdentitySymbolEncoder;
+import com.oracle.svm.core.encoder.SymbolEncoder;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.jdk.ClassLoaderSupport;
-import com.oracle.svm.core.meta.MethodPointer;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.meta.MethodRefSupport;
 import com.oracle.svm.hosted.BootLoaderSupport;
 import com.oracle.svm.hosted.ClassLoaderFeature;
 import com.oracle.svm.hosted.ExceptionSynthesizer;
 import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 import com.oracle.svm.hosted.classinitialization.SimulateClassInitializerSupport;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
+import com.oracle.svm.hosted.imagelayer.SVMImageLayerLoader;
+import com.oracle.svm.hosted.jdk.HostedClassLoaderPackageManagement;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.OriginalClassProvider;
 
+import jdk.graal.compiler.debug.Assertions;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class DynamicHubInitializer {
 
@@ -64,26 +80,49 @@ public class DynamicHubInitializer {
     private final SVMHost hostVM;
     private final AnalysisMetaAccess metaAccess;
     private final ConstantReflectionProvider constantReflection;
+    private final SymbolEncoder symbolEncoder;
 
     private final Map<InterfacesEncodingKey, DynamicHub[]> interfacesEncodings;
 
-    private final Field dynamicHubClassInitializationInfoField;
-    private final Field dynamicHubArrayHubField;
-    private final Field dynamicHubInterfacesEncodingField;
-    private final Field dynamicHubAnnotationsEnumConstantsReferenceField;
+    private final ResolvedJavaField hubCompanionArrayHubField;
+    private final ResolvedJavaField hubCompanionClassInitializationInfo;
+    private final ResolvedJavaField hubCompanionInterfacesEncoding;
+    private final ResolvedJavaField hubCompanionAnnotationsEnumConstantsReference;
+    private final ResolvedJavaField hubCompanionInterpreterType;
+    private final SVMImageLayerLoader layerLoader;
+
+    private static final class MetadataInitializationReason extends ScanReason {
+        private static final String PREFIX = "Metadata initialization for ";
+        private static final String SUFFIX = " triggered from class com.oracle.svm.hosted.analysis.DynamicHubInitializer";
+
+        private final DynamicHub hub;
+
+        private MetadataInitializationReason(DynamicHub hub) {
+            super(null, null);
+            this.hub = hub;
+        }
+
+        @Override
+        public String toString() {
+            return PREFIX + hub.getName() + SUFFIX;
+        }
+    }
 
     public DynamicHubInitializer(BigBang bb) {
         this.bb = bb;
         this.metaAccess = bb.getMetaAccess();
         this.hostVM = (SVMHost) bb.getHostVM();
         this.constantReflection = bb.getConstantReflectionProvider();
+        this.symbolEncoder = SymbolEncoder.singleton();
 
         this.interfacesEncodings = new ConcurrentHashMap<>();
-
-        dynamicHubClassInitializationInfoField = ReflectionUtil.lookupField(DynamicHub.class, "classInitializationInfo");
-        dynamicHubArrayHubField = ReflectionUtil.lookupField(DynamicHub.class, "arrayHub");
-        dynamicHubInterfacesEncodingField = ReflectionUtil.lookupField(DynamicHub.class, "interfacesEncoding");
-        dynamicHubAnnotationsEnumConstantsReferenceField = ReflectionUtil.lookupField(DynamicHub.class, "enumConstantsReference");
+        ResolvedJavaType dynamicHubCompanionType = GuestAccess.get().lookupType(DynamicHubCompanion.class);
+        hubCompanionArrayHubField = JVMCIReflectionUtil.getUniqueDeclaredField(dynamicHubCompanionType, "arrayHub");
+        hubCompanionClassInitializationInfo = JVMCIReflectionUtil.getUniqueDeclaredField(dynamicHubCompanionType, "classInitializationInfo");
+        hubCompanionInterfacesEncoding = JVMCIReflectionUtil.getUniqueDeclaredField(dynamicHubCompanionType, "interfacesEncoding");
+        hubCompanionAnnotationsEnumConstantsReference = JVMCIReflectionUtil.getUniqueDeclaredField(dynamicHubCompanionType, "enumConstantsReference");
+        hubCompanionInterpreterType = JVMCIReflectionUtil.getUniqueDeclaredField(dynamicHubCompanionType, "interpreterType");
+        layerLoader = HostedImageLayerBuildingSupport.singleton().getLoader();
     }
 
     public void initializeMetaData(ImageHeapScanner heapScanner, AnalysisType type) {
@@ -91,44 +130,42 @@ public class DynamicHubInitializer {
 
         AnalysisError.guarantee(!BuildPhaseProvider.isAnalysisFinished(), "Initializing type metadata after analysis for %s.", type.toJavaName(true));
 
-        Class<?> javaClass = type.getJavaClass();
+        Class<?> javaClass = OriginalClassProvider.getJavaClass(type);
         DynamicHub hub = hostVM.dynamicHub(type);
 
-        registerPackage(heapScanner, javaClass, hub);
-
-        boolean rescan = true;
+        ScanReason reason = new MetadataInitializationReason(hub);
         /*
-         * The constant should not be rescanned directly if it is from the base layer, as it would
-         * try to access the constant again, which would trigger the dynamic hub initialization
-         * again. The constant has to be rescanned after the initialization is finished.
+         * Since the javaClass is java.lang.Object for BaseLayerTypes, the java.lang package would
+         * be registered in the wrong class loader.
          */
-        if (hostVM.useBaseLayer()) {
-            ImageHeapConstant hubConstant = (ImageHeapConstant) heapScanner.createImageHeapConstant(hub, OtherReason.HUB);
-            rescan = hubConstant == null || !hubConstant.isInBaseLayer();
+        if (!(type.getWrapped() instanceof BaseLayerType)) {
+            registerPackage(heapScanner, javaClass, hub, reason);
         }
+
+        boolean rescan = shouldRescanHub(heapScanner, hub, reason);
 
         /*
          * Start by rescanning the hub itself. This ensures the correct scan reason in case this is
          * the first time we see this hub.
          */
         if (rescan) {
-            heapScanner.rescanObject(hub, OtherReason.HUB);
+            heapScanner.rescanObject(hub, reason);
         }
 
-        buildClassInitializationInfo(heapScanner, type, hub, rescan);
+        buildClassInitializationInfo(heapScanner, type, hub, rescan, reason);
 
         if (type.getJavaKind() == JavaKind.Object) {
             if (type.isArray()) {
                 AnalysisError.guarantee(hub.getComponentHub().getArrayHub() == null, "Array hub already initialized for %s.", type.getComponentType().toJavaName(true));
                 hub.getComponentHub().setArrayHub(hub);
-                if (rescan) {
-                    heapScanner.rescanField(hub.getComponentHub(), dynamicHubArrayHubField);
+                if (shouldRescanHub(heapScanner, hub.getComponentHub(), reason)) {
+                    heapScanner.rescanField(hub.getComponentHub().getCompanion(), hubCompanionArrayHubField, reason);
                 }
             }
 
             fillInterfaces(type, hub);
             if (rescan) {
-                heapScanner.rescanField(hub, dynamicHubInterfacesEncodingField);
+                heapScanner.rescanField(hub.getCompanion(), hubCompanionInterfacesEncoding, reason);
             }
 
             /* Support for Java enumerations. */
@@ -140,16 +177,38 @@ public class DynamicHubInitializer {
                     hub.initEnumConstants(retrieveEnumConstantArray(type, javaClass));
                 }
                 if (rescan) {
-                    heapScanner.rescanField(hub, dynamicHubAnnotationsEnumConstantsReferenceField);
+                    heapScanner.rescanField(hub.getCompanion(), hubCompanionAnnotationsEnumConstantsReference, reason);
                 }
             }
         }
+
+        if (RuntimeClassLoading.isSupported()) {
+            ResolvedJavaType interpreterType = RuntimeClassLoading.createInterpreterType(hub, type);
+            DynamicHubUtils.setInterpreterType(hub, interpreterType);
+            heapScanner.rescanField(hub.getCompanion(), hubCompanionInterpreterType, reason);
+            heapScanner.rescanObject(CremaSupport.singleton().getAllDeclaredMethods(interpreterType), reason);
+        }
+    }
+
+    /**
+     * The hub should not be rescanned directly if it is from the base layer, as it would try to
+     * access the constant again, which would trigger the dynamic hub initialization again. The hub
+     * has to be rescanned after the initialization is finished. This will be simplified by
+     * GR-60254.
+     */
+    private boolean shouldRescanHub(ImageHeapScanner heapScanner, DynamicHub hub, ScanReason reason) {
+        if (hostVM.buildingExtensionLayer()) {
+            JavaConstant hubConst = GuestAccess.get().getSnippetReflection().forObject(hub);
+            ImageHeapConstant hubConstant = (ImageHeapConstant) heapScanner.createImageHeapConstant(hubConst, reason);
+            return hubConstant == null || !hubConstant.isInSharedLayer();
+        }
+        return true;
     }
 
     /**
      * For reachable classes, register class's package in appropriate class loader.
      */
-    private static void registerPackage(ImageHeapScanner heapScanner, Class<?> javaClass, DynamicHub hub) {
+    private void registerPackage(ImageHeapScanner heapScanner, Class<?> javaClass, DynamicHub hub, ScanReason reason) {
         /*
          * Due to using {@link NativeImageSystemClassLoader}, a class's ClassLoader during runtime
          * may be different from the class used to load it during native-image generation.
@@ -164,8 +223,10 @@ public class DynamicHubInitializer {
             ClassLoader runtimeClassLoader = ClassLoaderFeature.getRuntimeClassLoader(classloader);
             VMError.guarantee(runtimeClassLoader != null, "Class loader missing for class %s", hub.getName());
             String packageName = hub.getPackageName();
-            var loaderPackages = ClassLoaderSupport.registerPackage(runtimeClassLoader, packageName, packageValue);
-            heapScanner.rescanObject(loaderPackages);
+            if (symbolEncoder instanceof IdentitySymbolEncoder) {
+                assert packageName.equals(packageValue.getName()) : Assertions.errorMessage("Package name mismatch:", packageName, packageValue.getName());
+            }
+            HostedClassLoaderPackageManagement.singleton().registerPackage(runtimeClassLoader, packageName, packageValue, object -> heapScanner.rescanObject(object, reason));
         }
     }
 
@@ -208,24 +269,30 @@ public class DynamicHubInitializer {
         return enumConstants;
     }
 
-    private void buildClassInitializationInfo(ImageHeapScanner heapScanner, AnalysisType type, DynamicHub hub, boolean rescan) {
+    private void buildClassInitializationInfo(ImageHeapScanner heapScanner, AnalysisType type, DynamicHub hub, boolean rescan, ScanReason reason) {
         AnalysisError.guarantee(hub.getClassInitializationInfo() == null, "Class initialization info already computed for %s.", type.toJavaName(true));
-        boolean initializedAtBuildTime = SimulateClassInitializerSupport.singleton().trySimulateClassInitializer(bb, type);
         ClassInitializationInfo info;
-        boolean typeReachedTracked = ClassInitializationSupport.singleton().requiresInitializationNodeForTypeReached(type);
-        if (initializedAtBuildTime) {
-            info = type.getClassInitializer() == null ? ClassInitializationInfo.forNoInitializerInfo(typeReachedTracked)
-                            : ClassInitializationInfo.forInitializedInfo(typeReachedTracked);
+        if (type.getWrapped() instanceof BaseLayerType) {
+            info = layerLoader.getClassInitializationInfo(type);
         } else {
-            info = buildRuntimeInitializationInfo(type, typeReachedTracked);
+            boolean hasInitializer = type.getClassInitializer() != null;
+            boolean typeReachedTracked = ClassInitializationSupport.singleton().requiresInitializationNodeForTypeReached(type);
+            boolean initializedOrSimulated = SimulateClassInitializerSupport.singleton().trySimulateClassInitializer(bb, type);
+
+            if (initializedOrSimulated) {
+                info = ClassInitializationInfo.forBuildTimeInitializedClass(FullyInitialized, hasInitializer, typeReachedTracked);
+            } else {
+                info = buildRuntimeInitializationInfo(type, hasInitializer, typeReachedTracked);
+            }
+            VMError.guarantee(!type.isInSharedLayer() || layerLoader.isInitializationInfoStable(type, info));
         }
         hub.setClassInitializationInfo(info);
         if (rescan) {
-            heapScanner.rescanField(hub, dynamicHubClassInitializationInfoField);
+            heapScanner.rescanField(hub.getCompanion(), hubCompanionClassInitializationInfo, reason);
         }
     }
 
-    private ClassInitializationInfo buildRuntimeInitializationInfo(AnalysisType type, boolean typeReachedTracked) {
+    private ClassInitializationInfo buildRuntimeInitializationInfo(AnalysisType type, boolean hasInitializer, boolean typeReachedTracked) {
         assert !type.isInitialized();
         try {
             /*
@@ -233,18 +300,17 @@ public class DynamicHubInitializer {
              * already failed in a previous attempt.
              */
             type.link();
-
         } catch (VerifyError e) {
             /* Synthesize a VerifyError to be thrown at run time. */
             AnalysisMethod throwVerifyError = metaAccess.lookupJavaMethod(ExceptionSynthesizer.throwExceptionMethod(VerifyError.class));
             bb.addRootMethod(throwVerifyError, true, "Class initialization error, registered in " + DynamicHubInitializer.class);
-            return new ClassInitializationInfo(new MethodPointer(throwVerifyError), typeReachedTracked);
+            return ClassInitializationInfo.forRuntimeTimeInitializedClass(MethodRefSupport.createMethodPointer(throwVerifyError), typeReachedTracked);
         } catch (Throwable t) {
             /*
              * All other linking errors will be reported as NoClassDefFoundError when initialization
              * is attempted at run time.
              */
-            return ClassInitializationInfo.forFailedInfo(typeReachedTracked);
+            return ClassInitializationInfo.forBuildTimeInitializedClass(InitializationError, hasInitializer, typeReachedTracked);
         }
 
         /*
@@ -257,9 +323,9 @@ public class DynamicHubInitializer {
         if (classInitializer != null) {
             assert classInitializer.getCode() != null;
             bb.addRootMethod(classInitializer, true, "Class initialization, registered in " + DynamicHubInitializer.class);
-            classInitializerFunction = new MethodPointer(classInitializer);
+            classInitializerFunction = MethodRefSupport.createMethodPointer(classInitializer);
         }
-        return new ClassInitializationInfo(classInitializerFunction, typeReachedTracked);
+        return ClassInitializationInfo.forRuntimeTimeInitializedClass(classInitializerFunction, typeReachedTracked);
     }
 
     class InterfacesEncodingKey {

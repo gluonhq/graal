@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,47 +24,30 @@
  */
 package jdk.graal.compiler.nodes.gc;
 
-import org.graalvm.word.LocationIdentity;
-
 import jdk.graal.compiler.core.common.memory.BarrierType;
-import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.extended.RawStoreNode;
 import jdk.graal.compiler.nodes.memory.FixedAccessNode;
+import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 /**
  * A {@link BarrierSet} that does not emit any read or write barriers.
  */
-public class NoBarrierSet implements BarrierSet {
-    @Override
-    public boolean hasWriteBarrier() {
-        return false;
+public class NoBarrierSet extends BarrierSet {
+
+    public NoBarrierSet() {
+        super(null, false);
     }
 
     @Override
-    public boolean hasReadBarrier() {
-        return false;
-    }
-
-    @Override
-    public void addBarriers(FixedAccessNode n) {
+    public void addBarriers(FixedAccessNode n, CoreProviders context) {
         // Nothing to do.
     }
 
     @Override
-    public BarrierType fieldReadBarrierType(ResolvedJavaField field, JavaKind storageKind) {
-        return BarrierType.NONE;
-    }
-
-    @Override
     public BarrierType fieldWriteBarrierType(ResolvedJavaField field, JavaKind storageKind) {
-        return BarrierType.NONE;
-    }
-
-    @Override
-    public BarrierType readBarrierType(LocationIdentity location, ValueNode address, Stamp loadStamp) {
         return BarrierType.NONE;
     }
 
@@ -81,10 +64,5 @@ public class NoBarrierSet implements BarrierSet {
     @Override
     public BarrierType readWriteBarrier(ValueNode object, ValueNode value) {
         return BarrierType.NONE;
-    }
-
-    @Override
-    public boolean mayNeedPreWriteBarrier(JavaKind storageKind) {
-        return false;
     }
 }

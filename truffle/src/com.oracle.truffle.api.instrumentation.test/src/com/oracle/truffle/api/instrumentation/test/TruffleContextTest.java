@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -240,12 +240,12 @@ public class TruffleContextTest extends AbstractPolyglotTest {
 
         assertFails(() -> tc.closeCancelled(node, "testreason"), getCancelExecutionClass(), (e) -> {
             assertSame(getCancelExecutionLocation(e), node);
-            assertEquals("testreason", ((Throwable) e).getMessage());
+            assertEquals("testreason", e.getMessage());
         });
 
         assertFails(() -> tc.closeResourceExhausted(node, "testreason"), getCancelExecutionClass(), (e) -> {
             assertSame(getCancelExecutionLocation(e), node);
-            assertEquals("testreason", ((Throwable) e).getMessage());
+            assertEquals("testreason", e.getMessage());
         });
 
         tc.leave(null, prev);
@@ -401,12 +401,11 @@ public class TruffleContextTest extends AbstractPolyglotTest {
                 waitUntilExited.countDown();
             });
 
-            boolean othrerThreadExited = false;
-            while (!othrerThreadExited) {
-                try {
-                    waitUntilExited.await();
-                    othrerThreadExited = true;
-                } catch (InterruptedException ie) {
+            try {
+                TruffleSafepoint.setBlockedThreadInterruptible(null, CountDownLatch::await, waitUntilExited);
+            } catch (ThreadDeath e) {
+                if (!"Exit was called with exit code 1.".equals(e.getMessage())) {
+                    throw e;
                 }
             }
             /*
@@ -575,7 +574,7 @@ public class TruffleContextTest extends AbstractPolyglotTest {
         innerContext.leave(null, prev);
 
         assertFails(() -> innerContext.evalInternal(null, com.oracle.truffle.api.source.Source.newBuilder("foobarbazz$_", "", "").build()), IllegalArgumentException.class, (e) -> {
-            assertTrue(e.getMessage(), e.getMessage().startsWith("A language with id 'foobarbazz$_' is not installed. Installed languages are:"));
+            assertTrue(e.getMessage(), e.getMessage().startsWith("A language with id 'foobarbazz$_' is not available. Available languages are:"));
         });
         innerContext.close();
     }
@@ -612,6 +611,31 @@ public class TruffleContextTest extends AbstractPolyglotTest {
         }
         assertEquals(3, innerException.executeCount);
         assertEquals(3, outerObject.executeCount);
+        innerContext.close();
+    }
+
+    @Test
+    public void testInnerContextRethrowsOuterContextError() throws InteropException {
+        EvalContextTestException outerException = new EvalContextTestException();
+        EvalContextRethrowingObject innerObject = new EvalContextRethrowingObject(outerException);
+        AtomicReference<AbstractTruffleException> innerCaughtException = new AtomicReference<>();
+        setupLanguageThatReturns(() -> innerObject);
+
+        TruffleContext innerContext = languageEnv.newInnerContextBuilder().initializeCreatorContext(true).build();
+        outerException.expectedContext = languageEnv.getContext();
+        innerObject.expectedContext = innerContext;
+        innerObject.innerCaughtException = innerCaughtException;
+
+        Object result = innerContext.evalInternal(null, newTruffleSource());
+        assertNotEquals("must be wrapped", innerObject, result);
+        try {
+            InteropLibrary.getUncached().execute(result, outerException);
+            fail();
+        } catch (AbstractTruffleException e) {
+            assertSame(outerException, e);
+        }
+        assertNotNull(innerCaughtException.get());
+        assertEquals(1, innerObject.executeCount);
         innerContext.close();
     }
 
@@ -659,6 +683,45 @@ public class TruffleContextTest extends AbstractPolyglotTest {
         }
     }
 
+    @ExportLibrary(InteropLibrary.class)
+    static class EvalContextRethrowingObject implements TruffleObject {
+
+        final EvalContextTestException outerException;
+        TruffleContext expectedContext;
+        AtomicReference<AbstractTruffleException> innerCaughtException;
+        int executeCount;
+
+        EvalContextRethrowingObject(EvalContextTestException outerException) {
+            this.outerException = outerException;
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        final boolean isExecutable() {
+            assertTrue(expectedContext.isEntered());
+            return true;
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        final Object execute(Object[] args) {
+            assertTrue(expectedContext.isEntered());
+            assertEquals(1, args.length);
+            executeCount++;
+            try {
+                InteropLibrary.getUncached().throwException(args[0]);
+                fail();
+            } catch (AbstractTruffleException e) {
+                Assert.assertNotSame(outerException, e);
+                innerCaughtException.set(e);
+                throw e;
+            } catch (InteropException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+            return null;
+        }
+    }
+
     @Test
     public void testPublicEvalInnerContext() {
         // test that primitive values can just be passed through
@@ -694,6 +757,9 @@ public class TruffleContextTest extends AbstractPolyglotTest {
 
         // arguments of the parent context are entered in the outer context
         result = InteropLibrary.getUncached().execute(result, outerObject);
+
+        // try a void method
+        InteropLibrary.getUncached().toNative(result);
 
         // and return values are entered again in the inner context
         result = InteropLibrary.getUncached().execute(result, outerObject);

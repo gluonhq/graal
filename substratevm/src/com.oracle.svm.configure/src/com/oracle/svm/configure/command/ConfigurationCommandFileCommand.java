@@ -66,7 +66,7 @@ public final class ConfigurationCommandFileCommand extends ConfigurationCommand 
 
     @Override
     public String getUsage() {
-        return "native-image-configure command-file <command-file-path>";
+        return "native-image-utils command-file <command-file-path>";
     }
 
     @Override
@@ -87,6 +87,6 @@ public final class ConfigurationCommandFileCommand extends ConfigurationCommand 
                                                   tools.
                             <command-file-path>
                                                   specifies the path to a command file
-                        """.replaceAll("\n", System.lineSeparator());
+                        """.replace("\n", System.lineSeparator());
     }
 }

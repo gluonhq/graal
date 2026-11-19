@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,27 +28,30 @@ import java.lang.reflect.Executable;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.jdk.InternalVMMethod;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.core.meta.MethodRefUtils;
 import com.oracle.svm.core.reflect.ReflectionAccessorHolder.MethodInvokeFunctionPointer;
 
 import jdk.internal.reflect.ConstructorAccessor;
+import jdk.internal.vm.annotation.Hidden;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-@InternalVMMethod
 public final class SubstrateConstructorAccessor extends SubstrateAccessor implements ConstructorAccessor {
 
-    private final CFunctionPointer factoryMethodTarget;
+    private final Class<?> declaringClass;
+    private final MethodRef factoryMethodTarget;
 
     @Platforms(Platform.HOSTED_ONLY.class) //
     private final ResolvedJavaMethod factoryMethod;
 
-    public SubstrateConstructorAccessor(Executable member, CFunctionPointer expandSignature, CFunctionPointer directTarget, ResolvedJavaMethod targetMethod, CFunctionPointer factoryMethodTarget,
+    public SubstrateConstructorAccessor(Executable member, MethodRef expandSignature, MethodRef directTarget, ResolvedJavaMethod targetMethod, MethodRef factoryMethodTarget,
                     ResolvedJavaMethod factoryMethod, DynamicHub initializeBeforeInvoke) {
         super(member, expandSignature, directTarget, targetMethod, initializeBeforeInvoke);
+        Class<?> constructorDeclaringClass = member.getDeclaringClass();
+        this.declaringClass = constructorDeclaringClass;
         this.factoryMethodTarget = factoryMethodTarget;
         this.factoryMethod = factoryMethod;
     }
@@ -63,14 +66,37 @@ public final class SubstrateConstructorAccessor extends SubstrateAccessor implem
         if (initializeBeforeInvoke != null) {
             EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
         }
-        return ((MethodInvokeFunctionPointer) expandSignature).invoke(null, args, factoryMethodTarget);
+        return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(null, args, MethodRefUtils.asCodePointer(factoryMethodTarget));
     }
 
-    @Override
-    public Object invokeSpecial(Object obj, Object[] args) {
+    /**
+     * This variant of {@link #newInstance(Object[])} is @Hidden. This is important when this is
+     * called as part of the method handle implementation where this frame is not expected to
+     * appear.
+     */
+    @Hidden
+    public Object methodHandleNewInstance(Object[] args) {
         if (initializeBeforeInvoke != null) {
             EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
         }
-        return super.invokeSpecial(obj, args);
+        return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(null, args, MethodRefUtils.asCodePointer(factoryMethodTarget));
+    }
+
+    public static void checkReceiver(Class<?> declaringClass, Object obj) {
+        if (obj == null) {
+            throw new NullPointerException();
+        } else if (!declaringClass.isInstance(obj)) {
+            throw new IllegalArgumentException("Receiver type " + obj.getClass().getName() + " is not an instance of the constructor's declaring class " + declaringClass.getName());
+        }
+    }
+
+    @Override
+    @Hidden
+    public Object methodHandleInvokeSpecial(Object obj, Object[] args) {
+        if (initializeBeforeInvoke != null) {
+            EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
+        }
+        checkReceiver(declaringClass, obj);
+        return super.methodHandleInvokeSpecial(obj, args);
     }
 }

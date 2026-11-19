@@ -27,12 +27,14 @@ package com.oracle.svm.core.heap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Set;
 
+import com.oracle.svm.shared.config.ObjectLayout;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.core.common.util.TypeWriter;
 
 import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.guest.staging.core.heap.ReferenceMapIndex;
+import org.graalvm.collections.EconomicSet;
 
 public class CodeReferenceMapEncoder extends ReferenceMapEncoder {
 
@@ -59,7 +61,7 @@ public class CodeReferenceMapEncoder extends ReferenceMapEncoder {
      * @return The index into the final bytes.
      */
     private long encode(ReferenceMapEncoder.OffsetIterator offsets) {
-        int compressedSize = ConfigurationValues.getObjectLayout().getReferenceSize();
+        int compressedSize = ObjectLayout.singleton().getReferenceSize();
         int uncompressedSize = FrameAccess.uncompressedReferenceSize();
 
         long startIndex = writeBuffer.getBytesWritten();
@@ -117,13 +119,13 @@ public class CodeReferenceMapEncoder extends ReferenceMapEncoder {
             return;
         }
 
-        assert firstRun || gap >= 0;
+        GraalError.guarantee(firstRun || gap >= 0, "Non-first reference map run has a negative gap: %s", gap);
         assert compressed ? refsCount > 0 : refsCount >= 0;
         writeBuffer.putSV(derived ? -gap - 1 : gap);
         writeBuffer.putSV(compressed ? -refsCount : refsCount);
     }
 
-    private void encodeDerivedRun(boolean firstRun, int gap, int baseOffset, Set<Integer> derivedOffsets, boolean compressed, int size) {
+    private void encodeDerivedRun(boolean firstRun, int gap, int baseOffset, EconomicSet<Integer> derivedOffsets, boolean compressed, int size) {
         encodeRun(firstRun, gap, derivedOffsets.size(), compressed, true);
         for (int derivedOffset : derivedOffsets) {
             assert baseOffset % size == 0 && derivedOffset % size == 0 && derivedOffset != baseOffset;

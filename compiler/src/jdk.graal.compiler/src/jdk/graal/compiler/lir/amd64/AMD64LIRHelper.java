@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +24,13 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
+import static jdk.vm.ci.code.ValueUtil.asRegister;
+
 import jdk.graal.compiler.asm.amd64.AMD64Address;
 import jdk.graal.compiler.core.common.LIRKind;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.asm.ArrayDataPointerConstant;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
-
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
@@ -40,6 +41,10 @@ public final class AMD64LIRHelper {
     private AMD64LIRHelper() {
     }
 
+    protected static void guaranteeFixedRegister(Value value, Register expected, String name) {
+        GraalError.guarantee(asRegister(value).equals(expected), "expect %s at %s, but was %s", name, expected, value);
+    }
+
     protected static Value[] registersToValues(Register[] registers) {
         Value[] temps = new Value[registers.length];
         for (int i = 0; i < registers.length; i++) {
@@ -48,6 +53,8 @@ public final class AMD64LIRHelper {
                 temps[i] = register.asValue(LIRKind.value(AMD64Kind.QWORD));
             } else if (AMD64.XMM.equals(register.getRegisterCategory())) {
                 temps[i] = register.asValue(LIRKind.value(AMD64Kind.DOUBLE));
+            } else if (AMD64.MASK.equals(register.getRegisterCategory())) {
+                temps[i] = register.asValue(LIRKind.value(AMD64Kind.MASK64));
             } else {
                 throw GraalError.shouldNotReachHere("Unsupported register type in math stubs."); // ExcludeFromJacocoGeneratedReport
             }
@@ -55,8 +62,20 @@ public final class AMD64LIRHelper {
         return temps;
     }
 
+    /**
+     * Records a RIP-relative patched reference to a data-section constant.
+     * <p>
+     * This helper should be used at the instruction emission site that actually needs the data
+     * reference. Avoid storing the returned address in a local variable and using it for a later
+     * emitted instruction later than the immediately following instruction.
+     */
     protected static AMD64Address recordExternalAddress(CompilationResultBuilder crb, ArrayDataPointerConstant ptr) {
-        return (AMD64Address) crb.recordDataReferenceInCode(ptr);
+        int alignment = crb.dataBuilder.ensureValidDataAlignment(ptr.getAlignment());
+        return (AMD64Address) crb.recordDataReferenceInCode(ptr, alignment);
+    }
+
+    protected static ArrayDataPointerConstant pointerConstant(int alignment, byte[] bytes) {
+        return new ArrayDataPointerConstant(bytes, alignment);
     }
 
     protected static ArrayDataPointerConstant pointerConstant(int alignment, int[] ints) {

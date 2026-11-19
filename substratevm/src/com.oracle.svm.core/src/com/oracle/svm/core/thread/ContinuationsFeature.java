@@ -27,27 +27,41 @@ package com.oracle.svm.core.thread;
 import java.lang.reflect.Field;
 import java.util.List;
 
-import com.oracle.svm.core.SubstrateControlFlowIntegrityFeature;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
 import com.oracle.svm.core.SubstrateControlFlowIntegrity;
+import com.oracle.svm.core.SubstrateControlFlowIntegrityFeature;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.deopt.DeoptimizationSupport;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.heap.StoredContinuation;
 import com.oracle.svm.core.heap.StoredContinuationAccess;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.singletons.ImageSingletonLoader;
+import com.oracle.svm.shared.singletons.ImageSingletonWriter;
+import com.oracle.svm.shared.singletons.LayeredPersistFlags;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.LayeredCallbacksSingletonTrait;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacksSupplier;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = ContinuationsFeature.LayeredCallbacks.class)
 @AutomaticallyRegisteredFeature
 public class ContinuationsFeature implements InternalFeature {
     private Boolean supported;
+    private Boolean previousLayerSupported;
 
     public static boolean isSupported() {
-        return ImageSingletons.lookup(ContinuationsFeature.class).supported;
+        ContinuationsFeature feature = ImageSingletons.lookup(ContinuationsFeature.class);
+        VMError.guarantee(feature.supported != null, "Not initialized");
+        return feature.supported;
     }
 
     @Override
@@ -56,42 +70,90 @@ public class ContinuationsFeature implements InternalFeature {
     }
 
     @Override
+    public void onRegistration(OnRegistrationAccess access) {
+        ImageSingletons.add(ContinuationsFeature.class, this);
+    }
+
+    @Override
     public void afterRegistration(AfterRegistrationAccess access) {
+        VMError.guarantee(supported == null);
+
         /* If continuations are not supported, "virtual" threads are bound to platform threads. */
-        if (ContinuationSupport.Options.VMContinuations.getValue()) {
-            supported = !DeoptimizationSupport.enabled() && !SubstrateOptions.useLLVMBackend() && SubstrateControlFlowIntegrity.singleton().continuationsSupported();
-            UserError.guarantee(supported || !ContinuationSupport.Options.VMContinuations.hasBeenSet(),
+        if (SubstrateOptions.VMContinuations.getValue()) {
+            boolean hostSupport = jdk.internal.vm.ContinuationSupport.isSupported();
+            if (!hostSupport) {
+                if (SubstrateOptions.VMContinuations.hasBeenSet()) {
+                    throw UserError.abort("Continuation support has been explicitly enabled with option %s but is not available in the host VM", SubstrateOptions.VMContinuations.getName());
+                }
+            }
+            supported = hostSupport && !DeoptimizationSupport.enabled() && !SubstrateOptions.useLLVMBackend() && SubstrateControlFlowIntegrity.singleton().continuationsSupported();
+            UserError.guarantee(supported || !SubstrateOptions.VMContinuations.hasBeenSet(),
                             "Continuation support has been explicitly enabled with option %s but is not available " +
                                             "because of the runtime compilation, LLVM backend, or control flow integrity features.",
-                            ContinuationSupport.Options.VMContinuations.getName());
+                            SubstrateOptions.VMContinuations.getName());
         } else {
             supported = false;
+        }
+        if (!supported) {
+            /*
+             * Thread.ofVirtual() creates bound virtual threads, but VirtualThread code can also
+             * become reachable via the Preserve option or reflection. Ensure that calls at runtime
+             * fail in the Continuation initializer.
+             */
+            JVMCIRuntimeClassInitializationSupport rci = JVMCIRuntimeClassInitializationSupport.singleton();
+            rci.initializeAtRunTime("jdk.internal.vm.Continuation", "Host continuations are not supported");
+        }
+
+        if (ImageLayerBuildingSupport.buildingExtensionLayer()) {
+            VMError.guarantee(supported == previousLayerSupported, "The previous layer supported value was %b, but the one from the current layer is %b", previousLayerSupported, supported);
         }
     }
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
         if (isSupported()) {
-            if (!ImageSingletons.contains(ContinuationSupport.class)) {
+            if (!ImageSingletons.contains(ContinuationSupport.class) && ImageLayerBuildingSupport.firstImageBuild()) {
                 ImageSingletons.add(ContinuationSupport.class, new ContinuationSupport());
             }
 
             Field ipField = ReflectionUtil.lookupField(StoredContinuation.class, "ip");
             access.registerAsAccessed(ipField);
+            Field originalCarrierSPField = ReflectionUtil.lookupField(StoredContinuation.class, "originalCarrierSP");
+            access.registerAsAccessed(originalCarrierSPField);
 
-            access.registerReachabilityHandler(a -> access.registerAsInHeap(StoredContinuation.class),
+            access.registerReachabilityHandler(_ -> access.registerAsInHeap(StoredContinuation.class),
                             ReflectionUtil.lookupMethod(StoredContinuationAccess.class, "allocate", int.class));
         } else {
-            access.registerReachabilityHandler(a -> VMError.shouldNotReachHere("Virtual threads internals are reachable but support is not available or active."), StoredContinuationAccess.class);
+            access.registerReachabilityHandler(_ -> VMError.shouldNotReachHere("Virtual threads internals are reachable but support is not available or active."), StoredContinuationAccess.class);
         }
     }
 
     @Override
     public void beforeCompilation(BeforeCompilationAccess access) {
-        if (isSupported()) {
+        if (isSupported() && ImageLayerBuildingSupport.firstImageBuild()) {
             Field ipField = ReflectionUtil.lookupField(StoredContinuation.class, "ip");
             long offset = access.objectFieldOffset(ipField);
             ContinuationSupport.singleton().setIPOffset(offset);
+        }
+    }
+
+    static class LayeredCallbacks extends SingletonLayeredCallbacksSupplier {
+        @Override
+        public LayeredCallbacksSingletonTrait getLayeredCallbacksTrait() {
+            var action = new SingletonLayeredCallbacks<ContinuationsFeature>() {
+                @Override
+                public LayeredPersistFlags doPersist(ImageSingletonWriter writer, ContinuationsFeature singleton) {
+                    writer.writeInt("supported", ContinuationsFeature.isSupported() ? 1 : 0);
+                    return LayeredPersistFlags.CALLBACK_ON_REGISTRATION;
+                }
+
+                @Override
+                public void onSingletonRegistration(ImageSingletonLoader loader, ContinuationsFeature singleton) {
+                    VMError.guarantee(singleton.previousLayerSupported == null);
+                    singleton.previousLayerSupported = loader.readInt("supported") == 1;
+                }
+            };
+            return new LayeredCallbacksSingletonTrait(action);
         }
     }
 }

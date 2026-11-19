@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,7 +39,6 @@ import jdk.graal.compiler.nodes.spi.Canonicalizable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import jdk.graal.compiler.nodes.util.GraphUtil;
-
 import jdk.vm.ci.meta.Constant;
 
 @NodeInfo(shortName = "|")
@@ -94,6 +93,14 @@ public final class OrNode extends BinaryArithmeticNode<Or> implements Canonicali
                 return forX;
             } else if (((~yStamp.mustBeSet()) & xStamp.mayBeSet()) == 0) {
                 return forY;
+            } else if (IntegerStamp.bitwiseDisjoint(xStamp, yStamp)) {
+                /*
+                 * Representing a disjoint "or" as an add may help us discover induction variables.
+                 * However, don't destroy bit rotate patterns.
+                 */
+                if (!(forX instanceof ShiftNode<?> && forY instanceof ShiftNode<?>)) {
+                    return AddNode.create(forX, forY, view);
+                }
             }
         }
 
@@ -111,7 +118,17 @@ public final class OrNode extends BinaryArithmeticNode<Or> implements Canonicali
         }
         if (forY instanceof NotNode && ((NotNode) forY).getValue() == forX) {
             // x | ~x |-> -1
-            return ConstantNode.forIntegerStamp(rawXStamp, -1L);
+            return BinaryArithmeticNode.createIntegerConstant(rawXStamp, -1L);
+        }
+        if (forY instanceof OrNode innerOr && (innerOr.getX() == forX || innerOr.getY() == forX)) {
+            // x | (x | y) |-> x | y
+            // x | (y | x) |-> y | x
+            return innerOr;
+        }
+        if (forX instanceof OrNode innerOr && (innerOr.getX() == forY || innerOr.getY() == forY)) {
+            // (y | x) | y |-> y | x
+            // (x | y) | y |-> x | y
+            return innerOr;
         }
         return self != null ? self : new OrNode(forX, forY).maybeCommuteInputs();
     }

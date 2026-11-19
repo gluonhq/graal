@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.core.aarch64;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
@@ -33,17 +33,25 @@ import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateControlFlowIntegrity;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.graal.nodes.aarch64.AArch64PACNode;
 import com.oracle.svm.core.graal.nodes.aarch64.AArch64XPACNode;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 @AutomaticallyRegisteredImageSingleton(FrameAccess.class)
 @Platforms(Platform.AARCH64.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class AArch64FrameAccess extends FrameAccess {
     @Override
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     protected int getReturnAddressSize() {
-        return wordSize();
+        return SubstrateTarget.getWordSize();
     }
 
     @Override
@@ -51,6 +59,15 @@ public class AArch64FrameAccess extends FrameAccess {
     public CodePointer unsafeReadReturnAddress(Pointer sourceSp) {
         CodePointer returnAddress = super.unsafeReadReturnAddress(sourceSp);
         return stripAddress(returnAddress);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public CodePointer encodeReturnAddress(Pointer sourceSp, CodePointer returnAddress) {
+        if (SubstrateControlFlowIntegrity.enabled()) {
+            return AArch64PACNode.signAddress(returnAddress, sourceSp);
+        }
+        return returnAddress;
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)

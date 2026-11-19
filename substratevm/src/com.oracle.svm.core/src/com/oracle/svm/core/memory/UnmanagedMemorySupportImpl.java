@@ -28,13 +28,19 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.impl.UnmanagedMemorySupport;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.headers.LibCSupport;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -42,6 +48,7 @@ import jdk.graal.compiler.api.replacements.Fold;
  * Delegates to the libc-specific memory management functions. Some platforms use a different
  * implementation.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class UnmanagedMemorySupportImpl implements UnmanagedMemorySupport {
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -50,14 +57,14 @@ class UnmanagedMemorySupportImpl implements UnmanagedMemorySupport {
          * Some libc implementations may return a nullptr when the size is 0. We use a minimum size
          * of 1 to ensure that we always get a unique pointer if the allocation succeeds.
          */
-        UnsignedWord allocationSize = UnsignedUtils.max(size, WordFactory.unsigned(1));
+        UnsignedWord allocationSize = UnsignedUtils.max(size, Word.unsigned(1));
         return libc().malloc(allocationSize);
     }
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public <T extends PointerBase> T calloc(UnsignedWord size) {
-        return libc().calloc(WordFactory.unsigned(1), size);
+        return libc().calloc(Word.unsigned(1), size);
     }
 
     @Override
@@ -72,7 +79,7 @@ class UnmanagedMemorySupportImpl implements UnmanagedMemorySupport {
         libc().free(ptr);
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     static LibCSupport libc() {
         return ImageSingletons.lookup(LibCSupport.class);
     }
@@ -80,6 +87,11 @@ class UnmanagedMemorySupportImpl implements UnmanagedMemorySupport {
 
 @AutomaticallyRegisteredFeature
 class UnmanagedMemorySupportFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void duringSetup(DuringSetupAccess access) {
         if (!ImageSingletons.contains(UnmanagedMemorySupport.class)) {

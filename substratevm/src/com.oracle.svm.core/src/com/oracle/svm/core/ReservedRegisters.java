@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +30,12 @@ import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.core.graal.nodes.ReadReservedRegisterFixedNode;
+import com.oracle.svm.core.graal.nodes.ReadReservedRegisterFloatingNode;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+
 import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.meta.JavaValue;
@@ -45,12 +50,14 @@ public abstract class ReservedRegisters {
     protected final Register frameRegister;
     protected final Register threadRegister;
     protected final Register heapBaseRegister;
+    protected final Register codeBaseRegister;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    protected ReservedRegisters(Register frameRegister, Register threadRegister, Register heapBaseRegisterCandidate) {
+    protected ReservedRegisters(Register frameRegister, Register threadRegister, Register heapBaseRegister, Register codeBaseRegisterCandidate) {
         this.frameRegister = frameRegister;
         this.threadRegister = threadRegister;
-        this.heapBaseRegister = SubstrateOptions.SpawnIsolates.getValue() ? heapBaseRegisterCandidate : null;
+        this.heapBaseRegister = heapBaseRegister;
+        this.codeBaseRegister = SubstrateOptions.useRelativeCodePointers() ? codeBaseRegisterCandidate : null;
     }
 
     /**
@@ -68,12 +75,17 @@ public abstract class ReservedRegisters {
         return threadRegister;
     }
 
-    /**
-     * Returns the register holding the heap base address for compressed pointers, i.e., the current
-     * {@link Isolate}; or null if no heap base register is used.
-     */
+    /** Returns the register holding the heap base address of the current {@link Isolate}. */
     public Register getHeapBaseRegister() {
         return heapBaseRegister;
+    }
+
+    /**
+     * Returns the register holding the code base address for method pointers, or {@code null} if no
+     * code base register is used.
+     */
+    public Register getCodeBaseRegister() {
+        return codeBaseRegister;
     }
 
     /**
@@ -82,12 +94,30 @@ public abstract class ReservedRegisters {
      * deoptimization.
      */
     public boolean isAllowedInFrameState(JavaValue value) {
-        if (value instanceof RegisterValue) {
-            Register register = ((RegisterValue) value).getRegister();
-            if (register.equals(threadRegister) || register.equals(heapBaseRegister)) {
-                return true;
-            }
+        if (value instanceof RegisterValue rv) {
+            Register r = rv.getRegister();
+            return r.equals(threadRegister) || r.equals(heapBaseRegister) || r.equals(codeBaseRegister);
         }
         return false;
+    }
+
+    public boolean isReservedRegister(Register r) {
+        return r.equals(frameRegister) || r.equals(heapBaseRegister) || r.equals(threadRegister) || r.equals(codeBaseRegister);
+    }
+
+    /**
+     * Determines whether a graph must use fixed read nodes for a reserved register or can use
+     * floating reads instead.
+     *
+     * A floating node to access the register is more efficient: it allows value numbering of
+     * multiple accesses, including floating nodes that use it as an input. But for deoptimization
+     * target methods, we must not do value numbering because there is no proxying at deoptimization
+     * entry points for this node, so the value is not restored during deoptimization.
+     *
+     * @see ReadReservedRegisterFixedNode
+     * @see ReadReservedRegisterFloatingNode
+     */
+    public boolean mustUseFixedRead(StructuredGraph graph) {
+        return graph.method() instanceof SharedMethod m && m.isDeoptTarget();
     }
 }

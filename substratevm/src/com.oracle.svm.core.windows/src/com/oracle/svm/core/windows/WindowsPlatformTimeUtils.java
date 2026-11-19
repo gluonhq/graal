@@ -24,44 +24,53 @@
  */
 package com.oracle.svm.core.windows;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static com.oracle.svm.core.windows.headers.SysinfoAPI.GetSystemTimeAsFileTime;
 
 import org.graalvm.nativeimage.StackValue;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.util.BasedOnJDKFile;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 import com.oracle.svm.core.util.PlatformTimeUtils;
 import com.oracle.svm.core.windows.headers.WinBase.FILETIME;
 
 @AutomaticallyRegisteredImageSingleton(PlatformTimeUtils.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class WindowsPlatformTimeUtils extends PlatformTimeUtils {
 
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1123") //
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1123") //
     private static final long OFFSET = 116444736000000000L;
 
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1153-L1155")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1153-L1155")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static long offset() {
         return OFFSET;
     }
 
     /* Returns time ticks in (10th of micro seconds) */
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1158-L1161")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1158-L1161")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static long windowsToTimeTicks(FILETIME wt) {
-        long a = WordFactory.unsigned(wt.dwHighDateTime()).shiftLeft(32).or(WordFactory.unsigned(wt.dwLowDateTime())).rawValue();
+        long a = Word.unsigned(wt.dwHighDateTime()).shiftLeft(32).or(Word.unsigned(wt.dwLowDateTime())).rawValue();
         return (a - offset());
     }
 
     @Override
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1198-L1205")
-    protected SecondsNanos javaTimeSystemUTC() {
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+3/src/hotspot/os/windows/os_windows.cpp#L1198-L1205")
+    @Uninterruptible(reason = "Must not migrate platform threads when executing on a virtual thread.")
+    protected void javaTimeSystemUTC0(SecondsNanosBuffer result) {
         FILETIME wt = StackValue.get(FILETIME.class);
         GetSystemTimeAsFileTime(wt);
         long ticks = windowsToTimeTicks(wt); // 10th of micros
         long secs = ticks / 10000000L; // 10000 * 1000
-        long seconds = secs;
         long nanos = (ticks - (secs * 10000000L)) * 100L;
-        return new SecondsNanos(seconds, nanos);
+        result.setSeconds(secs);
+        result.setNanos(nanos);
     }
-
 }

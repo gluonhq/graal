@@ -71,17 +71,19 @@ public class ExperimentPair {
      * @return an iterable over hot pairs of methods sorted by the execution period
      */
     public Iterable<MethodPair> getHotMethodPairsByDescendingPeriod() {
-        return () -> getHotMethodPairs().stream().sorted(Comparator.comparingLong(pair -> -pair.getTotalPeriod())).iterator();
+        return () -> getMethodPairs(true).stream().sorted(Comparator.comparingLong(pair -> -pair.getTotalPeriod())).iterator();
     }
 
     /**
-     * Gets a list of hot method pairs. A method pair is hot iff at least one of its methods is hot.
+     * Gets method pairs from both experiments.
      *
-     * @return a list of hot method pairs
+     * @param onlyHot if {@code true}, only methods that are hot in at least one experiment are
+     *            paired; otherwise, all methods are paired
+     * @return the list of method pairs
      */
-    private List<MethodPair> getHotMethodPairs() {
-        EconomicSet<String> union = EconomicMapUtil.keySet(experiment1.getHotMethodsByName());
-        union.addAll(EconomicMapUtil.keySet(experiment2.getHotMethodsByName()));
+    public List<MethodPair> getMethodPairs(boolean onlyHot) {
+        EconomicSet<String> union = onlyHot ? EconomicMapUtil.keySet(experiment1.getHotMethodsByName()) : EconomicMapUtil.keySet(experiment1.getMethodsByName());
+        union.addAll(onlyHot ? EconomicMapUtil.keySet(experiment2.getHotMethodsByName()) : EconomicMapUtil.keySet(experiment2.getMethodsByName()));
 
         List<MethodPair> methodPairs = new ArrayList<>();
         for (String methodName : union) {
@@ -98,7 +100,7 @@ public class ExperimentPair {
      * @throws ExperimentParserError failed to load a tree pair for an experiment
      */
     public void createCompilationFragments() throws ExperimentParserError {
-        for (MethodPair methodPair : getHotMethodPairs()) {
+        for (MethodPair methodPair : getMethodPairs(true)) {
             for (Method method : List.of(methodPair.getMethod1(), methodPair.getMethod2())) {
                 List<CompilationUnit> compilationUnitsSnapshot = new ArrayList<>();
                 for (CompilationUnit compilationUnit : method.getHotCompilationUnits()) {

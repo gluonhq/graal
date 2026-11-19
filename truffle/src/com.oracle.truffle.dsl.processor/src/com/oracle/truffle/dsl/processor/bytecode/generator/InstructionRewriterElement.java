@@ -1,0 +1,283 @@
+/*
+ * Copyright (c) 2025, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.dsl.processor.bytecode.generator;
+
+import static com.oracle.truffle.dsl.processor.bytecode.model.DFABuilder.DFAModel.DFAState;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.SequencedCollection;
+import java.util.SequencedMap;
+import java.util.SequencedSet;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
+
+import com.oracle.truffle.dsl.processor.ProcessorContext;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionRewriteRuleModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionRewriterModel;
+import com.oracle.truffle.dsl.processor.bytecode.model.DFABuilder.RewriteRuleState;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.InstructionEncoding;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionModel.InstructionImmediateEncoding;
+import com.oracle.truffle.dsl.processor.bytecode.model.InstructionRewriteRuleModel.ResolvedInstructionPatternModel;
+import com.oracle.truffle.dsl.processor.java.ElementUtils;
+import com.oracle.truffle.dsl.processor.java.model.CodeExecutableElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
+import com.oracle.truffle.dsl.processor.java.model.CodeTypeElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeVariableElement;
+
+public class InstructionRewriterElement extends CodeTypeElement {
+    // For debugging only. Emitting verbose Javadoc can drastically increase file size.
+    private static final boolean EMIT_VERBOSE_JAVADOC = false;
+
+    public final ProcessorContext context;
+    public final InstructionRewriterModel model;
+    private final Function<InstructionModel, CodeVariableElement> instructionConstantSupplier;
+    private final Map<InstructionEncoding, StepMethod> stepMethods;
+    public final Map<DFAState, CodeVariableElement> stateConstants;
+    public final CodeVariableElement startState;
+
+    @SuppressWarnings("this-escape")
+    public InstructionRewriterElement(ProcessorContext context, TypeElement templateType, InstructionRewriterModel model, Function<InstructionModel, CodeVariableElement> instructionConstantSupplier) {
+        super(Set.of(Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL), ElementKind.CLASS, ElementUtils.findPackageElement(templateType), model.getGeneratedTypeName());
+        this.context = context;
+        this.model = model;
+        this.instructionConstantSupplier = instructionConstantSupplier;
+        this.stepMethods = new LinkedHashMap<>();
+        this.stateConstants = new LinkedHashMap<>();
+        this.startState = createConstant(model.dfa.startState);
+        for (DFAState state : model.dfa.states) {
+            if (state == model.dfa.startState) {
+                continue;
+            }
+            createConstant(state);
+        }
+        TreeMap<InstructionEncoding, List<InstructionModel>> instructionsByEncoding = model.getInstructionsByEncoding();
+        for (var entry : instructionsByEncoding.entrySet()) {
+            InstructionEncoding encoding = entry.getKey();
+            List<InstructionModel> instructions = entry.getValue();
+            StepMethod step = createStepMethod(encoding, instructions);
+            if (step != null) {
+                this.stepMethods.put(encoding, step);
+                this.add(step.method);
+            }
+        }
+    }
+
+    private String fieldName(DFAState state) {
+        if (state == model.dfa.startState) {
+            return "START";
+        }
+        return "s" + state.id;
+    }
+
+    private CodeVariableElement createConstant(DFAState state) {
+        CodeVariableElement field = new CodeVariableElement(Set.of(Modifier.STATIC, Modifier.FINAL), context.getType(int.class), fieldName(state));
+        field.createInitBuilder().string(state.id);
+
+        CodeTreeBuilder docBuilder = field.createDocBuilder().startJavadoc();
+        if (!state.transitions.isEmpty()) {
+            docBuilder.string("Transitions:").newLine();
+            List<InstructionModel> orderedTransitions = state.transitions.keySet().stream().map(model::getInstruction).sorted(model.instructionComparator()).toList();
+            for (InstructionModel instruction : orderedTransitions) {
+                docBuilder.string("  ").string(instruction.getName()).string(" -> {@link #").string(fieldName(state.transitions.get(instruction.getName()))).string("}").newLine();
+            }
+        }
+        if (EMIT_VERBOSE_JAVADOC) {
+            docBuilder.string("Rewrite rule state:").newLine();
+            for (RewriteRuleState ruleState : state.getRewriteStates().stream().sorted().toList()) {
+                docBuilder.string("  ").string(ruleState.toString()).newLine();
+            }
+        }
+        if (state.isAccepting()) {
+            InstructionRewriteRuleModel acceptingRule = state.getAcceptingRule();
+            docBuilder.string("Accepting rule (see {@link ", BuilderElement.RootStackElement.NAME, "#applyRewriteRule").string(acceptingRule.getIndex()).string("}):").newLine();
+            docBuilder.string("  ").string(acceptingRule.toString()).newLine();
+        }
+        docBuilder.end();
+        stateConstants.put(state, add(field));
+        return field;
+    }
+
+    private StepMethod createStepMethod(InstructionEncoding encoding, List<InstructionModel> instructions) {
+        SequencedMap<DFAState, List<RewriteRuleState>> steppingStates = computeRelevantRulesByState(instructions);
+        if (steppingStates.isEmpty()) {
+            return null;
+        }
+
+        StringBuilder methodName = new StringBuilder("step");
+        for (InstructionImmediateEncoding immediate : encoding.immediates()) {
+            methodName.append(immediate.width().toEncodedName());
+        }
+
+        CodeExecutableElement ex = new CodeExecutableElement(Set.of(Modifier.STATIC), context.getType(int.class), methodName.toString(),
+                        new CodeVariableElement(context.getType(int.class), "currentState"),
+                        new CodeVariableElement(context.getType(short.class), "opcode"));
+        SequencedSet<RewriteRuleState> allRewriteStates = steppingStates.values().stream().flatMap(List::stream).sorted().collect(Collectors.toCollection(LinkedHashSet::new));
+        boolean canRewrite = allRewriteStates.stream().anyMatch(RewriteRuleState::leadsToAcceptingState);
+
+        CodeTreeBuilder docBuilder = ex.createDocBuilder().startJavadoc();
+        docBuilder.string("Instructions: ").string(instructionsString(instructions)).newLine();
+        if (EMIT_VERBOSE_JAVADOC) {
+            docBuilder.string("Rewrite rules: ").newLine();
+            for (RewriteRuleState rewriteState : allRewriteStates) {
+                docBuilder.string("  ").string(rewriteState.toString()).newLine();
+            }
+            docBuilder.end();
+        }
+
+        CodeTreeBuilder p = ex.createBuilder();
+
+        List<InstructionModel> transitioningInstructions = instructions.stream().filter(
+                        instruction -> model.dfa.states.stream().anyMatch(state -> state.transitions.containsKey(instruction.getName()))).toList();
+        Map<EqualityCodeTree, List<InstructionModel>> instructionGrouping = EqualityCodeTree.group(p, transitioningInstructions, (instruction, b) -> {
+            Map<DFAState, List<DFAState>> sourcesByDestination = new LinkedHashMap<>();
+            for (DFAState source : model.dfa.states) {
+                DFAState destination = source.transitions.get(instruction.getName());
+                if (destination == null) {
+                    destination = model.dfa.startState;
+                }
+                sourcesByDestination.computeIfAbsent(destination, unused -> new ArrayList<>()).add(source);
+            }
+
+            // Code size optimization: use the "default" case for whichever destination state has
+            // the most source states.
+            DFAState defaultDestination = null;
+            int defaultDestinationSourceCount = -1;
+            for (var entry : sourcesByDestination.entrySet()) {
+                if (entry.getValue().size() > defaultDestinationSourceCount) {
+                    defaultDestination = entry.getKey();
+                    defaultDestinationSourceCount = entry.getValue().size();
+                }
+            }
+
+            b.startSwitch().string("currentState").end().startBlock();
+            for (var entry : sourcesByDestination.entrySet()) {
+                if (entry.getKey() == defaultDestination) {
+                    continue;
+                }
+                for (DFAState source : entry.getValue()) {
+                    b.startCase().staticReference(stateConstants.get(source)).end();
+                }
+                b.startCaseBlock();
+                b.startReturn().staticReference(stateConstants.get(entry.getKey())).end();
+                b.end();
+            }
+            b.caseDefault().startCaseBlock();
+            b.startReturn().staticReference(stateConstants.get(defaultDestination)).end();
+            b.end();
+            b.end(); // switch(currentState)
+        });
+
+        CodeTreeBuilder b = p;
+        b.startSwitch().string("opcode").end().startBlock();
+        for (var group : instructionGrouping.entrySet()) {
+            EqualityCodeTree key = group.getKey();
+            for (InstructionModel instruction : group.getValue()) {
+                b.startCase().staticReference(getInstructionConstant(instruction)).end();
+            }
+            b.startCaseBlock();
+            b.tree(key.getTree());
+            b.end();
+        }
+        b.caseDefault().startCaseBlock();
+        b.startReturn().staticReference(startState).string(" /* reset */").end();
+        b.end();
+        b.end(); // switch(opcode)
+
+        return new StepMethod(ex, allRewriteStates, canRewrite);
+    }
+
+    /**
+     * Compute the subset of the DFA states and rules that the given instructions can transition on.
+     */
+    private SequencedMap<DFAState, List<RewriteRuleState>> computeRelevantRulesByState(List<InstructionModel> instructions) {
+        Set<String> instructionNames = instructions.stream().map(InstructionModel::getName).collect(Collectors.toSet());
+        SequencedMap<DFAState, List<RewriteRuleState>> result = new LinkedHashMap<>();
+        for (DFAState state : model.dfa.states) {
+            // Collect all rewrite states _ * X _ -> _ where X is one of the given instructions.
+            for (RewriteRuleState rewriteState : state.getRewriteStates()) {
+                ResolvedInstructionPatternModel nextInstruction = rewriteState.getNextInstruction();
+                if (nextInstruction != null && instructionNames.contains(nextInstruction.instruction().getName())) {
+                    if (!state.transitions.containsKey(nextInstruction.instruction().getName())) {
+                        throw new AssertionError("DFA state with rewrite state " + rewriteState + " does not have a transition on " + nextInstruction);
+                    }
+
+                    result.computeIfAbsent(state, unused -> new ArrayList<>()).add(rewriteState);
+                }
+            }
+        }
+        return result;
+    }
+
+    public record StepMethod(CodeExecutableElement method, SequencedCollection<RewriteRuleState> rewriteStates, boolean canRewrite) {
+
+    }
+
+    public StepMethod getStepMethod(InstructionEncoding encoding) {
+        return stepMethods.get(encoding);
+    }
+
+    public CodeVariableElement getInstructionConstant(InstructionModel instruction) {
+        CodeVariableElement instructionConstant = instructionConstantSupplier.apply(instruction);
+        if (instructionConstant == null) {
+            throw new AssertionError("Missing instruction constant for instruction " + instruction);
+        }
+        return instructionConstant;
+    }
+
+    public static String instructionsString(List<InstructionModel> instructions) {
+        return instructions.stream() //
+                        .map(InstructionModel::getName) //
+                        .sorted() //
+                        .collect(Collectors.joining(", ", "[", "]"));
+    }
+
+}

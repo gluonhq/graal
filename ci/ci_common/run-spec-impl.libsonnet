@@ -95,7 +95,7 @@ local std_get = (import "../../ci/ci_common/common-utils.libsonnet").std_get;
            else
              // exclusion
              assert std.length(excluded) == std.length(_values) : "Cannot mix inclusion with exclusion (either all entries start with '!' or none): " + _values;
-             std.setDiff(std.objectFieldsAll(feature_map[self.feature]), excluded)
+             std.setDiff(std.set(std.objectFieldsAll(feature_map[self.feature])), std.set(excluded))
          }
        ;
     local is_feature_desc(key) = std.member(feature_order, get_feature_value_pair(key).feature);
@@ -215,7 +215,7 @@ local std_get = (import "../../ci/ci_common/common-utils.libsonnet").std_get;
       local onlyMatrixKeys = union == known_fields;
       local noMatrixKeys = inter == [];
       if isLeaf then
-        assert noMatrixKeys: "unexected platform spec keys in build definition %s (context: %s, stack: %s)" % [inter, context, stack];
+        assert noMatrixKeys: "unexpected platform spec keys in build definition %s (context: %s, stack: %s)" % [inter, context, stack];
         obj
       else
         assert onlyMatrixKeys : "unexpected keys in platform spec %s, expected %s (context: %s, stack: %s)" % [diff, known_fields, context, stack];

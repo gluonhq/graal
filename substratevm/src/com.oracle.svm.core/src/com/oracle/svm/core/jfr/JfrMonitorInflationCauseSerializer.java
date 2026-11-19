@@ -29,22 +29,26 @@ package com.oracle.svm.core.jfr;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.monitor.MonitorInflationCause;
 
 public class JfrMonitorInflationCauseSerializer implements JfrSerializer {
+    private final MonitorInflationCause[] causes;
+
     @Platforms(Platform.HOSTED_ONLY.class)
     public JfrMonitorInflationCauseSerializer() {
+        causes = MonitorInflationCause.values();
     }
 
     @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
     public void write(JfrChunkWriter writer) {
         writer.writeCompressedLong(JfrType.MonitorInflationCause.getId());
 
-        MonitorInflationCause[] inflationCauses = MonitorInflationCause.values();
-        writer.writeCompressedLong(inflationCauses.length);
-        for (int i = 0; i < inflationCauses.length; i++) {
+        writer.writeCompressedLong(causes.length);
+        for (int i = 0; i < causes.length; i++) {
             writer.writeCompressedInt(i);
-            writer.writeString(inflationCauses[i].getText());
+            writer.writeString(causes[i].getText());
         }
     }
 }

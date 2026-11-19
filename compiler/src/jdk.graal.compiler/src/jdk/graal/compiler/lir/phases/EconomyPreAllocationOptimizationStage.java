@@ -25,10 +25,12 @@
 package jdk.graal.compiler.lir.phases;
 
 import jdk.graal.compiler.lir.alloc.SaveCalleeSaveRegisters;
+import jdk.graal.compiler.lir.alloc.UseKillMoveInjectionPhase;
 
 public class EconomyPreAllocationOptimizationStage extends LIRPhaseSuite<PreAllocationOptimizationPhase.PreAllocationOptimizationContext> {
     @SuppressWarnings("this-escape")
     public EconomyPreAllocationOptimizationStage() {
+        appendPhase(new UseKillMoveInjectionPhase());
         /*
          * Although HotSpot does not use callee saved registers on any configuration, this phase is
          * not optional. SVM for example uses a different calling convention that requires it. If

@@ -65,10 +65,9 @@ public final class VerifyMaxRegisterSizePhase extends FinalCodeAnalysisPhase {
     }
 
     protected void verifyInstruction(LIRInstruction inst) {
-        inst.visitEachInput(this::verifyOperands);
-        inst.visitEachOutput(this::verifyOperands);
-        inst.visitEachAlive(this::verifyOperands);
-        inst.visitEachTemp(this::verifyOperands);
+        // Register-size validation only inspects operand buckets attached to this instruction, so
+        // it uses the canonical forward operand walk.
+        inst.visitEachValueForward(this::verifyOperands);
     }
 
     @SuppressWarnings("unused")

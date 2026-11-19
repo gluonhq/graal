@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,8 @@
  */
 package com.oracle.svm.core.jni.functions;
 
-import static com.oracle.svm.core.heap.RestrictHeapAccess.Access.NO_ALLOCATION;
+import static com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess.Access.NO_ALLOCATION;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
@@ -49,38 +50,43 @@ import org.graalvm.nativeimage.c.type.CConst;
 import org.graalvm.nativeimage.c.type.CShortPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.WordPointer;
+import org.graalvm.nativeimage.impl.ClassLoadingSupport;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
+import com.oracle.svm.configure.ClassNameSupport;
 import com.oracle.svm.core.JavaMemoryUtil;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.StaticFieldsSupport;
+import com.oracle.svm.core.MissingRegistrationUtils;
 import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.function.CEntryPointActions;
-import com.oracle.svm.core.c.function.CEntryPointErrors;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
-import com.oracle.svm.core.c.function.CEntryPointOptions.ReturnNullPointer;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
 import com.oracle.svm.core.handles.PrimitiveArrayView;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.hub.PredefinedClassesSupport;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.guest.staging.hub.ClassDefinitionInfo;
+import com.oracle.svm.core.hub.RuntimeReflectionMetadata;
+import com.oracle.svm.core.hub.crema.CremaResolvedJavaField;
+import com.oracle.svm.core.hub.crema.CremaResolvedJavaMethod;
+import com.oracle.svm.core.hub.crema.CremaResolvedJavaType;
+import com.oracle.svm.core.hub.crema.CremaSupport;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.core.interpreter.InterpreterJNIFieldIds;
+import com.oracle.svm.core.interpreter.InterpreterJNIMethodIds;
+import com.oracle.svm.core.interpreter.InterpreterSupport;
 import com.oracle.svm.core.jdk.DirectByteBufferUtil;
-import com.oracle.svm.core.jni.JNIObjectFieldAccess;
+import com.oracle.svm.core.jdk.StackTraceUtils;
+import com.oracle.svm.core.jdk.Target_jdk_internal_loader_NativeLibraries_RespectsClassLoader;
 import com.oracle.svm.core.jni.JNIObjectHandles;
 import com.oracle.svm.core.jni.JNIThreadLocalPendingException;
 import com.oracle.svm.core.jni.JNIThreadLocalPrimitiveArrayViews;
 import com.oracle.svm.core.jni.JNIThreadOwnedMonitors;
+import com.oracle.svm.core.jni.MissingJNIRegistrationUtils;
 import com.oracle.svm.core.jni.access.JNIAccessibleField;
 import com.oracle.svm.core.jni.access.JNIAccessibleMethod;
 import com.oracle.svm.core.jni.access.JNIAccessibleMethodDescriptor;
@@ -111,27 +117,43 @@ import com.oracle.svm.core.jni.headers.JNIObjectHandle;
 import com.oracle.svm.core.jni.headers.JNIObjectRefType;
 import com.oracle.svm.core.jni.headers.JNIValue;
 import com.oracle.svm.core.jni.headers.JNIVersion;
-import com.oracle.svm.core.jni.headers.JNIVersionJDKLatest;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.log.CoreLogSupport;
+import com.oracle.svm.core.metadata.MetadataTracer;
 import com.oracle.svm.core.monitor.MonitorInflationCause;
 import com.oracle.svm.core.monitor.MonitorSupport;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.core.stack.JavaFrameAnchors;
 import com.oracle.svm.core.thread.ContinuationSupport;
 import com.oracle.svm.core.thread.JavaThreads;
 import com.oracle.svm.core.thread.Target_java_lang_BaseVirtualThread;
 import com.oracle.svm.core.thread.Target_jdk_internal_vm_Continuation;
 import com.oracle.svm.core.thread.VMThreads.SafepointBehavior;
 import com.oracle.svm.core.util.ArrayUtil;
-import com.oracle.svm.core.util.Utf8;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions.ReturnNullPointer;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.util.Utf8;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
 import jdk.graal.compiler.nodes.java.ArrayLengthNode;
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.internal.misc.Unsafe;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaUtil;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * Implementations of the functions defined by the Java Native Interface.
@@ -170,11 +192,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = CEntryPointOptions.NoPrologue.class, epilogue = CEntryPointOptions.NoEpilogue.class)
     @Uninterruptible(reason = "No need to enter the isolate and also no way to report errors if unable to.")
     static int GetVersion(JNIEnvironment env) {
-        if (JavaVersionUtil.JAVA_SPEC == 21) {
-            return JNIVersion.JNI_VERSION_21();
-        } else {
-            return JNIVersionJDKLatest.JNI_VERSION_LATEST();
-        }
+        return JNIVersion.JNI_VERSION_LATEST();
     }
 
     /*
@@ -208,7 +226,7 @@ public final class JNIFunctions {
             return JNIErrors.JNI_ERR();
         }
         JNIObjectHandles.ensureLocalCapacity(capacity);
-        return 0;
+        return JNIErrors.JNI_OK();
     }
 
     /*
@@ -360,15 +378,15 @@ public final class JNIFunctions {
 
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullHandle.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullHandle.class)
+    @NeverInline("Access of caller frame.")
     static JNIObjectHandle FindClass(JNIEnvironment env, CCharPointer cname) {
-        CharSequence name = Utf8.wrapUtf8CString(cname);
-        if (name == null) {
-            throw new NoClassDefFoundError("Class name is either null or invalid UTF-8 string");
-        }
-
-        Class<?> clazz = JNIReflectionDictionary.singleton().getClassObjectByName(name);
-        if (clazz == null) {
-            throw new NoClassDefFoundError(name.toString());
+        Class<?> clazz;
+        // GR-77088: libgraal should also respect classloaders here
+        if (!LibGraalSupport.inLibGraalRuntime() && Support.useClassRegistriesInFindClass()) {
+            Class<?> callerClass = StackTraceUtils.getCallerClass(KnownIntrinsics.readCallerStackPointer(), false);
+            clazz = Support.findClassInClassRegistries(cname, callerClass);
+        } else {
+            clazz = Support.findClassInReflectionDictionary(cname);
         }
         /* Ensure that native code can't access the uninitialized native state, if any. */
         DynamicHub.fromClass(clazz).ensureInitialized();
@@ -399,19 +417,7 @@ public final class JNIFunctions {
 
             CFunctionPointer fnPtr = entry.fnPtr();
 
-            String declaringClass = MetaUtil.toInternalName(clazz.getName());
-            JNINativeLinkage linkage = JNIReflectionDictionary.singleton().getLinkage(declaringClass, name, signature);
-            if (linkage != null) {
-                linkage.setEntryPoint(fnPtr);
-            } else {
-                /*
-                 * It happens that libraries register arbitrary Java native methods from their
-                 * native code. If during analysis, we didn't reach some of those JNI methods (see
-                 * com.oracle.svm.jni.hosted.JNINativeCallWrapperSubstitutionProcessor.lookup and
-                 * com.oracle.svm.jni.access.JNIAccessFeature.duringAnalysis) we shouldn't fail:
-                 * those native methods can never be invoked.
-                 */
-            }
+            Support.registerNative(DynamicHub.fromClass(clazz), name, signature, i, fnPtr, false);
 
             p = p.add(SizeOf.get(JNINativeMethod.class));
         }
@@ -426,8 +432,23 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnEDetached.class)
     static int UnregisterNatives(JNIEnvironment env, JNIObjectHandle hclazz) {
         Class<?> clazz = JNIObjectHandles.getObject(hclazz);
+        if (RuntimeClassLoading.isSupported()) {
+            DynamicHub hub = DynamicHub.fromClass(clazz);
+            if (hub.isRuntimeLoaded()) {
+                ResolvedJavaType interpreterType = DynamicHubUtils.getInterpreterType(hub);
+                assert interpreterType instanceof CremaResolvedJavaType : "expected Crema type";
+                CremaResolvedJavaType type = (CremaResolvedJavaType) interpreterType;
+                for (CremaResolvedJavaMethod cremaMethod : type.getDeclaredCremaMethods()) {
+                    if (cremaMethod.isNative()) {
+                        cremaMethod.getJNINativeLinkage().unsetEntryPoint();
+                    }
+                }
+                return JNIErrors.JNI_OK();
+            }
+        }
+
         String internalName = MetaUtil.toInternalName(clazz.getName());
-        JNIReflectionDictionary.singleton().unsetEntryPoints(internalName);
+        JNIReflectionDictionary.unsetEntryPoints(internalName);
         return JNIErrors.JNI_OK();
     }
 
@@ -557,7 +578,7 @@ public final class JNIFunctions {
     static CCharPointer GetStringUTFChars(JNIEnvironment env, JNIObjectHandle hstr, CCharPointer isCopy) {
         String str = JNIObjectHandles.getObject(hstr);
         if (str == null) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         if (isCopy.isNonNull()) {
             isCopy.write((byte) 1);
@@ -661,7 +682,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullPointer.class)
     static WordPointer GetDirectBufferAddress(JNIEnvironment env, JNIObjectHandle handle) {
         Target_java_nio_Buffer buf = Support.directBufferFromJNIHandle(handle);
-        return (buf == null) ? WordFactory.nullPointer() : WordFactory.pointer(buf.address);
+        return (buf == null) ? Word.nullPointer() : Word.pointer(buf.address);
     }
 
     /*
@@ -801,7 +822,7 @@ public final class JNIFunctions {
     static WordPointer GetPrimitiveArrayCritical(JNIEnvironment env, JNIObjectHandle harray, CCharPointer isCopy) {
         Object array = JNIObjectHandles.getObject(harray);
         if (array == null) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         PrimitiveArrayView ref = JNIThreadLocalPrimitiveArrayViews.createArrayView(array);
         if (isCopy.isNonNull()) {
@@ -948,11 +969,23 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullWord.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullPointer.class)
     static JNIFieldId FromReflectedField(JNIEnvironment env, JNIObjectHandle fieldHandle) {
-        JNIFieldId fieldId = WordFactory.zero();
+        JNIFieldId fieldId = Word.zero();
         Field obj = JNIObjectHandles.getObject(fieldHandle);
         if (obj != null) {
+            Class<?> clazz = obj.getDeclaringClass();
             boolean isStatic = Modifier.isStatic(obj.getModifiers());
-            fieldId = JNIReflectionDictionary.singleton().getDeclaredFieldID(obj.getDeclaringClass(), obj.getName(), isStatic);
+            DynamicHub hub = DynamicHub.fromClass(clazz);
+            ResolvedJavaField resolvedField = null;
+            boolean resolvedFieldCanUseInterpreterFallback = false;
+            if ((RuntimeClassLoading.isSupported() && hub.isRuntimeLoaded()) || RuntimeClassLoading.isJNIRegistrationFallbackSupported()) {
+                resolvedField = CremaSupport.singleton().toJVMCI(obj);
+                resolvedFieldCanUseInterpreterFallback = InterpreterSupport.singleton().canCreateJNIFieldId(resolvedField);
+            }
+            fieldId = JNIReflectionDictionary.getDeclaredFieldID(clazz, obj.getName(), isStatic, !resolvedFieldCanUseInterpreterFallback);
+            if (fieldId.isNull() && resolvedFieldCanUseInterpreterFallback) {
+                fieldId = InterpreterSupport.singleton().getOrCreateJNIFieldId(resolvedField);
+            }
+            assert fieldId.isNull() || Support.isJNIClassAccessible(hub) : clazz.getName();
         }
         return fieldId;
     }
@@ -962,16 +995,34 @@ public final class JNIFunctions {
      */
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullHandle.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullHandle.class)
-    static JNIObjectHandle ToReflectedField(JNIEnvironment env, JNIObjectHandle classHandle, JNIFieldId fieldId) {
+    static JNIObjectHandle ToReflectedField(JNIEnvironment env, JNIObjectHandle classHandle, JNIFieldId fieldId, boolean isStatic) {
         Field field = null;
         Class<?> clazz = JNIObjectHandles.getObject(classHandle);
         if (clazz != null) {
-            String name = JNIReflectionDictionary.singleton().getFieldNameByID(clazz, fieldId);
-            if (name != null) {
-                try {
-                    field = clazz.getDeclaredField(name);
-                } catch (NoSuchFieldException ignored) {
-                    // proceed and return null
+            if (InterpreterSupport.isEnabled() && InterpreterJNIFieldIds.isInterpreterFieldId(fieldId)) {
+                ResolvedJavaField resolvedField = InterpreterSupport.singleton().getJNIField(clazz, fieldId, isStatic);
+                if (resolvedField instanceof CremaResolvedJavaField cremaField) {
+                    DynamicHub hub = DynamicHub.fromClass(InterpreterSupport.singleton().toClass(cremaField.getDeclaringClass()));
+                    assert Support.isJNIClassAccessible(hub) : hub.getName();
+                    field = RuntimeReflectionMetadata.fromResolvedField(hub, cremaField);
+                } else if (resolvedField != null) {
+                    Class<?> declaringClass = InterpreterSupport.singleton().toClass(resolvedField.getDeclaringClass());
+                    assert Support.isJNIClassAccessible(DynamicHub.fromClass(declaringClass)) : declaringClass.getName();
+                    try {
+                        field = declaringClass.getDeclaredField(resolvedField.getName());
+                    } catch (NoSuchFieldException ignored) {
+                        // proceed and return null
+                    }
+                }
+            } else {
+                String name = JNIReflectionDictionary.getFieldNameByID(clazz, fieldId);
+                if (name != null) {
+                    assert DynamicHub.fromClass(clazz).isJNIAccessible() : clazz.getName();
+                    try {
+                        field = clazz.getDeclaredField(name);
+                    } catch (NoSuchFieldException ignored) {
+                        // proceed and return null
+                    }
                 }
             }
         }
@@ -984,12 +1035,24 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullWord.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullPointer.class)
     static JNIMethodId FromReflectedMethod(JNIEnvironment env, JNIObjectHandle methodHandle) {
-        JNIMethodId methodId = WordFactory.nullPointer();
+        JNIMethodId methodId = Word.nullPointer();
         Executable method = JNIObjectHandles.getObject(methodHandle);
         if (method != null) {
+            Class<?> clazz = method.getDeclaringClass();
             boolean isStatic = Modifier.isStatic(method.getModifiers());
             JNIAccessibleMethodDescriptor descriptor = JNIAccessibleMethodDescriptor.of(method);
-            methodId = JNIReflectionDictionary.singleton().getDeclaredMethodID(method.getDeclaringClass(), descriptor, isStatic);
+            DynamicHub hub = DynamicHub.fromClass(clazz);
+            ResolvedJavaMethod resolvedMethod = null;
+            boolean resolvedMethodCanUseInterpreterFallback = false;
+            if ((RuntimeClassLoading.isSupported() && hub.isRuntimeLoaded()) || RuntimeClassLoading.isJNIRegistrationFallbackSupported()) {
+                resolvedMethod = CremaSupport.singleton().toJVMCI(method);
+                resolvedMethodCanUseInterpreterFallback = InterpreterSupport.singleton().canCreateJNIMethodId(resolvedMethod);
+            }
+            methodId = JNIReflectionDictionary.getDeclaredMethodID(clazz, descriptor, isStatic);
+            if (methodId.isNull() && resolvedMethodCanUseInterpreterFallback) {
+                methodId = InterpreterSupport.singleton().getOrCreateJNIMethodId(resolvedMethod);
+            }
+            assert methodId.isNull() || Support.isJNIClassAccessible(hub) : clazz.getName();
         }
         return methodId;
     }
@@ -1000,19 +1063,29 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullHandle.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnNullPointer.class)
     static JNIObjectHandle ToReflectedMethod(JNIEnvironment env, JNIObjectHandle classHandle, JNIMethodId methodId, boolean isStatic) {
+        if (InterpreterSupport.isEnabled() && InterpreterJNIMethodIds.isInterpreterMethodId(methodId)) {
+            Executable result = InterpreterSupport.singleton().getJNIMethodExecutable(methodId);
+            if (result != null) {
+                Class<?> clazz = result.getDeclaringClass();
+                assert Support.isJNIClassAccessible(DynamicHub.fromClass(clazz)) : clazz.getName();
+            }
+            return JNIObjectHandles.createLocal(result);
+        }
+
         Executable result = null;
         JNIAccessibleMethod jniMethod = JNIReflectionDictionary.getMethodByID(methodId);
         JNIAccessibleMethodDescriptor descriptor = JNIReflectionDictionary.getMethodDescriptor(jniMethod);
         if (descriptor != null) {
             Class<?> clazz = jniMethod.getDeclaringClass().getClassObject();
+            assert DynamicHub.fromClass(clazz).isJNIAccessible() : clazz.getName();
             Class<?>[] parameter = MethodType.fromMethodDescriptorString(descriptor.getSignature(), JNIFunctions.class.getClassLoader()).parameterArray();
             try {
                 result = descriptor.isConstructor() ? clazz.getDeclaredConstructor(parameter) : clazz.getDeclaredMethod(descriptor.getName(), parameter);
             } catch (NoSuchMethodException e) {
                 /*
                  * The method might have been registered for JNI access but not for reflection. When
-                 * missing registration errors are not thrown, this results in a
-                 * NoSuchMethodException, which means we have to return null.
+                 * missing registration errors are not thrown, this results in a NoSuchMethodException,
+                 * which means we have to return null.
                  */
             }
         }
@@ -1117,13 +1190,10 @@ public final class JNIFunctions {
             throw new ClassFormatError();
         }
         String name = Utf8.utf8ToString(cname);
-        if (name != null) { // inverse to HotSpot fixClassname():
-            name = name.replace('/', '.');
-        }
         ClassLoader classLoader = JNIObjectHandles.getObject(loader);
         byte[] data = new byte[bufLen];
         CTypeConversion.asByteBuffer(buf, bufLen).get(data);
-        Class<?> clazz = PredefinedClassesSupport.loadClass(classLoader, name, data, 0, data.length, null);
+        Class<?> clazz = RuntimeClassLoading.defineClass(classLoader, name, data, 0, data.length, ClassDefinitionInfo.EMPTY);
         return JNIObjectHandles.createLocal(clazz);
     }
 
@@ -1333,7 +1403,10 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullWord.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static JNIObjectHandle GetObjectField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
-        return JNIObjectFieldAccess.singleton().getObjectField(obj, fieldId);
+        Object object = JNIObjectHandles.getObject(obj);
+        long offset = Support.getInstanceFieldOffset(fieldId);
+        Object result = U.getReference(object, offset);
+        return JNIObjectHandles.createLocal(result);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
@@ -1341,7 +1414,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static boolean GetBooleanField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getBoolean(o, offset);
     }
 
@@ -1350,7 +1423,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static byte GetByteField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getByte(o, offset);
     }
 
@@ -1359,7 +1432,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static short GetShortField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getShort(o, offset);
     }
 
@@ -1368,7 +1441,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static char GetCharField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getChar(o, offset);
     }
 
@@ -1377,7 +1450,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static int GetIntField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getInt(o, offset);
     }
 
@@ -1386,7 +1459,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static long GetLongField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getLong(o, offset);
     }
 
@@ -1395,7 +1468,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static float GetFloatField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getFloat(o, offset);
     }
 
@@ -1404,7 +1477,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static double GetDoubleField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         return U.getDouble(o, offset);
     }
 
@@ -1412,8 +1485,8 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnNullWord.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static JNIObjectHandle GetStaticObjectField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        Object result = U.getReference(StaticFieldsSupport.getStaticObjectFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        Object result = U.getReference(Support.getStaticFieldBase(fieldId, false), offset);
         return JNIObjectHandles.createLocal(result);
     }
 
@@ -1421,71 +1494,71 @@ public final class JNIFunctions {
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static boolean GetStaticBooleanField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getBoolean(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getBoolean(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static byte GetStaticByteField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getByte(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getByte(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static short GetStaticShortField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getShort(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getShort(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static char GetStaticCharField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getChar(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getChar(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static int GetStaticIntField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getInt(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getInt(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static long GetStaticLongField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getLong(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getLong(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static float GetStaticFloatField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getFloat(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getFloat(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static double GetStaticDoubleField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        return U.getDouble(StaticFieldsSupport.getStaticPrimitiveFields(), offset);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        return U.getDouble(Support.getStaticFieldBase(fieldId, true), offset);
     }
 
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerVoid.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetObjectField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, JNIObjectHandle value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putReference(o, offset, JNIObjectHandles.getObject(value));
     }
 
@@ -1494,7 +1567,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetBooleanField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, boolean value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putBoolean(o, offset, value);
     }
 
@@ -1503,7 +1576,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetByteField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, byte value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putByte(o, offset, value);
     }
 
@@ -1512,7 +1585,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetShortField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, short value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putShort(o, offset, value);
     }
 
@@ -1521,7 +1594,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetCharField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, char value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putChar(o, offset, value);
     }
 
@@ -1530,7 +1603,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetIntField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, int value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putInt(o, offset, value);
     }
 
@@ -1539,7 +1612,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetLongField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, long value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putLong(o, offset, value);
     }
 
@@ -1548,7 +1621,7 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetFloatField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, float value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putFloat(o, offset, value);
     }
 
@@ -1557,79 +1630,90 @@ public final class JNIFunctions {
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetDoubleField(JNIEnvironment env, JNIObjectHandle obj, JNIFieldId fieldId, double value) {
         Object o = JNIObjectHandles.getObject(obj);
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        long offset = Support.getInstanceFieldOffset(fieldId);
         U.putDouble(o, offset, value);
     }
 
     @CEntryPoint(exceptionHandler = JNIExceptionHandlerVoid.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticObjectField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, JNIObjectHandle value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putReference(StaticFieldsSupport.getStaticObjectFields(), offset, JNIObjectHandles.getObject(value));
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putReference(Support.getStaticFieldBase(fieldId, false), offset, JNIObjectHandles.getObject(value));
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticBooleanField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, boolean value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putBoolean(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putBoolean(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticByteField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, byte value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putByte(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putByte(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticShortField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, short value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putShort(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putShort(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticCharField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, char value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putChar(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putChar(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticIntField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, int value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putInt(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putInt(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticLongField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, long value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putLong(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putLong(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticFloatField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, float value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putFloat(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putFloat(Support.getStaticFieldBase(fieldId, true), offset, value);
     }
 
     @Uninterruptible(reason = "Must not throw any exceptions.")
     @CEntryPoint(exceptionHandler = FatalExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = JNIEnvEnterFatalOnFailurePrologue.class)
     static void SetStaticDoubleField(JNIEnvironment env, JNIObjectHandle clazz, JNIFieldId fieldId, double value) {
-        long offset = JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
-        U.putDouble(StaticFieldsSupport.getStaticPrimitiveFields(), offset, value);
+        long offset = Support.getStaticFieldOffset(fieldId);
+        U.putDouble(Support.getStaticFieldBase(fieldId, true), offset, value);
+    }
+
+    /*
+     * jlong GetStringUTFLengthAsLong(JNIEnv *env, jstring string);
+     */
+
+    @CEntryPoint(exceptionHandler = JNIExceptionHandlerReturnMinusOne.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
+    @CEntryPointOptions(prologue = JNIEnvEnterPrologue.class, prologueBailout = ReturnMinusOneLong.class)
+    static long GetStringUTFLengthAsLong(JNIEnvironment env, JNIObjectHandle hstr) {
+        String str = JNIObjectHandles.getObject(hstr);
+        return Utf8.utf8LengthAsLong(str);
     }
 
     // Checkstyle: resume
@@ -1639,14 +1723,14 @@ public final class JNIFunctions {
      * JNI functions.
      */
     public static class Support {
-        static class JNIEnvEnterPrologue implements CEntryPointOptions.Prologue {
+        public static class JNIEnvEnterPrologue implements CEntryPointOptions.Prologue {
             @Uninterruptible(reason = "prologue")
             public static int enter(JNIEnvironment env) {
                 return CEntryPointActions.enter((IsolateThread) env);
             }
         }
 
-        static class ReturnNullHandle implements CEntryPointOptions.PrologueBailout {
+        public static class ReturnNullHandle implements CEntryPointOptions.PrologueBailout {
             @Uninterruptible(reason = "prologue")
             public static JNIObjectHandle bailout(int prologueResult) {
                 return JNIObjectHandles.nullHandle();
@@ -1687,14 +1771,19 @@ public final class JNIFunctions {
             }
         }
 
-        static class JNIJavaVMEnterAttachThreadEnsureJavaThreadPrologue implements CEntryPointOptions.Prologue {
+        static class JNIDetachThreadOrDestroyVMPrologue implements CEntryPointOptions.Prologue {
             @Uninterruptible(reason = "prologue")
             static int enter(JNIJavaVM vm) {
                 /*
                  * DetachCurrentThread and DestroyJavaVM never return a more specific error than
                  * JNI_ERR on HotSpot. So, we need to do the same.
                  */
-                int code = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), false, true);
+                int code = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), true);
+                if (code == CEntryPointErrors.NO_ERROR && JavaFrameAnchors.getFrameAnchor().isNonNull()) {
+                    /* There are remaining Java frames on the stack. */
+                    CEntryPointActions.leave();
+                    return JNIErrors.JNI_ERR();
+                }
                 return convertCEntryPointErrorToJNIError(code, false);
             }
         }
@@ -1706,11 +1795,12 @@ public final class JNIFunctions {
                  * AttachCurrentThread and AttachCurrentThreadAsDaemon never return a more specific
                  * error than JNI_ERR on HotSpot. So, we need to do the same.
                  */
-                int code = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), false, false);
+                int code = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), false);
                 return convertCEntryPointErrorToJNIError(code, false);
             }
         }
 
+        /// Records an exception from a void JNI entry point as the pending JNI exception.
         public static class JNIExceptionHandlerVoid implements CEntryPoint.ExceptionHandler {
             @Uninterruptible(reason = "exception handler")
             static void handle(Throwable t) {
@@ -1718,7 +1808,8 @@ public final class JNIFunctions {
             }
         }
 
-        static class JNIExceptionHandlerReturnNullHandle implements CEntryPoint.ExceptionHandler {
+        /// Records an exception from an object-returning JNI entry point and returns a null handle.
+        public static class JNIExceptionHandlerReturnNullHandle implements CEntryPoint.ExceptionHandler {
             @Uninterruptible(reason = "exception handler")
             static JNIObjectHandle handle(Throwable t) {
                 Support.handleException(t);
@@ -1730,11 +1821,12 @@ public final class JNIFunctions {
             @Uninterruptible(reason = "exception handler")
             static WordBase handle(Throwable t) {
                 Support.handleException(t);
-                return WordFactory.nullPointer();
+                return Word.nullPointer();
             }
         }
 
-        static class JNIExceptionHandlerReturnFalse implements CEntryPoint.ExceptionHandler {
+        /// Records an exception from a boolean JNI entry point and returns `false`.
+        public static class JNIExceptionHandlerReturnFalse implements CEntryPoint.ExceptionHandler {
             @Uninterruptible(reason = "exception handler")
             static boolean handle(Throwable t) {
                 Support.handleException(t);
@@ -1750,7 +1842,8 @@ public final class JNIFunctions {
             }
         }
 
-        static class JNIExceptionHandlerReturnZero implements CEntryPoint.ExceptionHandler {
+        /// Records an exception from an integer JNI entry point and returns zero.
+        public static class JNIExceptionHandlerReturnZero implements CEntryPoint.ExceptionHandler {
             @Uninterruptible(reason = "exception handler")
             static int handle(Throwable t) {
                 Support.handleException(t);
@@ -1836,12 +1929,56 @@ public final class JNIFunctions {
             return getMethodID(clazz, name, signature, isStatic);
         }
 
-        private static JNIMethodId getMethodID(Class<?> clazz, CharSequence name, CharSequence signature, boolean isStatic) {
-            JNIMethodId methodID = JNIReflectionDictionary.singleton().getMethodID(clazz, name, signature, isStatic);
+        private static JNIMethodId getMethodID(Class<?> origClazz, CharSequence name, CharSequence signature, boolean isStatic) {
+            DynamicHub hub = DynamicHub.fromClass(origClazz);
+            JNIMethodId methodID = Word.nullPointer();
+            ResolvedJavaMethod resolvedJavaMethod = null;
+            boolean resolvedMethodCanUseInterpreterFallback = false;
+            boolean methodFoundWithOppositeStaticKind = false;
+            boolean runtimeLoaded = RuntimeClassLoading.isSupported() && hub.isRuntimeLoaded();
+            boolean registrationFallback = RuntimeClassLoading.isJNIRegistrationFallbackSupported();
+            boolean interpreterFallback = runtimeLoaded || registrationFallback;
+
+            if (interpreterFallback) {
+                resolvedJavaMethod = InterpreterSupport.singleton().lookupMethodForJNI(origClazz, name.toString(), signature.toString());
+                if (resolvedJavaMethod != null) {
+                    resolvedMethodCanUseInterpreterFallback = (resolvedJavaMethod instanceof CremaResolvedJavaMethod || registrationFallback) &&
+                                    InterpreterSupport.singleton().canCreateJNIMethodId(resolvedJavaMethod);
+                }
+            }
+
+            /*
+             * A method resolved in a runtime-loaded class can be inherited from an AOT class. An AOT
+             * method gets its jmethodID from the JNI dictionary if it was registered during the image
+             * build. If no method was found for a runtime-loaded class, a dictionary lookup cannot
+             * find it because the class was not known during the image build.
+             */
+            boolean lookupInDictionary = !runtimeLoaded || (resolvedJavaMethod != null && !(resolvedJavaMethod instanceof CremaResolvedJavaMethod));
+            if (lookupInDictionary) {
+                boolean reportMissingRegistrationErrors = !interpreterFallback || (resolvedJavaMethod != null && !resolvedMethodCanUseInterpreterFallback);
+                methodID = JNIReflectionDictionary.getMethodID(origClazz, name, signature, isStatic, reportMissingRegistrationErrors,
+                                !resolvedMethodCanUseInterpreterFallback || resolvedJavaMethod.isStatic() != isStatic);
+            }
+
+            if (InterpreterSupport.isEnabled() && methodID.isNull() && resolvedMethodCanUseInterpreterFallback) {
+                if (resolvedJavaMethod.isStatic() == isStatic) {
+                    methodID = InterpreterSupport.singleton().getOrCreateJNIMethodId(resolvedJavaMethod);
+                    if (MetadataTracer.enabled()) {
+                        Class<?> declaringClass = InterpreterSupport.singleton().toClass(resolvedJavaMethod.getDeclaringClass());
+                        MetadataTracer.singleton().traceJNIMethodAccess(declaringClass, name.toString(), signature.toString());
+                    }
+                } else {
+                    methodFoundWithOppositeStaticKind = true;
+                }
+            }
+
+            if (methodID.isNull() && !interpreterFallback) {
+                methodFoundWithOppositeStaticKind = JNIReflectionDictionary.getMethodID(origClazz, name, signature, !isStatic, false, true).isNonNull();
+            }
+
             if (methodID.isNull()) {
-                String message = clazz.getName() + "." + name + signature;
-                JNIMethodId candidate = JNIReflectionDictionary.singleton().getMethodID(clazz, name, signature, !isStatic);
-                if (candidate.isNonNull()) {
+                String message = origClazz.getName() + "." + name + signature;
+                if (methodFoundWithOppositeStaticKind) {
                     if (isStatic) {
                         message += " (found matching non-static method that would be returned by GetMethodID)";
                     } else {
@@ -1855,25 +1992,166 @@ public final class JNIFunctions {
 
         static JNIFieldId getFieldID(JNIObjectHandle hclazz, CCharPointer cname, CCharPointer csig, boolean isStatic) {
             Class<?> clazz = JNIObjectHandles.getObject(hclazz);
-            DynamicHub.fromClass(clazz).ensureInitialized();
+            DynamicHub hub = DynamicHub.fromClass(clazz);
+            hub.ensureInitialized();
 
             CharSequence name = Utf8.wrapUtf8CString(cname);
             if (name == null) {
                 throw new NoSuchFieldError("Field name is either null or invalid UTF-8 string");
             }
 
-            JNIFieldId fieldID = JNIReflectionDictionary.singleton().getFieldID(clazz, name, isStatic);
+            CharSequence signature = Utf8.wrapUtf8CString(csig);
+            if (signature == null) {
+                throw new NoSuchFieldError("Field signature is either null or invalid UTF-8 string");
+            }
+
+            boolean runtimeLoaded = RuntimeClassLoading.isSupported() && hub.isRuntimeLoaded();
+            boolean registrationFallback = RuntimeClassLoading.isJNIRegistrationFallbackSupported();
+            boolean interpreterFallback = runtimeLoaded || registrationFallback;
+            ResolvedJavaField resolvedField = null;
+            boolean resolvedFieldCanUseInterpreterFallback = false;
+            JNIFieldId fieldID = Word.nullPointer();
+            if (interpreterFallback) {
+                resolvedField = InterpreterSupport.singleton().lookupFieldForJNI(clazz, name.toString(), signature.toString(), isStatic);
+                if (resolvedField != null) {
+                    resolvedFieldCanUseInterpreterFallback = (resolvedField instanceof CremaResolvedJavaField || registrationFallback) &&
+                                    InterpreterSupport.singleton().canCreateJNIFieldId(resolvedField);
+                }
+            }
+
+            boolean lookupInDictionary = !runtimeLoaded || (resolvedField != null && !(resolvedField instanceof CremaResolvedJavaField));
+            if (lookupInDictionary) {
+                boolean reportMissingRegistrationErrors = !interpreterFallback || (resolvedField != null && !resolvedFieldCanUseInterpreterFallback);
+                fieldID = JNIReflectionDictionary.getFieldID(clazz, name, isStatic, reportMissingRegistrationErrors, !resolvedFieldCanUseInterpreterFallback);
+            }
+
+            if (InterpreterSupport.isEnabled() && fieldID.isNull() && resolvedFieldCanUseInterpreterFallback) {
+                fieldID = InterpreterSupport.singleton().getOrCreateJNIFieldId(resolvedField);
+                if (MetadataTracer.enabled()) {
+                    Class<?> declaringClass = InterpreterSupport.singleton().toClass(resolvedField.getDeclaringClass());
+                    MetadataTracer.singleton().traceJNIFieldAccess(declaringClass, name.toString());
+                }
+            }
             if (fieldID.isNull()) {
                 throw new NoSuchFieldError(clazz.getName() + '.' + name);
             }
-            // TODO: check field signature
+            assert !InterpreterJNIFieldIds.isInterpreterFieldId(fieldID) || isJNIClassAccessible(hub);
+
+            // TODO: check the field signature in reflection dictionary lookup
             return fieldID;
+        }
+
+        private static Class<?> findClassInClassRegistries(CCharPointer cname, Class<?> callerClass) {
+            String name = Utf8.utf8ToString(cname);
+            if (name == null) {
+                throw new NoClassDefFoundError("Class name is either null or invalid UTF-8 string");
+            }
+            if (!ClassNameSupport.isValidJNIName(name)) {
+                throw new NoClassDefFoundError(name);
+            }
+
+            if (MetadataTracer.enabled()) {
+                MetadataTracer.singleton().traceJNIType(ClassNameSupport.jniNameToTypeName(name));
+            }
+
+            Class<?> clazz;
+            try {
+                /*
+                 * Loader-aware lookup must not be governed by reflection metadata. JNI accessibility is
+                 * enforced explicitly after the registry lookup.
+                 */
+                var support = ClassLoadingSupport.singleton();
+                support.startIgnoreReflectionConfigurationScope();
+                try {
+                    clazz = ClassRegistries.forName(ClassNameSupport.jniNameToReflectionName(name), getClassLoader(callerClass));
+                } finally {
+                    support.endIgnoreReflectionConfigurationScope();
+                }
+            } catch (ClassNotFoundException e) {
+                clazz = null;
+            }
+
+            /*
+             * Expected negative queries suppress missing-registration reporting only. Missing classes
+             * and resolved classes without JNI accessibility must still behave as not found.
+             */
+            boolean hubInaccessible = clazz != null && !isJNIClassAccessible(DynamicHub.fromClass(clazz));
+
+            if (MissingRegistrationUtils.throwMissingRegistrationErrors() &&
+                            (hubInaccessible || (clazz == null && !JNIReflectionDictionary.isNegativeClassLookup(name)))) {
+                MissingJNIRegistrationUtils.reportClassAccess(name);
+            }
+
+            // In case the hub is not accessible we also throw an error.
+            if (clazz == null || hubInaccessible) {
+                throw new NoClassDefFoundError(name);
+            }
+
+            return clazz;
+        }
+
+        private static Class<?> findClassInReflectionDictionary(CCharPointer cname) {
+            CharSequence name = Utf8.wrapUtf8CString(cname);
+            if (name == null) {
+                throw new NoClassDefFoundError("Class name is either null or invalid UTF-8 string");
+            }
+            Class<?> clazz = JNIReflectionDictionary.getClassObjectByName(name);
+            if (clazz == null) {
+                throw new NoClassDefFoundError(name.toString());
+            }
+            assert DynamicHub.fromClass(clazz).isJNIAccessible() : clazz.getName();
+            return clazz;
+        }
+
+        private static ClassLoader getClassLoader(Class<?> callerClass) {
+            if (callerClass == null) {
+                return ClassLoader.getSystemClassLoader();
+            }
+            if (ClassRegistries.respectClassLoader() && "jdk.internal.loader.NativeLibraries".equals(callerClass.getName())) {
+                Class<?> fromClass = Target_jdk_internal_loader_NativeLibraries_RespectsClassLoader.getFromClass();
+                if (fromClass != null) {
+                    return fromClass.getClassLoader();
+                }
+            }
+            return callerClass.getClassLoader();
+        }
+
+        public static boolean useClassRegistriesInFindClass() {
+            return ClassRegistries.respectClassLoader();
+        }
+
+        static boolean isJNIClassAccessible(DynamicHub hub) {
+            return hub.isJNIAccessible() || RuntimeClassLoading.isJNIRegistrationFallbackSupported();
+        }
+
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public static long getInstanceFieldOffset(JNIFieldId fieldId) {
+            if (RuntimeClassLoading.isSupported() && InterpreterJNIFieldIds.isInterpreterFieldId(fieldId)) {
+                return InterpreterJNIFieldIds.getInstanceFieldOffset(fieldId);
+            }
+            return JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        }
+
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        static long getStaticFieldOffset(JNIFieldId fieldId) {
+            if (RuntimeClassLoading.isSupported() && InterpreterJNIFieldIds.isInterpreterFieldId(fieldId)) {
+                return InterpreterJNIFieldIds.getStaticFieldOffset(fieldId);
+            }
+            return JNIAccessibleField.getOffsetFromId(fieldId).rawValue();
+        }
+
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        static Object getStaticFieldBase(JNIFieldId fieldId, boolean primitive) {
+            if (InterpreterSupport.isEnabled() && InterpreterJNIFieldIds.isInterpreterFieldId(fieldId)) {
+                return InterpreterSupport.singleton().getJNIStaticFieldBase(fieldId, primitive);
+            }
+            return primitive ? JNIAccessibleField.getStaticPrimitiveFieldsAtRuntime(fieldId) : JNIAccessibleField.getStaticObjectFieldsAtRuntime(fieldId);
         }
 
         static CShortPointer getNulTerminatedStringCharsAndPin(JNIObjectHandle hstr, CCharPointer isCopy) {
             String str = JNIObjectHandles.getObject(hstr);
             if (str == null) {
-                return WordFactory.nullPointer();
+                return Word.nullPointer();
             }
             if (isCopy.isNonNull()) {
                 isCopy.write((byte) 1);
@@ -1911,7 +2189,7 @@ public final class JNIFunctions {
             StackOverflowCheck.singleton().disableStackOverflowChecksForFatalError();
 
             LogHandler logHandler = ImageSingletons.lookup(LogHandler.class);
-            Log log = Log.enterFatalContext(logHandler, callerIP, message, null);
+            Log log = CoreLogSupport.enterFatalContext(logHandler, callerIP, message, null);
             if (log != null) {
                 try {
                     log.string("Fatal error reported via JNI: ").string(message).newline();
@@ -1967,10 +2245,10 @@ public final class JNIFunctions {
                 throw new ArrayIndexOutOfBoundsException();
             }
             if (count > 0) {
-                long offset = ConfigurationValues.getObjectLayout().getArrayElementOffset(elementKind, start);
-                int elementSize = ConfigurationValues.getObjectLayout().sizeInBytes(elementKind);
-                UnsignedWord bytes = WordFactory.unsigned(count).multiply(elementSize);
-                JavaMemoryUtil.copyOnHeap(obj, WordFactory.unsigned(offset), null, WordFactory.unsigned(buffer.rawValue()), bytes);
+                long offset = ObjectLayoutCompilerSupport.getArrayElementOffset(ObjectLayout.singleton(), elementKind, start);
+                int elementSize = ObjectLayoutCompilerSupport.sizeInBytes(ObjectLayout.singleton(), elementKind);
+                UnsignedWord bytes = Word.unsigned(count).multiply(elementSize);
+                JavaMemoryUtil.copyOnHeap(obj, Word.unsigned(offset), null, Word.unsigned(buffer.rawValue()), bytes);
             }
         }
 
@@ -1980,12 +2258,63 @@ public final class JNIFunctions {
                 throw new ArrayIndexOutOfBoundsException();
             }
             if (count > 0) {
-                long offset = ConfigurationValues.getObjectLayout().getArrayElementOffset(elementKind, start);
-                int elementSize = ConfigurationValues.getObjectLayout().sizeInBytes(elementKind);
-                UnsignedWord bytes = WordFactory.unsigned(count).multiply(elementSize);
-                JavaMemoryUtil.copyOnHeap(null, WordFactory.unsigned(buffer.rawValue()), obj, WordFactory.unsigned(offset), bytes);
+                long offset = ObjectLayoutCompilerSupport.getArrayElementOffset(ObjectLayout.singleton(), elementKind, start);
+                int elementSize = ObjectLayoutCompilerSupport.sizeInBytes(ObjectLayout.singleton(), elementKind);
+                UnsignedWord bytes = Word.unsigned(count).multiply(elementSize);
+                JavaMemoryUtil.copyOnHeap(null, Word.unsigned(buffer.rawValue()), obj, Word.unsigned(offset), bytes);
             }
         }
+
+        /// Registers `fnPtr` as the native implementation of the method identified by `clazz`,
+        /// `name`, and `signature`.
+        ///
+        /// Updates runtime-loaded Crema classes through their interpreter-side JNI linkage and
+        /// image classes through the JNI reflection dictionary.
+        ///
+        /// @throws NoSuchMethodError when a runtime-loaded class does not declare the requested
+        /// native method, or when an AOT class does not declare it and `methodMustExist` is true.
+        public static void registerNative(DynamicHub clazz, CharSequence name, CharSequence signature, int i, CFunctionPointer fnPtr, boolean methodMustExist) {
+            /*
+             * Runtime-loaded Crema classes are not represented in the JNI reflection dictionary, so
+             * RegisterNatives must also update their interpreter-side JNI linkages directly.
+             */
+            if (RuntimeClassLoading.isSupported()) {
+                if (clazz.isRuntimeLoaded()) {
+                    assert JNIReflectionDictionary.getLinkage(clazz, name, signature) == null : "Runtime loaded classes should have no global linkage";
+                    ResolvedJavaType interpreterType = DynamicHubUtils.getInterpreterType(clazz);
+                    assert interpreterType instanceof CremaResolvedJavaType : "expected Crema type";
+                    CremaResolvedJavaType type = (CremaResolvedJavaType) interpreterType;
+                    CremaResolvedJavaMethod cremaMethod = type.lookupDeclaredMethod(name.toString(), signature.toString());
+                    if (cremaMethod == null || !cremaMethod.isNative()) {
+                        throw nativeMethodNotFound(clazz, name, signature, i);
+                    }
+                    JNINativeLinkage linkage = cremaMethod.getJNINativeLinkage();
+                    linkage.setEntryPoint(fnPtr);
+                    return;
+                }
+            }
+
+            JNINativeLinkage linkage = JNIReflectionDictionary.getLinkage(clazz, name, signature);
+            if (linkage != null) {
+                linkage.setEntryPoint(fnPtr);
+            } else if (methodMustExist) {
+                throw nativeMethodNotFound(clazz, name, signature, i);
+            } else {
+                /*
+                 * It happens that libraries register arbitrary Java native methods from their
+                 * native code. If during analysis, we didn't reach some of those JNI methods (see
+                 * com.oracle.svm.jni.hosted.JNINativeCallWrapperSubstitutionProcessor.lookup and
+                 * com.oracle.svm.jni.access.JNIAccessFeature.duringAnalysis) we shouldn't fail:
+                 * those native methods can never be invoked.
+                 */
+            }
+        }
+
+        private static NoSuchMethodError nativeMethodNotFound(DynamicHub clazz, CharSequence name, CharSequence signature, int i) {
+            String m = clazz.getName() + '.' + name + signature;
+            return new NoSuchMethodError("Native method " + m + " at index " + i + " not found");
+        }
+
     }
 
     static final CGlobalData<CCharPointer> UNIMPLEMENTED_UNATTACHED_ERROR_MESSAGE = CGlobalDataFactory.createCString(
@@ -2022,7 +2351,7 @@ public final class JNIFunctions {
     static class JNIJavaVMUnimplementedPrologue implements CEntryPointOptions.Prologue {
         @Uninterruptible(reason = "prologue")
         static void enter(JNIJavaVM vm) {
-            int error = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), false, true);
+            int error = CEntryPointActions.enterAttachThread(vm.getFunctions().getIsolate(), true);
             if (error != CEntryPointErrors.NO_ERROR) {
                 CEntryPointActions.failFatally(error, UNIMPLEMENTED_UNATTACHED_ERROR_MESSAGE.get());
             }

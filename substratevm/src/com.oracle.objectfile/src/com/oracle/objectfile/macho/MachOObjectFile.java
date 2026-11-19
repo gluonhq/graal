@@ -31,7 +31,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
@@ -42,6 +41,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 
@@ -165,7 +165,7 @@ public final class MachOObjectFile extends ObjectFile {
 
     @Override
     public int getWordSizeInBytes() {
-        return 8; // FIXME: add 32-bit support
+        return 8;
     }
 
     @Override
@@ -174,13 +174,13 @@ public final class MachOObjectFile extends ObjectFile {
     }
 
     @Override
-    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal) {
+    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal, boolean isExported) {
         MachOSymtab symtab = (MachOSymtab) getOrCreateSymbolTable();
-        return symtab.newDefinedEntry(name, (MachOSection) baseSection, position, size, isGlobal, isCode);
+        return symtab.newDefinedEntry(name, (MachOSection) baseSection, position, size, isGlobal, isCode, isExported);
     }
 
     @Override
-    public Symbol createUndefinedSymbol(String name, int size, boolean isCode) {
+    public Symbol createUndefinedSymbol(String name, boolean isCode) {
         MachOSymtab symtab = (MachOSymtab) getOrCreateSymbolTable();
         return symtab.newUndefinedEntry(name, isCode);
     }
@@ -381,7 +381,7 @@ public final class MachOObjectFile extends ObjectFile {
 
     private LoadCommandList loadCommands = new LoadCommandList();
 
-    private class LoadCommandList implements Iterable<LoadCommand> {
+    private final class LoadCommandList implements Iterable<LoadCommand> {
 
         LinkEditSegment64Command linkEditCommand; // or null; if present, always comes last!
         List<LoadCommand> otherCommands = new ArrayList<>();
@@ -493,7 +493,7 @@ public final class MachOObjectFile extends ObjectFile {
              * together. This is because, unlike ELF, a single logical segment *must* be mapped in a
              * single mmapping.
              */
-            HashSet<BuildDependency> deps = new HashSet<>();
+            EconomicSet<BuildDependency> deps = EconomicSet.create();
             Segment prevNonEmptySegment = null;
             for (Segment s : getSegments()) {
                 Element prev = null;
@@ -1001,9 +1001,6 @@ public final class MachOObjectFile extends ObjectFile {
 
         public UUIDCommand(String name) {
             super(name, LoadCommandKind.UUID);
-            /*
-             * FIXME: this is a sketchy interpretation of the UUID v4 RFC.
-             */
             UUID randomUUID = UUID.randomUUID();
             // we write the whole thing big-endianly
             OutputAssembler oa = AssemblyBuffer.createOutputAssembler(ByteOrder.BIG_ENDIAN);
@@ -1011,7 +1008,6 @@ public final class MachOObjectFile extends ObjectFile {
             oa.write8Byte(randomUUID.getLeastSignificantBits());
             assert oa.pos() == 16; // UUIDs are 16 bytes long
             uuidbytes = oa.getBlob();
-            // FIXME: use nameUUIDFromBytes() instead, i.e. v3/v5 not v4
 
             assert uuidbytes.length == 16;
         }
@@ -1064,9 +1060,7 @@ public final class MachOObjectFile extends ObjectFile {
      */
     public abstract class AbstractDylibCommand extends LoadCommand {
 
-        String libName = "blah.dylib"; // FIXME
-
-        // FIXME: other fields
+        String libName = "blah.dylib";
 
         public AbstractDylibCommand(String name, LoadCommandKind k, String libName) {
             super(name, k);
@@ -1082,10 +1076,12 @@ public final class MachOObjectFile extends ObjectFile {
             /*
              * Our payload is just our dylib struct followed by the string denoting our name. The
              * first field of our dylib struct is the offset of the string into the load command,
-             * which is just the load command header length plus the size of the dylib struct.
+             * which is just the load command header length plus the size of the dylib struct. The
+             * remaining dylib metadata fields are placeholders and need real values if these load
+             * commands become relevant to generated Mach-O files.
              */
             int loadCommandHeaderLength = getWrittenSize(0);
-            DylibStruct s = new DylibStruct(0, 0, 0, 0); // FIXME: real values please!
+            DylibStruct s = new DylibStruct(0, 0, 0, 0);
             s.stroff = loadCommandHeaderLength + s.getWrittenSize();
             s.write(out);
             out.writeString(libName);
@@ -1129,7 +1125,6 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         protected void writePayload(OutputAssembler out, Map<Element, LayoutDecisionMap> alreadyDecided) {
-            // FIXME: be smarter than just writing "10.07"
             out.writeByte((byte) 0);
             out.writeByte((byte) 7);
             out.writeByte((byte) 10);
@@ -1195,7 +1190,7 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             deps.add(BuildDependency.createOrGet(ourContent, decisions.get(el).getDecision(LayoutDecision.Kind.OFFSET)));
             deps.add(BuildDependency.createOrGet(ourContent, decisions.get(el).getDecision(LayoutDecision.Kind.SIZE)));
@@ -1264,8 +1259,6 @@ public final class MachOObjectFile extends ObjectFile {
                 }
             }
             out.writeLEB128(0);
-            // zero-pad to overapproximated size
-            // FIXME: this creates quite a bit of unnecessary padding
             int overapproximation = overapproximateSize();
             assert out.pos() <= overapproximation;
             out.skip(overapproximation - out.pos());
@@ -1295,7 +1288,7 @@ public final class MachOObjectFile extends ObjectFile {
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
             // our content depends on the offset of every section we're going to reference
-            HashSet<BuildDependency> deps = ObjectFile.defaultDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.defaultDependencies(decisions, this);
             ArrayList<Section> requiredOffsets = new ArrayList<>();
             for (LoadCommand c : loadCommands) {
                 if (c instanceof SymtabCommand) {
@@ -1358,7 +1351,7 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             // our content (but not our size) depends on the offsets and sizes of every text section
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             for (Section s : getSections()) {
@@ -1407,7 +1400,7 @@ public final class MachOObjectFile extends ObjectFile {
                 Integer nextOffset = (i + 1 < decisionsOfInterest.size()) ? (int) decisionsOfInterest.get(i + 1).getValue() : null;
                 int nextPageBoundary = (sectionEndInFile % getPageSize()) == 0 ? sectionEndInFile : (((sectionEndInFile >> getPageSizeShift()) + 1) << getPageSizeShift());
                 ent.length = (short) (nextOffset == null ? nextPageBoundary : Math.min(nextPageBoundary, nextOffset));
-                ent.entryKind = (short) 0; // FIXME
+                ent.entryKind = (short) 0;
                 ent.write(out);
             }
             return out.getBlob();
@@ -1434,7 +1427,7 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             // our content (but not our size) depends on the offset and size
             // of the corresponding element
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
@@ -1573,20 +1566,14 @@ public final class MachOObjectFile extends ObjectFile {
             segment.add(firstNonSectionPosition, this);
             this.segment = segment;
 
-            /*
-             * Guess a destination segment name, if we're relocatable. This is a bit of a HACK right
-             * now. It also duplicates SectionName knowledge. FIXME: why not just ask SectionName?
-             */
+            /* Guess a destination segment name, if we're relocatable. */
             if (name.contains("debug")) {
                 destinationSegmentName = "__DWARF";
                 /*
-                 * FIXME: set the DEBUG flag on this section. Unfortunately, this currently breaks
-                 * debugging: on OS X, the linker intentionally strips debug sections because
-                 * debuggers are expected to retrieve them from the original object files or from a
-                 * debug info archive. We should conform to this by creating a debug info archive
-                 * using dsymutil(1), which would also reduce the size of the linked binary.
-                 * However, attempts to implement this as in an extra step after linking has failed,
-                 * which likely means that more other stuff needs to be fixed beforehand.
+                 * Do not set SectionFlag.DEBUG here. On OS X, the linker strips debug sections with
+                 * that flag because debuggers are expected to retrieve them from the original object
+                 * files or from a debug info archive. This should be revisited only together with
+                 * reliable dsymutil(1) debug info archive generation.
                  */
                 // flags.add(SectionFlag.DEBUG);
             } else if (flags.contains(
@@ -1669,7 +1656,7 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             // our content depends on the offset and size of strtab, and offset of symtab
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             LayoutDecision strtabSize = decisions.get(symtab.strtab).getDecision(LayoutDecision.Kind.SIZE);
@@ -1723,7 +1710,7 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             return deps;
         }
 
@@ -1836,6 +1823,8 @@ public final class MachOObjectFile extends ObjectFile {
 
     public class Segment64Command extends LoadCommand implements Segment {
 
+        private static final int PAYLOAD_HEADER_SIZE = 16 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4;
+
         String segname;  // 16 characters
         // long vmaddr; // starting virtual memory address
         // long vmsize; // number of bytes of virtual memory occupied by this segment
@@ -1868,6 +1857,10 @@ public final class MachOObjectFile extends ObjectFile {
         @Override
         public boolean isWritable() {
             return initprot.contains(VMProt.WRITE);
+        }
+
+        boolean isLinkEditSegment() {
+            return false;
         }
 
         List<SectionInfoStruct> readStructs = new ArrayList<>();
@@ -1921,11 +1914,6 @@ public final class MachOObjectFile extends ObjectFile {
             Element firstElementByOffset = (minOffsetDecisions == null) ? null : minOffsetDecisions.get(0).getElement();
             @SuppressWarnings("unused")
             Element lastElementByOffset = (maxOffsetDecision == null) ? null : maxOffsetDecision.getElement();
-
-            // these are *not* true because some elements need not have vaddr
-            // assert firstElementByOffset == firstSectionByVaddr;
-            // assert lastElementByOffset == lastSectionByVaddr;
-            // -- FIXME: find out a sensible assertion that should be true along these lines
 
             int fileOffset = (firstElementByOffset == null) ? 0 : (int) alreadyDecided.get(firstElementByOffset).getDecidedValue(LayoutDecision.Kind.OFFSET);
 
@@ -2041,14 +2029,13 @@ public final class MachOObjectFile extends ObjectFile {
 
         @Override
         public int getOrDecideSize(Map<Element, LayoutDecisionMap> alreadyDecided, int sizeHint) {
-            // FIXME: please....
-            return 4 + 4 + 16 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + (sectionsInSegment() * SectionInfoStruct.DEFAULT_SIZE);
+            return getWrittenSize(PAYLOAD_HEADER_SIZE + sectionsInSegment() * SectionInfoStruct.DEFAULT_SIZE);
         }
 
         @Override
         public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
             // 'minimal' means that our size does not depend on our bytewise-encoded content
-            HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
             // our content depends on the offset and size of every section we contain
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             for (Element s : elementsInSegment) {
@@ -2236,6 +2223,11 @@ public final class MachOObjectFile extends ObjectFile {
 
         public MachORelocationElement getRelocations() {
             return relocs;
+        }
+
+        @Override
+        boolean isLinkEditSegment() {
+            return true;
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,11 +47,8 @@ import com.oracle.truffle.regex.tregex.parser.ast.CharacterClass;
 import com.oracle.truffle.regex.tregex.parser.ast.Group;
 import com.oracle.truffle.regex.tregex.parser.ast.LookAheadAssertion;
 import com.oracle.truffle.regex.tregex.parser.ast.LookBehindAssertion;
-import com.oracle.truffle.regex.tregex.parser.ast.PositionAssertion;
 import com.oracle.truffle.regex.tregex.parser.ast.RegexAST;
-import com.oracle.truffle.regex.tregex.parser.ast.Sequence;
 import com.oracle.truffle.regex.tregex.parser.ast.SubexpressionCall;
-import com.oracle.truffle.regex.tregex.string.AbstractString;
 import com.oracle.truffle.regex.tregex.string.AbstractStringBuffer;
 
 public final class PreCalcResultVisitor extends DepthFirstTraversalRegexASTVisitor {
@@ -111,12 +108,12 @@ public final class PreCalcResultVisitor extends DepthFirstTraversalRegexASTVisit
         return visitor.result;
     }
 
-    public AbstractString getLiteral() {
-        return literal.materialize();
+    public AbstractStringBuffer getLiteral() {
+        return literal;
     }
 
-    public AbstractString getMask() {
-        return mask == null ? null : mask.materialize();
+    public AbstractStringBuffer getMask() {
+        return mask;
     }
 
     public PreCalculatedResultFactory getResultFactory() {
@@ -134,6 +131,7 @@ public final class PreCalcResultVisitor extends DepthFirstTraversalRegexASTVisit
 
     @Override
     protected void visit(Group group) {
+        assert group.size() == 1;
         if (group.isCapturing()) {
             result.setStart(group.getGroupNumber(), index);
         }
@@ -161,14 +159,6 @@ public final class PreCalcResultVisitor extends DepthFirstTraversalRegexASTVisit
                 lastGroup = groupUnroller.lastGroup;
             }
         }
-    }
-
-    @Override
-    protected void visit(Sequence sequence) {
-    }
-
-    @Override
-    protected void visit(PositionAssertion assertion) {
     }
 
     @Override

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,7 +27,6 @@ package com.oracle.graal.pointsto.meta;
 import static jdk.vm.ci.common.JVMCIError.shouldNotReachHere;
 import static jdk.vm.ci.common.JVMCIError.unimplemented;
 
-import java.lang.annotation.Annotation;
 import java.lang.reflect.Executable;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
@@ -39,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.ReentrantLock;
@@ -46,21 +46,31 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import com.oracle.svm.shared.meta.GuaranteeFolded;
 import org.graalvm.nativeimage.hosted.Feature.DuringAnalysisAccess;
 
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.api.PointstoOptions;
+import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.api.HostVM;
+import com.oracle.graal.pointsto.api.ImageLayerLoader;
+import com.oracle.graal.pointsto.api.ImageLayerWriter;
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
 import com.oracle.graal.pointsto.flow.AnalysisParsedGraph;
+import com.oracle.graal.pointsto.flow.AnalysisParsedGraph.Stage;
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
-import com.oracle.graal.pointsto.infrastructure.OriginalMethodProvider;
 import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaMethod;
 import com.oracle.graal.pointsto.reports.ReportUtils;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.AtomicUtils;
 import com.oracle.graal.pointsto.util.ConcurrentLightHashSet;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.svm.sdk.staging.hosted.layeredimage.LayeredCompilationSupport;
+import com.oracle.svm.sdk.staging.layeredimage.LayeredCompilationBehavior;
+import com.oracle.svm.sdk.staging.layeredimage.LayeredCompilationBehavior.Behavior;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.graph.NodeSourcePosition;
@@ -86,7 +96,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.SpeculationLog;
 
-public abstract class AnalysisMethod extends AnalysisElement implements WrappedJavaMethod, GraphProvider, OriginalMethodProvider, MultiMethod {
+public abstract class AnalysisMethod extends AnalysisElement implements WrappedJavaMethod, GraphProvider, OriginalMethodProvider, MethodVariant {
     private static final AtomicReferenceFieldUpdater<AnalysisMethod, Object> isVirtualRootMethodUpdater = AtomicReferenceFieldUpdater
                     .newUpdater(AnalysisMethod.class, Object.class, "isVirtualRootMethod");
 
@@ -111,15 +121,30 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     static final AtomicReferenceFieldUpdater<AnalysisMethod, Object> allImplementationsUpdater = AtomicReferenceFieldUpdater
                     .newUpdater(AnalysisMethod.class, Object.class, "allImplementations");
 
+    private static final AtomicReferenceFieldUpdater<AnalysisMethod, Boolean> reachableInCurrentLayerUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisMethod.class, Boolean.class, "reachableInCurrentLayer");
+
+    public static final AnalysisMethod[] EMPTY_ARRAY = new AnalysisMethod[0];
+    private static final ExceptionHandler[] EMPTY_EXCEPTION_HANDLERS = new ExceptionHandler[0];
+
     public record Signature(String name, AnalysisType[] parameterTypes) {
     }
 
     public final ResolvedJavaMethod wrapped;
 
+    /**
+     * Unique id assigned to each {@link AnalysisMethod}. This id is consistent across layers and
+     * can be used to load or match a method in an extension layer.
+     */
     private final int id;
-    /** Marks a method loaded from a base layer. */
-    private final boolean isInBaseLayer;
+    /** True when the current layer built is a shared layer. */
+    private final boolean buildingSharedLayer;
+    /** Marks a method loaded from a shared layer. */
+    private final boolean isInSharedLayer;
+    /** Marks a method analyzed in a prior layer. */
+    private final boolean analyzedInPriorLayer;
     private final boolean hasNeverInlineDirective;
+    private final boolean hasNeverStrengthenGraphWithConstantsDirective;
     private final ExceptionHandler[] exceptionHandlers;
     private final LocalVariableTable localVariableTable;
     private final String name;
@@ -130,27 +155,26 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     protected final ResolvedSignature<AnalysisType> signature;
     private final int parsingContextMaxDepth;
 
-    private final MultiMethodKey multiMethodKey;
+    private final MethodVariantKey methodVariantKey;
 
     /**
-     * Map from a key to the corresponding implementation. All multi-method implementations for a
-     * given Java method share the same map. This allows one to easily switch between different
-     * implementations when needed. When {@code multiMethodMap} is null, then
-     * {@link #multiMethodKey} points to {@link #ORIGINAL_METHOD} and no other implementations exist
-     * for the method. This is done to reduce the memory overhead in the common case when only this
-     * one implementation is present.
+     * Map from a method variant key to the corresponding method variant implementation. All method
+     * variants for a given Java method share the same map. This allows one to easily switch between
+     * different implementations when needed. When {@code methodVariantsMap} is {@code null}, then
+     * {@link #methodVariantKey} points to {@link #ORIGINAL_METHOD} and no other implementations
+     * exist for the method. This is done to reduce the memory overhead in the common case when only
+     * this one implementation is present.
      */
-    private volatile Map<MultiMethodKey, MultiMethod> multiMethodMap;
+    private volatile Map<MethodVariantKey, MethodVariant> methodVariantsMap;
 
     @SuppressWarnings("rawtypes") //
-    private static final AtomicReferenceFieldUpdater<AnalysisMethod, Map> MULTIMETHOD_MAP_UPDATER = AtomicReferenceFieldUpdater.newUpdater(AnalysisMethod.class, Map.class,
-                    "multiMethodMap");
+    private static final AtomicReferenceFieldUpdater<AnalysisMethod, Map> METHOD_VARIANTS_UPDATER = AtomicReferenceFieldUpdater.newUpdater(AnalysisMethod.class, Map.class, "methodVariantsMap");
 
     /** Virtually invoked method registered as root. */
     @SuppressWarnings("unused") private volatile Object isVirtualRootMethod;
     /** Direct (special or static) invoked method registered as root. */
     @SuppressWarnings("unused") private volatile Object isDirectRootMethod;
-    private Object entryPointData;
+    private Object nativeEntryPointData;
     @SuppressWarnings("unused") private volatile Object isInvoked;
     @SuppressWarnings("unused") private volatile Object isImplementationInvoked;
     /**
@@ -161,10 +185,11 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     @SuppressWarnings("unused") private volatile Object implementationInvokedNotifications;
     @SuppressWarnings("unused") private volatile Object isIntrinsicMethod;
     @SuppressWarnings("unused") private volatile Object isInlined;
+    @SuppressWarnings("unused") private volatile Boolean reachableInCurrentLayer;
+    private final boolean enableReachableInCurrentLayer;
 
-    private final AtomicReference<Object> parsedGraphCacheState = new AtomicReference<>(GRAPH_CACHE_UNPARSED);
-    private static final Object GRAPH_CACHE_UNPARSED = "unparsed";
-    private static final Object GRAPH_CACHE_CLEARED = "cleared by cleanupAfterAnalysis";
+    private final AtomicReference<GraphCacheEntry> parsedGraphCacheState = new AtomicReference<>(GraphCacheEntry.UNPARSED);
+    private final AtomicBoolean trackedGraphPersisted = new AtomicBoolean(false);
 
     private EncodedGraph analyzedGraph;
 
@@ -177,51 +202,76 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     @SuppressWarnings("unused") private volatile Object allImplementations;
 
     /**
-     * Indicates that this method returns all instantiated types. This is necessary when there are
-     * control flows present which cannot be tracked by analysis, which happens for continuation
-     * support.
+     * Indicates that this method has opaque return. This is necessary when there are control flows
+     * present which cannot be tracked by analysis, which happens for continuation support.
      *
      * This should only be set via calling
      * {@code FeatureImpl.BeforeAnalysisAccessImpl#registerOpaqueMethodReturn}.
      */
-    private boolean returnsAllInstantiatedTypes;
+    private boolean hasOpaqueReturn;
 
-    @SuppressWarnings("this-escape")
-    protected AnalysisMethod(AnalysisUniverse universe, ResolvedJavaMethod wrapped, MultiMethodKey multiMethodKey, Map<MultiMethodKey, MultiMethod> multiMethodMap) {
+    private LayeredCompilationBehavior.Behavior compilationBehavior;
+
+    private boolean isGuaranteeFolded;
+
+    @SuppressWarnings({"this-escape", "unchecked"})
+    protected AnalysisMethod(AnalysisUniverse universe, ResolvedJavaMethod wrapped, MethodVariantKey methodVariantKey, Map<MethodVariantKey, MethodVariant> methodVariantsMap) {
+        super(universe.hostVM.enableTrackAcrossLayers());
+        HostVM hostVM = universe.hostVM();
+        ResolvedJavaMethod originalMethod = OriginalMethodProvider.getOriginalMethod(wrapped);
+        AnalysisError.guarantee(originalMethod == null || originalMethod instanceof BaseLayerMethod || GuestAccess.get().owns(originalMethod),
+                        "Analysis method is not owned by the guest context: %s", wrapped);
         this.wrapped = wrapped;
 
         declaringClass = universe.lookup(wrapped.getDeclaringClass());
-        signature = getUniverse().lookup(wrapped.getSignature(), wrapped.getDeclaringClass());
-        hasNeverInlineDirective = universe.hostVM().hasNeverInlineDirective(wrapped);
+        var wrappedSignature = wrapped.getSignature();
+        if (wrappedSignature instanceof ResolvedSignature<?> resolvedSignature) {
+            /* BaseLayerMethods return fully resolved signatures */
+            if (resolvedSignature.getReturnType() instanceof AnalysisType) {
+                signature = (ResolvedSignature<AnalysisType>) resolvedSignature;
+            } else {
+                signature = getUniverse().lookup(wrappedSignature, wrapped.getDeclaringClass());
+            }
+        } else {
+            signature = getUniverse().lookup(wrappedSignature, wrapped.getDeclaringClass());
+        }
+        hasNeverInlineDirective = hostVM.hasNeverInlineDirective(wrapped);
+        hasNeverStrengthenGraphWithConstantsDirective = hostVM.hasNeverStrengthenGraphWithConstantsDirective(wrapped);
 
-        name = createName(wrapped, multiMethodKey);
+        name = createName(wrapped, methodVariantKey);
         qualifiedName = format("%H.%n(%P)");
         modifiers = wrapped.getModifiers();
 
-        if (universe.hostVM().useBaseLayer()) {
+        buildingSharedLayer = hostVM.buildingSharedLayer();
+        if (hostVM.buildingExtensionLayer() && declaringClass.isInSharedLayer()) {
             int mid = universe.getImageLayerLoader().lookupHostedMethodInBaseLayer(this);
             if (mid != -1) {
                 /*
-                 * This id is the actual link between the corresponding method from the base layer
+                 * This id is the actual link between the corresponding method from the shared layer
                  * and this new method.
                  */
                 id = mid;
-                isInBaseLayer = true;
+                isInSharedLayer = true;
             } else {
                 id = universe.computeNextMethodId();
-                isInBaseLayer = false;
+                isInSharedLayer = false;
             }
         } else {
             id = universe.computeNextMethodId();
-            isInBaseLayer = false;
+            isInSharedLayer = false;
         }
+        analyzedInPriorLayer = isInSharedLayer && hostVM.analyzedInPriorLayer(this);
 
-        ExceptionHandler[] original = wrapped.getExceptionHandlers();
-        exceptionHandlers = new ExceptionHandler[original.length];
-        for (int i = 0; i < original.length; i++) {
-            ExceptionHandler h = original[i];
-            JavaType catchType = getCatchType(universe, wrapped, h);
-            exceptionHandlers[i] = new ExceptionHandler(h.getStartBCI(), h.getEndBCI(), h.getHandlerBCI(), h.catchTypeCPI(), catchType);
+        ExceptionHandler[] originalHandlers = wrapped.getExceptionHandlers();
+        if (originalHandlers.length == 0) {
+            exceptionHandlers = EMPTY_EXCEPTION_HANDLERS;
+        } else {
+            exceptionHandlers = new ExceptionHandler[originalHandlers.length];
+            for (int i = 0; i < originalHandlers.length; i++) {
+                ExceptionHandler h = originalHandlers[i];
+                JavaType catchType = getCatchType(universe, wrapped, h);
+                exceptionHandlers[i] = new ExceptionHandler(h.getStartBCI(), h.getEndBCI(), h.getHandlerBCI(), h.catchTypeCPI(), catchType);
+            }
         }
 
         LocalVariableTable analysisLocalVariableTable = null;
@@ -243,45 +293,146 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         }
         localVariableTable = analysisLocalVariableTable;
 
-        this.multiMethodKey = multiMethodKey;
-        this.multiMethodMap = multiMethodMap;
+        this.methodVariantKey = methodVariantKey;
+        this.methodVariantsMap = methodVariantsMap;
 
-        if (PointstoOptions.TrackAccessChain.getValue(declaringClass.universe.hostVM().options())) {
+        if (universe.analysisPolicy().trackAccessChain()) {
             startTrackInvocations();
         }
-        parsingContextMaxDepth = PointstoOptions.ParsingContextMaxDepth.getValue(declaringClass.universe.hostVM.options());
+        parsingContextMaxDepth = universe.analysisPolicy().parsingContextMaxDepth();
+
+        this.enableReachableInCurrentLayer = universe.hostVM.enableReachableInCurrentLayer();
+        compilationBehavior = LayeredCompilationBehavior.Behavior.DEFAULT;
+        if (universe.hostVM.buildingImageLayer()) {
+            LayeredCompilationBehaviorGuestValue behavior = LayeredCompilationBehaviorGuestValue.get(wrapped);
+            if (behavior != null) {
+                compilationBehavior = behavior.value();
+                if (compilationBehavior == LayeredCompilationBehavior.Behavior.PINNED_TO_INITIAL_LAYER && universe.hostVM.buildingExtensionLayer() && !isInSharedLayer) {
+                    var errorMessage = String.format("User methods with layered compilation behavior %s must be registered via %s in the initial layer",
+                                    LayeredCompilationBehavior.Behavior.PINNED_TO_INITIAL_LAYER, LayeredCompilationSupport.class);
+                    throw AnalysisError.userError(errorMessage);
+                }
+            }
+        }
     }
 
     @SuppressWarnings("this-escape")
-    protected AnalysisMethod(AnalysisMethod original, MultiMethodKey multiMethodKey) {
+    protected AnalysisMethod(AnalysisMethod original, MethodVariantKey methodVariantKey) {
+        super(original.enableTrackAcrossLayers);
         wrapped = original.wrapped;
         id = original.id;
-        isInBaseLayer = original.isInBaseLayer;
+        buildingSharedLayer = original.buildingSharedLayer;
+        isInSharedLayer = original.isInSharedLayer;
+        analyzedInPriorLayer = original.analyzedInPriorLayer;
         declaringClass = original.declaringClass;
         signature = original.signature;
         hasNeverInlineDirective = original.hasNeverInlineDirective;
+        hasNeverStrengthenGraphWithConstantsDirective = original.hasNeverStrengthenGraphWithConstantsDirective;
         exceptionHandlers = original.exceptionHandlers;
         localVariableTable = original.localVariableTable;
         parsingContextMaxDepth = original.parsingContextMaxDepth;
 
-        name = createName(wrapped, multiMethodKey);
+        name = createName(wrapped, methodVariantKey);
         qualifiedName = format("%H.%n(%P)");
         modifiers = original.modifiers;
 
-        this.multiMethodKey = multiMethodKey;
-        assert original.multiMethodMap != null;
-        multiMethodMap = original.multiMethodMap;
-        returnsAllInstantiatedTypes = original.returnsAllInstantiatedTypes;
+        this.methodVariantKey = methodVariantKey;
+        assert original.methodVariantsMap != null;
+        methodVariantsMap = original.methodVariantsMap;
+        hasOpaqueReturn = original.hasOpaqueReturn;
 
-        if (PointstoOptions.TrackAccessChain.getValue(declaringClass.universe.hostVM().options())) {
+        if (original.getUniverse().analysisPolicy().trackAccessChain()) {
             startTrackInvocations();
         }
+
+        this.enableReachableInCurrentLayer = original.enableReachableInCurrentLayer;
     }
 
-    private static String createName(ResolvedJavaMethod wrapped, MultiMethodKey multiMethodKey) {
+    /**
+     * This method should not be used directly, except to set the {@link Behavior} from a previous
+     * layer. To set a new {@link Behavior}, please use the associated setter.
+     */
+    public void setCompilationBehavior(LayeredCompilationBehavior.Behavior compilationBehavior) {
+        assert getUniverse().getBigbang().getHostVM().buildingImageLayer() : "The method compilation behavior can only be set in layered images";
+        this.compilationBehavior = compilationBehavior;
+    }
+
+    private void setNewCompilationBehavior(LayeredCompilationBehavior.Behavior compilationBehavior) {
+        assert (!isInSharedLayer && this.compilationBehavior == LayeredCompilationBehavior.Behavior.DEFAULT) || this.compilationBehavior == compilationBehavior : "The method was already assigned " +
+                        this.compilationBehavior + ", but trying to assign " + compilationBehavior;
+        setCompilationBehavior(compilationBehavior);
+    }
+
+    public LayeredCompilationBehavior.Behavior getCompilationBehavior() {
+        return compilationBehavior;
+    }
+
+    /**
+     * Delays this method to the application layer. This should not be called after the method was
+     * already parsed to avoid analyzing all the method's callees.
+     */
+    public void setFullyDelayedToApplicationLayer() {
+        HostVM hostVM = getUniverse().getBigbang().getHostVM();
+        AnalysisError.guarantee(hostVM.buildingImageLayer(), "Methods can only be delayed in layered images: %s", this);
+        AnalysisError.guarantee(parsedGraphCacheState.get() == GraphCacheEntry.UNPARSED, "The method %s was marked as delayed to the application layer but was already parsed", this);
+        AnalysisError.guarantee(!hostVM.hasAlwaysInlineDirective(this), "Method %s with an always inline directive cannot be delayed to the application layer as such methods cannot be inlined", this);
+        AnalysisError.guarantee(isConcrete(), "Method %s is not concrete and cannot be delayed to the application layer", this);
+        setNewCompilationBehavior(LayeredCompilationBehavior.Behavior.FULLY_DELAYED_TO_APPLICATION_LAYER);
+    }
+
+    /**
+     * Returns true if this method is marked as delayed to the application layer and the current
+     * layer is a shared layer.
+     */
+    public boolean isDelayed() {
+        return compilationBehavior == LayeredCompilationBehavior.Behavior.FULLY_DELAYED_TO_APPLICATION_LAYER && buildingSharedLayer;
+    }
+
+    /**
+     * Ensures this method is compiled in the initial layer. See
+     * {@link Behavior#PINNED_TO_INITIAL_LAYER} for more details.
+     */
+    public void setPinnedToInitialLayer() {
+        BigBang bigbang = getUniverse().getBigbang();
+        AnalysisError.guarantee(bigbang.getHostVM().buildingInitialLayer(), "Methods can only be pinned to the initial layer: %s", this);
+        AnalysisError.guarantee(declaringClass.isInstanceClass() && isConcrete(), "Only concrete methods declared in instance classes can be pinned to the initial layer: %s", this);
+        if (!isStatic() && declaringClass.isAbstract()) {
+            /*
+             * Wait for concrete receiver types before analyzing the body. Forcing analysis without
+             * receivers would leave the formal input states empty, even though this method must be
+             * usable by callers in later layers. The hosted compilation support checks that a
+             * receiver was registered before analysis finishes.
+             */
+            bigbang.addRootMethod(this, true, "pinned to initial layer");
+        } else {
+            bigbang.forcedAddRootMethod(this, true, "pinned to initial layer");
+        }
+        if (!isStatic() && !declaringClass.isAbstract()) {
+            declaringClass.registerAsInstantiated("declared method " + this.format("%H.%n(%p)") + " is pinned to initial layer");
+        }
+        setNewCompilationBehavior(LayeredCompilationBehavior.Behavior.PINNED_TO_INITIAL_LAYER);
+    }
+
+    public boolean isPinnedToInitialLayer() {
+        return compilationBehavior == LayeredCompilationBehavior.Behavior.PINNED_TO_INITIAL_LAYER;
+    }
+
+    public boolean isGuaranteeFolded() {
+        return isGuaranteeFolded || GuestAnnotationAccess.isAnnotationPresent(this, GuaranteeFolded.class);
+    }
+
+    public void setGuaranteeFolded() {
+        this.isGuaranteeFolded = true;
+    }
+
+    public void checkGuaranteeFolded() {
+        AnalysisError.guarantee(!isGuaranteeFolded(), "A method that is guaranteed to always be folded is analyzed: %s. ", this);
+    }
+
+    private static String createName(ResolvedJavaMethod wrapped, MethodVariantKey methodVariantKey) {
         String aName = wrapped.getName();
-        if (multiMethodKey != ORIGINAL_METHOD) {
-            aName += StableMethodNameFormatter.MULTI_METHOD_KEY_SEPARATOR + multiMethodKey;
+        if (methodVariantKey != ORIGINAL_METHOD) {
+            aName += StableMethodNameFormatter.METHOD_VARIANT_KEY_SEPARATOR + methodVariantKey;
         }
         return aName;
     }
@@ -315,9 +466,17 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return declaringClass.getUniverse();
     }
 
+    /**
+     * @see PointsToAnalysis#validateFixedPointState
+     */
+    public boolean validateFixedPointState(@SuppressWarnings("unused") BigBang bb) {
+        return true;
+    }
+
     public void cleanupAfterAnalysis() {
-        if (parsedGraphCacheState.get() instanceof AnalysisParsedGraph) {
-            parsedGraphCacheState.set(GRAPH_CACHE_CLEARED);
+        GraphCacheEntry graphCacheEntry = parsedGraphCacheState.get();
+        if (graphCacheEntry != GraphCacheEntry.CLEARED) {
+            parsedGraphCacheState.set(GraphCacheEntry.CLEARED);
         }
     }
 
@@ -342,7 +501,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         Object curr = getParsingReason();
 
         while (curr != null) {
-            if (!(curr instanceof BytecodePosition)) {
+            if (!(curr instanceof BytecodePosition position)) {
                 AnalysisError.guarantee(curr instanceof String, "Parsing reason should be a BytecodePosition or String: %s", curr);
                 trace.add(ReportUtils.rootMethodSentinel((String) curr));
                 break;
@@ -351,7 +510,6 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
                 trace.add(ReportUtils.truncatedStackTraceSentinel(this));
                 break;
             }
-            BytecodePosition position = (BytecodePosition) curr;
             AnalysisMethod caller = (AnalysisMethod) position.getMethod();
             trace.add(caller.asStackTraceElement(position.getBCI()));
             curr = caller.getParsingReason();
@@ -363,8 +521,28 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return id;
     }
 
-    public boolean isInBaseLayer() {
-        return isInBaseLayer;
+    public boolean isInSharedLayer() {
+        return isInSharedLayer;
+    }
+
+    public boolean analyzedInPriorLayer() {
+        return analyzedInPriorLayer;
+    }
+
+    public boolean reachableInCurrentLayer() {
+        return enableReachableInCurrentLayer && reachableInCurrentLayer != null && reachableInCurrentLayer;
+    }
+
+    public void setReachableInCurrentLayer() {
+        if (enableReachableInCurrentLayer && !reachableInCurrentLayer()) {
+            AtomicUtils.atomicSetAndRun(this, true, reachableInCurrentLayerUpdater, () -> {
+                ImageLayerLoader imageLayerLoader = getUniverse().getImageLayerLoader();
+                if (imageLayerLoader != null) {
+                    imageLayerLoader.loadPriorStrengthenedGraphAnalysisElements(this);
+                }
+                ConcurrentLightHashSet.forEach(this, allImplementationsUpdater, AnalysisMethod::setReachableInCurrentLayer);
+            });
+        }
     }
 
     /**
@@ -374,25 +552,34 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
      */
     public void registerAsIntrinsicMethod(Object reason) {
         assert isValidReason(reason) : "Registering a method as intrinsic needs to provide a valid reason, found: " + reason;
-        AtomicUtils.atomicSetAndRun(this, reason, isIntrinsicMethodUpdater, this::onImplementationInvoked);
+        AtomicUtils.atomicSetAndRun(this, reason, isIntrinsicMethodUpdater, () -> onImplementationInvoked(reason));
     }
 
-    public void registerAsEntryPoint(Object newEntryPointData) {
+    /**
+     * Registers this method as a native entrypoint, i.e. a method callable from the host
+     * environment. Only direct root methods can be registered as entrypoints.
+     */
+    public void registerAsNativeEntryPoint(Object newEntryPointData) {
+        checkGuaranteeFolded();
         assert newEntryPointData != null;
-        if (entryPointData != null && !entryPointData.equals(newEntryPointData)) {
-            throw new UnsupportedFeatureException("Method is registered as entry point with conflicting entry point data: " + entryPointData + ", " + newEntryPointData);
+        assert isDirectRootMethod() : "All native entrypoints must be direct root methods: " + this;
+        if (nativeEntryPointData != null && !nativeEntryPointData.equals(newEntryPointData)) {
+            throw new UnsupportedFeatureException("Method is registered as entry point with conflicting entry point data: " + nativeEntryPointData + ", " + newEntryPointData);
         }
-        entryPointData = newEntryPointData;
+        nativeEntryPointData = newEntryPointData;
         /* We need that to check that entry points are not invoked from other Java methods. */
         startTrackInvocations();
     }
 
     public boolean registerAsInvoked(Object reason) {
+        checkGuaranteeFolded();
         assert isValidReason(reason) : "Registering a method as invoked needs to provide a valid reason, found: " + reason;
+        registerAsTrackedAcrossLayers(reason);
         return AtomicUtils.atomicSet(this, reason, isInvokedUpdater);
     }
 
     public boolean registerAsImplementationInvoked(Object reason) {
+        checkGuaranteeFolded();
         assert isValidReason(reason) : "Registering a method as implementation invoked needs to provide a valid reason, found: " + reason;
         assert !Modifier.isAbstract(getModifiers()) : this;
 
@@ -405,12 +592,13 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
          * return before the class gets marked as reachable.
          */
         getDeclaringClass().registerAsReachable("declared method " + qualifiedName + " is registered as implementation invoked");
-        return AtomicUtils.atomicSetAndRun(this, reason, isImplementationInvokedUpdater, this::onImplementationInvoked);
+        return AtomicUtils.atomicSetAndRun(this, reason, isImplementationInvokedUpdater, () -> onImplementationInvoked(reason));
     }
 
     public void registerAsInlined(Object reason) {
+        checkGuaranteeFolded();
         assert reason instanceof NodeSourcePosition || reason instanceof ResolvedJavaMethod : "Registering a method as inlined needs to provide the inline location as reason, found: " + reason;
-        AtomicUtils.atomicSetAndRun(this, reason, isInlinedUpdater, this::onReachable);
+        AtomicUtils.atomicSetAndRun(this, reason, isInlinedUpdater, () -> onReachable(reason));
     }
 
     public void registerImplementationInvokedCallback(Consumer<DuringAnalysisAccess> callback) {
@@ -437,6 +625,13 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         ConcurrentLightHashSet.removeElementIf(this, implementationInvokedNotificationsUpdater, ElementNotification::isNotified);
     }
 
+    private void persistTrackedGraph(AnalysisParsedGraph graph) {
+        if (isTrackedAcrossLayers() && trackedGraphPersisted.compareAndSet(false, true)) {
+            ImageLayerWriter imageLayerWriter = getUniverse().getImageLayerWriter();
+            imageLayerWriter.persistAnalysisParsedGraph(this, graph);
+        }
+    }
+
     /** Get the set of all callers for this method, as inferred by the static analysis. */
     public Set<AnalysisMethod> getCallers() {
         return getInvokeLocations().stream().map(location -> (AnalysisMethod) location.getMethod()).collect(Collectors.toSet());
@@ -445,12 +640,19 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     /** Get the list of all invoke locations for this method, as inferred by the static analysis. */
     public abstract List<BytecodePosition> getInvokeLocations();
 
-    public boolean isEntryPoint() {
-        return entryPointData != null;
+    /** Get the node markers used to store per-node mappings to metadata for encoded nodes. */
+    public abstract Iterable<EncodedGraph.EncodedNodeReference> getEncodedNodeReferences();
+
+    /**
+     * Returns true if this method is a native entrypoint, i.e. it may be called from the host
+     * environment.
+     */
+    public boolean isNativeEntryPoint() {
+        return nativeEntryPointData != null;
     }
 
-    public Object getEntryPointData() {
-        return entryPointData;
+    public Object getNativeEntryPointData() {
+        return nativeEntryPointData;
     }
 
     public boolean isIntrinsicMethod() {
@@ -471,14 +673,19 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
      * as in {@link AnalysisMethod#registerAsImplementationInvoked(Object)}.
      */
     public boolean registerAsVirtualRootMethod(Object reason) {
+        checkGuaranteeFolded();
         getDeclaringClass().registerAsReachable("declared method " + qualifiedName + " is registered as virtual root");
         return AtomicUtils.atomicSet(this, reason, isVirtualRootMethodUpdater);
     }
 
     /**
-     * Registers this method as a direct (special or static) root for the analysis.
+     * Registers this method as a direct (special or static) root for the analysis. Note that for
+     * `invokespecial` direct roots, this <b>does not</b> guarantee that the method is
+     * implementation invoked, as that registration is delayed until a suitable receiver type is
+     * marked as instantiated.
      */
     public boolean registerAsDirectRootMethod(Object reason) {
+        checkGuaranteeFolded();
         getDeclaringClass().registerAsReachable("declared method " + qualifiedName + " is registered as direct root");
         return AtomicUtils.atomicSet(this, reason, isDirectRootMethodUpdater);
     }
@@ -502,6 +709,10 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return AtomicUtils.isSet(this, isDirectRootMethodUpdater);
     }
 
+    public boolean isSimplyInvoked() {
+        return AtomicUtils.isSet(this, isInvokedUpdater);
+    }
+
     public boolean isSimplyImplementationInvoked() {
         return AtomicUtils.isSet(this, isImplementationInvokedUpdater);
     }
@@ -513,7 +724,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return isIntrinsicMethod() || isVirtualRootMethod() || isDirectRootMethod() || AtomicUtils.isSet(this, isInvokedUpdater);
     }
 
-    protected Object getInvokedReason() {
+    public Object getInvokedReason() {
         return isInvoked;
     }
 
@@ -550,14 +761,30 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return isClassInitializer() && getDeclaringClass().isInitialized();
     }
 
-    public void onImplementationInvoked() {
-        onReachable();
+    public void onImplementationInvoked(Object reason) {
+        onReachable(reason);
         notifyImplementationInvokedCallbacks();
     }
 
     @Override
-    public void onReachable() {
+    public void onReachable(Object reason) {
+        registerAsTrackedAcrossLayers(reason);
         notifyReachabilityCallbacks(declaringClass.getUniverse(), new ArrayList<>());
+    }
+
+    @Override
+    protected void onTrackedAcrossLayers(Object reason) {
+        AnalysisError.guarantee(!getUniverse().sealed(), "Method %s was marked as tracked after the universe was sealed", this);
+        getUniverse().getImageLayerWriter().onTrackedAcrossLayer(this, reason);
+        declaringClass.registerAsTrackedAcrossLayers(reason);
+        for (AnalysisType parameter : toParameterList()) {
+            parameter.registerAsTrackedAcrossLayers(reason);
+        }
+        signature.getReturnType().registerAsTrackedAcrossLayers(reason);
+
+        if (getParsedGraphCacheStateObject() instanceof AnalysisParsedGraph analysisParsedGraph) {
+            persistTrackedGraph(analysisParsedGraph);
+        }
     }
 
     public void registerOverrideReachabilityNotification(MethodOverrideReachableNotification notification) {
@@ -602,6 +829,14 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
             return graphProvider.allowRuntimeCompilation();
         }
         return true;
+    }
+
+    @Override
+    public boolean allowStrengthenGraphWithConstants() {
+        if (wrapped instanceof GraphProvider graphProvider) {
+            return graphProvider.allowStrengthenGraphWithConstants();
+        }
+        return !hasNeverStrengthenGraphWithConstantsDirective;
     }
 
     @Override
@@ -655,6 +890,11 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     }
 
     @Override
+    public boolean isDeclared() {
+        return wrapped.isDeclared();
+    }
+
+    @Override
     public boolean isClassInitializer() {
         return wrapped.isClassInitializer();
     }
@@ -699,7 +939,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
             return includeOurselfs ? Set.of(this) : Set.of();
         }
 
-        Set<AnalysisMethod> result = new HashSet<>(allImplementationsSize + 1);
+        Set<AnalysisMethod> result = new HashSet<>(allImplementationsSize + 1); // noEconomicSet(streaming)
         if (includeOurselfs) {
             result.add(this);
         }
@@ -735,18 +975,14 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     }
 
     @Override
-    public Annotation[][] getParameterAnnotations() {
-        return wrapped.getParameterAnnotations();
-    }
-
-    @Override
     public Type[] getGenericParameterTypes() {
         return wrapped.getGenericParameterTypes();
     }
 
     @Override
     public boolean canBeInlined() {
-        return !hasNeverInlineDirective();
+        /* Delayed methods should not be inlined in the current layer */
+        return !hasNeverInlineDirective() && !isDelayed();
     }
 
     @Override
@@ -768,7 +1004,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     public String toString() {
         return "AnalysisMethod<" + format("%h.%n") + " -> " + wrapped.toString() + ", invoked: " + (isInvoked != null) +
                         ", implInvoked: " + (isImplementationInvoked != null) + ", intrinsic: " + (isIntrinsicMethod != null) + ", inlined: " + (isInlined != null) +
-                        (isVirtualRootMethod() ? ", virtual root" : "") + (isDirectRootMethod() ? ", direct root" : "") + (isEntryPoint() ? ", entry point" : "") + ">";
+                        (isVirtualRootMethod() ? ", virtual root" : "") + (isDirectRootMethod() ? ", direct root" : "") + (isNativeEntryPoint() ? ", entry point" : "") + ">";
     }
 
     @Override
@@ -817,6 +1053,10 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
     }
 
     public Executable getJavaMethod() {
+        if (wrapped instanceof BaseLayerMethod) {
+            /* We don't know the corresponding Java method. */
+            return null;
+        }
         return OriginalMethodProvider.getJavaMethod(this);
     }
 
@@ -824,7 +1064,15 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
      * Forces the graph to be reparsed and the reparsing to be done by this thread.
      */
     public AnalysisParsedGraph reparseGraph(BigBang bb) {
-        return ensureGraphParsedHelper(bb, true);
+        return ensureGraphParsedHelper(bb, Stage.finalStage(), true);
+    }
+
+    /**
+     * Returns the object currently stored in the parsed graph cache. This won't trigger any parsing
+     * or cache state transition.
+     */
+    public Object getParsedGraphCacheStateObject() {
+        return parsedGraphCacheState.get().get(Stage.finalStage());
     }
 
     /**
@@ -832,37 +1080,168 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
      * the method is available.
      */
     public AnalysisParsedGraph ensureGraphParsed(BigBang bb) {
-        return ensureGraphParsedHelper(bb, false);
+        return ensureGraphParsed(bb, Stage.finalStage());
     }
 
-    private AnalysisParsedGraph ensureGraphParsedHelper(BigBang bb, boolean forceReparse) {
+    /**
+     * Ensures that the method has been processed up to and including the required stage, i.e., that
+     * the {@link StructuredGraph Graal IR} for the method is available.
+     */
+    public AnalysisParsedGraph ensureGraphParsed(BigBang bb, Stage stage) {
+        return ensureGraphParsedHelper(bb, stage, false);
+    }
+
+    /**
+     * Invariant:
+     *
+     * <pre>
+     * isStageParsed(OPTIMIZATIONS_APPLIED) => isStageParsed(BYTECODE_PARSED)
+     * </pre>
+     *
+     * This invariant ensures that we do not create the parsed graphs for earlier stages if the
+     * graph is already available for a later stage. There are three reasons why this is necessary:
+     * (1) For performance, we allow to directly create the graph for later stages if the
+     * {@link Stage#isRequiredStage stage definition} doesn't require the previous stages to be
+     * published explicitly. The invariant ensures that we don't drop this performance advantage.
+     * (2) Parsed graphs for the final stage may be loaded from a file or similar (e.g. in case of
+     * layered images). In that case, the bytecode for a method may not be available and creating
+     * earlier stages is just not possible. (3) If a graph for a later stage is already available,
+     * creating them for earlier stages may result in different graphs and therefore inconsistent
+     * results due to global optimizations and their state.
+     */
+    private record GraphCacheEntry(Object bytecodeParsedObject, Object afterParsingHooksDoneObject) {
+
+        private record Sentinel(String description) {
+            @Override
+            public String toString() {
+                return description;
+            }
+        }
+
+        private static final Object GRAPH_CACHE_UNPARSED = new Sentinel("unparsed");
+        private static final Object GRAPH_CACHE_CLEARED = new Sentinel("cleared by cleanupAfterAnalysis");
+        private static final GraphCacheEntry UNPARSED = new GraphCacheEntry(GRAPH_CACHE_UNPARSED, GRAPH_CACHE_UNPARSED);
+        private static final GraphCacheEntry CLEARED = new GraphCacheEntry(GRAPH_CACHE_CLEARED, GRAPH_CACHE_CLEARED);
+
+        private GraphCacheEntry {
+            // invariant: isStageParsed(OPTIMIZATIONS_APPLIED) => isStageParsed(BYTECODE_PARSED)
+            assert !(afterParsingHooksDoneObject instanceof AnalysisParsedGraph) || bytecodeParsedObject instanceof AnalysisParsedGraph;
+        }
+
+        static GraphCacheEntry createLockEntry(Stage stage, GraphCacheEntry base, ReentrantLock lock) {
+            return switch (stage) {
+                case BYTECODE_PARSED -> new GraphCacheEntry(lock, lock);
+                /*
+                 * If the stage 1 is skipped, the first stage needs to be locked too, to avoid
+                 * another thread stealing the unparsed state.
+                 */
+                case OPTIMIZATIONS_APPLIED -> base.bytecodeParsedObject == GRAPH_CACHE_UNPARSED ? new GraphCacheEntry(lock, lock) : new GraphCacheEntry(base.bytecodeParsedObject, lock);
+            };
+        }
+
+        static GraphCacheEntry createParsingError(Stage stage, GraphCacheEntry base, Throwable throwable) {
+            return switch (stage) {
+                case BYTECODE_PARSED -> new GraphCacheEntry(throwable, GRAPH_CACHE_UNPARSED);
+                case OPTIMIZATIONS_APPLIED -> new GraphCacheEntry(base.bytecodeParsedObject, throwable);
+            };
+        }
+
+        boolean isUnparsed(Stage stage) {
+            return get(stage) == GRAPH_CACHE_UNPARSED;
+        }
+
+        private Object get(Stage stage) {
+            return switch (stage) {
+                case BYTECODE_PARSED -> bytecodeParsedObject;
+                case OPTIMIZATIONS_APPLIED -> afterParsingHooksDoneObject;
+            };
+        }
+
+        boolean isParsing(Stage stage) {
+            return get(stage) instanceof ReentrantLock;
+        }
+
+        boolean isStageParsed(Stage stage) {
+            return get(stage) instanceof AnalysisParsedGraph;
+        }
+
+        boolean isParsingError() {
+            assert !(bytecodeParsedObject instanceof Throwable && afterParsingHooksDoneObject instanceof Throwable);
+            return bytecodeParsedObject instanceof Throwable || afterParsingHooksDoneObject instanceof Throwable;
+        }
+
+        boolean isCleared() {
+            return bytecodeParsedObject == GRAPH_CACHE_CLEARED && afterParsingHooksDoneObject == GRAPH_CACHE_CLEARED;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("GraphCacheState(%s, %s)", bytecodeParsedObject, afterParsingHooksDoneObject);
+        }
+    }
+
+    private AnalysisParsedGraph ensureGraphParsedHelper(BigBang bb, Stage stage, boolean forceReparse) {
+        assert Stage.isRequiredStage(stage, this);
         while (true) {
-            Object curState = parsedGraphCacheState.get();
+            GraphCacheEntry curState = parsedGraphCacheState.get();
 
             /*-
              * This implements a state machine that ensures parsing is atomic. States:
-             * 1) unparsed: represented by the String "unparsed".
-             * 2) parsing: represented by a locked ReentrantLock object that other threads can wait on.
-             * 3) parsed: represented by the ParsedGraph with the parsing result
-             * 4) cleared: represented by the String "cleared".
-             * 5) parsing error: represented by a Throwable
+             * 1) unparsed: stage1 and stage2 object are set to a sentinel value for the unparsed state.
+             * 2) stage1 parsing: represented by a locked ReentrantLock object that other threads can wait on.
+             * 3) stage1 parsed: represented by the ParsedGraph in 'bytecodeParsedObject'
+             * 4) stage2 parsing: represented by a locked ReentrantLock object that other threads can wait on.
+             * 5) stage2 parsed: represented by the ParsedGraph in 'afterParsingHooksDoneObject'
+             * 6) cleared: stage1 and stage2 object are set to String "cleared".
+             * 7) stage1 parsing error: represented by a Throwable in 'bytecodeParsedObject'
+             * 8) stage2 parsing error: represented by a Throwable in 'afterParsingHooksDoneObject'
+             *
+             * Transitions:
+             *
+             * -) Common case: The method to be parsed is not a class initializer and stage 2 is requested.
+             *    This omits the stage 1 graph since it will never be necessary to provide it because only
+             *    class initializers can have cyclic dependencies.
+             *    1 -> 4 -> 5
+             *
+             * -) Full case: The method to be parsed is a class initializer and stage 2 is requested.
+             *    In this case, the stage 1 graph will be created and published to avoid parsing problems
+             *    (either a deadlock or an endless recursion) due to cyclic dependencies.
+             *    1 -> 2 -> 3 -> 4 -> 5
+             *
+             * -) Error transitions:
+             *    ... -> 2 -> 7
+             *    ... -> 4 -> 8
+             *
+             * -) After analysis, parsed graphs are cleared to save memory:
+             *           1 -> 6
+             *    ... -> 3 -> 6
+             *    ... -> 5 -> 6
+             *    ... -> 7 -> 6
+             *    ... -> 8 -> 6
+             *
+             * The only end state is state 6 (i.e. no further transition is possible).
              */
 
-            if (curState == GRAPH_CACHE_UNPARSED || (forceReparse && curState instanceof AnalysisParsedGraph)) {
-                AnalysisParsedGraph graph = parseGraph(bb, curState);
+            if (curState.isUnparsed(stage) || (forceReparse && curState.isStageParsed(stage))) {
+                AnalysisParsedGraph graph;
+                if (isInSharedLayer && getUniverse().getImageLayerLoader().hasAnalysisParsedGraph(this)) {
+                    graph = getBaseLayerGraph(bb, curState);
+                } else {
+                    graph = createAnalysisParsedGraph(bb, stage, curState, forceReparse);
+                }
                 if (graph != null) {
                     return graph;
                 }
-            } else if (curState instanceof ReentrantLock) {
-                waitOnLock((ReentrantLock) curState);
+            } else if (curState.isParsing(stage)) {
+                waitOnLock(stage, (ReentrantLock) curState.get(stage));
 
-            } else if (!forceReparse && curState instanceof AnalysisParsedGraph) {
-                return (AnalysisParsedGraph) curState;
+            } else if (!forceReparse && curState.isStageParsed(stage)) {
+                return (AnalysisParsedGraph) curState.get(stage);
 
-            } else if (curState instanceof Throwable) {
-                throw AnalysisError.shouldNotReachHere("parsing had failed in another thread", (Throwable) curState);
+            } else if (curState.isParsingError()) {
+                throw AnalysisError.shouldNotReachHere("parsing had failed in another thread", (Throwable) curState.get(stage));
 
-            } else if (curState == GRAPH_CACHE_CLEARED) {
+            } else if (curState.isCleared()) {
                 return null;
 
             } else {
@@ -871,7 +1250,81 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         }
     }
 
-    private AnalysisParsedGraph parseGraph(BigBang bb, Object expectedValue) {
+    @FunctionalInterface
+    private interface GraphSupplier {
+        GraphCacheEntry get(BigBang bb, AnalysisMethod method, GraphCacheEntry curState);
+    }
+
+    private static final GraphSupplier CREATE_FIRST_STAGE = (bb, method, curState) -> new GraphCacheEntry(AnalysisParsedGraph.parseBytecode(bb, method), GraphCacheEntry.GRAPH_CACHE_UNPARSED);
+
+    private static final GraphSupplier GET_FROM_BASE_LAYER = (bb, method, curState) -> {
+        AnalysisParsedGraph graph = method.getUniverse().getImageLayerLoader().getAnalysisParsedGraph(method);
+        return new GraphCacheEntry(graph, graph);
+    };
+
+    private static final GraphSupplier CREATE_FINAL_STAGE = (bb, method, curState) -> {
+        AnalysisParsedGraph stage1Graph = null;
+        Stage previous = Stage.firstStage();
+        if (curState.isStageParsed(previous)) {
+            stage1Graph = (AnalysisParsedGraph) curState.get(previous);
+        }
+        // if stage1 graph is null, stage2 graph will directly be created
+        AnalysisParsedGraph stage2Graph = AnalysisParsedGraph.createFinalStage(bb, method, stage1Graph);
+        if (stage1Graph != null) {
+            return new GraphCacheEntry(stage1Graph, stage2Graph);
+        }
+        /*
+         * If we directly created the stage2 graph, the graph will also be used if someone requests
+         * the stage1 graph. This is necessary to maintain the invariant: if a stage2 graph is
+         * available, a stage1 graph is also available.
+         */
+        return new GraphCacheEntry(stage2Graph, stage2Graph);
+    };
+
+    private static final GraphSupplier REPARSE_FINAL_STAGE = (bb, method, curState) -> {
+        // when reparsing, we MUST NOT reuse any graph of a previous stage
+        AnalysisParsedGraph stage2Graph = AnalysisParsedGraph.createFinalStage(bb, method, null);
+        return new GraphCacheEntry(stage2Graph, stage2Graph);
+    };
+
+    private static GraphSupplier getGraphSupplierForStage(Stage stage, boolean forceReparse) {
+        return switch (stage) {
+            case BYTECODE_PARSED -> CREATE_FIRST_STAGE;
+            case OPTIMIZATIONS_APPLIED -> forceReparse ? REPARSE_FINAL_STAGE : CREATE_FINAL_STAGE;
+        };
+    }
+
+    private AnalysisParsedGraph getBaseLayerGraph(BigBang bb, GraphCacheEntry expectedValue) {
+        /*
+         * If the ParsedGraph is loaded from the base layer, it will also be used if someone
+         * requests the stage1 graph. This is necessary to maintain the invariant: if a stage2 graph
+         * is available, a stage1 graph is also available (see description of GraphCacheEntry).
+         */
+        return setGraph(bb, Stage.finalStage(), expectedValue, GET_FROM_BASE_LAYER);
+    }
+
+    private AnalysisParsedGraph createAnalysisParsedGraph(BigBang bb, Stage stage, GraphCacheEntry curState, boolean forceReparse) {
+        /*
+         * If the requested stage requires that the previous stage is explicitly available, we still
+         * need to create the previous stage's result first and publish it. Then we can create the
+         * requested stage's result.
+         *
+         * Note: If 'stage == Stage.firstStage()' then 'previous == null' and we will never enter
+         * this branch.
+         */
+        if (stage.hasPrevious() && Stage.isRequiredStage(stage.previous(), this) && !curState.isStageParsed(stage.previous())) {
+            /*
+             * We need to do a recursive call to 'ensureGraphParsedHelper' because we don't know
+             * anything about stage1's state here.
+             */
+            ensureGraphParsedHelper(bb, stage.previous(), forceReparse);
+            // do another round in the outer loop such that 'curState' is reloaded
+            return null;
+        }
+        return setGraph(bb, stage, curState, getGraphSupplierForStage(stage, forceReparse));
+    }
+
+    private AnalysisParsedGraph setGraph(BigBang bb, Stage stage, GraphCacheEntry expectedValue, GraphSupplier graphSupplier) {
         ReentrantLock lock = new ReentrantLock();
         lock.lock();
         try {
@@ -879,24 +1332,32 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
              * Atomically try to claim the parsing. Note that the lock must be locked already, and
              * remain locked until the parsing is done. Other threads will wait on this lock.
              */
-            if (!parsedGraphCacheState.compareAndSet(expectedValue, lock)) {
+            GraphCacheEntry lockState = GraphCacheEntry.createLockEntry(stage, expectedValue, lock);
+            if (!parsedGraphCacheState.compareAndSet(expectedValue, lockState)) {
                 /* We lost the race, another thread is doing the parsing. */
                 return null;
             }
+            AnalysisError.guarantee(!isDelayed(), "The method %s was parsed even though it was marked as delayed to the application layer", this);
 
-            AnalysisParsedGraph graph = AnalysisParsedGraph.parseBytecode(bb, this);
+            GraphCacheEntry newEntry = graphSupplier.get(bb, this, expectedValue);
 
             /*
              * Since we still hold the parsing lock, the transition form "parsing" to "parsed"
              * cannot fail.
              */
-            boolean result = parsedGraphCacheState.compareAndSet(lock, graph);
+            boolean result = parsedGraphCacheState.compareAndSet(lockState, newEntry);
             AnalysisError.guarantee(result, "State transition failed");
 
-            return graph;
+            AnalysisParsedGraph analysisParsedGraph = (AnalysisParsedGraph) newEntry.get(stage);
+
+            if (stage == Stage.finalStage()) {
+                persistTrackedGraph(analysisParsedGraph);
+            }
+
+            return analysisParsedGraph;
 
         } catch (Throwable ex) {
-            parsedGraphCacheState.set(ex);
+            parsedGraphCacheState.set(GraphCacheEntry.createParsingError(stage, expectedValue, ex));
             throw ex;
 
         } finally {
@@ -904,7 +1365,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         }
     }
 
-    private void waitOnLock(ReentrantLock lock) {
+    private void waitOnLock(Stage stage, ReentrantLock lock) {
         AnalysisError.guarantee(!lock.isHeldByCurrentThread(), "Recursive parsing request, would lead to endless waiting loop");
 
         lock.lock();
@@ -913,7 +1374,7 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
              * When we can acquire the lock, parsing has finished. The next loop iteration will
              * return the result.
              */
-            AnalysisError.guarantee(parsedGraphCacheState.get() != lock, "Parsing must have finished in the thread that installed the lock");
+            AnalysisError.guarantee(parsedGraphCacheState.get().get(stage) != lock, "Parsing must have finished in the thread that installed the lock");
         } finally {
             lock.unlock();
         }
@@ -964,55 +1425,59 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         this.analyzedGraph = analyzedGraph;
     }
 
+    public void clearAnalyzedGraph() {
+        this.analyzedGraph = null;
+    }
+
     public EncodedGraph getAnalyzedGraph() {
         return analyzedGraph;
     }
 
     @Override
-    public MultiMethodKey getMultiMethodKey() {
-        return multiMethodKey;
+    public MethodVariantKey getMethodVariantKey() {
+        return methodVariantKey;
     }
 
     @Override
-    public AnalysisMethod getOrCreateMultiMethod(MultiMethodKey key) {
-        return getOrCreateMultiMethod(key,
+    public AnalysisMethod getOrCreateMethodVariant(MethodVariantKey key) {
+        return getOrCreateMethodVariant(key,
                         (k) -> {
                         });
     }
 
     @Override
-    public AnalysisMethod getMultiMethod(MultiMethodKey key) {
-        if (key == multiMethodKey) {
+    public AnalysisMethod getMethodVariant(MethodVariantKey key) {
+        if (key == methodVariantKey) {
             return this;
-        } else if (multiMethodMap == null) {
+        } else if (methodVariantsMap == null) {
             return null;
         } else {
-            return (AnalysisMethod) multiMethodMap.get(key);
+            return (AnalysisMethod) methodVariantsMap.get(key);
         }
     }
 
     @Override
-    public Collection<MultiMethod> getAllMultiMethods() {
-        if (multiMethodMap == null) {
+    public Collection<MethodVariant> getAllMethodVariants() {
+        if (methodVariantsMap == null) {
             return Collections.singleton(this);
         } else {
-            return multiMethodMap.values();
+            return methodVariantsMap.values();
         }
     }
 
-    public AnalysisMethod getOrCreateMultiMethod(MultiMethodKey key, Consumer<AnalysisMethod> createAction) {
-        if (key == multiMethodKey) {
+    public AnalysisMethod getOrCreateMethodVariant(MethodVariantKey key, Consumer<AnalysisMethod> createAction) {
+        if (key == methodVariantKey) {
             return this;
         }
 
-        if (multiMethodMap == null) {
-            ConcurrentHashMap<MultiMethodKey, MultiMethod> newMultiMethodMap = new ConcurrentHashMap<>();
-            newMultiMethodMap.put(multiMethodKey, this);
-            MULTIMETHOD_MAP_UPDATER.compareAndSet(this, null, newMultiMethodMap);
+        if (methodVariantsMap == null) {
+            ConcurrentHashMap<MethodVariantKey, MethodVariant> newMethodVariantsMap = new ConcurrentHashMap<>();
+            newMethodVariantsMap.put(methodVariantKey, this);
+            METHOD_VARIANTS_UPDATER.compareAndSet(this, null, newMethodVariantsMap);
         }
 
-        return (AnalysisMethod) multiMethodMap.computeIfAbsent(key, (k) -> {
-            AnalysisMethod newMethod = createMultiMethod(AnalysisMethod.this, k);
+        return (AnalysisMethod) methodVariantsMap.computeIfAbsent(key, (k) -> {
+            AnalysisMethod newMethod = createMethodVariant(AnalysisMethod.this, k);
             createAction.accept(newMethod);
             return newMethod;
         });
@@ -1022,13 +1487,13 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
      * This should only be set via calling
      * {@code FeatureImpl.BeforeAnalysisAccessImpl#registerOpaqueMethodReturn}.
      */
-    public void setReturnsAllInstantiatedTypes() {
-        returnsAllInstantiatedTypes = true;
+    public void setOpaqueReturn() {
+        hasOpaqueReturn = true;
     }
 
-    public boolean getReturnsAllInstantiatedTypes() {
-        return returnsAllInstantiatedTypes;
+    public boolean hasOpaqueReturn() {
+        return hasOpaqueReturn;
     }
 
-    protected abstract AnalysisMethod createMultiMethod(AnalysisMethod analysisMethod, MultiMethodKey newMultiMethodKey);
+    protected abstract AnalysisMethod createMethodVariant(AnalysisMethod analysisMethod, MethodVariantKey newMethodVariantKey);
 }

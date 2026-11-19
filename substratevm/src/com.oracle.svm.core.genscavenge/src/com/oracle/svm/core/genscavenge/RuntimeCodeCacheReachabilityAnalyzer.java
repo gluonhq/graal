@@ -24,46 +24,67 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import java.io.Serial;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.heap.ObjectHeader;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
 import com.oracle.svm.core.heap.ReferenceAccess;
 import com.oracle.svm.core.heap.RuntimeCodeCacheCleaner;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
-import jdk.graal.compiler.word.Word;
-
+/**
+ * Analyzes if run-time compiled code has any references to otherwise unreachable objects. Throws an
+ * {@link UnreachableObjectsException} if a reference to an otherwise unreachable object is
+ * detected.
+ */
 @DuplicatedInNativeCode
 final class RuntimeCodeCacheReachabilityAnalyzer implements ObjectReferenceVisitor {
-    private boolean unreachableObjects;
+    private static final UnreachableObjectsException UNREACHABLE_OBJECTS_EXCEPTION = PreallocatedExceptions.prepare(new UnreachableObjectsException());
 
     @Platforms(Platform.HOSTED_ONLY.class)
     RuntimeCodeCacheReachabilityAnalyzer() {
     }
 
-    public void initialize() {
-        this.unreachableObjects = false;
+    @Override
+    @Uninterruptible(reason = "Avoid unnecessary safepoint checks in GC for performance.")
+    public void visitObjectReferences(Pointer firstObjRef, boolean compressed, int referenceSize, Object holderObject, int count) {
+        Pointer pos = firstObjRef;
+        Pointer end = firstObjRef.add(Word.unsigned(count).multiply(referenceSize));
+        while (pos.belowThan(end)) {
+            visitObjectReference(pos, compressed);
+            pos = pos.add(referenceSize);
+        }
     }
 
-    public boolean hasUnreachableObjects() {
-        return unreachableObjects;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void visitObjectReference(Pointer ptrPtrToObject, boolean compressed) {
+        Pointer ptrToObj = ReferenceAccess.singleton().readObjectAsUntrackedPointer(ptrPtrToObject, compressed);
+        if (ptrToObj.isNonNull() && !isReachable(ptrToObj)) {
+            throw UNREACHABLE_OBJECTS_EXCEPTION;
+        }
     }
 
     @Override
-    public boolean visitObjectReference(Pointer ptrPtrToObject, boolean compressed, Object holderObject) {
-        assert !unreachableObjects;
-        Pointer ptrToObj = ReferenceAccess.singleton().readObjectAsUntrackedPointer(ptrPtrToObject, compressed);
-        if (ptrToObj.isNonNull() && !isReachable(ptrToObj)) {
-            unreachableObjects = true;
-            return false;
-        }
-        return true;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void visitDerivedReference(Pointer baseObjRef, Pointer derivedObjRef, boolean compressed, Object holderObject) {
+        /*
+         * The default visitDerivedReferenceBase processes the base object reference through
+         * visitObjectReferences. The derived slot is an interior address and must not be checked as
+         * a separate object start.
+         */
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isReachable(Pointer ptrToObj) {
         assert ptrToObj.isNonNull();
         if (HeapImpl.getHeapImpl().isInImageHeap(ptrToObj)) {
@@ -71,11 +92,12 @@ final class RuntimeCodeCacheReachabilityAnalyzer implements ObjectReferenceVisit
         }
 
         ObjectHeaderImpl ohi = ObjectHeaderImpl.getObjectHeaderImpl();
-        Word header = ObjectHeader.readHeaderFromPointer(ptrToObj);
+        Word header = ohi.readHeaderFromPointer(ptrToObj);
         if (ObjectHeaderImpl.isForwardedHeader(header)) {
             return true;
         }
-        if (SerialGCOptions.useCompactingOldGen() && ObjectHeaderImpl.isMarkedHeader(header)) {
+        if (ObjectHeaderImpl.isMarkedHeader(header)) {
+            // Note that marking is also used in copying collections in chunks with pinned objects.
             return true;
         }
         Space space = HeapChunk.getSpace(HeapChunk.getEnclosingHeapChunk(ptrToObj, header));
@@ -85,17 +107,30 @@ final class RuntimeCodeCacheReachabilityAnalyzer implements ObjectReferenceVisit
         if (space.isCompactingOldSpace() && !GCImpl.getGCImpl().isCompleteCollection()) {
             return true;
         }
-        Class<?> clazz = DynamicHub.toClass(ohi.dynamicHubFromObjectHeader(header));
+        Class<?> clazz = DynamicHub.toClass((DynamicHub) ohi.dynamicHubFromObjectHeader(header));
         return isAssumedReachable(clazz);
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static boolean isAssumedReachable(Class<?> clazz) {
+        SubstrateUtil.guaranteeRuntimeOnly();
         Class<?>[] classesAssumedReachable = RuntimeCodeCacheCleaner.CLASSES_ASSUMED_REACHABLE;
-        for (int i = 0; i < classesAssumedReachable.length; i++) {
-            if (classesAssumedReachable[i].isAssignableFrom(clazz)) {
+        for (Class<?> aClass : classesAssumedReachable) {
+            if (aClass.isAssignableFrom(clazz)) {
                 return true;
             }
         }
         return false;
+    }
+
+    static final class UnreachableObjectsException extends RuntimeException {
+        @Serial private static final long serialVersionUID = 1L;
+
+        @Override
+        @SuppressWarnings("sync-override")
+        public Throwable fillInStackTrace() {
+            /* No stacktrace needed. */
+            return this;
+        }
     }
 }

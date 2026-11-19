@@ -1,0 +1,215 @@
+/*
+ * Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+package org.graalvm.webimage.api;
+
+import java.math.BigInteger;
+
+/**
+ * Java representation of a JavaScript value.
+ * <p>
+ * The subclasses of this class represent JavaScript's six primitive data types and the object data
+ * type. The JavaScript {@code Null} data type does not have a special representation -- the
+ * JavaScript {@code null} value is directly mapped to the Java {@code null} value.
+ */
+public abstract class JSValue {
+
+    JSValue() {
+    }
+
+    /**
+     * Attempts to coerce a given value to the specified Java type.
+     * <p>
+     * If the value is a {@link JSValue}, it will be converted using {@link #as(Class)}. Otherwise,
+     * the value is cast directly.
+     *
+     * @param value the value to coerce, which may be a {@code JSValue} or a native Java object
+     * @param cls the target Java class to coerce to
+     * @param <R> the return type
+     * @return the coerced value as an instance of {@code cls}
+     * @throws ClassCastException if the coercion fails or is unsupported
+     */
+    @SuppressWarnings("unchecked")
+    public static <R> R checkedCoerce(Object value, Class<R> cls) {
+        if (value instanceof JSValue jsResult) {
+            return jsResult.as(cls);
+        }
+        return (R) value;
+    }
+
+    /**
+     * Checks whether the given value is the JavaScript {@code undefined} value.
+     *
+     * @see #isUndefined()
+     */
+    public static boolean isUndefined(Object value) {
+        return value instanceof JSValue jsValue && jsValue.isUndefined();
+    }
+
+    /**
+     * Specialization of {@link #isUndefined(Object)} that avoids the type check for
+     * {@link JSValue}.
+     */
+    public static boolean isUndefined(JSValue value) {
+        return value.isUndefined();
+    }
+
+    /**
+     * Checks whether this is the JavaScript {@code undefined} value.
+     */
+    public boolean isUndefined() {
+        return false;
+    }
+
+    public static JSUndefined undefined() {
+        return JSUndefined.instance();
+    }
+
+    public abstract String typeof();
+
+    /**
+     * Returns the JS string representation of this value (by calling the JS {@code toString} method
+     * on it) and {@code "undefined"} for the JS {@code undefined} value.
+     *
+     * @since 25.1
+     */
+    @JS.Coerce
+    @JS("return this?.toString()?? 'undefined';")
+    public final native String stringValue();
+
+    public Boolean asBoolean() {
+        throw classCastError("Boolean");
+    }
+
+    public Byte asByte() {
+        throw classCastError("Byte");
+    }
+
+    public Short asShort() {
+        throw classCastError("Short");
+    }
+
+    public Character asChar() {
+        throw classCastError("Character");
+    }
+
+    public Integer asInt() {
+        throw classCastError("Integer");
+    }
+
+    public Float asFloat() {
+        throw classCastError("Float");
+    }
+
+    public Long asLong() {
+        throw classCastError("Long");
+    }
+
+    public Double asDouble() {
+        throw classCastError("Double");
+    }
+
+    public BigInteger asBigInteger() {
+        throw classCastError(BigInteger.class.getName());
+    }
+
+    public String asString() {
+        throw classCastError("String");
+    }
+
+    /**
+     * Coerces this JavaScript value to the requested Java type. See {@link JS.Coerce} for the
+     * JavaScript to Java coercion rules.
+     *
+     * @param cls The Java type to coerce to.
+     * @return The non-null coerced value of the requested type.
+     * @throws ClassCastException If this value cannot be coerced to the requested type.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T as(Class<T> cls) {
+        if (cls.isAssignableFrom(this.getClass())) {
+            return (T) this;
+        }
+        if (Number.class.isAssignableFrom(cls)) {
+            // Dispatch to known numeric class casts.
+            if (Integer.class.equals(cls)) {
+                return (T) asInt();
+            }
+            if (Float.class.equals(cls)) {
+                return (T) asFloat();
+            }
+            if (Long.class.equals(cls)) {
+                return (T) asLong();
+            }
+            if (Double.class.equals(cls)) {
+                return (T) asDouble();
+            }
+            if (Byte.class.equals(cls)) {
+                return (T) asByte();
+            }
+            if (Short.class.equals(cls)) {
+                return (T) asShort();
+            }
+            if (BigInteger.class.equals(cls)) {
+                return (T) asBigInteger();
+            }
+        }
+        if (String.class.equals(cls)) {
+            return (T) asString();
+        }
+        if (Character.class.equals(cls)) {
+            return (T) asChar();
+        }
+        if (Boolean.class.equals(cls)) {
+            return (T) asBoolean();
+        }
+        throw classCastError(cls.getName());
+    }
+
+    private ClassCastException classCastError(String type) {
+        throw new ClassCastException("JavaScript '" + typeof() + "' value cannot be coerced to a Java '" + type + "'.");
+    }
+
+    @Override
+    public String toString() {
+        return "JavaScript<" + typeof() + "; " + stringValue() + ">";
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,22 +34,25 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.hosted.Feature.DuringAnalysisAccess;
-import org.graalvm.nativeimage.impl.AnnotationExtractor;
 import org.graalvm.word.WordBase;
 
 import com.oracle.graal.pointsto.AnalysisPolicy;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.ObjectScanner;
 import com.oracle.graal.pointsto.api.HostVM;
+import com.oracle.graal.pointsto.api.ImageLayerLoader;
+import com.oracle.graal.pointsto.api.ImageLayerWriter;
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
+import com.oracle.graal.pointsto.constraints.UnsupportedPlatformException;
 import com.oracle.graal.pointsto.heap.HeapSnapshotVerifier;
 import com.oracle.graal.pointsto.heap.HostedValuesProvider;
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
-import com.oracle.graal.pointsto.heap.ImageLayerLoader;
-import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
 import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.infrastructure.Universe;
@@ -58,6 +61,7 @@ import com.oracle.graal.pointsto.infrastructure.WrappedJavaType;
 import com.oracle.graal.pointsto.meta.AnalysisElement.MethodOverrideReachableNotification;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.ConcurrentLightHashSet;
+import com.oracle.svm.util.OriginalClassProvider;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
@@ -76,6 +80,9 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 
+/**
+ * See javadoc for {@code HostedUniverse}.
+ */
 public class AnalysisUniverse implements Universe {
 
     protected final HostVM hostVM;
@@ -91,26 +98,26 @@ public class AnalysisUniverse implements Universe {
     private final ConcurrentMap<ResolvedSignature<AnalysisType>, ResolvedSignature<AnalysisType>> uniqueSignatures = new ConcurrentHashMap<>();
     private final ConcurrentMap<ConstantPool, WrappedConstantPool> constantPools = new ConcurrentHashMap<>(ESTIMATED_NUMBER_OF_TYPES);
     private final ConcurrentHashMap<Constant, Object> embeddedRoots = new ConcurrentHashMap<>(ESTIMATED_EMBEDDED_ROOTS);
-    private final ConcurrentMap<AnalysisField, Boolean> unsafeAccessedStaticFields = new ConcurrentHashMap<>();
+    private final ConcurrentMap<AnalysisField, Boolean> unsafeAccessedStaticFields;
 
     private boolean sealed;
 
     private volatile AnalysisType[] typesById = new AnalysisType[ESTIMATED_NUMBER_OF_TYPES];
-    final AtomicInteger nextTypeId = new AtomicInteger();
+    final AtomicInteger nextTypeId = new AtomicInteger(1);
     final AtomicInteger nextMethodId = new AtomicInteger(1);
     final AtomicInteger nextFieldId = new AtomicInteger(1);
 
     protected final SubstitutionProcessor substitutions;
 
-    private Function<Object, Object>[] objectReplacers;
+    private Function<JavaConstant, JavaConstant>[] objectReplacers;
+    private Function<JavaConstant, ImageHeapConstant>[] objectToConstantSnapshotReplacers;
+    private Consumer<AnalysisType>[] onTypeCreatedCallbacks;
 
     private SubstitutionProcessor[] featureSubstitutions;
     private SubstitutionProcessor[] featureNativeSubstitutions;
 
     private final MetaAccessProvider originalMetaAccess;
     private final AnalysisFactory analysisFactory;
-    private final AnnotationExtractor annotationExtractor;
-
     private final AtomicInteger numReachableTypes = new AtomicInteger();
 
     private AnalysisType objectClass;
@@ -118,6 +125,7 @@ public class AnalysisUniverse implements Universe {
     private final JavaKind wordKind;
     private AnalysisPolicy analysisPolicy;
     private ImageHeapScanner heapScanner;
+    private ImageLayerWriter imageLayerWriter;
     private ImageLayerLoader imageLayerLoader;
     private HeapSnapshotVerifier heapVerifier;
     private BigBang bb;
@@ -131,28 +139,26 @@ public class AnalysisUniverse implements Universe {
 
     @SuppressWarnings("unchecked")
     public AnalysisUniverse(HostVM hostVM, JavaKind wordKind, AnalysisPolicy analysisPolicy, SubstitutionProcessor substitutions, MetaAccessProvider originalMetaAccess,
-                    AnalysisFactory analysisFactory, AnnotationExtractor annotationExtractor) {
+                    AnalysisFactory analysisFactory) {
         this.hostVM = hostVM;
         this.wordKind = wordKind;
         this.analysisPolicy = analysisPolicy;
         this.substitutions = substitutions;
         this.originalMetaAccess = originalMetaAccess;
         this.analysisFactory = analysisFactory;
-        this.annotationExtractor = annotationExtractor;
 
         sealed = false;
-        objectReplacers = (Function<Object, Object>[]) new Function<?, ?>[0];
+        objectReplacers = (Function<JavaConstant, JavaConstant>[]) new Function<?, ?>[0];
+        objectToConstantSnapshotReplacers = (Function<JavaConstant, ImageHeapConstant>[]) new Function<?, ?>[0];
+        onTypeCreatedCallbacks = (Consumer<AnalysisType>[]) new Consumer<?>[0];
         featureSubstitutions = new SubstitutionProcessor[0];
         featureNativeSubstitutions = new SubstitutionProcessor[0];
+        unsafeAccessedStaticFields = analysisPolicy.useConservativeUnsafeAccess() ? null : new ConcurrentHashMap<>();
     }
 
     @Override
     public HostVM hostVM() {
         return hostVM;
-    }
-
-    protected AnnotationExtractor getAnnotationExtractor() {
-        return annotationExtractor;
     }
 
     public int getNextTypeId() {
@@ -210,6 +216,9 @@ public class AnalysisUniverse implements Universe {
         AnalysisType result = optionalLookup(type);
         if (result == null) {
             result = createType(type);
+            if (hostVM.buildingExtensionLayer() && result.isInSharedLayer()) {
+                imageLayerLoader.initializeBaseLayerType(result);
+            }
         }
         assert typesById[result.getId()].equals(result) : result;
         return result;
@@ -218,7 +227,7 @@ public class AnalysisUniverse implements Universe {
     @SuppressFBWarnings(value = {"ES_COMPARING_STRINGS_WITH_EQ"}, justification = "Bug in findbugs")
     private AnalysisType createType(ResolvedJavaType type) {
         if (!hostVM.platformSupported(type)) {
-            throw new UnsupportedFeatureException("Type is not available in this platform: " + type.toJavaName(true));
+            throw new UnsupportedPlatformException("Type is not available in this platform: " + type.toJavaName(true));
         }
         if (sealed && !type.isArray()) {
             /*
@@ -251,7 +260,7 @@ public class AnalysisUniverse implements Universe {
                     if (result == null) {
                         /*
                          * The other thread gave up, probably because of an exception. Re-try to
-                         * create the type ourself. Probably we are going to fail and throw an
+                         * create the type our self. Probably we are going to fail and throw an
                          * exception too, but that is OK.
                          */
                         continue retry;
@@ -299,7 +308,7 @@ public class AnalysisUniverse implements Universe {
              * ensures that typesById doesn't contain any null values. This could happen since the
              * AnalysisType constructor increments the nextTypeId counter.
              */
-            if (hostVM.useBaseLayer() && imageLayerLoader.hasDynamicHubIdentityHashCode(newValue.getId())) {
+            if (hostVM.buildingExtensionLayer() && imageLayerLoader.hasDynamicHubIdentityHashCode(newValue.getId())) {
                 hostVM.registerType(newValue, imageLayerLoader.getDynamicHubIdentityHashCode(newValue.getId()));
             } else {
                 hostVM.registerType(newValue);
@@ -317,6 +326,12 @@ public class AnalysisUniverse implements Universe {
             Object oldValue = types.put(type, newValue);
             assert oldValue == claim : oldValue + " != " + claim;
             claim = null;
+
+            /*
+             * Trigger type creation callbacks. Note this will run in parallel with other threads
+             * being able to retrieve this AnalysisType from {@code types}.
+             */
+            runOnTypeCreatedCallbacks(newValue);
 
             return newValue;
 
@@ -361,17 +376,26 @@ public class AnalysisUniverse implements Universe {
 
     private AnalysisField createField(ResolvedJavaField field) {
         if (!hostVM.platformSupported(field)) {
-            throw new UnsupportedFeatureException("Field is not available in this platform: " + field.format("%H.%n"));
+            throw new UnsupportedPlatformException("Field is not available in this platform: " + field.format("%H.%n"));
         }
         if (sealed) {
             return null;
         }
         AnalysisField newValue = analysisFactory.createField(this, field);
-        AnalysisField oldValue = fields.putIfAbsent(field, newValue);
-        if (oldValue == null && newValue.isInBaseLayer()) {
-            getImageLayerLoader().loadFieldFlags(newValue);
+        AnalysisField result = fields.computeIfAbsent(field, f -> {
+            if (newValue.isInSharedLayer()) {
+                getImageLayerLoader().addBaseLayerField(newValue);
+            }
+            return newValue;
+        });
+
+        if (result.equals(newValue)) {
+            if (newValue.isInSharedLayer()) {
+                getImageLayerLoader().initializeBaseLayerField(newValue);
+            }
         }
-        return oldValue != null ? oldValue : newValue;
+
+        return result;
     }
 
     @Override
@@ -391,12 +415,11 @@ public class AnalysisUniverse implements Universe {
         if (rawMethod == null) {
             return null;
         }
-        if (!(rawMethod instanceof ResolvedJavaMethod)) {
+        if (!(rawMethod instanceof ResolvedJavaMethod method)) {
             return rawMethod;
         }
         assert !(rawMethod instanceof AnalysisMethod) : rawMethod;
 
-        ResolvedJavaMethod method = (ResolvedJavaMethod) rawMethod;
         method = substitutions.lookup(method);
         AnalysisMethod result = methods.get(method);
         if (result == null) {
@@ -407,21 +430,24 @@ public class AnalysisUniverse implements Universe {
 
     private AnalysisMethod createMethod(ResolvedJavaMethod method) {
         if (!hostVM.platformSupported(method)) {
-            throw new UnsupportedFeatureException("Method " + method.format("%H.%n(%p)" + " is not available in this platform."));
+            throw new UnsupportedPlatformException("Method " + method.format("%H.%n(%p)" + " is not available in this platform."));
         }
         if (sealed) {
             return null;
         }
         AnalysisMethod newValue = analysisFactory.createMethod(this, method);
-        AnalysisMethod oldValue = methods.putIfAbsent(method, newValue);
-
-        if (oldValue == null) {
-            if (newValue.isInBaseLayer()) {
-                getImageLayerLoader().patchBaseLayerMethod(newValue);
+        AnalysisMethod result = methods.computeIfAbsent(method, m -> {
+            if (newValue.isInSharedLayer()) {
+                getImageLayerLoader().addBaseLayerMethod(newValue);
             }
+            return newValue;
+        });
+
+        if (result.equals(newValue)) {
             prepareMethodImplementations(newValue);
         }
-        return oldValue != null ? oldValue : newValue;
+
+        return result;
     }
 
     /** Prepare information that {@link AnalysisMethod#collectMethodImplementations} needs. */
@@ -432,22 +458,48 @@ public class AnalysisUniverse implements Universe {
                 AnalysisMethod override = subtype.resolveConcreteMethod(method, null);
                 if (override != null && !override.equals(method)) {
                     ConcurrentLightHashSet.addElement(method, AnalysisMethod.allImplementationsUpdater, override);
+                    if (method.reachableInCurrentLayer()) {
+                        override.setReachableInCurrentLayer();
+                    }
                 }
             }
         }
+    }
+
+    public AnalysisType[] lookup(ResolvedJavaType[] inputs) {
+        List<AnalysisType> result = new ArrayList<>(inputs.length);
+        for (ResolvedJavaType type : inputs) {
+            if (hostVM.platformSupported(type)) {
+                AnalysisType aType = null;
+                try {
+                    aType = lookup(type);
+                } catch (UnsupportedFeatureException ignored) {
+                    /* Unsupported elements should not prevent querying other members of the type */
+                }
+                if (aType != null) {
+                    result.add(aType);
+                }
+            }
+        }
+        return result.toArray(AnalysisType.EMPTY_ARRAY);
     }
 
     public AnalysisMethod[] lookup(JavaMethod[] inputs) {
         List<AnalysisMethod> result = new ArrayList<>(inputs.length);
         for (JavaMethod method : inputs) {
             if (hostVM.platformSupported((ResolvedJavaMethod) method)) {
-                AnalysisMethod aMethod = lookup(method);
+                AnalysisMethod aMethod = null;
+                try {
+                    aMethod = lookup(method);
+                } catch (UnsupportedFeatureException ignored) {
+                    /* Unsupported elements should not prevent querying other members of the type */
+                }
                 if (aMethod != null) {
                     result.add(aMethod);
                 }
             }
         }
-        return result.toArray(new AnalysisMethod[result.size()]);
+        return result.toArray(AnalysisMethod.EMPTY_ARRAY);
     }
 
     @Override
@@ -539,6 +591,29 @@ public class AnalysisUniverse implements Universe {
         return methods.get(resolvedJavaMethod);
     }
 
+    /**
+     * Returns the root {@link AnalysisMethod}s. Accessing the roots is useful when traversing the
+     * call graph.
+     *
+     * @param universe the universe from which the roots are derived from.
+     * @return the call tree roots.
+     */
+    public static List<AnalysisMethod> getCallTreeRoots(AnalysisUniverse universe) {
+        List<AnalysisMethod> roots = new ArrayList<>();
+        for (AnalysisMethod m : universe.getMethods()) {
+            if (m.isDirectRootMethod() && m.isSimplyImplementationInvoked()) {
+                roots.add(m);
+            }
+            if (m.isVirtualRootMethod()) {
+                for (AnalysisMethod impl : m.collectMethodImplementations(false)) {
+                    AnalysisError.guarantee(impl.isImplementationInvoked());
+                    roots.add(impl);
+                }
+            }
+        }
+        return roots;
+    }
+
     public Map<Constant, Object> getEmbeddedRoots() {
         return embeddedRoots;
     }
@@ -552,17 +627,33 @@ public class AnalysisUniverse implements Universe {
     }
 
     public void registerUnsafeAccessedStaticField(AnalysisField field) {
+        AnalysisError.guarantee(!analysisPolicy.useConservativeUnsafeAccess(), "With conservative unsafe access we don't track unsafe accessed fields.");
+        AnalysisError.guarantee(!field.getType().isWordType(), "static Word fields cannot be unsafe accessed %s", this);
         unsafeAccessedStaticFields.put(field, true);
     }
 
     public Set<AnalysisField> getUnsafeAccessedStaticFields() {
+        AnalysisError.guarantee(!analysisPolicy.useConservativeUnsafeAccess(), "With conservative unsafe access we don't track unsafe accessed fields.");
         return unsafeAccessedStaticFields.keySet();
     }
 
-    public void registerObjectReplacer(Function<Object, Object> replacer) {
+    public void registerObjectReplacer(Function<JavaConstant, JavaConstant> replacer) {
         assert replacer != null;
         objectReplacers = Arrays.copyOf(objectReplacers, objectReplacers.length + 1);
         objectReplacers[objectReplacers.length - 1] = replacer;
+    }
+
+    public void registerObjectToConstantReplacer(Function<JavaConstant, ImageHeapConstant> replacer) {
+        assert replacer != null;
+        objectToConstantSnapshotReplacers = Arrays.copyOf(objectToConstantSnapshotReplacers, objectToConstantSnapshotReplacers.length + 1);
+        objectToConstantSnapshotReplacers[objectToConstantSnapshotReplacers.length - 1] = replacer;
+    }
+
+    public void registerOnTypeCreatedCallback(Consumer<AnalysisType> consumer) {
+        assert consumer != null;
+        assert !bb.isInitialized() : "too late to add a callback";
+        onTypeCreatedCallbacks = Arrays.copyOf(onTypeCreatedCallbacks, onTypeCreatedCallbacks.length + 1);
+        onTypeCreatedCallbacks[onTypeCreatedCallbacks.length - 1] = consumer;
     }
 
     public void registerFeatureSubstitution(SubstitutionProcessor substitution) {
@@ -588,21 +679,93 @@ public class AnalysisUniverse implements Universe {
     }
 
     /**
-     * Invokes all registered object replacers for an object.
+     * Applies all registered ordinary and object-to-constant replacers to {@code source}.
      *
-     * @param source The source object
-     * @return The replaced object or the original source, if the source is not replaced by any
-     *         registered replacer.
+     * @return the replaced constant, or {@code source} if no replacer changes it
      */
-    public Object replaceObject(Object source) {
-        if (source == null) {
-            return null;
+    public JavaConstant replaceConstantWithAllReplacers(JavaConstant source) {
+        return replaceConstant(source, true);
+    }
+
+    /**
+     * Applies all registered ordinary replacers to {@code source}. Object-to-constant replacers are
+     * also evaluated, but a matching one triggers an error because this method only supports an
+     * ordinary constant result.
+     *
+     * @return the replaced constant, or {@code source} if no replacer changes it
+     */
+    public JavaConstant replaceConstantWithOrdinaryReplacers(JavaConstant source) {
+        return replaceConstant(source, false);
+    }
+
+    /**
+     * Applies registered object replacers to {@code source}. Replacers that do not support a
+     * provider-specific constant leave it unchanged. Ordinary results are canonicalized by the
+     * hosted-values provider. The result is either the final ordinary constant or the
+     * {@link ImageHeapConstant} returned by an object-to-constant replacer.
+     */
+    private JavaConstant replaceConstant(JavaConstant source, boolean allowObjectToConstantReplacement) {
+        assert !(source instanceof ImageHeapConstant) : "ImageHeapConstants were already processed and must not reach object replacement again: " + source;
+        if (source == null || source.getJavaKind() != JavaKind.Object || source.isNull()) {
+            return source;
         }
-        Object destination = source;
-        for (Function<Object, Object> replacer : objectReplacers) {
-            destination = replacer.apply(destination);
+
+        JavaConstant destination = source;
+        for (Function<JavaConstant, JavaConstant> replacer : objectReplacers) {
+            destination = Objects.requireNonNull(replacer.apply(destination));
+            assert destination.getJavaKind() == JavaKind.Object : destination;
         }
-        return destination;
+
+        ImageHeapConstant imageHeapConstant = null;
+        for (Function<JavaConstant, ImageHeapConstant> replacer : objectToConstantSnapshotReplacers) {
+            ImageHeapConstant result = replacer.apply(destination);
+            if (result != null) {
+                AnalysisError.guarantee(allowObjectToConstantReplacement, "Object to constant replacement has been triggered from an unsupported location");
+                AnalysisError.guarantee(imageHeapConstant == null, "Multiple object to constant replacers have been triggered on a single object %s %s %s", destination, imageHeapConstant, result);
+                imageHeapConstant = result;
+            }
+        }
+
+        if (imageHeapConstant != null) {
+            return imageHeapConstant;
+        }
+        JavaConstant canonicalResult = Objects.requireNonNull(getHostedValuesProvider().canonicalizeConstant(destination));
+        AnalysisError.guarantee(!(canonicalResult instanceof ImageHeapConstant), "Ordinary object replacers must not produce an ImageHeapConstant: %s", canonicalResult);
+        return canonicalResult;
+    }
+
+    public void notifyBigBangInitialized() {
+        assert bb.isInitialized();
+
+        /*
+         * It is possible for types to be created before all typeCreationCallbacks are installed.
+         * Hence, we trigger the typeCreationCallbacks for all types created prior to the completion
+         * of big bang initialization at this point.
+         */
+        for (var obj : types.values().toArray()) {
+            /*
+             * Nominally the map values are of type object and can hold a thread object while an
+             * AnalysisType is being created. However, this method is called when all values will be
+             * of type AnalysisType.
+             */
+            AnalysisType aType = (AnalysisType) obj;
+            runOnTypeCreatedCallbacks(aType);
+        }
+    }
+
+    private void runOnTypeCreatedCallbacks(AnalysisType type) {
+        if (bb == null || !bb.isInitialized()) {
+            /*
+             * Until the big bang is initialized, it is possible for more callbacks to be
+             * registered. Hence, these hooks are run on all types created before big bang
+             * initialization via {@code notifyBigBangInitialized}
+             */
+            return;
+        }
+
+        for (var callback : onTypeCreatedCallbacks) {
+            bb.postTask((t) -> callback.accept(type));
+        }
     }
 
     public void registerOverrideReachabilityNotification(AnalysisMethod declaredMethod, MethodOverrideReachableNotification notification) {
@@ -632,8 +795,8 @@ public class AnalysisUniverse implements Universe {
      * Since the sub-types are updated continuously as the universe is expanded this method may
      * return different results on each call, until the analysis universe reaches a stable state.
      */
-    public static Set<AnalysisType> reachableSubtypes(AnalysisType baseType) {
-        Set<AnalysisType> result = baseType.getAllSubtypes();
+    public static EconomicSet<AnalysisType> reachableSubtypes(AnalysisType baseType) {
+        EconomicSet<AnalysisType> result = baseType.getAllSubtypes();
         result.removeIf(t -> !t.isReachable());
         return result;
     }
@@ -693,6 +856,9 @@ public class AnalysisUniverse implements Universe {
     }
 
     public DuringAnalysisAccess getConcurrentAnalysisAccess() {
+        AnalysisError.guarantee(concurrentAnalysisAccess != null, "The requested DuringAnalysisAccess object is not available. " +
+                        "This means that an analysis task is executed too eagerly, before analysis. " +
+                        "Make sure that all analysis tasks are posted to the analysis execution engine.");
         return concurrentAnalysisAccess;
     }
 
@@ -702,6 +868,14 @@ public class AnalysisUniverse implements Universe {
 
     public ImageHeapScanner getHeapScanner() {
         return heapScanner;
+    }
+
+    public void setImageLayerWriter(ImageLayerWriter imageLayerWriter) {
+        this.imageLayerWriter = imageLayerWriter;
+    }
+
+    public ImageLayerWriter getImageLayerWriter() {
+        return imageLayerWriter;
     }
 
     public void setImageLayerLoader(ImageLayerLoader imageLayerLoader) {
@@ -736,7 +910,7 @@ public class AnalysisUniverse implements Universe {
         /* No type was created yet, so the array can be overwritten without any concurrency issue */
         typesById = new AnalysisType[startTid];
 
-        setStartId(nextTypeId, startTid, 0);
+        setStartId(nextTypeId, startTid, 1);
     }
 
     public void setStartMethodId(int startMid) {

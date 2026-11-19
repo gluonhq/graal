@@ -27,8 +27,8 @@ package com.oracle.svm.core.posix;
 import org.graalvm.word.PointerBase;
 
 import com.oracle.svm.core.RegisterDumper;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.posix.headers.Signal.ucontext_t;
 
 public interface UContextRegisterDumper extends RegisterDumper {

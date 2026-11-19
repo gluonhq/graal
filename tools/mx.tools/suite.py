@@ -21,13 +21,13 @@
 # questions.
 #
 suite = {
-    "mxversion": "7.27.0",
+    "mxversion": "7.86.0",
     "name": "tools",
     "defaultLicense" : "GPLv2-CPE",
 
     "groupId" : "org.graalvm.tools",
-    "version" : "24.2.0",
-    "release" : False,
+    "version_from" : "truffle",
+    "release_from" : "truffle",
     "url" : "http://openjdk.java.net/projects/graal",
     "developer" : {
         "name" : "GraalVM Development",
@@ -50,17 +50,17 @@ suite = {
         ]
     },
 
-    "ignore_suite_commit_info": True,
+    "capture_suite_commit_info": False,
 
     "projects" : {
         "com.oracle.truffle.tools.chromeinspector" : {
             "subDir" : "src",
             "sourceDirs" : ["src"],
             "dependencies" : [
+                "com.oracle.truffle.tools.utils.java_websocket",
                 "truffle:TRUFFLE_API",
                 "TRUFFLE_PROFILER",
                 "truffle:TRUFFLE_JSON",
-                "TruffleJWS",
             ],
             "requires" : [
                 "java.logging",
@@ -71,7 +71,7 @@ suite = {
               "com.oracle.truffle.tools.chromeinspector.instrument to org.graalvm.truffle"
             ],
             "javaCompliance" : "17+",
-            "checkstyleVersion" : "10.7.0",
+            "checkstyleVersion" : "10.21.0",
             "checkstyle" : "com.oracle.truffle.tools.chromeinspector",
             "annotationProcessors" : ["truffle:TRUFFLE_DSL_PROCESSOR"],
             "workingSets" : "Tools",
@@ -224,6 +224,10 @@ suite = {
             "checkstyle" : "com.oracle.truffle.tools.chromeinspector",
             "javaCompliance" : "17+",
             "workingSets" : "Tools",
+            "jacoco" : "include",
+            "jacocoExcludePackages" : [
+                "com.oracle.truffle.tools.dap.types",
+            ],
         },
         "com.oracle.truffle.tools.dap.test" : {
             "subDir" : "src",
@@ -296,12 +300,17 @@ suite = {
             "javaCompliance" : "17+",
             "annotationProcessors": ["truffle:TRUFFLE_DSL_PROCESSOR"],
             "workingSets": "Tools",
+            "jacoco" : "include",
+            "jacocoExcludePackages" : [
+                "org.graalvm.tools.lsp.server.types",
+            ],
         },
         "org.graalvm.tools.lsp.test": {
             "subDir": "src",
             "sourceDirs": ["src"],
             "dependencies": [
                 "org.graalvm.tools.lsp",
+                "truffle:TRUFFLE_TEST",
                 "truffle:TRUFFLE_SL",
                 "mx:JUNIT"
             ],
@@ -310,14 +319,74 @@ suite = {
             "annotationProcessors": ["truffle:TRUFFLE_DSL_PROCESSOR"],
             "workingSets": "Tools",
         },
+        "com.oracle.truffle.tools.utils.java_websocket" : {
+            "subDir" : "src",
+            "sourceDirs" : ["src"],
+            "javaCompliance" : "17+",
+            "spotbugsIgnoresGenerated" : True,
+            "requires" : [
+                "java.logging",
+            ],
+            "shadedDependencies" : [
+                "tools:JAVA_WEBSOCKET",
+            ],
+            "class" : "ShadedLibraryProject",
+            "shade" : {
+                "packages" : {
+                    "org.java_websocket" : "com.oracle.truffle.tools.utils.java_websocket",
+                },
+                "exclude" : [
+                    "META-INF/MANIFEST.MF",
+                    "META-INF/maven/org.java-websocket/Java-WebSocket/pom.xml",
+                    "META-INF/maven/org.java-websocket/Java-WebSocket/pom.properties",
+                ],
+                "patch" : {
+                    "org/java_websocket/server/WebSocketServer.java" : {
+                        "\"Uncaught exception in thread \\{\\}: \\{\\}\", (t\\.getName\\(\\)|getName\\(\\)), e" : "\"Uncaught exception in thread {0}: {1}\", new Object[] { \\g<1>, e }",
+                    },
+                    "org/java_websocket/WebSocketImpl.java" : {
+                        "\"process\\(\\{\\}\\): \\(\\{\\}\\)\", socketBuffer\\.remaining\\(\\)," : "\"process({0}): ({1})\", new Object[] { socketBuffer.remaining(),",
+                        "socketBuffer\\.remaining\\(\\)\\)\\)\\);" : "socketBuffer.remaining()))});",
+                        "\"write\\(\\{\\}\\): \\{\\}\", buf\\.remaining\\(\\)," : "\"write({0}): {1}\", new Object[] { buf.remaining(),",
+                        "new String\\(buf\\.array\\(\\)\\)\\);" : "new String(buf.array())});",
+                    },
+                    "org/java_websocket/drafts/Draft_6455.java" : {
+                        "\"after(Enconding|Decoding)\\(\\{\\}\\): \\{\\}\", (framedata|frame)\\.getPayloadData\\(\\)\\.remaining\\(\\)," : "\"after\\g<1>({0}): {1}\", new Object[] { \\g<2>.getPayloadData().remaining(),",
+                        "new String\\((framedata|frame)\\.getPayloadData\\(\\)\\.array\\(\\)\\)\\)\\);" : "new String(\\g<1>.getPayloadData().array()))});",
+                        "\"Payload limit reached\\. Allowed: \\{\\} Current: \\{\\}\", maxFrameSize, (length|totalSize)" : "\"Payload limit reached. Allowed: {0} Current: {1}\", new Object[] { maxFrameSize, \\g<1> }",
+                    },
+                    "org/java_websocket/**/*.java" : {
+                        "import org\\.slf4j\\.Logger;" : "import java.util.logging.Level;",
+                        "import org\\.slf4j\\.LoggerFactory;" : "import java.util.logging.Logger;",
+                        "LoggerFactory\\.getLogger\\(([A-Za-z_][A-Za-z0-9_]*)\\.class\\);" : "Logger.getLogger(\\g<1>.class.getName());",
+                        "log\\.trace\\(" : "log.log(Level.FINER, ",
+                        "log\\.error\\(" : "log.log(Level.SEVERE, ",
+                        "log\\.isTraceEnabled\\(\\)" : "log.isLoggable(Level.FINER)",
+                    },
+                },
+            },
+            "description" : "shaded Java-WebSocket library.",
+            "allowsJavadocWarnings": True,
+            "noMavenJavadoc": True,
+            # We need to force javac because the generated sources in this project produce warnings in JDT.
+            "forceJavac" : "true",
+            "javac.lint.overrides" : 'none',
+            "jacoco" : "exclude",
+            "graalCompilerSourceEdition": "ignore",
+            "workingSets" : "Tools",
+        },
     },
 
     "libraries": {
-        "TruffleJWS" : {
-          "urls" : ["https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/trufflejws-1.5.2.jar"],
-          "digest" : "sha512:6435a25bea1335553ce318be089f50ab56bbdd2f2e449b8d7f52dbfa69ee57e7aed4d2cf3225ba7dd63a7bc54ffafdc7ac497dfa64ac09f3552a1fec04016188",
-          "sourceUrls": ["https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/trufflejws-1.5.2-src.jar"],
-          "sourceDigest" : "sha512:a0d6c208a0bdb40a8b5960ba43569cb2b976a1387f0c85d97781704d5df642072b318826715191f6f49df0d981aecbd8a0b83b05dbc84018504554e2887f1a8c",
+        "JAVA_WEBSOCKET" : {
+            "moduleName": "org.java_websocket",
+            "digest" : "sha512:03a21b3e1f63e7f4d35db7eb5de6f5f25d03fa82b4d3bf4ddf78ddc4a665b83c772f3f4519c38aa92bb81551feb3fe04287ee0a7590dffec1f125b06520a0fc4",
+            "sourceDigest" : "sha512:42a13766f7e41a0579ac31c1d6204de0a2f62ce8d75cc8402e88c6e22178793edb5abf7ff265042db7e88835801fe4c2b0a7ba37c771783969b96922ae703486",
+            "maven" : {
+                "groupId" : "org.java-websocket",
+                "artifactId" : "Java-WebSocket",
+                "version" : "1.6.0",
+            }
         },
         "VISUALVM_COMMON" : {
             "urls" : ["https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/visualvm/visualvm-1090.tar.gz"],
@@ -369,6 +438,7 @@ suite = {
                   "org.graalvm.polyglot",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": ["com.oracle.truffle.tools.chromeinspector"],
             "distDependencies" : [
                 "truffle:TRUFFLE_API",
@@ -381,7 +451,7 @@ suite = {
             },
             "description" : "The core module of the polyglot debugging backend for chrome inspector.",
         },
-        "INSPECT_COMMUNITY": {
+        "INSPECT_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "CHROMEINSPECTOR",
@@ -389,7 +459,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "inspect-community",
+              "artifactId": "inspect",
               "tag": ["default", "public"],
             },
             "description": "The polyglot debugging backend for chrome inspector.",
@@ -430,6 +500,7 @@ suite = {
                   "org.graalvm.collections",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "org.graalvm.tools.insight",
                 "com.oracle.truffle.tools.agentscript"
@@ -443,7 +514,7 @@ suite = {
             },
             "description" : "The core module of the Insights Gathering Platform",
         },
-        "INSIGHT_COMMUNITY": {
+        "INSIGHT_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "INSIGHT",
@@ -451,7 +522,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "insight-community",
+              "artifactId": "insight",
               "tag": ["default", "public"],
             },
             "description": "The Ultimate Insights Gathering Platform",
@@ -466,6 +537,7 @@ suite = {
                   "org.graalvm.polyglot",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "org.graalvm.tools.insight.heap"
             ],
@@ -479,7 +551,7 @@ suite = {
             },
             "description" : "The core module of Heap Dump for Insight",
         },
-        "HEAP_COMMUNITY": {
+        "HEAP_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "INSIGHT_HEAP",
@@ -487,7 +559,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "heap-community",
+              "artifactId": "heap",
               "tag": ["default", "public"],
             },
             "description": "The Heap Dump for the Insights Gathering Platform",
@@ -537,6 +609,7 @@ suite = {
                   "org.graalvm.polyglot",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "com.oracle.truffle.tools.profiler",
             ],
@@ -551,7 +624,7 @@ suite = {
             "javadocType" : "api",
             "description" : "The core module of the Truffle profiler"
         },
-        "PROFILER_COMMUNITY": {
+        "PROFILER_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "TRUFFLE_PROFILER",
@@ -559,7 +632,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "profiler-community",
+              "artifactId": "profiler",
               "tag": ["default", "public"],
             },
             "description": "The truffle profiler, supporting CPU sampling and tracing. Memory tracing support is experimental"
@@ -596,6 +669,7 @@ suite = {
                   "org.graalvm.polyglot",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "com.oracle.truffle.tools.coverage",
             ],
@@ -610,7 +684,7 @@ suite = {
             "description" : "Core module of the Truffle code coverage tool",
             "javadocType" : "api",
         },
-        "COVERAGE_COMMUNITY": {
+        "COVERAGE_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "TRUFFLE_COVERAGE",
@@ -618,7 +692,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "coverage-community",
+              "artifactId": "coverage",
               "tag": ["default", "public"],
             },
             "description": "The Truffle code coverage tool"
@@ -657,6 +731,7 @@ suite = {
                   "org.graalvm.polyglot",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "com.oracle.truffle.tools.dap",
             ],
@@ -670,7 +745,7 @@ suite = {
             },
             "description" : "Core module of the polyglot debugging backend for the Debug Adapter Protocol",
         },
-        "DAP_COMMUNITY": {
+        "DAP_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "DAP",
@@ -678,7 +753,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "dap-community",
+              "artifactId": "dap",
               "tag": ["default", "public"],
             },
             "description": "The polyglot debugging backend for the Debug Adapter Protocol"
@@ -723,6 +798,7 @@ suite = {
             "subDir": "src",
             # This distribution defines a module.
             "moduleName" : "org.graalvm.tools.api.lsp",
+            "useModulePath" : True,
             "dependencies": ["org.graalvm.tools.api.lsp"],
             "distDependencies" : [
                 "truffle:TRUFFLE_API",
@@ -745,6 +821,7 @@ suite = {
                   "org.graalvm.truffle",
                 ],
             },
+            "useModulePath" : True,
             "dependencies": [
                 "org.graalvm.tools.api.lsp",
                 "org.graalvm.tools.lsp"
@@ -759,7 +836,7 @@ suite = {
             },
             "description" : "Core module of the polyglot Language Server backend",
         },
-        "LSP_COMMUNITY": {
+        "LSP_POM": {
             "type": "pom",
             "runtimeDependencies": [
                 "LSP",
@@ -767,7 +844,7 @@ suite = {
             ],
             "maven": {
               "groupId" : "org.graalvm.polyglot",
-              "artifactId": "lsp-community",
+              "artifactId": "lsp",
               "tag": ["default", "public"],
             },
             "description": "The polyglot Language Server backend"
@@ -777,7 +854,7 @@ suite = {
             "distDependencies" : [
                 "LSP",
                 "truffle:TRUFFLE_SL",
-                "truffle:TRUFFLE_TEST",  # runtime dependency for unittest config
+                "truffle:TRUFFLE_TEST",
             ],
             "exclude": [
               "mx:HAMCREST",

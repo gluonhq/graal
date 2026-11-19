@@ -20,10 +20,9 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.vm.npe;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.vm.VM;
@@ -37,7 +36,7 @@ public final class ExtendedNPEMessage {
         assert throwable.getKlass() == ctx.getMeta().java_lang_NullPointerException : "Calling getExtendedNPEMessage with non NPE throwable.";
 
         // Java tries to ensure NPE message is constructed after the stack trace is filled in.
-        VM.StackTrace frames = (VM.StackTrace) ctx.getMeta().HIDDEN_FRAMES.getHiddenObject(throwable);
+        VM.StackTrace frames = (VM.StackTrace) ctx.getMeta().java_lang_Throwable_0frames.getHiddenObject(throwable);
         if (frames == null) {
             return null;
         }
@@ -50,7 +49,7 @@ public final class ExtendedNPEMessage {
             return null;
         }
         // If this NPE was created via reflection, we have no real NPE.
-        if (top.getMethod().getDeclaringKlass().getType() == Symbol.Type.jdk_internal_reflect_NativeConstructorAccessorImpl) {
+        if (top.getMethod().getDeclaringKlass().getType() == Types.jdk_internal_reflect_NativeConstructorAccessorImpl) {
             return null;
         }
         try {

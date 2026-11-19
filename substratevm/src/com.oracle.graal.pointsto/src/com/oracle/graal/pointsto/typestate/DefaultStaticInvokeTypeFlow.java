@@ -37,7 +37,7 @@ import com.oracle.graal.pointsto.flow.TypeFlow;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.util.LightImmutableCollection;
-import com.oracle.svm.common.meta.MultiMethod.MultiMethodKey;
+import com.oracle.svm.common.meta.MethodVariant.MethodVariantKey;
 
 import jdk.vm.ci.code.BytecodePosition;
 
@@ -45,20 +45,26 @@ final class DefaultStaticInvokeTypeFlow extends AbstractStaticInvokeTypeFlow {
     private final boolean isDeoptInvokeTypeFlow;
 
     DefaultStaticInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey) {
-        this(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMultiMethodKey, false);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariantKey callerMethodVariantKey) {
+        this(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMethodVariantKey, false);
     }
 
     DefaultStaticInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey, boolean isDeoptInvokeTypeFlow) {
-        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariantKey callerMethodVariantKey, boolean isDeoptInvokeTypeFlow) {
+        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMethodVariantKey);
         this.isDeoptInvokeTypeFlow = isDeoptInvokeTypeFlow;
     }
 
     @Override
+    protected void onFlowEnabled(PointsToAnalysis bb) {
+        bb.postTask(() -> update(bb));
+    }
+
+    @Override
     public void update(PointsToAnalysis bb) {
+        assert isFlowEnabled() : "The linking should only be triggered for enabled flows: " + this;
         /* The static invokes should be updated only once and the callee should be null. */
-        guarantee(LightImmutableCollection.isEmpty(this, CALLEES_ACCESSOR), "static invoke updated multiple times!");
+        guarantee(LightImmutableCollection.isEmpty(this, CALLEES_ACCESSOR), "Static invoke updated multiple times, source %s, target method %s", getSource(), targetMethod);
 
         // Unlinked methods can not be parsed
         if (!targetMethod.getWrapped().getDeclaringClass().isLinked()) {

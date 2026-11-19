@@ -27,9 +27,19 @@ package com.oracle.svm.core.handles;
 import org.graalvm.nativeimage.ObjectHandles;
 import org.graalvm.nativeimage.impl.ObjectHandlesSupport;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+/*
+ * Note in some cases object instances are accessed during code initialized at buildtime.
+ * However, when this is done, one must be very careful to ensure analysis sees all changes
+ * made to these objects.
+ */
 
 @AutomaticallyRegisteredImageSingleton(ObjectHandlesSupport.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class ObjectHandlesSupportImpl implements ObjectHandlesSupport {
     final ObjectHandlesImpl globalHandles = new ObjectHandlesImpl();
 

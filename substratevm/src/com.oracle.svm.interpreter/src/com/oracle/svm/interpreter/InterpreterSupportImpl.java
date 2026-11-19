@@ -1,0 +1,907 @@
+/*
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.oracle.svm.interpreter;
+
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Executable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.c.function.CodePointer;
+import org.graalvm.nativeimage.impl.InternalPlatform;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.SignedWord;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.graal.pointsto.infrastructure.WrappedJavaMethod;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.code.CodeInfoQueryResult;
+import com.oracle.svm.core.code.FrameInfoEncoder.ValueRetentionPolicy;
+import com.oracle.svm.core.code.FrameInfoQueryResult;
+import com.oracle.svm.core.code.FrameInfoQueryResult.ValueType;
+import com.oracle.svm.core.code.FrameSourceInfo;
+import com.oracle.svm.core.deopt.DeoptimizedFrame;
+import com.oracle.svm.core.deopt.Deoptimizer;
+import com.oracle.svm.core.deopt.SubstrateInstalledCode;
+import com.oracle.svm.core.graal.code.PreparedSignature;
+import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.hub.RuntimeReflectionMetadata;
+import com.oracle.svm.core.hub.crema.CremaResolvedJavaMethod;
+import com.oracle.svm.core.hub.registry.SymbolsSupport;
+import com.oracle.svm.core.interpreter.InterpreterFrameSourceInfo;
+import com.oracle.svm.core.interpreter.InterpreterJNIFieldIds;
+import com.oracle.svm.core.interpreter.InterpreterJNIMethodIds;
+import com.oracle.svm.core.interpreter.InterpreterSupport;
+import com.oracle.svm.core.jni.headers.JNIFieldId;
+import com.oracle.svm.core.jni.headers.JNIMethodId;
+import com.oracle.svm.espresso.classfile.descriptors.ByteSequence;
+import com.oracle.svm.espresso.classfile.descriptors.Name;
+import com.oracle.svm.espresso.classfile.descriptors.ParserSymbols;
+import com.oracle.svm.espresso.classfile.descriptors.Symbol;
+import com.oracle.svm.espresso.classfile.descriptors.Type;
+import com.oracle.svm.espresso.shared.lookup.LookupSuccessInvocationFailure;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.hosted.SubstrateBytecodeHandlerStub;
+import com.oracle.svm.interpreter.metadata.InterpreterResolvedJavaField;
+import com.oracle.svm.interpreter.metadata.InterpreterResolvedJavaMethod;
+import com.oracle.svm.interpreter.metadata.InterpreterResolvedJavaType;
+import com.oracle.svm.interpreter.metadata.InterpreterResolvedObjectType;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionType;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.OriginalClassProvider;
+
+import jdk.vm.ci.code.BytecodeFrame;
+import jdk.vm.ci.code.CallingConvention;
+import jdk.vm.ci.code.StackSlot;
+import jdk.vm.ci.meta.AllocatableValue;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.LineNumberTable;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.Signature;
+
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+public final class InterpreterSupportImpl extends InterpreterSupport {
+    /* The uniform handler ABI starts with the static long curBCI parameter. */
+    private static final int BYTECODE_HANDLER_BCI_LOCAL = 0;
+
+    @Platforms(Platform.HOSTED_ONLY.class) private final ValueRetentionPolicy bytecodeHandlerValueRetentionPolicy = new ValueRetentionPolicy() {
+        @Override
+        public boolean retainLocalValue(ResolvedJavaMethod method, ResolvedJavaMethod caller, int localIndex) {
+            /* Stack walking consumes the BCI in the stub or its immediate inlined Java handler. */
+            return localIndex == BYTECODE_HANDLER_BCI_LOCAL &&
+                            (isInterpreterBytecodeHandlerStub(method) || (caller != null && isInterpreterBytecodeHandlerStub(caller)));
+        }
+
+        @Override
+        public boolean retainStackOperand(ResolvedJavaMethod method, ResolvedJavaMethod caller, int stackIndex) {
+            return false;
+        }
+    };
+
+    private static final int MAX_SYMBOL_LOG_LENGTH = 255;
+    private static final String BYTECODE_ROOT_METHOD_NAME = "executeBodyFromBCI";
+
+    private final int bciSlot;
+    private final int startBCISlot;
+    private final int interpretedMethodSlot;
+    private final int interpretedFrameSlot;
+    private final int intrinsicMethodSlot;
+    private final int intrinsicFrameSlot;
+    private final int interpreterJNIDowncallMethodSlot;
+    private final ConcurrentHashMap<PreparedSignature, PreparedSignature> preparedSignatures;
+    private final ConcurrentHashMap<PreparedSignature, PreparedSignature> preparedJNISignatures;
+
+    InterpreterSupportImpl(int bciSlot, int startBCISlot, int interpretedMethodSlot, int interpretedFrameSlot, int intrinsicMethodSlot, int intrinsicFrameSlot, int interpreterJNIDowncallMethodSlot) {
+        this.bciSlot = bciSlot;
+        this.startBCISlot = startBCISlot;
+        this.interpretedMethodSlot = interpretedMethodSlot;
+        this.interpretedFrameSlot = interpretedFrameSlot;
+        this.intrinsicMethodSlot = intrinsicMethodSlot;
+        this.intrinsicFrameSlot = intrinsicFrameSlot;
+        this.interpreterJNIDowncallMethodSlot = interpreterJNIDowncallMethodSlot;
+        this.preparedSignatures = new ConcurrentHashMap<>();
+        this.preparedJNISignatures = new ConcurrentHashMap<>();
+    }
+
+    @Override
+    public Executable getJNIMethodExecutable(JNIMethodId methodId) {
+        assert InterpreterJNIMethodIds.isInterpreterMethodId(methodId);
+        ResolvedJavaMethod method = InterpreterJNIMethodIds.getMethod(methodId);
+        if (method instanceof CremaResolvedJavaMethod cremaMethod) {
+            return RuntimeReflectionMetadata.fromResolvedMethod(cremaMethod);
+        } else if (method instanceof InterpreterResolvedJavaMethod interpreterMethod) {
+            Class<?> declaringClass = interpreterMethod.getDeclaringClass().getJavaClass();
+            Class<?>[] parameterTypes = MethodType.fromMethodDescriptorString(interpreterMethod.getSignature().toMethodDescriptor(), declaringClass.getClassLoader()).parameterArray();
+            try {
+                return interpreterMethod.isConstructor() ? declaringClass.getDeclaredConstructor(parameterTypes) : declaringClass.getDeclaredMethod(interpreterMethod.getName(), parameterTypes);
+            } catch (NoSuchMethodException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public boolean canCreateJNIMethodId(ResolvedJavaMethod method) {
+        return method instanceof InterpreterResolvedJavaMethod interpreterMethod && InterpreterToVM.canInvoke(interpreterMethod);
+    }
+
+    @Override
+    public JNIMethodId getOrCreateJNIMethodId(ResolvedJavaMethod method) {
+        assert canCreateJNIMethodId(method);
+        return ((InterpreterResolvedJavaMethod) method).getOrCreateJNIMethodId();
+    }
+
+    @Override
+    public ResolvedJavaMethod lookupMethodForJNI(Class<?> clazz, String name, String signature) {
+        if (clazz.isPrimitive()) {
+            return null;
+        }
+        Symbol<Name> symbolicName = SymbolsSupport.getNames().lookup(name);
+        if (symbolicName == null) {
+            return null;
+        }
+        var symbolicDescriptor = SymbolsSupport.getSignatures().lookupValidSignature(signature);
+        if (symbolicDescriptor == null) {
+            return null;
+        }
+        InterpreterResolvedObjectType type = (InterpreterResolvedObjectType) DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(clazz));
+        if (symbolicName == ParserSymbols.ParserNames._init_ || symbolicName == ParserSymbols.ParserNames._clinit_) {
+            return type.lookupDeclaredMethod(symbolicName, symbolicDescriptor);
+        }
+        try {
+            return type.lookupMethod(symbolicName, symbolicDescriptor);
+        } catch (LookupSuccessInvocationFailure e) {
+            return e.getResult();
+        }
+    }
+
+    @Override
+    public boolean canCreateJNIFieldId(ResolvedJavaField field) {
+        return field instanceof InterpreterResolvedJavaField interpreterField && interpreterField.canCreateJNIFieldId();
+    }
+
+    @Override
+    public JNIFieldId getOrCreateJNIFieldId(ResolvedJavaField field) {
+        assert canCreateJNIFieldId(field);
+        return ((InterpreterResolvedJavaField) field).getOrCreateJNIFieldId();
+    }
+
+    @Override
+    public ResolvedJavaField lookupFieldForJNI(Class<?> clazz, String name, String signature, boolean isStatic) {
+        if (clazz.isPrimitive() || clazz.isArray()) {
+            return null;
+        }
+        InterpreterResolvedObjectType type = (InterpreterResolvedObjectType) DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(clazz));
+        Symbol<Name> fieldName = SymbolsSupport.getNames().lookup(ByteSequence.create(name));
+        Symbol<Type> fieldType = SymbolsSupport.getTypes().lookupValidType(ByteSequence.create(signature));
+        if (fieldName == null || fieldType == null) {
+            return null;
+        }
+        return lookupInterpreterField(type, fieldName, fieldType, isStatic);
+    }
+
+    private static InterpreterResolvedJavaField lookupInterpreterField(InterpreterResolvedObjectType holder, Symbol<Name> name, Symbol<Type> type, boolean isStatic) {
+        for (InterpreterResolvedJavaField field : holder.getDeclaredFields()) {
+            if (name.equals(field.getSymbolicName()) && type.equals(field.getSymbolicType()) && field.isStatic() == isStatic) {
+                return field;
+            }
+        }
+        if (isStatic) {
+            for (InterpreterResolvedObjectType superInterface : holder.getInterfaces()) {
+                InterpreterResolvedJavaField field = lookupInterpreterField(superInterface, name, type, true);
+                if (field != null) {
+                    return field;
+                }
+            }
+        }
+        InterpreterResolvedObjectType superclass = holder.getSuperclass();
+        return superclass == null ? null : lookupInterpreterField(superclass, name, type, isStatic);
+    }
+
+    @Override
+    public ResolvedJavaField getJNIField(Class<?> clazz, JNIFieldId fieldId, boolean isStatic) {
+        if (clazz.isPrimitive() || !InterpreterJNIFieldIds.isInterpreterFieldId(fieldId)) {
+            return null;
+        }
+
+        ResolvedJavaField resolvedField = null;
+        if (isStatic) {
+            InterpreterResolvedObjectType type = (InterpreterResolvedObjectType) DynamicHubUtils.getInterpreterType(InterpreterJNIFieldIds.getStaticFieldHolder(fieldId));
+            resolvedField = type.findStaticFieldWithOffset(InterpreterJNIFieldIds.getStaticFieldOffset(fieldId), null);
+        } else {
+            Object interpreterType = DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(clazz));
+            if (interpreterType instanceof InterpreterResolvedObjectType type) {
+                resolvedField = type.findInstanceFieldWithOffset(InterpreterJNIFieldIds.getInstanceFieldOffset(fieldId), null);
+            }
+        }
+        return resolvedField;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public Object getJNIStaticFieldBase(JNIFieldId fieldId, boolean primitive) {
+        InterpreterResolvedObjectType type = (InterpreterResolvedObjectType) DynamicHubUtils.getInterpreterType(InterpreterJNIFieldIds.getStaticFieldHolder(fieldId));
+        return type.getStaticStorage(primitive, InterpreterJNIFieldIds.getStaticFieldLayerNum(fieldId));
+    }
+
+    @Override
+    public PreparedSignature prepareSignature(Signature signature, boolean hasReceiver, ResolvedJavaType accessingClass) {
+        int count = signature.getParameterCount(false);
+
+        InterpreterStubSection stubSection = ImageSingletons.lookup(InterpreterStubSection.class);
+        int[] argumentTypes = new int[count + (hasReceiver ? 1 : 0)];
+
+        // The calling convention is always used with a caller perspective, i.e. sp is unmodified.
+        SubstrateCallingConventionType callingConventionType = SubstrateCallingConventionKind.Java.toType(true);
+        JavaType thisType = hasReceiver ? accessingClass : null;
+        JavaType returnType = signature.getReturnType(accessingClass);
+        CallingConvention callingConvention = stubSection.registerConfig.getCallingConvention(callingConventionType, returnType, signature.toParameterTypes(thisType), stubSection.valueKindFactory);
+
+        int gpRegisterIndex = 0;
+        int fpRegisterIndex = 0;
+        int index = 0;
+        if (hasReceiver) {
+            argumentTypes[0] = PreparedSignature.encodeArgumentType(JavaKind.Object, gpRegisterIndex, true);
+            index++;
+            gpRegisterIndex++;
+        }
+        for (int i = 0; i < count; i++, index++) {
+            AllocatableValue allocatableValue = callingConvention.getArgument(index);
+            JavaKind argKind = signature.getParameterKind(i);
+            int value;
+            if (allocatableValue instanceof StackSlot stackSlot) {
+                // Both, in the enter- and leavestub we want the "outgoing semantics".
+                value = stackSlot.getOffset(0);
+            } else if (argKind.isNumericFloat()) {
+                value = fpRegisterIndex++;
+            } else {
+                value = gpRegisterIndex++;
+            }
+            boolean isRegister = !(allocatableValue instanceof StackSlot);
+            argumentTypes[index] = PreparedSignature.encodeArgumentType(argKind, value, isRegister);
+        }
+        return preparedSignature(signature.getReturnKind(), argumentTypes, callingConvention.getStackSize());
+    }
+
+    public PreparedSignature preparedSignature(JavaKind returnKind, int[] argumentTypes, int stackSize) {
+        return preparedSignatures.computeIfAbsent(new PreparedSignature(returnKind, argumentTypes, stackSize), Function.identity());
+    }
+
+    @Override
+    public PreparedSignature prepareJNIDowncallSignature(Signature signature, boolean hasReceiver, ResolvedJavaType accessingClass) {
+        InterpreterStubSection stubSection = ImageSingletons.lookup(InterpreterStubSection.class);
+        ResolvedJavaType wordType = DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(stubSection.target.wordJavaKind.toJavaClass()));
+
+        int parameterCount = signature.getParameterCount(false);
+        JavaType[] parameterTypes = new JavaType[parameterCount + 2];
+        int[] argumentTypes = new int[parameterTypes.length];
+        parameterTypes[0] = wordType;
+        parameterTypes[1] = wordType;
+        for (int i = 0; i < parameterCount; i++) {
+            JavaType parameterType = signature.getParameterType(i, accessingClass);
+            parameterTypes[i + 2] = parameterType.getJavaKind() == JavaKind.Object ? wordType : parameterType;
+        }
+
+        JavaType returnType = signature.getReturnType(accessingClass);
+        if (returnType.getJavaKind() == JavaKind.Object) {
+            returnType = wordType;
+        }
+
+        CallingConvention callingConvention = stubSection.registerConfig.getCallingConvention(SubstrateCallingConventionKind.Native.toType(true), returnType, parameterTypes,
+                        stubSection.valueKindFactory);
+        int gpRegisterIndex = 0;
+        int fpRegisterIndex = 0;
+        for (int i = 0; i < argumentTypes.length; i++) {
+            /*
+             * We need to keep using signature.getParameterKind here and not use parameterTypes
+             * since leaveInterpreterForJNIDowncall relies on that to decide what to wrap into a handle.
+             */
+            AllocatableValue allocatableValue = callingConvention.getArgument(i);
+            JavaKind argKind = i < 2 ? stubSection.target.wordJavaKind : signature.getParameterKind(i - 2);
+            int value;
+            if (allocatableValue instanceof StackSlot stackSlot) {
+                value = stackSlot.getOffset(0);
+            } else if (Platform.includedIn(InternalPlatform.WINDOWS_BASE.class) && Platform.includedIn(Platform.AMD64.class)) {
+                value = i;
+            } else if (argKind.isNumericFloat()) {
+                value = fpRegisterIndex++;
+            } else {
+                value = gpRegisterIndex++;
+            }
+            boolean isRegister = !(allocatableValue instanceof StackSlot);
+            argumentTypes[i] = PreparedSignature.encodeArgumentType(argKind, value, isRegister);
+        }
+        return preparedJNISignature(signature.getReturnKind(), argumentTypes, callingConvention.getStackSize());
+    }
+
+    public PreparedSignature preparedJNISignature(JavaKind returnKind, int[] argumentTypes, int stackSize) {
+        return preparedJNISignatures.computeIfAbsent(new PreparedSignature(returnKind, argumentTypes, stackSize), Function.identity());
+    }
+
+    @Override
+    public Class<?> toClass(ResolvedJavaType resolvedJavaType) {
+        /*
+         * A resolved java type, at runtime, will always have a Java class. Hence, the below will
+         * never throw the implicit NPE as checked by getJavaClass().
+         */
+        return ((InterpreterResolvedJavaType) resolvedJavaType).getJavaClass();
+    }
+
+    @Override
+    public PreparedSignature prepareJNIUpcallVarargsSignature(Signature signature, ResolvedJavaType accessingClass, boolean nonVirtual) {
+        InterpreterStubSection stubSection = ImageSingletons.lookup(InterpreterStubSection.class);
+
+        ResolvedJavaType wordType = DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(stubSection.target.wordJavaKind.toJavaClass()));
+
+        int parameterCount = signature.getParameterCount(false);
+        int startIndex = (nonVirtual ? 4 : 3);
+        JavaType[] parameterTypes = new JavaType[parameterCount + startIndex];
+        int[] argumentTypes = new int[parameterTypes.length];
+        parameterTypes[0] = wordType;
+        parameterTypes[1] = wordType;
+        parameterTypes[2] = wordType;
+        if (nonVirtual) {
+            parameterTypes[3] = wordType;
+        }
+        for (int i = 0; i < parameterCount; i++) {
+            parameterTypes[i + startIndex] = toJNIVarargsParameterType(signature, accessingClass, i, wordType);
+        }
+
+        JavaType returnType = signature.getReturnType(accessingClass);
+        if (returnType.getJavaKind() == JavaKind.Object) {
+            // handle
+            returnType = wordType;
+        }
+
+        CallingConvention callingConvention = stubSection.registerConfig.getCallingConvention(SubstrateCallingConventionKind.Native.toType(true), returnType, parameterTypes,
+                        stubSection.valueKindFactory);
+        int gpRegisterIndex = 0;
+        int fpRegisterIndex = 0;
+        for (int i = 0; i < argumentTypes.length; i++) {
+            JavaKind argKind = i < startIndex ? stubSection.target.wordJavaKind : toJNIVarargsParameterKind(signature.getParameterKind(i - startIndex), stubSection.target.wordJavaKind);
+            int value;
+            boolean isRegister = true;
+            if (callingConvention.getArgument(i) instanceof StackSlot stackSlot) {
+                value = stackSlot.getOffset(0);
+                isRegister = false;
+            } else if (Platform.includedIn(InternalPlatform.WINDOWS_BASE.class) && Platform.includedIn(Platform.AMD64.class)) {
+                value = i;
+            } else if (argKind == JavaKind.Float || argKind == JavaKind.Double) {
+                value = fpRegisterIndex++;
+            } else {
+                value = gpRegisterIndex++;
+            }
+            argumentTypes[i] = PreparedSignature.encodeArgumentType(argKind, value, isRegister);
+        }
+        return preparedJNISignature(signature.getReturnKind(), argumentTypes, PreparedSignature.UNKNOWN_STACK_SIZE);
+    }
+
+    private static JavaType toJNIVarargsParameterType(Signature signature, ResolvedJavaType accessingClass, int index, ResolvedJavaType wordType) {
+        JavaKind kind = signature.getParameterKind(index);
+        if (kind == JavaKind.Object) {
+            // handle
+            return wordType;
+        } else if (kind == JavaKind.Boolean || kind == JavaKind.Byte || kind == JavaKind.Short || kind == JavaKind.Char) {
+            // C varargs promote sub-words to int (C99, 6.5.2.2-6)
+            return DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(int.class));
+        } else if (kind == JavaKind.Float) {
+            // C varargs promote float to double (C99, 6.5.2.2-6)
+            return DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(double.class));
+        }
+        return signature.getParameterType(index, accessingClass);
+    }
+
+    private static JavaKind toJNIVarargsParameterKind(JavaKind kind, JavaKind wordKind) {
+        return switch (kind) {
+            case Boolean, Byte, Short, Char -> JavaKind.Int;
+            case Float -> JavaKind.Double;
+            case Object -> wordKind;
+            default -> kind;
+        };
+    }
+
+    @Override
+    public DeoptimizedFrame createInterpreterDeoptimizedFrame(SubstrateInstalledCode installedCode, Deoptimizer deoptimizer, CodePointer pc, FrameInfoQueryResult frameInfo,
+                    CodeInfoQueryResult physicalFrame, boolean eager) {
+        /*
+         * useRistretto() is a hosted fold. Keep the Ristretto-only deopt path behind it so
+         * no-Ristretto images do not retain the deopt support types at runtime.
+         */
+        if (!SubstrateOptions.useRistretto()) {
+            throw VMError.shouldNotReachHere("Interpreter deoptimization requires Ristretto.");
+        }
+        return RistrettoInterpreterSupport.singleton().createInterpreterDeoptimizedFrame(installedCode, deoptimizer, pc, frameInfo, physicalFrame, eager);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean isInterpreterDeoptReturnValueObject(FrameInfoQueryResult frameInfo) {
+        if (!SubstrateOptions.useRistretto()) {
+            return false;
+        }
+        return RistrettoInterpreterSupport.singleton().isInterpreterDeoptReturnValueObject(frameInfo);
+    }
+
+    /**
+     * Bridges the generic deoptimization stub ABI into the Ristretto-specific interpreter handoff.
+     *
+     * <p>
+     * When this hook runs, the raw GP/FP return registers still carry the compiled top-frame
+     * result, or the pending exception object if the deopt was taken on an exceptional edge. The
+     * Ristretto frame must snapshot that state before the stub tears down the compiled frame and
+     * tail-jumps into the typed interpreter entry point.
+     *
+     * <p>
+     * {@code gpReturnValueObject} is a best-effort decoded object value. It can be null even when the
+     * raw GP return value denotes an object, so the Ristretto frame keeps the raw register value as
+     * the fallback source of truth.
+     */
+    @Override
+    @Uninterruptible(reason = "Invoked from deoptimization stubs while transitioning to interpreter execution.")
+    public UnsignedWord continueInterpreterDeoptimization(DeoptimizedFrame frame, Pointer originalStackPointer, UnsignedWord gpReturnValue, UnsignedWord fpReturnValue,
+                    boolean hasException, Object gpReturnValueObject) {
+        if (!SubstrateOptions.useRistretto()) {
+            throw VMError.shouldNotReachHere("Interpreter deoptimization requires Ristretto.");
+        }
+        return RistrettoInterpreterSupport.singleton().continueInterpreterDeoptimization(frame, originalStackPointer, gpReturnValue, fpReturnValue, hasException, gpReturnValueObject);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean isInterpreterRoot(FrameInfoQueryResult frameInfo) {
+        return isInterpreterBytecodeRoot(frameInfo) || isInterpreterIntrinsicRoot(frameInfo) || isInterpreterJNIDowncallRoot(frameInfo);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean isInterpreterBytecodeHandlerStub(FrameInfoQueryResult frameInfo) {
+        return FrameSourceInfo.MethodFlags.isBytecodeHandlerStub(frameInfo.getSourceMethodFlags());
+    }
+
+    @Override
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public boolean isInterpreterBytecodeHandlerStub(ResolvedJavaMethod method) {
+        ResolvedJavaMethod unwrapped = method;
+        while (unwrapped instanceof WrappedJavaMethod wrapped) {
+            unwrapped = wrapped.getWrapped();
+        }
+        return unwrapped instanceof SubstrateBytecodeHandlerStub stub && !stub.isDefaultStub() &&
+                        OriginalClassProvider.getJavaClass(stub.getDeclaringClass()) == Interpreter.Root.class;
+    }
+
+    @Override
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public ValueRetentionPolicy getBytecodeHandlerValueRetentionPolicy() {
+        return bytecodeHandlerValueRetentionPolicy;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public int getInterpreterBytecodeHandlerBCI(FrameInfoQueryResult frameInfo, Pointer sp) {
+        /*
+         * Bytecode handlers and their generated stubs use a uniform ABI whose first argument is
+         * curBCI. The frame can therefore be either the Java handler inlined into the stub or the
+         * stub itself when an exceptional edge omits the inlined handler frame.
+         *
+         * Debugger-event delivery explicitly publishes the next BCI on the interpreter frame.
+         * TODO: An asynchronous stack walk directly inside prepareOpcodeForDispatch,
+         * processSingleStepForDispatch, or processBreakpointForDispatch could still observe this
+         * handler argument instead of the next BCI being prepared. These helpers do not suspend,
+         * but their BCI must be preserved explicitly if such asynchronous walks need to report the
+         * transition precisely.
+         */
+        return readBCISlot(frameInfo, sp, BYTECODE_HANDLER_BCI_LOCAL);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean isInterpreterBytecodeRoot(FrameInfoQueryResult frameInfo) {
+        return frameInfo.getSourceClass() == Interpreter.Root.class && BYTECODE_ROOT_METHOD_NAME.equals(frameInfo.getSourceMethodName());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean isInterpreterIntrinsicRoot(FrameInfoQueryResult frameInfo) {
+        return frameInfo.getSourceClass() == Interpreter.IntrinsicRoot.class;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean isInterpreterJNIDowncallRoot(FrameInfoQueryResult frameInfo) {
+        return Interpreter.JNIDowncallRoot.class == frameInfo.getSourceClass();
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static int readInt(Pointer addr, SignedWord offset) {
+        return addr.readInt(offset);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static <T> T readObject(Pointer addr, SignedWord offset, boolean compressed) {
+        Word p = ((Word) addr).add(offset);
+        Object obj = ReferenceAccess.singleton().readObjectAt(p, compressed);
+        return (T) obj;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private InterpreterResolvedJavaMethod readInterpretedMethod(FrameInfoQueryResult frameInfo, Pointer sp) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (interpretedMethodSlot >= valueInfos.length) {
+            return null;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[interpretedMethodSlot];
+        return readObject(sp, Word.signed(valueInfo.getData()), valueInfo.isCompressedReference());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private InterpreterResolvedJavaMethod readIntrinsicMethod(FrameInfoQueryResult frameInfo, Pointer sp) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (intrinsicMethodSlot >= valueInfos.length) {
+            return null;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[intrinsicMethodSlot];
+        return readObject(sp, Word.signed(valueInfo.getData()), valueInfo.isCompressedReference());
+    }
+
+    private InterpreterResolvedJavaMethod readInterpreterJNIDowncallMethod(FrameInfoQueryResult frameInfo, Pointer sp) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (interpreterJNIDowncallMethodSlot >= valueInfos.length) {
+            return null;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[interpreterJNIDowncallMethodSlot];
+        return readObject(sp, Word.signed(valueInfo.getData()), valueInfo.isCompressedReference());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static int readBCISlot(FrameInfoQueryResult frameInfo, Pointer sp, int slot) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (valueInfos == null || slot >= valueInfos.length) {
+            return BytecodeFrame.UNKNOWN_BCI;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[slot];
+        ValueType type = valueInfo.getType();
+        /*
+         * Frame metadata preserves the compiler's representation of a local. In particular, a BCI
+         * can be constant-folded before its first update, so ValueInfo.data is not necessarily a
+         * stack offset.
+         */
+        if (type == ValueType.StackSlot || type == ValueType.Register) {
+            return readInt(sp, Word.signed(valueInfo.getData()));
+        } else if (type == ValueType.Constant) {
+            return (int) valueInfo.getData();
+        } else if (type == ValueType.DefaultConstant) {
+            return 0;
+        }
+        return BytecodeFrame.UNKNOWN_BCI;
+    }
+
+    /**
+     * Reads the bytecode index for an interpreter root frame during stack walking.
+     *
+     * <p>
+     * {@code Interpreter.Root.executeBodyFromBCI(...)} writes two BCI-like locals into the root
+     * frame:
+     *
+     * <pre>
+     * startBCI = entry bytecode where this root started
+     * curBCI   = bytecode currently being executed
+     * </pre>
+     *
+     * Normal execution should publish {@code curBCI}. A narrow reporting-only window exists after
+     * the root frame has been created but before that slot has been written. In that window
+     * {@code startBCI} still names the same bytecode entry point, so stack walking falls back to it
+     * instead of reporting {@link BytecodeFrame#UNKNOWN_BCI}. If neither slot is available, keep
+     * the source location unknown rather than inventing a synthetic {@code 0} BCI.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private int readBCI(FrameInfoQueryResult frameInfo, Pointer sp) {
+        int bci = readBCISlot(frameInfo, sp, bciSlot);
+        if (bci != BytecodeFrame.UNKNOWN_BCI) {
+            return bci;
+        }
+
+        /*
+         * Stack walking can observe executeBodyFromBCI after the root frame exists but before
+         * curBCI has been written into it, e.g. on a stack-overflow edge through the interpreter
+         * prologue. In that reporting-only window startBCI is still the exact bytecode entry point
+         * for the current root frame, so use it instead of propagating UNKNOWN_BCI. This is the
+         * narrow workaround that should be revisited in the context of GR-74439.
+         */
+        return readBCISlot(frameInfo, sp, startBCISlot);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private InterpreterFrame readInterpreterFrame(FrameInfoQueryResult frameInfo, Pointer sp) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (interpretedFrameSlot >= valueInfos.length) {
+            return null;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[interpretedFrameSlot];
+        return readObject(sp, Word.signed(valueInfo.getData()), valueInfo.isCompressedReference());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private InterpreterFrame readIntrinsicFrame(FrameInfoQueryResult frameInfo, Pointer sp) {
+        FrameInfoQueryResult.ValueInfo[] valueInfos = frameInfo.getValueInfos();
+        if (intrinsicFrameSlot >= valueInfos.length) {
+            return null;
+        }
+        FrameInfoQueryResult.ValueInfo valueInfo = valueInfos[intrinsicFrameSlot];
+        return readObject(sp, Word.signed(valueInfo.getData()), valueInfo.isCompressedReference());
+    }
+
+    @Override
+    public FrameSourceInfo getInterpretedMethodFrameInfo(FrameInfoQueryResult frameInfo, Pointer sp, int threadedHandlerBCI) {
+        if (isInterpreterBytecodeRoot(frameInfo)) {
+            InterpreterResolvedJavaMethod interpretedMethod = readInterpretedMethod(frameInfo, sp);
+            InterpreterFrame interpreterFrame = readInterpreterFrame(frameInfo, sp);
+            int bci = selectStackWalkBCI(getDebuggerEventBCI(interpreterFrame), threadedHandlerBCI, readBCI(frameInfo, sp));
+            return createInterpretedMethodFrameInfo(frameInfo, interpretedMethod, bci, interpreterFrame);
+        }
+        if (isInterpreterIntrinsicRoot(frameInfo)) {
+            InterpreterResolvedJavaMethod intrinsicMethod = readIntrinsicMethod(frameInfo, sp);
+            InterpreterFrame interpreterFrame = readIntrinsicFrame(frameInfo, sp);
+            return createIntrinsicMethodFrameInfo(frameInfo, intrinsicMethod, interpreterFrame);
+        }
+        if (isInterpreterJNIDowncallRoot(frameInfo)) {
+            InterpreterResolvedJavaMethod nativeMethod = readInterpreterJNIDowncallMethod(frameInfo, sp);
+            return createNativeMethodFrameInfo(frameInfo, nativeMethod);
+        }
+        throw VMError.shouldNotReachHereAtRuntime();
+    }
+
+    @Override
+    @Uninterruptible(reason = "StoredContinuation must not move.", callerMustBe = true)
+    public void captureInterpretedMethodFrameInfo(FrameInfoQueryResult frameInfo, Pointer sp, InterpretedFrameData data) {
+        data.clear();
+        if (isInterpreterBytecodeRoot(frameInfo)) {
+            InterpreterFrame interpreterFrame = readInterpreterFrame(frameInfo, sp);
+            data.setInterpreted(frameInfo, readInterpretedMethod(frameInfo, sp), readBCI(frameInfo, sp), getDebuggerEventBCI(interpreterFrame), interpreterFrame);
+            return;
+        }
+        if (isInterpreterIntrinsicRoot(frameInfo)) {
+            data.setIntrinsic(frameInfo, readIntrinsicMethod(frameInfo, sp), readIntrinsicFrame(frameInfo, sp));
+            return;
+        }
+        throw VMError.shouldNotReachHereAtRuntime();
+    }
+
+    @Override
+    public FrameSourceInfo getInterpretedMethodFrameInfo(FrameInfoQueryResult frameInfo, InterpretedFrameData data, int threadedHandlerBCI) {
+        VMError.guarantee(data.isFor(frameInfo), "Captured interpreter frame data does not belong to this frame");
+        FrameSourceInfo sourceInfo;
+        if (data.isIntrinsic()) {
+            sourceInfo = createIntrinsicMethodFrameInfo(frameInfo, (InterpreterResolvedJavaMethod) data.getInterpretedMethod(), (InterpreterFrame) data.getInterpreterFrame());
+        } else {
+            int bci = selectStackWalkBCI(data.getDebuggerEventBCI(), threadedHandlerBCI, data.getBCI());
+            sourceInfo = createInterpretedMethodFrameInfo(frameInfo, (InterpreterResolvedJavaMethod) data.getInterpretedMethod(), bci, (InterpreterFrame) data.getInterpreterFrame());
+        }
+        if (sourceInfo == null) {
+            data.clear();
+        }
+        return sourceInfo;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static int getDebuggerEventBCI(InterpreterFrame interpreterFrame) {
+        return interpreterFrame != null ? interpreterFrame.getDebuggerEventBCI() : BytecodeFrame.UNKNOWN_BCI;
+    }
+
+    /**
+     * Selects the most precise BCI available for the reconstructed guest frame. An active debugger
+     * event reports the bytecode about to be dispatched, the threaded handler identifies the
+     * bytecode otherwise being executed, and the root BCI is the fallback outside threaded
+     * handlers.
+     */
+    private static int selectStackWalkBCI(int debuggerEventBCI, int threadedHandlerBCI, int rootBCI) {
+        if (debuggerEventBCI != BytecodeFrame.UNKNOWN_BCI) {
+            return debuggerEventBCI;
+        }
+        return threadedHandlerBCI != BytecodeFrame.UNKNOWN_BCI ? threadedHandlerBCI : rootBCI;
+    }
+
+    private static FrameSourceInfo createInterpretedMethodFrameInfo(FrameInfoQueryResult frameInfo, InterpreterResolvedJavaMethod interpretedMethod, int bci, InterpreterFrame interpreterFrame) {
+        if (interpretedMethod == null || interpreterFrame == null || bci == BytecodeFrame.UNKNOWN_BCI) {
+            StringBuilder sb = new StringBuilder("Failed to retrieve interpreter frame data (");
+            if (interpretedMethod == null) {
+                sb.append("no method;");
+            }
+            if (interpreterFrame == null) {
+                sb.append("no frame;");
+            }
+            if (bci == BytecodeFrame.UNKNOWN_BCI) {
+                sb.append("no bci;");
+            }
+            sb.append(") at ").append(frameInfo.getSourceReference());
+            VMError.shouldNotReachHere(sb.toString());
+        }
+        if (interpreterFrame.isHiddenFromStackWalking()) {
+            /*
+             * A compiled OSR continuation leaves its replaced interpreter activation on the
+             * physical stack. While that compiled continuation is the live logical frame, hide the
+             * stale interpreter activation from source-level Java stack walkers.
+             */
+            return null;
+        }
+        InterpreterFrameSourceInfo stackTraceCallerInfo = interpreterFrame.getStackTraceCallerInfo();
+        int flags = FrameSourceInfo.MethodFlags.computeSourceMethodFlags(interpretedMethod.getModifiers(), interpretedMethod.isHidden(), interpretedMethod.isLambdaFormCompiled());
+        return InterpreterFrameSourceInfo.forInterpretedMethod(interpretedMethod, bci, flags, interpreterFrame, stackTraceCallerInfo);
+    }
+
+    private static FrameSourceInfo createIntrinsicMethodFrameInfo(FrameInfoQueryResult frameInfo, InterpreterResolvedJavaMethod intrinsicMethod, InterpreterFrame interpreterFrame) {
+        if (intrinsicMethod == null || interpreterFrame == null) {
+            StringBuilder sb = new StringBuilder("Failed to retrieve interpreter intrinsic frame data (");
+            if (intrinsicMethod == null) {
+                sb.append("no intrinsic method;");
+            }
+            if (interpreterFrame == null) {
+                sb.append("no frame;");
+            }
+            sb.append(") at ").append(frameInfo.getSourceReference());
+            VMError.shouldNotReachHere(sb.toString());
+        }
+        int flags = FrameSourceInfo.MethodFlags.computeSourceMethodFlags(intrinsicMethod.getModifiers(), intrinsicMethod.isHidden(), intrinsicMethod.isLambdaFormCompiled());
+        return InterpreterFrameSourceInfo.forNativeMethod(intrinsicMethod, interpreterFrame, flags);
+    }
+
+    private static FrameSourceInfo createNativeMethodFrameInfo(FrameInfoQueryResult frameInfo, InterpreterResolvedJavaMethod nativeMethod) {
+        if (nativeMethod == null) {
+            VMError.shouldNotReachHere("Failed to retrieve interpreter JNI downcall method at " + frameInfo.getSourceReference());
+        }
+        return InterpreterFrameSourceInfo.forNativeMethod(nativeMethod, null, frameInfo.getSourceMethodFlags());
+    }
+
+    @Override
+    public FrameSourceInfo getSyntheticMethodFrameInfo(FrameInfoQueryResult frameInfo) {
+        if (!SubstrateOptions.useRistretto()) {
+            return null;
+        }
+        return RistrettoInterpreterSupport.singleton().getSyntheticMethodFrameInfo(frameInfo);
+    }
+
+    @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used for crash log")
+    public void logInterpreterFrame(Log log, FrameInfoQueryResult frameInfo, Pointer sp, int threadedHandlerBCI) {
+        if (isInterpreterIntrinsicRoot(frameInfo)) {
+            logInterpreterIntrinsicFrame(log, frameInfo, sp);
+        } else if (isInterpreterBytecodeRoot(frameInfo)) {
+            logInterpreterBytecodeFrame(log, frameInfo, sp, threadedHandlerBCI);
+        } else {
+            throw VMError.shouldNotReachHereAtRuntime();
+        }
+    }
+
+    @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used for crash log")
+    public boolean logRistrettoFrame(Log log, FrameInfoQueryResult frameInfo) {
+        if (!SubstrateOptions.useRistretto()) {
+            return false;
+        }
+        return RistrettoInterpreterSupport.singleton().logRistrettoFrame(log, frameInfo);
+    }
+
+    private void logInterpreterBytecodeFrame(Log log, FrameInfoQueryResult frameInfo, Pointer sp, int threadedHandlerBCI) {
+        if (!frameInfo.hasLocalValueInfo()) {
+            log.string("  missing local value info (bytecode)");
+            return;
+        }
+        InterpreterResolvedJavaMethod interpretedMethod = readInterpretedMethod(frameInfo, sp);
+        if (interpretedMethod == null) {
+            log.string("  no interpreter method (bytecode)");
+            return;
+        }
+        InterpreterFrame interpreterFrame = readInterpreterFrame(frameInfo, sp);
+        int bci = selectStackWalkBCI(getDebuggerEventBCI(interpreterFrame), threadedHandlerBCI, readBCI(frameInfo, sp));
+        logInterpreterMethod(log, interpretedMethod, bci);
+    }
+
+    private void logInterpreterIntrinsicFrame(Log log, FrameInfoQueryResult frameInfo, Pointer sp) {
+        if (!frameInfo.hasLocalValueInfo()) {
+            log.string("  missing local value info (intrinsic)");
+            return;
+        }
+        InterpreterResolvedJavaMethod intrinsicMethod = readIntrinsicMethod(frameInfo, sp);
+        if (intrinsicMethod == null) {
+            log.string("  no interpreter method (intrinsic)");
+            return;
+        }
+        logInterpreterMethod(log, intrinsicMethod, -1);
+    }
+
+    private static void logInterpreterMethod(Log log, InterpreterResolvedJavaMethod interpretedMethod, int bci) {
+        String sourceHolderName = interpretedMethod.getDeclaringClass().getJavaClass().getName();
+        Symbol<Name> sourceMethodName = interpretedMethod.getSymbolicName();
+        LineNumberTable lineNumberTable = interpretedMethod.getLineNumberTable();
+        int sourceLineNumber = -1; // unknown
+        if (lineNumberTable != null && bci >= 0) {
+            sourceLineNumber = lineNumberTable.getLineNumber(bci);
+        }
+        log.spaces(2);
+        log.string(sourceHolderName);
+        log.character('.');
+        logSymbol(log, sourceMethodName);
+        String sourceFileName = interpretedMethod.getDeclaringClass().getSourceFileName();
+        if (sourceFileName == null && sourceLineNumber >= 0) {
+            sourceFileName = "Unknown Source";
+        }
+        if (sourceFileName != null) {
+            log.character('(');
+            log.string(sourceFileName);
+            if (sourceLineNumber >= 0) {
+                log.string(":");
+                log.signed(sourceLineNumber);
+            }
+            log.character(')');
+        }
+        if (bci >= 0) {
+            log.spaces(1);
+            log.string("@bci ");
+            log.signed(bci);
+        }
+    }
+
+    private static void logSymbol(Log log, ByteSequence byteSequence) {
+        int length = Math.min(byteSequence.length(), MAX_SYMBOL_LOG_LENGTH);
+        for (int i = 0; i < length; i++) {
+            int b = byteSequence.unsignedByteAt(i);
+            if (0x20 <= b && b <= 0x7e) {
+                // only log printable ascii
+                log.character((char) b);
+            } else {
+                log.character('?');
+            }
+        }
+        if (byteSequence.length() > MAX_SYMBOL_LOG_LENGTH) {
+            log.string("...");
+        }
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    @Override
+    public void buildMethodIdMapping(ResolvedJavaMethod[] encodedMethods) {
+        if (InterpreterOptions.DebuggerWithInterpreter.getValue()) {
+            assert ImageSingletons.contains(DebuggerSupport.class);
+            ImageSingletons.lookup(DebuggerSupport.class).buildMethodIdMapping(encodedMethods);
+        }
+    }
+}

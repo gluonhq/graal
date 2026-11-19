@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,7 @@ package com.oracle.truffle.api.test.host;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -58,7 +59,6 @@ import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
-import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -70,6 +70,7 @@ import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest;
 import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
 import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
@@ -82,7 +83,6 @@ public class HostAdapterTest extends AbstractPolyglotTest {
     public enum Using {
         HostSymbol,
         HostClass,
-        Deprecated,
     }
 
     @Parameter(0) public Using using;
@@ -136,36 +136,30 @@ public class HostAdapterTest extends AbstractPolyglotTest {
         }
     }
 
+    @SuppressWarnings("deprecation")
     private static Object verifyHostAdapterClass(TruffleLanguage.Env env, Object hostAdapterClass) {
-        assertTrue(env.isHostObject(hostAdapterClass));
+        assertTrue(INTEROP.isHostObject(hostAdapterClass));
         assertTrue(env.isHostSymbol(hostAdapterClass));
+        assertTrue(INTEROP.isScope(hostAdapterClass));
         assertTrue(INTEROP.isMetaObject(hostAdapterClass));
         assertTrue(INTEROP.isInstantiable(hostAdapterClass));
         return hostAdapterClass;
     }
 
-    @SuppressWarnings("deprecation")
     Object createHostAdapterClass(TruffleLanguage.Env env, Class<?>[] classes) {
-        if (using == Using.Deprecated) {
-            return verifyHostAdapterClass(env, env.createHostAdapterClass(classes));
-        }
         Object[] hostTypes = Arrays.stream(classes).map(c -> asHostType(env, c)).toArray();
         return verifyHostAdapterClass(env, env.createHostAdapter(hostTypes));
     }
 
-    @SuppressWarnings("deprecation")
     Object createHostAdapterClassWithClassOverrides(TruffleLanguage.Env env, Class<?>[] classes, Object classOverrides) {
-        if (using == Using.Deprecated) {
-            return verifyHostAdapterClass(env, env.createHostAdapterClassWithStaticOverrides(classes, classOverrides));
-        }
         Object[] hostTypes = Arrays.stream(classes).map(c -> asHostType(env, c)).toArray();
         return verifyHostAdapterClass(env, env.createHostAdapterWithClassOverrides(hostTypes, classOverrides));
     }
 
-    private static Object instantianteHostAdapter(TruffleLanguage.Env env, Object adapter, Object... arguments) throws InteropException {
+    private static Object instantianteHostAdapter(Object adapter, Object... arguments) throws InteropException {
         Object instance = INTEROP.instantiate(adapter, arguments);
         assertTrue(INTEROP.isMetaInstance(adapter, instance));
-        assertTrue(env.isHostObject(instance));
+        assertTrue(INTEROP.isHostObject(instance));
         return instance;
     }
 
@@ -174,7 +168,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
         try (TestContext c = new TestContext((b) -> b.allowHostAccess(explicitHostAccessAllowImplementations(Callable.class)))) {
             TruffleLanguage.Env env = c.env;
             Object adapter = createHostAdapterClass(env, new Class<?>[]{Callable.class});
-            Object instance = instantianteHostAdapter(env, adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("call", (ProxyExecutable) (args) -> 42))));
+            Object instance = instantianteHostAdapter(adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("call", (ProxyExecutable) (args) -> 42))));
             assertEquals(42, INTEROP.invokeMember(instance, "call"));
 
             assertTrue(INTEROP.isMetaInstance(env.asHostSymbol(Callable.class), instance));
@@ -186,16 +180,16 @@ public class HostAdapterTest extends AbstractPolyglotTest {
         try (TestContext c = new TestContext((b) -> b.allowHostAccess(explicitHostAccessAllowImplementations(Extensible.class)))) {
             TruffleLanguage.Env env = c.env;
             Object adapter = createHostAdapterClass(env, new Class<?>[]{Extensible.class});
-            Object instance1 = instantianteHostAdapter(env, adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("abstractMethod", (ProxyExecutable) (args) -> "override"))));
+            Object instance1 = instantianteHostAdapter(adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("abstractMethod", (ProxyExecutable) (args) -> "override"))));
             assertEquals("override", INTEROP.invokeMember(instance1, "abstractMethod"));
             assertEquals("base", INTEROP.invokeMember(instance1, "baseMethod"));
 
-            Object instance2 = instantianteHostAdapter(env, adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("baseMethod", (ProxyExecutable) (args) -> "override"))));
+            Object instance2 = instantianteHostAdapter(adapter, env.asGuestValue(ProxyObject.fromMap(Collections.singletonMap("baseMethod", (ProxyExecutable) (args) -> "override"))));
             assertEquals("override", INTEROP.invokeMember(instance2, "baseMethod"));
 
             assertFails(() -> {
                 return INTEROP.invokeMember(instance2, "abstractMethod");
-            }, AbstractTruffleException.class, e -> assertTrue(e.toString(), env.isHostException(e)));
+            }, AbstractTruffleException.class, e -> assertTrue(e.toString(), INTEROP.isHostObject(e) && INTEROP.isException(e)));
 
             assertTrue(INTEROP.isMetaInstance(env.asHostSymbol(Extensible.class), instance1));
             assertTrue(INTEROP.isMetaInstance(env.asHostSymbol(Extensible.class), instance2));
@@ -213,7 +207,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl.put("baseMethod", (ProxyExecutable) (args) -> "baseMethodImpl");
             impl.put("call", (ProxyExecutable) (args) -> "callImpl");
             impl.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl");
-            Object instance = instantianteHostAdapter(env, adapter, env.asGuestValue(ProxyObject.fromMap(impl)));
+            Object instance = instantianteHostAdapter(adapter, env.asGuestValue(ProxyObject.fromMap(impl)));
 
             assertEquals("abstractMethodImpl", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("baseMethodImpl", INTEROP.invokeMember(instance, "baseMethod"));
@@ -245,7 +239,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             Map<String, Object> impl = new HashMap<>();
             impl.put("abstractMethod", (ProxyExecutable) (args) -> "abstractMethodImpl");
             impl.put("finalMethod", (ProxyExecutable) (args) -> "finalMethodImpl");
-            Object instance = instantianteHostAdapter(env, adapter, "concreteName", env.asGuestValue(ProxyObject.fromMap(impl)));
+            Object instance = instantianteHostAdapter(adapter, "concreteName", env.asGuestValue(ProxyObject.fromMap(impl)));
             assertEquals("abstractMethodImpl", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("final", INTEROP.invokeMember(instance, "finalMethod"));
             assertEquals("concreteName", INTEROP.readMember(instance, "name"));
@@ -308,7 +302,6 @@ public class HostAdapterTest extends AbstractPolyglotTest {
 
     @Test
     public void testCreateHostAdapterIllegalArgumentType() {
-        Assume.assumeFalse(using == Using.Deprecated);
         try (TestContext c = new TestContext((b) -> b.allowHostAccess(HostAccess.EXPLICIT))) {
             final String expectedMessage = "Types must be host symbols or host classes";
             TruffleLanguage.Env env = c.env;
@@ -347,7 +340,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl.put("baseMethod", (ProxyExecutable) (args) -> "baseMethodImpl");
             impl.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl");
             Object guestObject = env.asGuestValue(ProxyObject.fromMap(impl));
-            Object instance = instantianteHostAdapter(env, adapter, guestObject);
+            Object instance = instantianteHostAdapter(adapter, guestObject);
 
             assertEquals("abstractMethodImpl", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("baseMethodImpl", INTEROP.invokeMember(instance, "baseMethod"));
@@ -365,6 +358,127 @@ public class HostAdapterTest extends AbstractPolyglotTest {
     }
 
     @Test
+    public void testHostAdapterDelegatesDynamicMembersToThisObject() throws InteropException {
+        try (TestContext c = new TestContext((b) -> b.allowHostAccess(explicitHostAccessAllowImplementations(Callable.class)))) {
+            TruffleLanguage.Env env = c.env;
+            Object adapter = createHostAdapterClass(env, new Class<?>[]{Callable.class});
+            Map<String, Object> impl = new HashMap<>();
+            impl.put("call", (ProxyExecutable) (args) -> "callImpl");
+            Object guestObject = env.asGuestValue(ProxyObject.fromMap(impl));
+            Object instance = instantianteHostAdapter(adapter, guestObject);
+
+            assertEquals("callImpl", INTEROP.invokeMember(instance, "call"));
+            assertFalse(INTEROP.isMemberReadable(instance, "cylinders"));
+            assertTrue(INTEROP.isMemberInsertable(instance, "cylinders"));
+
+            INTEROP.writeMember(instance, "cylinders", 6);
+            assertTrue(INTEROP.isMemberReadable(instance, "cylinders"));
+            assertFalse(INTEROP.isMemberInsertable(instance, "cylinders"));
+            assertTrue(INTEROP.isMemberModifiable(instance, "cylinders"));
+            assertTrue(INTEROP.isMemberRemovable(instance, "cylinders"));
+            assertEquals(6, INTEROP.readMember(instance, "cylinders"));
+            assertEquals(6, INTEROP.readMember(guestObject, "cylinders"));
+
+            INTEROP.writeMember(instance, "cylinders", 8);
+            assertEquals(8, INTEROP.readMember(instance, "cylinders"));
+            assertEquals(8, INTEROP.readMember(guestObject, "cylinders"));
+
+            INTEROP.removeMember(instance, "cylinders");
+            assertFalse(INTEROP.isMemberReadable(instance, "cylinders"));
+            assertFalse(INTEROP.isMemberReadable(guestObject, "cylinders"));
+            assertTrue(INTEROP.isMemberInsertable(instance, "cylinders"));
+
+            impl.put("enabled", true);
+            assertTrue(INTEROP.isMemberReadable(instance, "enabled"));
+            assertTrue(INTEROP.isMemberRemovable(instance, "enabled"));
+            assertEquals(true, INTEROP.readMember(instance, "enabled"));
+
+            INTEROP.removeMember(instance, "enabled");
+            assertFalse(INTEROP.isMemberReadable(instance, "enabled"));
+            assertFalse(INTEROP.isMemberReadable(guestObject, "enabled"));
+        }
+    }
+
+    @Test
+    public void testHostAdapterMembersShadowThisObjectMembers() throws InteropException {
+        try (TestContext c = new TestContext((b) -> b.allowHostAccess(explicitHostAccessAllowImplementations(Callable.class)))) {
+            TruffleLanguage.Env env = c.env;
+            Object adapter = createHostAdapterClass(env, new Class<?>[]{Callable.class});
+            Map<String, Object> impl = new HashMap<>();
+            impl.put("call", (ProxyExecutable) (args) -> "callImpl");
+            impl.put("this", "guestThis");
+            impl.put("super", "guestSuper");
+            Object guestObject = env.asGuestValue(ProxyObject.fromMap(impl));
+            Object instance = instantianteHostAdapter(adapter, guestObject);
+
+            assertEquals("callImpl", INTEROP.invokeMember(instance, "call"));
+            assertEquals(guestObject, INTEROP.readMember(instance, "this"));
+            assertTrue(INTEROP.isMemberReadable(instance, "super"));
+            assertTrue(INTEROP.hasMembers(INTEROP.readMember(instance, "super")));
+
+            assertFalse(INTEROP.isMemberModifiable(instance, "call"));
+            assertFalse(INTEROP.isMemberInsertable(instance, "call"));
+            assertFalse(INTEROP.isMemberRemovable(instance, "call"));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.writeMember(instance, "call", "mutated");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: call", e.getMessage()));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.removeMember(instance, "call");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: call", e.getMessage()));
+            assertEquals("callImpl", INTEROP.invokeMember(instance, "call"));
+
+            assertFalse(INTEROP.isMemberModifiable(instance, "this"));
+            assertFalse(INTEROP.isMemberInsertable(instance, "this"));
+            assertFalse(INTEROP.isMemberRemovable(instance, "this"));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.writeMember(instance, "this", "mutated");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: this", e.getMessage()));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.removeMember(instance, "this");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: this", e.getMessage()));
+            assertEquals("guestThis", INTEROP.readMember(guestObject, "this"));
+
+            assertFalse(INTEROP.isMemberModifiable(instance, "super"));
+            assertFalse(INTEROP.isMemberInsertable(instance, "super"));
+            assertFalse(INTEROP.isMemberRemovable(instance, "super"));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.writeMember(instance, "super", "mutated");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: super", e.getMessage()));
+            assertFails((Callable<Void>) () -> {
+                INTEROP.removeMember(instance, "super");
+                return null;
+            }, UnknownIdentifierException.class, e -> assertEquals("Unknown identifier: super", e.getMessage()));
+            assertEquals("guestSuper", INTEROP.readMember(guestObject, "super"));
+        }
+    }
+
+    @Test
+    public void testHostAdapterHostFieldsShadowThisObjectMembers() throws InteropException {
+        try (TestContext c = new TestContext((b) -> b.allowHostAccess(explicitHostAccessAllowImplementations(ExportedFieldExtensible.class)))) {
+            TruffleLanguage.Env env = c.env;
+            Object adapter = createHostAdapterClass(env, new Class<?>[]{ExportedFieldExtensible.class});
+            Map<String, Object> impl = new HashMap<>();
+            impl.put("abstractMethod", (ProxyExecutable) (args) -> "abstractMethodImpl");
+            impl.put("cylinders", 4);
+            Object guestObject = env.asGuestValue(ProxyObject.fromMap(impl));
+            Object instance = instantianteHostAdapter(adapter, guestObject);
+
+            assertEquals(2, INTEROP.readMember(instance, "cylinders"));
+            assertTrue(INTEROP.isMemberModifiable(instance, "cylinders"));
+            assertFalse(INTEROP.isMemberInsertable(instance, "cylinders"));
+
+            INTEROP.writeMember(instance, "cylinders", 6);
+            assertEquals(6, INTEROP.readMember(instance, "cylinders"));
+            assertEquals(4, INTEROP.readMember(guestObject, "cylinders"));
+        }
+    }
+
+    @Test
     public void testHostAdapterWithCustomHostAccess() throws InteropException {
         Class<?>[] supertypes = new Class<?>[]{Extensible.class, Interface.class};
         try (TestContext c = new TestContext((b) -> b.allowHostAccess(minimalHostAccessAllowImplementations(supertypes)))) {
@@ -375,7 +489,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl.put("baseMethod", (ProxyExecutable) (args) -> "baseMethodImpl");
             impl.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl");
             Object guestObject = env.asGuestValue(ProxyObject.fromMap(impl));
-            Object instance = instantianteHostAdapter(env, adapter, guestObject);
+            Object instance = instantianteHostAdapter(adapter, guestObject);
 
             assertEquals("abstractMethodImpl", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("baseMethodImpl", INTEROP.invokeMember(instance, "baseMethod"));
@@ -398,7 +512,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl1.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl1");
             Object guestObject1 = env.asGuestValue(ProxyObject.fromMap(impl1));
             Object adapterClass1 = createHostAdapterClassWithClassOverrides(env, supertypes, guestObject1);
-            Object parent = instantianteHostAdapter(env, adapterClass1);
+            Object parent = instantianteHostAdapter(adapterClass1);
 
             assertEquals("abstractMethodImpl1", INTEROP.invokeMember(parent, "abstractMethod"));
             assertEquals("baseMethodImpl1", INTEROP.invokeMember(parent, "baseMethod"));
@@ -409,8 +523,8 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl2.put("baseMethod", (ProxyExecutable) (args) -> "baseMethodImpl2");
             impl2.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl2");
             Object guestObject2 = env.asGuestValue(ProxyObject.fromMap(impl2));
-            Object adapterClass2 = createHostAdapterClass(env, new Class<?>[]{Interface.class, (Class<?>) env.asHostObject(adapterClass1)});
-            Object instance = instantianteHostAdapter(env, adapterClass2, guestObject2);
+            Object adapterClass2 = createHostAdapterClass(env, new Class<?>[]{Interface.class, (Class<?>) INTEROP.asHostObject(adapterClass1)});
+            Object instance = instantianteHostAdapter(adapterClass2, guestObject2);
 
             assertEquals("abstractMethodImpl2", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("baseMethodImpl2", INTEROP.invokeMember(instance, "baseMethod"));
@@ -435,7 +549,7 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl1.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl1");
             Object guestObject1 = env.asGuestValue(ProxyObject.fromMap(impl1));
             Object adapterClass1 = createHostAdapterClass(env, supertypes);
-            Object parent = instantianteHostAdapter(env, adapterClass1, guestObject1);
+            Object parent = instantianteHostAdapter(adapterClass1, guestObject1);
 
             assertEquals("abstractMethodImpl1", INTEROP.invokeMember(parent, "abstractMethod"));
             assertEquals("baseMethodImpl1", INTEROP.invokeMember(parent, "baseMethod"));
@@ -446,8 +560,8 @@ public class HostAdapterTest extends AbstractPolyglotTest {
             impl2.put("baseMethod", (ProxyExecutable) (args) -> "baseMethodImpl2");
             impl2.put("defaultMethod", (ProxyExecutable) (args) -> "defaultMethodImpl2");
             Object guestObject2 = env.asGuestValue(ProxyObject.fromMap(impl2));
-            Object adapterClass2 = createHostAdapterClass(env, new Class<?>[]{Interface.class, (Class<?>) env.asHostObject(adapterClass1)});
-            Object instance = instantianteHostAdapter(env, adapterClass2, guestObject1, guestObject2);
+            Object adapterClass2 = createHostAdapterClass(env, new Class<?>[]{Interface.class, (Class<?>) INTEROP.asHostObject(adapterClass1)});
+            Object instance = instantianteHostAdapter(adapterClass2, guestObject1, guestObject2);
 
             assertEquals("abstractMethodImpl2", INTEROP.invokeMember(instance, "abstractMethod"));
             assertEquals("baseMethodImpl2", INTEROP.invokeMember(instance, "baseMethod"));
@@ -482,6 +596,13 @@ public class HostAdapterTest extends AbstractPolyglotTest {
         public String baseMethod() {
             return "base";
         }
+
+        @HostAccess.Export
+        public abstract String abstractMethod();
+    }
+
+    public abstract static class ExportedFieldExtensible {
+        @HostAccess.Export public int cylinders = 2;
 
         @HostAccess.Export
         public abstract String abstractMethod();

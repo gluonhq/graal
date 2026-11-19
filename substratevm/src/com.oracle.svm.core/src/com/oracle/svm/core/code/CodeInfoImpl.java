@@ -29,16 +29,18 @@ import org.graalvm.nativeimage.c.struct.RawField;
 import org.graalvm.nativeimage.c.struct.RawFieldOffset;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.c.NonmovableArray;
-import com.oracle.svm.core.c.NonmovableObjectArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
 import com.oracle.svm.core.code.InstalledCodeObserver.InstalledCodeObserverHandle;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
-import com.oracle.svm.core.heap.RuntimeCodeInfoGCSupport;
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.heap.RuntimeCodeInfoGCSupport;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.graal.compiler.word.Word;
 import jdk.vm.ci.code.InstalledCode;
 
 /**
@@ -170,6 +172,16 @@ interface CodeInfoImpl extends CodeInfo {
     void setCodeAndDataMemorySize(UnsignedWord codeAndDataMemorySize);
 
     @RawField
+    void setRelativeIPOffset(UnsignedWord offset);
+
+    /**
+     * An offset that enables us to store code in different memory regions while keeping the code
+     * info encoding as if it were part of a single continuous memory region.
+     */
+    @RawField
+    UnsignedWord getRelativeIPOffset();
+
+    @RawField
     NonmovableArray<Byte> getCodeInfoIndex();
 
     @RawField
@@ -180,6 +192,18 @@ interface CodeInfoImpl extends CodeInfo {
 
     @RawField
     void setCodeInfoEncodings(NonmovableArray<Byte> codeInfoEncodings);
+
+    @RawField
+    int getCodeInfoIndexEntriesPerBlock();
+
+    @RawField
+    void setCodeInfoIndexEntriesPerBlock(int entriesPerBlock);
+
+    @RawField
+    NonmovableArray<Byte> getCodeInfoDefaultFrameInfoIndexes();
+
+    @RawField
+    void setCodeInfoDefaultFrameInfoIndexes(NonmovableArray<Byte> codeInfoDefaultFrameInfoIndexes);
 
     @RawField
     NonmovableArray<Byte> getFrameInfoEncodings();
@@ -242,6 +266,12 @@ interface CodeInfoImpl extends CodeInfo {
 
     @RawField
     void setMethodTableFirstId(int methodId);
+
+    @RawField
+    int getMethodCount();
+
+    @RawField
+    void setMethodCount(int count);
 
     @RawField
     int getState();

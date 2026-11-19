@@ -288,7 +288,7 @@ public final class MethodHandleNode extends MacroNode implements Simplifiable {
                 JavaType parameterType = signature.getParameterType(index, target.getDeclaringClass());
                 maybeCastArgument(adder, arguments, receiverSkip + index, parameterType);
             }
-            T invoke = createTargetInvokeNode(factory, assumptions, intrinsicMethod, realTarget, original, bci, returnStamp, arguments);
+            T invoke = createTargetInvokeNode(factory, assumptions, intrinsicMethod, realTarget, bci, returnStamp, arguments);
             assert invoke != null : "graph has been modified so this must result an invoke";
             return invoke;
         }
@@ -296,13 +296,13 @@ public final class MethodHandleNode extends MacroNode implements Simplifiable {
     }
 
     /**
-     * Inserts a node to cast the argument at index to the given type if the given type is more
-     * concrete than the argument type.
+     * Inserts a node to cast the argument at index to the given type if the argument is not already
+     * known to satisfy the given type.
      *
      * @param index of the argument to be cast
      * @param type the type the argument should be cast to
      */
-    private static void maybeCastArgument(GraphAdder adder, ValueNode[] arguments, int index, JavaType type) {
+    public static void maybeCastArgument(GraphAdder adder, ValueNode[] arguments, int index, JavaType type) {
         ValueNode argument = arguments[index];
         if (type instanceof ResolvedJavaType && !((ResolvedJavaType) type).isJavaLangObject()) {
             Assumptions assumptions = adder.getAssumptions();
@@ -314,7 +314,13 @@ public final class MethodHandleNode extends MacroNode implements Simplifiable {
              */
             if (targetType != null && !targetType.getType().isPrimitive() && !argument.getStackKind().isPrimitive()) {
                 ResolvedJavaType argumentType = StampTool.typeOrNull(argument.stamp(NodeView.DEFAULT));
-                if (argumentType == null || (argumentType.isAssignableFrom(targetType.getType()) && !argumentType.equals(targetType.getType()))) {
+                /*
+                 * Guard when the stamp is not already known to be assignable to the target. The
+                 * changed case is an unrelated concrete stamp, e.g. String -> Integer, which
+                 * previously skipped the guard because String.isAssignableFrom(Integer) is false.
+                 * Known-safe cases, e.g. Integer -> Number, still skip the guard.
+                 */
+                if (argumentType == null || !targetType.getType().isAssignableFrom(argumentType)) {
                     LogicNode inst = InstanceOfNode.createAllowNull(targetType, argument, null, null);
                     assert !inst.isAlive();
                     if (!inst.isTautology()) {
@@ -332,13 +338,12 @@ public final class MethodHandleNode extends MacroNode implements Simplifiable {
     }
 
     /**
-     * Creates an {@link InvokeNode} for the given target method. The {@link CallTargetNode} passed
-     * to the InvokeNode is in fact a {@link ResolvedMethodHandleCallTargetNode}.
+     * Creates an {@link InvokeNode} for the given target method.
      *
      * @return invoke node for the member name target
      */
     private static <T extends Invoke> T createTargetInvokeNode(InvokeFactory<T> factory, Assumptions assumptions, IntrinsicMethod intrinsicMethod,
-                    ResolvedJavaMethod target, ResolvedJavaMethod original, int bci, StampPair returnStamp, ValueNode[] arguments) {
+                    ResolvedJavaMethod target, int bci, StampPair returnStamp, ValueNode[] arguments) {
         InvokeKind targetInvokeKind = target.isStatic() ? InvokeKind.Static : InvokeKind.Special;
         JavaType targetReturnType = target.getSignature().getReturnType(null);
 
@@ -360,7 +365,7 @@ public final class MethodHandleNode extends MacroNode implements Simplifiable {
         }
         StampPair targetReturnStamp = StampFactory.forDeclaredType(assumptions, targetReturnType, false);
 
-        MethodCallTargetNode callTarget = ResolvedMethodHandleCallTargetNode.create(targetInvokeKind, target, targetArguments, targetReturnStamp, original, arguments, returnStamp);
+        MethodCallTargetNode callTarget = new MethodCallTargetNode(targetInvokeKind, target, targetArguments, targetReturnStamp, null);
 
         // The call target can have a different return type than the invoker,
         // e.g. the target returns an Object but the invoker void. In this case

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,6 @@ package org.graalvm.home;
 import java.nio.file.Path;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.ServiceLoader;
 
 import org.graalvm.home.impl.DefaultHomeFinder;
@@ -95,28 +94,35 @@ public abstract class HomeFinder {
      * @since 19.3
      */
     public static HomeFinder getInstance() {
-        if (ImageInfo.inImageCode() && ImageSingletons.contains(HomeFinder.class)) {
+        if (ImageInfo.inImageRuntimeCode() && ImageSingletons.contains(HomeFinder.class)) {
             return ImageSingletons.lookup(HomeFinder.class);
-        }
-        Class<?> lookupClass = HomeFinder.class;
-        ModuleLayer moduleLayer = lookupClass.getModule().getLayer();
-        Iterable<HomeFinder> services;
-        if (moduleLayer != null) {
-            services = ServiceLoader.load(moduleLayer, HomeFinder.class);
         } else {
-            services = ServiceLoader.load(HomeFinder.class, lookupClass.getClassLoader());
-        }
-        Iterator<HomeFinder> iterator = services.iterator();
-        if (!iterator.hasNext()) {
-            services = ServiceLoader.load(HomeFinder.class);
-            iterator = services.iterator();
-        }
-        try {
-            return iterator.next();
-        } catch (NoSuchElementException e) {
-            throw new IllegalStateException("No implementation of " + HomeFinder.class.getName() + " could be found");
+            HomeFinder finder = instance;
+            if (finder == null) {
+                Class<?> lookupClass = HomeFinder.class;
+                ModuleLayer moduleLayer = lookupClass.getModule().getLayer();
+                Iterable<HomeFinder> services;
+                if (moduleLayer != null) {
+                    services = ServiceLoader.load(moduleLayer, HomeFinder.class);
+                } else {
+                    services = ServiceLoader.load(HomeFinder.class, lookupClass.getClassLoader());
+                }
+                Iterator<HomeFinder> iterator = services.iterator();
+                if (!iterator.hasNext()) {
+                    services = ServiceLoader.load(HomeFinder.class);
+                    iterator = services.iterator();
+                }
+                if (!iterator.hasNext()) {
+                    throw new IllegalStateException("No implementation of " + HomeFinder.class.getName() + " could be found");
+                }
+                finder = iterator.next();
+                instance = finder;
+            }
+            return finder;
         }
     }
+
+    private static volatile HomeFinder instance;
 }
 
 class HomeFinderFeature implements Feature {

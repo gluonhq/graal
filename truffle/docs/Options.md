@@ -48,10 +48,25 @@ They are useful to users and language and tool implementers.
 
 <!-- BEGIN: expert-engine-options -->
 ```shell
+- `--engine.BytecodeHistogram=true|false|<group>[,<group>...]` : Collect and print a histogram of executed bytecode opcodes. Set to 'true' to enable basic mode or use a comma separated list to configure grouping (e.g. source,root). Available groupings are root, tier, source, language, thread. Grouping order matters and controls the primary, secondary, ... nesting in the printed histogram. This feature adds high overhead, use for profiling in non-production runs only. Supported only by Bytecode DSL interpreters. Prints when the engine is closed by default, or periodically if BytecodeHistogramInterval > 0.
+- `--engine.BytecodeHistogramInterval` : Print and reset the opcode histogram at a fixed interval while BytecodeHistogram is enabled. Use 0 to disable periodic printing and print only once at shutdown. Examples: 250ms, 2s, 1m.
+- `--engine.BytecodeLanguageFilter` : Limit tracing and statistics to specific language IDs. Provide a comma-separated list of language IDs, for example: `js`, `python`. An empty value includes all languages. Applies to `--engine.TraceBytecode`, `--engine.TraceBytecodeTransition`, and `--engine.BytecodeHistogram`.
+- `--engine.BytecodeMethodFilter` : Limit tracing and statistics to selected methods. Matches against `RootNode.getQualifiedName()`. Provide a comma-separated list of includes, or excludes prefixed with `~`. An empty value means no restriction. Whitespace around commas is ignored. Applies to `--engine.TraceBytecode`, `--engine.TraceBytecodeTransition`, and `--engine.BytecodeHistogram`.
+- `--engine.ForceStaticObjectSafetyChecks=true|false` : On property accesses, the Static Object Model always performs safety checks, overriding engine.RelaxStaticObjectSafetyChecks and builder-level safety check configuration.
+- `--engine.HostCallStackHeadRoom=[0, inf)<B>|<KB>|<MB>|<GB>` : Stack space headroom for calls to the host. A value of 0 disables this check.
+- `--engine.InterpreterCallStackHeadRoom=[0, inf)<B>|<KB>|<MB>|<GB>` : Stack space headroom for any interpreter call. Supported only in the AOT mode.
+- `--engine.IsolateMemoryProtection=true|false` : Enable memory protection for the isolate.
+- `--engine.IsolateOption.<key>=<value>` : Isolate VM options.
 - `--engine.PreinitializeContexts` : Preinitialize language contexts for given languages.
-- `--engine.RelaxStaticObjectSafetyChecks` : On property accesses, the Static Object Model does not perform shape checks and uses unsafe casts
+- `--engine.RelaxStaticObjectSafetyChecks=true|false` : On property accesses, the Static Object Model does not perform shape checks and uses unsafe casts
+- `--engine.SourceCacheStatisticDetails` : Print source cache statistics for an engine when the engine is closed. With the details enabled, statistics for all individual sources are printed.
+- `--engine.SourceCacheStatistics` : Print source cache statistics for an engine when the engine is closed.
 - `--engine.SynchronousThreadLocalActionMaxWait=[0, inf)` : How long to wait for other threads to reach a synchronous ThreadLocalAction before cancelling it, in seconds. 0 means no limit.
 - `--engine.SynchronousThreadLocalActionPrintStackTraces` : Print thread stacktraces when a synchronous ThreadLocalAction is waiting for more than SynchronousThreadLocalActionMaxWait seconds.
+- `--engine.TraceBytecode` : Trace every executed bytecode instruction. Very high overhead, use only for debugging, never in production. Supported only by Bytecode DSL interpreters. Combine with engine.BytecodeMethodFilter and engine.BytecodeLanguageFilter to limit output.
+- `--engine.TraceBytecodeTransition=true|false|<kind>[,<kind>...]` : Trace on-stack bytecode interpreter transitions while bytecode is executing (for example uncached-to-cached updates, on-stack bytecode updates, and deoptimization transfers). Set to `true` to trace all transitions, or use a comma-separated subset of transition kinds. Available kinds are `transferToInterpreter`, `bytecode`, `tier`, `tag`, `instrumentation`. The `bytecode` kind traces all bytecode updates; `tier`, `tag`, and `instrumentation` select subsets of bytecode updates. Supported only by Bytecode DSL interpreters. Combine with `--engine.BytecodeMethodFilter` and `--engine.BytecodeLanguageFilter` to limit output.
+- `--engine.TraceSourceCache` : Print information for source cache misses/evictions/failures.
+- `--engine.TraceSourceCacheDetails` : Print information for all source cache events including hits and uncached misses.
 - `--engine.TraceStackTraceInterval=[1, inf)` : Prints the stack trace for all threads for a time interval. By default 0, which disables the output.
 - `--engine.DebugCacheCompileUseLastTier=true|false` : If true uses the last tier instead of the first tier compiler. By default the last tier compiler is used (default: true).
 - `--engine.BackgroundCompilation=true|false` : Enable asynchronous truffle compilation in background threads (default: true)
@@ -64,12 +79,14 @@ The accepted values are:
   Diagnose - Retry compilation with extra diagnostics enabled.
     ExitVM - Exit the VM process.
 - `--engine.CompilerIdleDelay=<ms>` : Set the time in milliseconds an idle Truffle compiler thread will wait for new tasks before terminating. New compiler threads will be started once new compilation tasks are submitted. Select '0' to never terminate the Truffle compiler thread. The option is not supported by all Truffle runtimes. On the runtime which doesn't support it the option has no effect. default: 10000
+- `--engine.CompilerThreadStackSize=[0, inf)B|KB|MB|GB` : Set the requested stack size of Truffle compiler threads. By default compiler threads use 640KB stack space. The requested size is rounded up to implementation-specific minima and page sizes as needed.
 - `--engine.CompilerThreads=[1, inf)` : Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.
 - `--engine.EncodedGraphCachePurgeDelay=<ms>` : Delay, in milliseconds, after which the encoded graph cache is dropped when a Truffle compiler thread becomes idle (default: 10000).
 - `--engine.FirstTierBackedgeCounts=true|false` : Whether to emit look-back-edge counters in the first-tier compilations. (default: true)
 - `--engine.FirstTierCompilationThreshold=[1, inf)` : Number of invocations or loop iterations needed to compile a guest language root in first tier under normal compilation load.Might be reduced/increased when compilation load is low/high if DynamicCompilationThresholds is enabled. (default: 400).
 - `--engine.FirstTierMinInvokeThreshold=[1, inf)` : Minimum number of calls before a call target is compiled in the first tier (default: 1)
 - `--engine.LastTierCompilationThreshold=[1, inf)` : Number of invocations or loop iterations needed to compile a guest language root in first tier under normal compilation load.Might be reduced/increased when compilation load is low/high if DynamicCompilationThresholds is enabled. (default: 10000).
+- `--engine.MaximumCompilations=(-inf, inf)` : Maximum number of successful compilations for a single call target before a permanent bailout. Exceeding the limit will result in a compilation failure with the appropriate reason and there will be no further attempts to compile the call target. (negative integer means no limit, default: 100)
 - `--engine.MinInvokeThreshold=[1, inf)` : Minimum number of calls before a call target is compiled (default: 3).
 - `--engine.Mode=latency|throughput` : Configures the execution mode of the engine. Available modes are 'latency' and 'throughput'. The default value balances between the two.
 - `--engine.MultiTier=true|false` : Whether to use multiple Truffle compilation tiers by default. (default: true)
@@ -79,6 +96,7 @@ The accepted values are:
 - `--engine.PartialBlockMaximumSize=[1, inf)` : Sets the maximum non-trivial Truffle node size for partial compilation of BlockNode nodes (default: 10000).
 - `--engine.SingleTierCompilationThreshold=[1, inf)` : Minimum number of invocations or loop iterations needed to compile a guest language root when not using multi tier (default: 1000).
 - `--engine.Splitting=true|false` : Enable automatic duplication of compilation profiles (splitting) (default: true).
+- `--engine.StoppedCompilationRetryDelay=<ms>` : Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the compilation activity mode in the host VM. If the activity mode indicates a full code cache, no new compilation requests are submitted and the compilation queue is flushed. After 'StoppedCompilationRetryDelay' milliseconds new compilations will be submitted again (which might trigger a sweep of the code cache and a reset of the compilation activity mode in the host JVM). The option is only supported on the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 5000
 - `--engine.TraceCompilation` : Print information for compilation results.
 - `--compiler.EncodedGraphCache` : Cache encoded graphs across Truffle compilations to speed up partial evaluation. (default: true).
 - `--compiler.FirstTierUseEconomy` : Whether to use the economy configuration in the first-tier compilations. (default: true, syntax: true|false)
@@ -92,10 +110,6 @@ The accepted values are:
 - `--engine.InliningExpansionBudget` : The base expansion budget for language-agnostic inlining (default: 12000). Syntax: [1, inf)
 - `--engine.InliningInliningBudget` : The base inlining budget for language-agnostic inlining (default: 12000). Syntax: [1, inf)
 - `--engine.InliningRecursionDepth` : Maximum depth for recursive inlining (default: 2, usage: [0, inf)).
-- `--engine.HostCallStackHeadRoom=[1, inf)<B>|<KB>|<MB>|<GB>` : Stack space headroom for calls to the host.
-- `--engine.InterpreterCallStackHeadRoom=[0, inf)<B>|<KB>|<MB>|<GB>` : Stack space headroom for any interpreter call. Supported only in the AOT mode.
-- `--engine.IsolateMemoryProtection=true|false` : Enable memory protection for the isolate.
-- `--engine.IsolateOption.<key>=<value>` : Isolate VM options.
 ```
 <!-- END: expert-engine-options -->
 
@@ -109,6 +123,8 @@ These are internal options for debugging language implementations and tools.
 - `--engine.DisableCodeSharing` : Option to force disable code sharing for this engine, even if the context was created with an explicit engine. This option is intended for testing purposes only.
 - `--engine.ForceCodeSharing` : Option to force enable code sharing for this engine, even if the context was created with a bound engine. This option is intended for testing purposes only.
 - `--engine.InstrumentExceptionsAreThrown=true|false` : Propagates exceptions thrown by instruments. (default: true)
+- `--engine.IsolateLauncher=<path>` : Path to the external isolate launcher.
+- `--engine.IsolateLibrary=<path>` : Path to the isolate library.
 - `--engine.PrintInternalStackTrace` : Printed PolyglotException stacktrace unconditionally contains the stacktrace of the original internal exception as well as the stacktrace of the creation of the PolyglotException instance.
 - `--engine.SafepointALot` : Repeadly submits thread local actions and collects statistics about safepoint intervals in the process. Prints event and interval statistics when the context is closed for each thread. This option significantly slows down execution and is therefore intended for testing purposes only.
 - `--engine.ShowInternalStackFrames` : Show internal frames specific to the language implementation in stack traces.
@@ -120,12 +136,13 @@ These are internal options for debugging language implementations and tools.
 - `--engine.TriggerUncaughtExceptionHandlerForCancel` : Propagates cancel execution exception into UncaughtExceptionHandler. For testing purposes only.
 - `--engine.UseConservativeContextReferences` : Enables conservative context references. This allows invalid sharing between contexts. For testing purposes only.
 - `--engine.UsePreInitializedContext=true|false` : Use pre-initialized context when it's available (default: true).
-- `--engine.DebugCacheCompile=none|compiled|hot|aot|executed` : Policy to use to to force compilation for executed call targets before persisting the engine. Possible values are:
-  - 'none':     No compilations will be persisted and existing compilations will be invalidated.
-  - 'compiled': No compilations will be forced but finished compilations will be persisted.
-  - 'hot':      (default) All started compilations will be completed and then persisted.
-  - 'aot':      All started and AOT compilable roots will be forced to compile and persisted.
-  - 'executed': All executed and all AOT compilable roots will be forced to compile.
+- `--engine.DebugCacheCompile=none|compiled|hot|aot|executed` : Compilation policy to apply before persisting the engine. Possible values are:
+  - 'none':     Invalidate existing compilations and persist no compiled code.
+  - 'compiled': Persist existing compiled code without forcing new compilations. Cancel unfinished compilations and wait for them to terminate.
+  - 'hot':      (default) Wait for pending compilations, then compile roots that meet the runtime compilation thresholds. Also compile the parent roots of valid on-stack replacement (OSR) compilations.
+  - 'aot':      Like 'hot', plus uninitialized roots that support AOT preparation.
+  - 'executed': Like 'aot', but compile initialized roots regardless of compilation thresholds.
+OSR roots themselves are not forced to compile.
 - `--engine.DebugCacheLoad` : Prepares the engine to take the stored engine from the static field instead of reading it from disk.
 - `--engine.DebugCachePreinitializeContext=true|false` : Preinitialize a new context with all languages that support it and that were used during the run (default: true).
 - `--engine.DebugCacheStore` : Prepares the engine for caching and stores it a static field instead of writing it to disk.
@@ -137,8 +154,9 @@ These are internal options for debugging language implementations and tools.
 - `--engine.CompileImmediately` : Compile immediately to test Truffle compilation
 - `--engine.CompileOnly=<name>,<name>,...` : Restrict compilation to ','-separated list of includes (or excludes prefixed with '~'). No restriction by default.
 - `--engine.DynamicCompilationThresholds=true|false` : Reduce or increase the compilation threshold depending on the size of the compilation queue (default: true).
-- `--engine.DynamicCompilationThresholdsMaxNormalLoad=[1, inf)` : The desired maximum compilation queue load. When the load rises above this value, the compilation thresholds are increased. The load is scaled by the number of compiler threads.  (default: 10)
-- `--engine.DynamicCompilationThresholdsMinNormalLoad=[1, inf)` : The desired minimum compilation queue load. When the load falls bellow this value, the compilation thresholds are decreased. The load is scaled by the number of compiler threads (default: 10).
+- `--engine.DynamicCompilationThresholdsHighLoadSlope=[0.0, inf)` : The slope used to increase compilation thresholds when compilation queue load is above DynamicCompilationThresholdsMaxNormalLoad (default: 0.09).
+- `--engine.DynamicCompilationThresholdsMaxNormalLoad=[1, inf)` : The desired maximum compilation queue load. When the load rises above this value, the compilation thresholds are increased. The load is scaled by the number of compiler threads.  (default: 90)
+- `--engine.DynamicCompilationThresholdsMinNormalLoad=[0, inf)` : The desired minimum compilation queue load. When the load falls below this value, the compilation thresholds are decreased. The load is scaled by the number of compiler threads (default: 0).
 - `--engine.DynamicCompilationThresholdsMinScale=[0.0, inf)` : The minimal scale the compilation thresholds can be reduced to (default: 0.1).
 - `--engine.OSRCompilationThreshold=[1, inf)` : Number of loop iterations until on-stack-replacement compilation is triggered (default 100352).
 - `--engine.OSRMaxCompilationReAttempts=[0, inf)` : Number of compilation re-attempts before bailing out of OSR compilation for a given method (default 30). This number is an approximation of the acceptable number of deopts.
@@ -166,7 +184,14 @@ These are internal options for debugging language implementations and tools.
 - `--engine.TraversingCompilationQueue=true|false` : Use a traversing compilation queue. (default: true)
 - `--engine.TraversingQueueFirstTierBonus=[0.0, inf)` : Controls how much of a priority should be given to first tier compilations (default 15.0).
 - `--engine.TraversingQueueFirstTierPriority` : Traversing queue gives first tier compilations priority.
+- `--engine.TraversingQueueInvalidatedBonus=[0.0, inf)` : Controls how much of a priority should be given to compilations after invalidations (default: 1.0, no bonus).
+- `--engine.TraversingQueueOSRBonus=[0.0, inf)` : Controls how much of a priority should be given to OSR compilations (default: 1.0, no bonus).
+- `--engine.TraversingQueueRateHalfLife=[0, inf)` : Sets the time, in milliseconds, after which the impact of a compilation unit's observed execution rate is halved. (default: 300 ms)
+- `--engine.TraversingQueueStaleTaskDelay=[0, inf)` : Maximum time in milliseconds a queued compilation task may stay without invocation activity before it is considered stale. Set to 0 to disable. (default: 100)
 - `--engine.TraversingQueueWeightingBothTiers=true|false` : Traversing queue uses rate as priority for both tier. (default: true)
+- `--compiler.CompilationTimeout` : Time limit in seconds before a compilation expires and throws a bailout (0 to disable the limit). 
+- `--compiler.DeoptCycleDetectionAllowedRepeats` : Maximum allowed repeats of the same compiled code for the same compilable. Works only if the detection of repeated compilation is enabled after DeoptCycleDetectionThreshold has been reached for the compilable. (negative integer means 0, default: 0)
+- `--compiler.DeoptCycleDetectionThreshold` : Threshold for enabling deopt cycle detection for a call target. When the number of successful compilation of the call target reaches the threshold, deopt cycle detection is enabled for the call target. (negative integer means the detection is never enabled, default: 15)
 - `--compiler.DiagnoseFailure` : Forces diagnostics for compilation failures (default: false).
 - `--compiler.ExcludeAssertions` : Exclude assertion code from Truffle compilations (default: true)
 - `--compiler.FirstTierInliningPolicy` : Explicitly pick a first tier inlining policy by name (None, TrivialOnly). If empty (default) the lowest priority policy (TrivialOnly) is chosen.
@@ -182,7 +207,7 @@ These are internal options for debugging language implementations and tools.
 - `--compiler.InstrumentationTableSize` : Maximum number of instrumentation counters available (default: 10000, syntax: [1, inf))
 - `--compiler.IterativePartialEscape` : Run the partial escape analysis iteratively in Truffle compilation.
 - `--compiler.LogInlinedTargets` : Logs inlined targets for statistical purposes (default: false).
-- `--compiler.MaximumGraalGraphSize` : Stop partial evaluation when the graph exceeded this size (default: 150000, syntax: [1, inf))
+- `--compiler.MaximumGraalGraphSize` : Stop partial evaluation when the graph exceeded this size, disabled if < 0. (default: -1, syntax: [-inf, inf))
 - `--compiler.MethodExpansionStatistics` : Print statistics on expanded Java methods during partial evaluation at the end of a run.(syntax: true|false|peTier|truffleTier|lowTier|<tier>,<tier>,...)
   Accepted values are:
       true - Collect data for the default tier 'truffleTier'.
@@ -222,7 +247,6 @@ These are internal options for debugging language implementations and tools.
 - `--compiler.TracePerformanceWarnings` : Print potential performance problems, Performance warnings are: call, instanceof, store, frame_merge, trivial. (syntax: none|all|<perfWarning>,<perfWarning>,...)
 - `--compiler.TraceStackTraceLimit` : Number of stack trace elements printed by TraceTruffleTransferToInterpreter, TraceTruffleAssumptions and TraceDeoptimizeFrame (default: 20). Syntax: [1, inf).
 - `--compiler.TreatPerformanceWarningsAsErrors` : Treat performance warnings as error. Handling of the error depends on the CompilationFailureAction option value. Performance warnings are: call, instanceof, store, frame_merge, trivial. (syntax: none|all|<perfWarning>,<perfWarning>,...)
-- `--engine.DiagnoseFailure` : Forces diagnostics for compilation failures (default: false).
 - `--engine.ExcludeAssertions` : Exclude assertion code from Truffle compilations (default: true)
 - `--engine.FirstTierInliningPolicy` : Explicitly pick a first tier inlining policy by name (None, TrivialOnly). If empty (default) the lowest priority policy (TrivialOnly) is chosen.
 - `--engine.InlineAcrossTruffleBoundary` : Enable inlining across Truffle boundary
@@ -236,8 +260,7 @@ These are internal options for debugging language implementations and tools.
 - `--engine.InstrumentFilter` : Method filter for host methods in which to add instrumentation (syntax: <method>,<method>,....)
 - `--engine.InstrumentationTableSize` : Maximum number of instrumentation counters available (default: 10000, syntax: [1, inf))
 - `--engine.IterativePartialEscape` : Run the partial escape analysis iteratively in Truffle compilation.
-- `--engine.LogInlinedTargets` : Logs inlined targets for statistical purposes (default: false).
-- `--engine.MaximumGraalGraphSize` : Stop partial evaluation when the graph exceeded this size (default: 150000, syntax: [1, inf))
+- `--engine.MaximumGraalGraphSize` : Stop partial evaluation when the graph exceeded this size, disabled if < 0. (default: -1, syntax: [-inf, inf))
 - `--engine.MethodExpansionStatistics` : Print statistics on expanded Java methods during partial evaluation at the end of a run.(syntax: true|false|peTier|truffleTier|lowTier|<tier>,<tier>,...)
   Accepted values are:
       true - Collect data for the default tier 'truffleTier'.
@@ -277,6 +300,5 @@ These are internal options for debugging language implementations and tools.
 - `--engine.TracePerformanceWarnings` : Print potential performance problems, Performance warnings are: call, instanceof, store, frame_merge, trivial. (syntax: none|all|<perfWarning>,<perfWarning>,...)
 - `--engine.TraceStackTraceLimit` : Number of stack trace elements printed by TraceTruffleTransferToInterpreter, TraceTruffleAssumptions and TraceDeoptimizeFrame (default: 20). Syntax: [1, inf).
 - `--engine.TreatPerformanceWarningsAsErrors` : Treat performance warnings as error. Handling of the error depends on the CompilationFailureAction option value. Performance warnings are: call, instanceof, store, frame_merge, trivial. (syntax: none|all|<perfWarning>,<perfWarning>,...)
-- `--engine.IsolateLibrary=<path>` : Path to the isolate library.
 ```
 <!-- END: internal-engine-options -->

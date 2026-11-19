@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,11 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
-import static jdk.vm.ci.amd64.AMD64.r8;
-import static jdk.vm.ci.amd64.AMD64.rax;
-import static jdk.vm.ci.amd64.AMD64.rcx;
-import static jdk.vm.ci.amd64.AMD64.rdi;
-import static jdk.vm.ci.amd64.AMD64.rdx;
-import static jdk.vm.ci.amd64.AMD64.rsi;
-import static jdk.vm.ci.code.ValueUtil.asRegister;
-import static jdk.vm.ci.code.ValueUtil.isIllegal;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.QWORD;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.XMM;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.YMM;
+import static jdk.vm.ci.code.ValueUtil.asRegister;
+import static jdk.vm.ci.code.ValueUtil.isIllegal;
 
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -53,12 +47,9 @@ import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
 import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.code.TargetDescription;
-import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.Value;
 
@@ -82,13 +73,6 @@ import jdk.vm.ci.meta.Value;
 public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
     public static final LIRInstructionClass<AMD64ArrayRegionCompareToOp> TYPE = LIRInstructionClass.create(AMD64ArrayRegionCompareToOp.class);
 
-    private static final Register REG_ARRAY_A = rsi;
-    private static final Register REG_OFFSET_A = rax;
-    private static final Register REG_ARRAY_B = rdi;
-    private static final Register REG_OFFSET_B = rcx;
-    private static final Register REG_LENGTH = rdx;
-    private static final Register REG_STRIDE = r8;
-
     private static final int ONES_16 = 0xffff;
     private static final int ONES_32 = 0xffffffff;
 
@@ -97,46 +81,14 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
     private final AMD64MacroAssembler.ExtendMode extendMode;
 
     @Def({OperandFlag.REG}) private Value resultValue;
-    @Use({OperandFlag.REG}) private Value arrayAValue;
-    @Use({OperandFlag.REG}) private Value offsetAValue;
-    @Use({OperandFlag.REG}) private Value arrayBValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValue;
-    @Use({OperandFlag.REG}) private Value lengthValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStridesValue;
-
-    @Temp({OperandFlag.REG}) private Value arrayAValueTemp;
-    @Temp({OperandFlag.REG}) private Value offsetAValueTemp;
-    @Temp({OperandFlag.REG}) private Value arrayBValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValueTemp;
-    @Temp({OperandFlag.REG}) private Value lengthValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStridesValueTemp;
+    @UseKill({OperandFlag.REG}) private Value arrayAValue;
+    @UseKill({OperandFlag.REG}) private Value offsetAValue;
+    @UseKill({OperandFlag.REG}) private Value arrayBValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValue;
+    @UseKill({OperandFlag.REG}) private Value lengthValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStridesValue;
 
     @Temp({OperandFlag.REG}) Value[] vectorTemp;
-
-    private AMD64ArrayRegionCompareToOp(LIRGeneratorTool tool, Stride strideA, Stride strideB,
-                    EnumSet<CPUFeature> runtimeCheckedCPUFeatures, Value result, Value arrayA, Value offsetA, Value arrayB, Value offsetB, Value length, Value dynamicStrides,
-                    AMD64MacroAssembler.ExtendMode extendMode) {
-        super(TYPE, tool, runtimeCheckedCPUFeatures, YMM);
-        this.extendMode = extendMode;
-        if (strideA == null) {
-            this.argStrideA = null;
-            this.argStrideB = null;
-        } else {
-            GraalError.guarantee(strideA.value <= 4, "unsupported strideA");
-            GraalError.guarantee(strideB.value <= 4, "unsupported strideB");
-            this.argStrideA = strideA;
-            this.argStrideB = strideB;
-        }
-        this.resultValue = result;
-        this.arrayAValue = this.arrayAValueTemp = arrayA;
-        this.offsetAValue = this.offsetAValueTemp = offsetA;
-        this.arrayBValue = this.arrayBValueTemp = arrayB;
-        this.offsetBValue = this.offsetBValueTemp = offsetB;
-        this.lengthValue = this.lengthValueTemp = length;
-        this.dynamicStridesValue = this.dynamicStridesValueTemp = dynamicStrides;
-
-        this.vectorTemp = allocateVectorRegisters(tool, JavaKind.Byte, isVectorCompareSupported(tool.target(), runtimeCheckedCPUFeatures, argStrideA, argStrideB) ? 4 : 0);
-    }
 
     /**
      * Compares array regions of length {@code length} in {@code arrayA} and {@code arrayB},
@@ -155,29 +107,36 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
      * @param dynamicStrides dynamic stride dispatch as described in {@link StrideUtil}.
      * @param extendMode integer extension mode for {@code arrayB}.
      */
-    public static AMD64ArrayRegionCompareToOp movParamsAndCreate(LIRGeneratorTool tool, Stride strideA, Stride strideB,
+    public AMD64ArrayRegionCompareToOp(LIRGeneratorTool tool, Stride strideA, Stride strideB,
                     EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
                     Value result, Value arrayA, Value offsetA, Value arrayB, Value offsetB, Value length, Value dynamicStrides,
                     AMD64MacroAssembler.ExtendMode extendMode) {
-        RegisterValue regArrayA = REG_ARRAY_A.asValue(arrayA.getValueKind());
-        RegisterValue regOffsetA = REG_OFFSET_A.asValue(offsetA.getValueKind());
-        RegisterValue regArrayB = REG_ARRAY_B.asValue(arrayB.getValueKind());
-        RegisterValue regOffsetB = REG_OFFSET_B.asValue(offsetB.getValueKind());
-        RegisterValue regLength = REG_LENGTH.asValue(length.getValueKind());
-        Value regStride = dynamicStrides == null ? Value.ILLEGAL : REG_STRIDE.asValue(length.getValueKind());
-        tool.emitConvertNullToZero(regArrayA, arrayA);
-        tool.emitMove(regOffsetA, offsetA);
-        tool.emitConvertNullToZero(regArrayB, arrayB);
-        tool.emitMove(regOffsetB, offsetB);
-        tool.emitMove(regLength, length);
-        if (dynamicStrides != null) {
-            tool.emitMove((AllocatableValue) regStride, dynamicStrides);
+        super(TYPE, tool, runtimeCheckedCPUFeatures, YMM);
+        this.extendMode = extendMode;
+        if (strideA == null) {
+            this.argStrideA = null;
+            this.argStrideB = null;
+        } else {
+            GraalError.guarantee(strideA.value <= 4, "unsupported strideA");
+            GraalError.guarantee(strideB.value <= 4, "unsupported strideB");
+            this.argStrideA = strideA;
+            this.argStrideB = strideB;
         }
-        return new AMD64ArrayRegionCompareToOp(tool, strideA, strideB, runtimeCheckedCPUFeatures, result, regArrayA, regOffsetA, regArrayB, regOffsetB, regLength, regStride, extendMode);
+        this.resultValue = result;
+        this.arrayAValue = arrayA;
+        this.offsetAValue = offsetA;
+        this.arrayBValue = arrayB;
+        this.offsetBValue = offsetB;
+        this.lengthValue = length;
+        this.dynamicStridesValue = dynamicStrides;
+
+        this.vectorTemp = allocateVectorRegisters(tool, JavaKind.Byte, isVectorCompareSupported(tool.target(), runtimeCheckedCPUFeatures, argStrideA, argStrideB) ? 4 : 0);
     }
 
     @Override
     public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
+        AMD64Assembler.AMD64SIMDInstructionEncoding oldEncoding = masm.setTemporaryAvxEncoding(AMD64Assembler.AMD64SIMDInstructionEncoding.VEX);
+
         Register result = asRegister(resultValue);
         Register arrayA = asRegister(arrayAValue);
         Register arrayB = asRegister(arrayBValue);
@@ -210,6 +169,8 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
             }
             masm.bind(done);
         }
+
+        masm.resetAvxEncoding(oldEncoding);
     }
 
     private static boolean isVectorCompareSupported(TargetDescription target, EnumSet<CPUFeature> runtimeCheckedCPUFeatures, Stride strideA, Stride strideB) {
@@ -275,7 +236,8 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
         // convert result to bitmask
         masm.pmovmsk(vectorSize, tmp1, vector1);
         // invert bit mask. if the result is non-zero, compared regions are not equal
-        masm.xorlAndJcc(tmp1, vectorSize == XMM ? ONES_16 : ONES_32, ConditionFlag.NotZero, diffFound, true);
+        masm.xorl(tmp1, vectorSize == XMM ? ONES_16 : ONES_32);
+        masm.jccb(ConditionFlag.NotZero, diffFound);
         // regions are equal, continue the loop
         masm.addqAndJcc(length, elementsPerVector, ConditionFlag.NotZero, loop, true);
 
@@ -289,7 +251,8 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
         masm.leaq(length, new AMD64Address(length, result, Stride.S1, -elementsPerVector));
         masm.pcmpeq(vectorSize, maxStride, vector1, vector2);
         masm.pmovmsk(vectorSize, tmp1, vector1);
-        masm.xorlAndJcc(tmp1, vectorSize == XMM ? ONES_16 : ONES_32, ConditionFlag.NotZero, diffFound, true);
+        masm.xorl(tmp1, vectorSize == XMM ? ONES_16 : ONES_32);
+        masm.jccb(ConditionFlag.NotZero, diffFound);
         // all elements are equal, return 0
         masm.xorq(result, result);
         masm.jmp(returnLabel);
@@ -360,7 +323,8 @@ public final class AMD64ArrayRegionCompareToOp extends AMD64ComplexVectorOp {
         }
         masm.pcmpeq(cmpSize, maxStride, vector1, vector2);
         masm.pmovmsk(cmpSize, result, vector1);
-        masm.xorlAndJcc(result, cmpSize == XMM ? ONES_16 : ONES_32, ConditionFlag.Zero, returnLabel, false);
+        masm.xorl(result, cmpSize == XMM ? ONES_16 : ONES_32);
+        masm.jcc(ConditionFlag.Zero, returnLabel);
 
         bsfq(masm, tmp2, result);
         if (maxStride.value > 1) {

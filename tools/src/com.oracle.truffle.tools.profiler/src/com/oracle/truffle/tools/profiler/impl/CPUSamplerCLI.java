@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,6 +28,9 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.PrintStream;
+import java.time.Duration;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -57,6 +60,8 @@ import com.oracle.truffle.tools.profiler.ProfilerNode;
 @Option.Group(CPUSamplerInstrument.ID)
 class CPUSamplerCLI extends ProfilerCLI {
 
+    private static final String DURATION_SYNTAX = "[0, inf)ms|s|m|h|d";
+    private static final String NONZERO_DURATION_SYNTAX = "[1, inf)ms|s|m|h|d";
     public static final long MILLIS_TO_NANOS = 1_000_000L;
     public static final double MAX_OVERHEAD_WARNING_THRESHOLD = 0.2;
     public static final String DEFAULT_FLAMEGRAPH_FILE = "flamegraph.svg";
@@ -169,15 +174,73 @@ class CPUSamplerCLI extends ProfilerCLI {
                         }
                     });
 
+    private static OptionType<Duration> createDurationType() {
+        return new OptionType<>("time", new Function<String, Duration>() {
+
+            @SuppressWarnings("ResultOfMethodCallIgnored")
+            @Override
+            public Duration apply(String timeStr) {
+                try {
+                    ChronoUnit foundUnit = ChronoUnit.MILLIS; // If no unit is specified,
+                                                              // milliseconds are assumed.
+                    String foundUnitName = "";
+                    for (ChronoUnit unit : ChronoUnit.values()) {
+                        String unitName = getUnitName(unit);
+                        if (unitName == null) {
+                            continue;
+                        }
+                        if (timeStr.endsWith(unitName)) {
+                            foundUnit = unit;
+                            foundUnitName = unitName;
+                            break;
+                        }
+                    }
+                    String subString = timeStr.substring(0, timeStr.length() - foundUnitName.length());
+                    long value = Long.parseLong(subString);
+                    if (value < 0) {
+                        throw invalidValue(timeStr);
+                    }
+                    return Duration.of(value, foundUnit);
+                } catch (NumberFormatException | ArithmeticException | DateTimeParseException e) {
+                    throw invalidValue(timeStr);
+                }
+            }
+
+            private String getUnitName(ChronoUnit unit) {
+                return switch (unit) {
+                    case MILLIS -> "ms";
+                    case SECONDS -> "s";
+                    case MINUTES -> "m";
+                    case HOURS -> "h";
+                    case DAYS -> "d";
+                    default -> null;
+                };
+            }
+
+            private IllegalArgumentException invalidValue(String value) {
+                throw new IllegalArgumentException("Invalid duration '" + value + "' specified. " //
+                                + "A valid duration consists of an integer value >= 0 optionally followed by a chronological time unit. " //
+                                + "For example, '11', '15ms', or '6s'. Valid time units are " //
+                                + "'' or 'ms' for milliseconds, " //
+                                + "'s' for seconds, " //
+                                + "'m' for minutes, " //
+                                + "'h' for hours, and " //
+                                + "'d' for days.");
+            }
+        });
+    }
+
     @Option(name = "", help = "Enable/Disable the CPU sampler, or enable with specific Output - as specified by the Output option (default: false). Choosing an output with this options defaults to printing the output to std out, " +
                     "except for the flamegraph which is printed to a flamegraph.svg file.", usageSyntax = "true|false|<Output>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<EnableOptionData> ENABLED = new OptionKey<>(new EnableOptionData(false, null), ENABLE_OPTION_TYPE);
 
-    @Option(name = "Period", help = "Period in milliseconds to sample the stack (default: 10)", usageSyntax = "<ms>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Long> SAMPLE_PERIOD = new OptionKey<>(10L);
+    @Option(name = "Period", help = "Sampling period for the stack. Example: 5ms. The default unit is milliseconds, and the default value is 10, meaning the stack is sampled every 10 ms.", //
+                    usageSyntax = NONZERO_DURATION_SYNTAX, category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<Duration> SAMPLE_PERIOD = new OptionKey<>(Duration.ofMillis(10), createDurationType());
 
-    @Option(name = "Delay", help = "Delay the sampling for this many milliseconds (default: 0).", usageSyntax = "<ms>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Long> DELAY_PERIOD = new OptionKey<>(0L);
+    @Option(name = "Delay", help = "Delay sampling for the specified time. Example: 500ms. The default unit is milliseconds, and the default value is 0 (no delay), meaning sampling starts immediately.", usageSyntax = DURATION_SYNTAX, //
+                    category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<Duration> DELAY_PERIOD = new OptionKey<>(Duration.ZERO, createDurationType());
 
     @Option(name = "StackLimit", help = "Maximum number of maximum stack elements (default: 10000).", usageSyntax = "[1, inf)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Integer> STACK_LIMIT = new OptionKey<>(10000);
@@ -224,6 +287,13 @@ class CPUSamplerCLI extends ProfilerCLI {
     @Option(name = "GatherAsyncStackTrace", help = "Try to gather async stack trace elements for each sample (default: true). " +
                     "Disabling this option may reduce sampling overhead.", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> GATHER_ASYNC_STACK_TRACE = new OptionKey<>(true);
+
+    @Option(name = "DumpInterval", category = OptionCategory.EXPERT, stability = OptionStability.STABLE, help = "Dump the sampler output at the specified interval. Example: 10s. The default unit is milliseconds, " + //
+                    "and the default value is 0 (no interval-based dumping), meaning output is only produced at the end of execution.", usageSyntax = DURATION_SYNTAX)//
+    static final OptionKey<Duration> DUMP_INTERVAL = new OptionKey<>(Duration.ZERO, createDurationType());
+
+    @Option(name = "ResetAfterIntervalDump", category = OptionCategory.EXPERT, stability = OptionStability.STABLE, help = "Specifies whether to clear the sampler data after each interval-based dump. The default value is false (do not clear).")//
+    static final OptionKey<Boolean> RESET_AFTER_INTERVAL_DUMP = new OptionKey<>(false);
 
     static void handleOutput(TruffleInstrument.Env env, CPUSampler sampler, String absoluteOutputPath) {
         PrintStream out = chooseOutputStream(env, absoluteOutputPath);
@@ -369,7 +439,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             sample.put("self_tier_count", selfTierCount);
             int[] tierCount = new int[payload.getNumberOfTiers()];
             for (int i = 0; i < tierCount.length; i++) {
-                tierCount[i] = payload.getTierSelfCount(i);
+                tierCount[i] = payload.getTierTotalCount(i);
             }
             sample.put("tier_count", tierCount);
             sample.put("children", getSamplesRec(node.getChildren()));
@@ -475,7 +545,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             this.summariseThreads = options.get(SUMMARISE_THREADS);
             this.minSamples = options.get(MIN_SAMPLES);
             this.showTiers = options.get(ShowTiers);
-            this.samplePeriod = options.get(SAMPLE_PERIOD);
+            this.samplePeriod = options.get(SAMPLE_PERIOD).toMillis();
             this.samplesTaken = data.getSamples();
             Map<Thread, SourceLocationNodes> perThreadSourceLocationPayloads = new HashMap<>();
             this.samplesMissed = data.missedSamples();
@@ -695,7 +765,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             this.summariseThreads = options.get(SUMMARISE_THREADS);
             this.minSamples = options.get(MIN_SAMPLES);
             this.showTiers = options.get(ShowTiers);
-            this.samplePeriod = options.get(SAMPLE_PERIOD);
+            this.samplePeriod = options.get(SAMPLE_PERIOD).toMillis();
             this.samplesTaken = data.getSamples();
             this.samplesMissed = data.missedSamples();
             Map<Thread, Collection<ProfilerNode<CPUSampler.Payload>>> threadData = data.getThreadData();
@@ -718,7 +788,10 @@ class CPUSamplerCLI extends ProfilerCLI {
 
         private void calculateMaxValuesRec(ProfilerNode<CPUSampler.Payload> node, int depth) {
             maxNameLength = Math.max(maxNameLength, node.getRootName().length() + OutputEntry.computeIndentSize(depth));
-            tiers.add(node.getPayload().getNumberOfTiers() - 1);
+            int numberOfTiers = node.getPayload().getNumberOfTiers();
+            for (int i = 0; i < numberOfTiers; i++) {
+                tiers.add(i);
+            }
             for (ProfilerNode<CPUSampler.Payload> child : node.getChildren()) {
                 calculateMaxValuesRec(child, depth + 1);
             }
@@ -759,7 +832,10 @@ class CPUSamplerCLI extends ProfilerCLI {
 
         private CallTreeOutputEntry makeEntry(ProfilerNode<CPUSampler.Payload> node, int depth) {
             maxNameLength = Math.max(maxNameLength, node.getRootName().length() + OutputEntry.computeIndentSize(depth));
-            tiers.add(node.getPayload().getNumberOfTiers() - 1);
+            int numberOfTiers = node.getPayload().getNumberOfTiers();
+            for (int i = 0; i < numberOfTiers; i++) {
+                tiers.add(i);
+            }
             CallTreeOutputEntry entry = new CallTreeOutputEntry(node);
             for (ProfilerNode<CPUSampler.Payload> child : node.getChildren()) {
                 entry.children.add(makeEntry(child, depth + 1));

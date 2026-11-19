@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,9 +24,17 @@
  */
 package jdk.graal.compiler.hotspot;
 
+import java.util.BitSet;
+import java.util.List;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.EconomicSet;
+
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect;
 import jdk.graal.compiler.core.common.spi.ForeignCallLinkage;
+import jdk.graal.compiler.core.common.spi.ForeignCallSignature;
 import jdk.graal.compiler.core.target.Backend;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor;
 import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor.Transition;
 import jdk.graal.compiler.hotspot.replacements.HotSpotAllocationSnippets;
@@ -41,7 +49,11 @@ import jdk.graal.compiler.nodes.FrameState.StackState;
 import jdk.graal.compiler.nodes.extended.ForeignCallNode;
 import jdk.graal.compiler.nodes.java.MonitorEnterNode;
 import jdk.graal.compiler.nodes.java.NewArrayNode;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.graal.compiler.replacements.SnippetTemplate;
+import jdk.graal.compiler.serviceprovider.GlobalAtomicLong;
+import jdk.internal.misc.Unsafe;
+import jdk.vm.ci.code.Register;
 import jdk.vm.ci.meta.InvokeTarget;
 
 /**
@@ -255,6 +267,11 @@ public interface HotSpotForeignCallLinkage extends ForeignCallLinkage, InvokeTar
     long getAddress();
 
     /**
+     * Returns {@code true} if this linkage has a finalized address.
+     */
+    boolean hasAddress();
+
+    /**
      * Determines if the runtime function or stub might use floating point registers. If the answer
      * is no, then no FPU state management prologue or epilogue needs to be emitted around the call.
      */
@@ -269,4 +286,116 @@ public interface HotSpotForeignCallLinkage extends ForeignCallLinkage, InvokeTar
      * Gets the VM symbol associated with the target {@linkplain #getAddress() address} of the call.
      */
     String getSymbol();
+
+    /**
+     * Encapsulates a stub's entry point and set of registers it kills.
+     *
+     * @param start address of first instruction in the stub
+     * @param killedRegisters see {@link Stub#getDestroyedCallerRegisters()}
+     */
+    record CodeInfo(long start, EconomicSet<Register> killedRegisters) {
+        public static CodeInfo fromMemory(long memory, List<Register> allRegisters) {
+            Unsafe unsafe = Unsafe.getUnsafe();
+            // @formatter:off
+            int offset = 0;
+            long start = unsafe.getLong(memory + offset);       offset += Long.BYTES;
+            int bsLongsLength = unsafe.getInt(memory + offset); offset += Integer.BYTES;
+            long[] bsLongs = new long[bsLongsLength];
+            for (int i = 0; i < bsLongsLength; i++) {
+                bsLongs[i] = unsafe.getLong(memory + offset);   offset += Long.BYTES;
+            }
+            // @formatter:on
+            BitSet bs = BitSet.valueOf(bsLongs);
+            EconomicSet<Register> killedRegisters = EconomicSet.create(bs.cardinality());
+            for (int regNum = bs.nextSetBit(0); regNum >= 0; regNum = bs.nextSetBit(regNum + 1)) {
+                killedRegisters.add(allRegisters.get(regNum));
+            }
+            return new CodeInfo(start, killedRegisters);
+        }
+
+        public long toMemory() {
+            BitSet bs = new BitSet();
+            for (Register reg : killedRegisters) {
+                bs.set(reg.number);
+            }
+            Unsafe unsafe = Unsafe.getUnsafe();
+            long[] bsLongs = bs.toLongArray();
+            int memorySize = Long.BYTES + Integer.BYTES + Long.BYTES * bsLongs.length;
+            long memory = unsafe.allocateMemory(memorySize);
+            int offset = 0;
+            // @formatter:off
+            unsafe.putLong(memory + offset, start);           offset += Long.BYTES;
+            unsafe.putInt(memory + offset, bsLongs.length);   offset += Integer.BYTES;
+            for (long l : bsLongs) {
+                unsafe.putLong(memory + offset, l);           offset += Long.BYTES;
+            }
+            // @formatter:on
+            GraalError.guarantee(memorySize == offset, "%s != %s", memorySize, offset);
+            return memory;
+        }
+    }
+
+    class Stubs {
+        /**
+         * Map from a foreign call signature to global long that is the address of a block of memory
+         * containing the result of {@link HotSpotForeignCallLinkageImpl.CodeInfo#toMemory()}.
+         * <p>
+         * This map is used to mitigate against libgraal isolates compiling and installing duplicate
+         * {@code RuntimeStub}s for a foreign call. Completely preventing duplicates requires
+         * inter-isolate synchronization for which there is currently no support. A small number of
+         * duplicates is acceptable given how few foreign call runtime stubs there are in practice.
+         * Duplicates will only result when libgraal isolates race to install code for the same
+         * stub. Testing shows that this is extremely rare.
+         *
+         * In the context of libgraal, this map is initialized at image build-time (see callers of
+         * {@link #initStubs}) and is part of the image heap (which is shared among all isolates).
+         */
+        private static final EconomicMap<ForeignCallSignature, GlobalAtomicLong> STUBS = EconomicMap.create();
+
+        /**
+         * Racy between isolates but as stated in {@link #STUBS} javadoc, it's not a problem in
+         * practice.
+         */
+        static HotSpotForeignCallLinkageImpl.CodeInfo getCodeInfo(Stub stub, Backend backend) {
+            ForeignCallSignature sig = stub.getLinkage().getDescriptor().getSignature();
+            GlobalAtomicLong data = getStubData(sig);
+            long codeInfoInMemory = data.get();
+            if (codeInfoInMemory == 0L) {
+                HotSpotForeignCallLinkageImpl.CodeInfo codeInfo = new HotSpotForeignCallLinkageImpl.CodeInfo(stub.getCode(backend).getStart(), stub.getDestroyedCallerRegisters());
+                data.set(codeInfo.toMemory());
+                return codeInfo;
+            }
+            List<Register> allRegisters = backend.getCodeCache().getTarget().arch.getRegisters();
+            return HotSpotForeignCallLinkageImpl.CodeInfo.fromMemory(codeInfoInMemory, allRegisters);
+        }
+
+        private static GlobalAtomicLong getStubData(ForeignCallSignature sig) {
+            GlobalAtomicLong data;
+            if (LibGraalSupport.inLibGraalRuntime()) {
+                data = STUBS.get(sig);
+                GraalError.guarantee(data != null, "missing global data for %s", sig);
+            } else {
+                synchronized (STUBS) {
+                    data = STUBS.get(sig);
+                    if (data == null) {
+                        data = new GlobalAtomicLong("STUB_" + sig.getName(), 0L);
+                        STUBS.put(sig, data);
+                    }
+                }
+            }
+            return data;
+        }
+
+        /**
+         * Initializes the map for avoiding duplicate {@code RuntimeStub}s for foreign calls.
+         *
+         * @param sigs signatures for which runtime stubs will be created
+         */
+        public static void initStubs(List<ForeignCallSignature> sigs) {
+            GraalError.guarantee(STUBS.isEmpty(), "cannot re-initialize STUBS: %s", STUBS);
+            for (ForeignCallSignature sig : sigs) {
+                STUBS.put(sig, new GlobalAtomicLong("STUB_" + sig.getName(), 0L));
+            }
+        }
+    }
 }

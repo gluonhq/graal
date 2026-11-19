@@ -24,11 +24,11 @@
  */
 package com.oracle.svm.core.meta;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -37,10 +37,11 @@ public final class DirectSubstrateObjectConstant extends SubstrateObjectConstant
 
     /** The raw object wrapped by this constant. */
     private final Object object;
+
     /**
      * The identity hash code for this constant. It may or may not be the same as of the identity
      * hashcode of the object. When the constant is used during image build the value is provided
-     * via {@link IdentityHashCodeProvider}. When used for run time JIT compilation the initial
+     * via {@link ConstantReflectionProvider}. When used for run time JIT compilation the initial
      * value is 0, and it is computed lazily.
      */
     private int identityHashCode;
@@ -50,9 +51,6 @@ public final class DirectSubstrateObjectConstant extends SubstrateObjectConstant
         this.object = object;
         this.identityHashCode = identityHashCode;
         assert object != null;
-        if (SubstrateUtil.isInLibgraal()) {
-            throw new InternalError();
-        }
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)

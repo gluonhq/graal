@@ -28,7 +28,7 @@ package jdk.graal.compiler.lir.ssa;
 import static jdk.vm.ci.code.ValueUtil.isRegister;
 
 import java.util.EnumSet;
-import java.util.HashMap;
+import java.util.Map;
 
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
 import jdk.graal.compiler.core.common.cfg.BasicBlockSet;
@@ -38,7 +38,7 @@ import jdk.graal.compiler.lir.InstructionValueConsumer;
 import jdk.graal.compiler.lir.LIR;
 import jdk.graal.compiler.lir.LIRInstruction;
 import jdk.graal.compiler.lir.LIRValueUtil;
-
+import jdk.graal.compiler.util.EconomicHashMap;
 import jdk.vm.ci.meta.Value;
 
 final class SSAVerifier {
@@ -54,13 +54,13 @@ final class SSAVerifier {
 
     private final LIR lir;
     private final BasicBlockSet visited;
-    private final HashMap<Value, Entry> defined;
+    private final Map<Value, Entry> defined;
     private BasicBlock<?> currentBlock;
 
     SSAVerifier(LIR lir) {
         this.lir = lir;
         this.visited = lir.getControlFlowGraph().createBasicBlockSet();
-        this.defined = new HashMap<>();
+        this.defined = new EconomicHashMap<>();
     }
 
     @SuppressWarnings("try")
@@ -97,13 +97,12 @@ final class SSAVerifier {
         assert !visited.get(block) : "Block already visited: " + block;
         visited.set(block);
         for (LIRInstruction op : lir.getLIRforBlock(block)) {
-            op.visitEachAlive(this::useConsumer);
             op.visitEachState(this::useConsumer);
-            op.visitEachInput(this::useConsumer);
-
-            op.visitEachTemp(this::defConsumer);
-            op.visitEachOutput(this::defConsumer);
-
+            // SSA verification only checks that each use is already defined before the current
+            // instruction defines new values, so it keeps frame-state uses before the canonical
+            // forward operand walk. UseKillMoveInjectionPhase still runs later, so use-kill
+            // operands are still uses here and are not treated as fresh definitions.
+            op.visitEachValueForward(this::useConsumer, this::useConsumer, this::useConsumer, this::defConsumer, this::defConsumer);
         }
         currentBlock = null;
         return true;

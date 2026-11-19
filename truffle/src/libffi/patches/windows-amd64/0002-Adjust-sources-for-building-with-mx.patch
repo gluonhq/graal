@@ -1,4 +1,4 @@
-From e5a5380862ea8e92c3e0c1634c5f305c8648425b Mon Sep 17 00:00:00 2001
+From 0bd926c2eef32a398d5f7cf5eb6bbbe6ac8138bf Mon Sep 17 00:00:00 2001
 From: Roland Schatz <roland.schatz@oracle.com>
 Date: Wed, 17 May 2023 16:10:46 +0200
 Subject: [PATCH 2/2] Adjust sources for building with mx
@@ -31,7 +31,7 @@ index 5f0d406..0000000
 -nodist_include_HEADERS = ffi.h ffitarget.h
 diff --git a/include/Makefile.in b/include/Makefile.in
 deleted file mode 100644
-index 7e3bbf0..0000000
+index 7e9940f..0000000
 --- a/include/Makefile.in
 +++ /dev/null
 @@ -1,610 +0,0 @@
@@ -219,7 +219,6 @@ index 7e3bbf0..0000000
 -am__DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/ffi.h.in
 -DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 -ACLOCAL = @ACLOCAL@
--ALLOCA = @ALLOCA@
 -AMTAR = @AMTAR@
 -AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
 -AM_LTLDFLAGS = @AM_LTLDFLAGS@
@@ -313,6 +312,7 @@ index 7e3bbf0..0000000
 -ac_ct_CC = @ac_ct_CC@
 -ac_ct_CXX = @ac_ct_CXX@
 -ac_ct_DUMPBIN = @ac_ct_DUMPBIN@
+-ac_ct_READELF = @ac_ct_READELF@
 -am__include = @am__include@
 -am__leading_dot = @am__leading_dot@
 -am__quote = @am__quote@
@@ -654,5 +654,5 @@ similarity index 100%
 rename from fficonfig.h
 rename to src/fficonfig.h
 -- 
-2.38.4
+2.47.2
 

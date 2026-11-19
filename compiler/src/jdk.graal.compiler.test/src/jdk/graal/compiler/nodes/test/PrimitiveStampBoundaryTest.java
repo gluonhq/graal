@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,7 +25,9 @@
 package jdk.graal.compiler.nodes.test;
 
 import java.util.EnumSet;
-import java.util.HashSet;
+import java.util.Set;
+
+import org.junit.Test;
 
 import jdk.graal.compiler.core.common.calc.FloatConvert;
 import jdk.graal.compiler.core.common.calc.FloatConvertCategory;
@@ -39,8 +41,7 @@ import jdk.graal.compiler.core.common.type.PrimitiveStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.test.GraalTest;
-import org.junit.Test;
-
+import jdk.graal.compiler.util.EconomicHashSet;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -56,12 +57,12 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
 
     static int[] shiftBoundaryValues = {-128, -1, 0, 1, 4, 8, 16, 31, 63, 128};
 
-    static HashSet<IntegerStamp> shiftStamps;
-    static HashSet<PrimitiveStamp> integerTestStamps;
-    static HashSet<PrimitiveStamp> floatTestStamps;
+    static Set<IntegerStamp> shiftStamps;
+    static Set<PrimitiveStamp> integerTestStamps;
+    static Set<PrimitiveStamp> floatTestStamps;
 
     static {
-        shiftStamps = new HashSet<>();
+        shiftStamps = new EconomicHashSet<>();
         for (long v1 : shiftBoundaryValues) {
             for (long v2 : shiftBoundaryValues) {
                 shiftStamps.add(IntegerStamp.create(32, Math.min(v1, v2), Math.max(v1, v2)));
@@ -69,7 +70,7 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         }
         shiftStamps.add((IntegerStamp) StampFactory.empty(JavaKind.Int));
 
-        integerTestStamps = new HashSet<>();
+        integerTestStamps = new EconomicHashSet<>();
         for (long v1 : longBoundaryValues) {
             for (long v2 : longBoundaryValues) {
                 if (v2 == (int) v2 && v1 == (int) v1) {
@@ -90,22 +91,24 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
     static double[] doubleSpecialValues = {Double.NaN, -0.0, -0.0F, Float.NaN};
 
     static {
-        floatTestStamps = new HashSet<>();
+        floatTestStamps = new EconomicHashSet<>();
 
         for (double d1 : doubleBoundaryValues) {
             for (double d2 : doubleBoundaryValues) {
                 float f1 = (float) d2;
                 float f2 = (float) d1;
                 if (d2 == f1 && d1 == f2) {
-                    generateFloatingStamps(new FloatStamp(32, Math.min(f2, f1), Math.max(f2, f1), true));
-                    generateFloatingStamps(new FloatStamp(32, Math.min(f2, f1), Math.max(f2, f1), false));
+                    generateFloatingStamps(FloatStamp.create(32, Math.min(f2, f1), Math.max(f2, f1), true));
+                    generateFloatingStamps(FloatStamp.create(32, Math.min(f2, f1), Math.max(f2, f1), false));
                 }
-                generateFloatingStamps(new FloatStamp(64, Math.min(d1, d2), Math.max(d1, d2), true));
-                generateFloatingStamps(new FloatStamp(64, Math.min(d1, d2), Math.max(d1, d2), false));
+                generateFloatingStamps(FloatStamp.create(64, Math.min(d1, d2), Math.max(d1, d2), true));
+                generateFloatingStamps(FloatStamp.create(64, Math.min(d1, d2), Math.max(d1, d2), false));
             }
         }
         floatTestStamps.add((PrimitiveStamp) StampFactory.empty(JavaKind.Float));
         floatTestStamps.add((PrimitiveStamp) StampFactory.empty(JavaKind.Double));
+        floatTestStamps.add(FloatStamp.createNaN(Float.SIZE));
+        floatTestStamps.add(FloatStamp.createNaN(Double.SIZE));
     }
 
     private static void generateFloatingStamps(FloatStamp floatStamp) {
@@ -125,7 +128,7 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         testConvertBoundaryValues(IntegerStamp.OPS.getNarrow(), 64, 32, integerTestStamps);
     }
 
-    private static void testConvertBoundaryValues(IntegerConvertOp<?> op, int inputBits, int resultBits, HashSet<PrimitiveStamp> stamps) {
+    private static void testConvertBoundaryValues(IntegerConvertOp<?> op, int inputBits, int resultBits, Set<PrimitiveStamp> stamps) {
         for (PrimitiveStamp stamp : stamps) {
             if (inputBits == stamp.getBits()) {
                 Stamp lower = boundaryStamp(stamp, false);
@@ -162,7 +165,7 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         }
     }
 
-    private static void testConvertBoundaryValues(ArithmeticOpTable.FloatConvertOp op, int bits, HashSet<PrimitiveStamp> stamps) {
+    private static void testConvertBoundaryValues(ArithmeticOpTable.FloatConvertOp op, int bits, Set<PrimitiveStamp> stamps) {
         for (PrimitiveStamp stamp : stamps) {
             if (bits == stamp.getBits()) {
                 Stamp lower = boundaryStamp(stamp, false);
@@ -175,13 +178,12 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
     }
 
     static void shouldConstantFold(boolean b, Stamp folded, Object o, Stamp s1) {
-        assertTrue(b || (folded instanceof FloatStamp && ((FloatStamp) folded).contains(0.0)), "should constant fold %s %s %s", o, s1, folded);
+        assertTrue(b || constantFloatStampMayNotFold(folded), "should constant fold %s %s %s", o, s1, folded);
     }
 
-    private static boolean constantFloatStampMayIncludeNegativeZero(Stamp s) {
-        if (s instanceof FloatStamp) {
-            FloatStamp f = (FloatStamp) s;
-            return Double.compare(f.lowerBound(), f.upperBound()) == 0 && f.isNonNaN();
+    private static boolean constantFloatStampMayNotFold(Stamp s) {
+        if (s instanceof FloatStamp f) {
+            return f.lowerBound() == 0 || f.isNaN();
         }
         return false;
     }
@@ -199,7 +201,7 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         }
     }
 
-    private static void testShiftBoundaryValues(ShiftOp<?> shiftOp, HashSet<PrimitiveStamp> stamps, HashSet<IntegerStamp> shifts) {
+    private static void testShiftBoundaryValues(ShiftOp<?> shiftOp, Set<PrimitiveStamp> stamps, Set<IntegerStamp> shifts) {
         for (PrimitiveStamp testStamp : stamps) {
             if (testStamp instanceof IntegerStamp) {
                 IntegerStamp stamp = (IntegerStamp) testStamp;
@@ -222,21 +224,19 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         IntegerStamp v1stamp = IntegerStamp.create(bits, v1, v1);
         IntegerStamp v2stamp = IntegerStamp.create(32, v2, v2);
         IntegerStamp folded = (IntegerStamp) op.foldStamp(v1stamp, v2stamp);
-        Constant constant = op.foldConstant(JavaConstant.forPrimitiveInt(bits, v1), (int) v2);
+        Constant constant = op.foldConstant(JavaConstant.forPrimitiveInt(bits, v1), JavaConstant.forInt((int) v2));
         assertTrue(constant != null);
         assertTrue(folded.asConstant() != null, "should constant fold %s %s %s %s", op, v1stamp, v2stamp, folded);
         assertTrue(result.meet(folded).equals(result), "result out of range %s %s %s %s %s %s", op, v1stamp, v2stamp, folded, result, result.meet(folded));
     }
 
     private static void checkBinaryOperation(ArithmeticOpTable.BinaryOp<?> op, Stamp result, Stamp v1stamp, Stamp v2stamp) {
-        if (constantFloatStampMayIncludeNegativeZero(v1stamp) || constantFloatStampMayIncludeNegativeZero(v2stamp)) {
-            return;
-        }
         Stamp folded = op.foldStamp(v1stamp, v2stamp);
         if (v1stamp.isEmpty() || v2stamp.isEmpty()) {
             assertTrue(folded.isEmpty());
-            assertTrue(v1stamp.asConstant() != null || v1stamp.isEmpty());
-            assertTrue(v2stamp.asConstant() != null || v2stamp.isEmpty());
+            return;
+        }
+        if (constantFloatStampMayNotFold(v1stamp) || constantFloatStampMayNotFold(v2stamp)) {
             return;
         }
         Constant constant = op.foldConstant(v1stamp.asConstant(), v2stamp.asConstant());
@@ -245,16 +245,13 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
             Constant constant2 = folded.asConstant();
             if (constant2 == null && v1stamp instanceof FloatStamp) {
                 JavaConstant c = (JavaConstant) constant;
-                assertTrue((c.getJavaKind() == JavaKind.Double && Double.isNaN(c.asDouble())) ||
-                                (c.getJavaKind() == JavaKind.Float && Float.isNaN(c.asFloat())));
-            } else {
-                assertTrue(constant2 != null, "should constant fold %s %s %s %s", op, v1stamp, v2stamp, folded);
-                if (!constant.equals(constant2)) {
-                    op.foldConstant(v1stamp.asConstant(), v2stamp.asConstant());
-                    op.foldStamp(v1stamp, v2stamp);
-                }
-                assertTrue(constant.equals(constant2), "should produce same constant %s %s %s %s %s", op, v1stamp, v2stamp, constant, constant2);
+                assertTrue((c.getJavaKind() == JavaKind.Double && (Double.isNaN(c.asDouble()) || c.asDouble() == 0) ||
+                                (c.getJavaKind() == JavaKind.Float && (Float.isNaN(c.asFloat()) || c.asFloat() == 0))));
+                return;
             }
+
+            assertTrue(constant2 != null, "should constant fold %s %s %s %s", op, v1stamp, v2stamp, folded);
+            assertTrue(constant.equals(constant2), "should produce same constant %s %s %s %s %s", op, v1stamp, v2stamp, constant, constant2);
             assertTrue(result.meet(folded).equals(result), "result out of range %s %s %s %s %s %s", op, v1stamp, v2stamp, folded, result, result.meet(folded));
         }
     }
@@ -294,13 +291,13 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
     private static FloatStamp floatStampForConstant(double bound, int bits) {
         if (bits == 32) {
             float fbound = (float) bound;
-            return new FloatStamp(bits, fbound, fbound, !Float.isNaN(fbound));
+            return FloatStamp.create(bits, fbound, fbound, !Float.isNaN(fbound));
         } else {
-            return new FloatStamp(bits, bound, bound, !Double.isNaN(bound));
+            return FloatStamp.create(bits, bound, bound, !Double.isNaN(bound));
         }
     }
 
-    private static void testBinaryBoundaryValues(ArithmeticOpTable.BinaryOp<?> op, HashSet<PrimitiveStamp> stamps) {
+    private static void testBinaryBoundaryValues(ArithmeticOpTable.BinaryOp<?> op, Set<PrimitiveStamp> stamps) {
         for (PrimitiveStamp v1 : stamps) {
             for (PrimitiveStamp v2 : stamps) {
                 if (v1.getBits() == v2.getBits() && v1.getClass() == v2.getClass()) {
@@ -332,7 +329,7 @@ public class PrimitiveStampBoundaryTest extends GraalTest {
         }
     }
 
-    private static void testUnaryBoundaryValues(ArithmeticOpTable.UnaryOp<?> op, HashSet<PrimitiveStamp> stamps) {
+    private static void testUnaryBoundaryValues(ArithmeticOpTable.UnaryOp<?> op, Set<PrimitiveStamp> stamps) {
         for (PrimitiveStamp v1 : stamps) {
             Stamp result = op.foldStamp(v1);
             checkUnaryOperation(op, result, boundaryStamp(v1, false));

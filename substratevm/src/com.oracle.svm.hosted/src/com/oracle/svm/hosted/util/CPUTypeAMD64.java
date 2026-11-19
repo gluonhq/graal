@@ -63,12 +63,12 @@ import java.util.stream.Stream;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.graal.pointsto.util.GraalAccess;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.NativeImageOptions;
-import com.oracle.svm.util.LogUtils;
-import com.oracle.svm.util.StringUtil;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.StringUtil;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64.CPUFeature;
@@ -105,7 +105,7 @@ public enum CPUTypeAMD64 implements CPUType {
 
     private static CPUFeature[] getNativeOrEmpty() {
         CPUFeature[] empty = new CPUFeature[0];
-        if (GraalAccess.getOriginalTarget().arch instanceof AMD64 arch) {
+        if (GuestAccess.get().getTarget().arch instanceof AMD64 arch) {
             return arch.getFeatures().toArray(empty);
         } else {
             return empty;
@@ -115,6 +115,10 @@ public enum CPUTypeAMD64 implements CPUType {
     private final String name;
     private final CPUTypeAMD64 parent;
     private final EnumSet<CPUFeature> specificFeatures;
+
+    private static final int GNU_PROPERTY_X86_ISA_1_V2 = 1 << 1;
+    private static final int GNU_PROPERTY_X86_ISA_1_V3 = 1 << 2;
+    private static final int GNU_PROPERTY_X86_ISA_1_V4 = 1 << 3;
 
     CPUTypeAMD64(String cpuTypeName, CPUFeature... features) {
         this(cpuTypeName, null, features);
@@ -169,6 +173,19 @@ public enum CPUTypeAMD64 implements CPUType {
             value = getDefaultName(true);
         }
         return getCPUFeaturesForArch(value);
+    }
+
+    public static int getSelectedFeaturesGNUPropertyValue() {
+        EnumSet<CPUFeature> features = getSelectedFeatures();
+        if (features.containsAll(X86_64_V4.getFeatures())) {
+            return GNU_PROPERTY_X86_ISA_1_V4;
+        } else if (features.containsAll(X86_64_V3.getFeatures())) {
+            return GNU_PROPERTY_X86_ISA_1_V3;
+        } else if (features.containsAll(X86_64_V2.getFeatures())) {
+            return GNU_PROPERTY_X86_ISA_1_V2;
+        } else {
+            return 0;
+        }
     }
 
     public static EnumSet<CPUFeature> getCPUFeaturesForArch(String marchValue) {

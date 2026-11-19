@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,27 +26,31 @@ package com.oracle.svm.hosted.code.amd64;
 
 import java.util.function.Consumer;
 
+import com.oracle.svm.core.graal.code.CGlobalDataDirectReference;
+import com.oracle.svm.core.graal.code.CGlobalDataIndirectReference;
+import com.oracle.svm.hosted.code.HostedCGlobalDataIndirectReferencePatcher;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.objectfile.ObjectFile.RelocationKind;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.graal.code.CGlobalDataReference;
 import com.oracle.svm.core.graal.code.PatchConsumerFactory;
-import com.oracle.svm.core.layeredimagesingleton.FeatureSingleton;
-import com.oracle.svm.core.layeredimagesingleton.UnsavedSingleton;
-import com.oracle.svm.core.meta.MethodPointer;
+import com.oracle.svm.guest.staging.meta.MethodPointer;
 import com.oracle.svm.core.meta.SubstrateMethodPointerConstant;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.hosted.code.HostedImageHeapConstantPatch;
 import com.oracle.svm.hosted.code.HostedPatcher;
 import com.oracle.svm.hosted.image.RelocatableBuffer;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.graal.compiler.asm.Assembler;
+import jdk.graal.compiler.asm.Assembler.CodeAnnotation;
 import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.AddressDisplacementAnnotation;
 import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandDataAnnotation;
 import jdk.graal.compiler.code.CompilationResult;
@@ -58,30 +62,40 @@ import jdk.vm.ci.meta.VMConstant;
 
 @AutomaticallyRegisteredFeature
 @Platforms({Platform.AMD64.class})
-class AMD64HostedPatcherFeature implements InternalFeature, FeatureSingleton, UnsavedSingleton {
+class AMD64HostedPatcherFeature implements InternalFeature {
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(PatchConsumerFactory.HostedPatchConsumerFactory.class, new PatchConsumerFactory.HostedPatchConsumerFactory() {
-            @Override
-            public Consumer<Assembler.CodeAnnotation> newConsumer(CompilationResult compilationResult) {
-                return new Consumer<>() {
-                    @Override
-                    public void accept(Assembler.CodeAnnotation annotation) {
-                        if (annotation instanceof OperandDataAnnotation) {
-                            compilationResult.addAnnotation(new AMD64HostedPatcher((OperandDataAnnotation) annotation));
+        ImageSingletons.add(PatchConsumerFactory.HostedPatchConsumerFactory.class, new AMD64HostedPatchConsumerFactory());
+    }
 
-                        } else if (annotation instanceof AddressDisplacementAnnotation) {
-                            AddressDisplacementAnnotation dispAnnotation = (AddressDisplacementAnnotation) annotation;
-                            compilationResult.addAnnotation(new HostedImageHeapConstantPatch(dispAnnotation.operandPosition, (JavaConstant) dispAnnotation.annotation));
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
+    private static final class AMD64HostedPatchConsumerFactory extends PatchConsumerFactory.HostedPatchConsumerFactory {
+        @Override
+        public Consumer<CodeAnnotation> newConsumer(CompilationResult compilationResult) {
+            return new Consumer<>() {
+                @Override
+                public void accept(CodeAnnotation annotation) {
+                    if (annotation instanceof OperandDataAnnotation) {
+                        compilationResult.addAnnotation(new AMD64HostedPatcher((OperandDataAnnotation) annotation));
+                    } else if (annotation instanceof AddressDisplacementAnnotation dispAnnotation) {
+                        CompilationResult.CodeAnnotation patch;
+                        switch (dispAnnotation.annotation) {
+                            case CGlobalDataIndirectReference addressAnnotation -> {
+                                compilationResult.recordDataPatch(dispAnnotation.operandPosition, addressAnnotation);
+                                patch = new HostedCGlobalDataIndirectReferencePatcher(dispAnnotation.operandPosition, addressAnnotation);
+                            }
+                            case JavaConstant javaConstant -> patch = new HostedImageHeapConstantPatch(dispAnnotation.operandPosition, javaConstant);
+                            default -> throw new IllegalStateException("Unexpected value: " + dispAnnotation.annotation);
                         }
+                        compilationResult.addAnnotation(patch);
                     }
-                };
-            }
-        });
+                }
+            };
+        }
     }
 }
 
-class AMD64HostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
+class AMD64HostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher, HostedPatcher.ContiguousOperandPatchSite {
     private final OperandDataAnnotation annotation;
 
     AMD64HostedPatcher(OperandDataAnnotation annotation) {
@@ -102,13 +116,39 @@ class AMD64HostedPatcher extends CompilationResult.CodeAnnotation implements Hos
         assert curValue == 0;
     }
 
+    private int operandToNextInstruction() {
+        int result = annotation.nextInstructionPosition - annotation.operandPosition;
+        assert result >= annotation.operandSize : annotation;
+        return result;
+    }
+
+    @Override
+    public int instructionPosition() {
+        return annotation.instructionPosition;
+    }
+
+    @Override
+    public int operandPosition() {
+        return annotation.operandPosition;
+    }
+
+    @Override
+    public int operandSize() {
+        return annotation.operandSize;
+    }
+
+    @Override
+    public int nextInstructionPosition() {
+        return annotation.nextInstructionPosition;
+    }
+
     @Override
     public boolean equals(Object obj) {
         return obj == this;
     }
 
     @Override
-    public void relocate(Reference ref, RelocatableBuffer relocs, int compStart) {
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
         /*
          * The relocation site is some offset into the instruction, which is some offset into the
          * method, which is some offset into the text section (a.k.a. code cache). The offset we get
@@ -116,32 +156,38 @@ class AMD64HostedPatcher extends CompilationResult.CodeAnnotation implements Hos
          * method. We add the method start to get the section-relative offset.
          */
         long siteOffset = compStart + annotation.operandPosition;
-        if (ref instanceof DataSectionReference || ref instanceof CGlobalDataReference) {
+        if (ref instanceof DataSectionReference || ref instanceof CGlobalDataDirectReference) {
             /*
-             * Do we have an addend? Yes; it's constStart. BUT x86/x86-64 PC-relative references are
-             * relative to the *next* instruction. So, if the next instruction starts n bytes from
-             * the relocation site, we want to subtract n bytes from our addend.
+             * x86/x86-64 PC-relative references are relative to the next instruction. SVM's
+             * relocation processing subtracts the recorded addend from the target offset, so record
+             * the distance from the relocation site to the next instruction. The relocation site can
+             * be followed by additional instruction bytes, such as an immediate operand.
              */
-            long addend = (annotation.nextInstructionPosition - annotation.operandPosition);
-            assert addend == annotation.operandSize;
-            relocs.addRelocationWithAddend((int) siteOffset, RelocationKind.getPCRelative(annotation.operandSize), addend, ref);
+            long addend = operandToNextInstruction();
+            codeBuffer.addRelocationWithAddend((int) siteOffset, RelocationKind.getPCRelative(annotation.operandSize), addend, ref);
         } else if (ref instanceof ConstantReference constantReference) {
             VMConstant constant = constantReference.getConstant();
             if (constant instanceof SubstrateMethodPointerConstant methodPointerConstant) {
                 MethodPointer pointer = methodPointerConstant.pointer();
-                HostedMethod hMethod = (HostedMethod) pointer.getMethod();
+                HostedMethod hMethod = (HostedMethod) methodPointerConstant.getMethod();
+                VMError.guarantee(!hMethod.isCompiledInPriorLayer(), "Method %s was compiled in a prior layer", hMethod);
                 VMError.guarantee(hMethod.isCompiled(), "Method %s is not compiled although there is a method pointer constant created for it.", hMethod);
 
                 RelocationKind kindPCRelative = RelocationKind.getPCRelative(annotation.operandSize);
                 // lea instruction using rip relative addressing, account for additional offset
-                long addend = -RelocationKind.getRelocationSize(kindPCRelative);
-                relocs.addRelocationWithAddend((int) siteOffset, kindPCRelative, addend, pointer);
+                long addend = -operandToNextInstruction();
+                codeBuffer.addRelocationWithAddend((int) siteOffset, kindPCRelative, addend, pointer);
             } else {
                 RelocationKind kindDirect = RelocationKind.getDirect(annotation.operandSize);
-                relocs.addRelocationWithoutAddend((int) siteOffset, kindDirect, constantReference);
+                codeBuffer.addRelocationWithoutAddend((int) siteOffset, kindDirect, constantReference);
             }
         } else {
             throw VMError.shouldNotReachHere("Unknown type of reference in code");
         }
+    }
+
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{annotation=" + annotation + '}';
     }
 }

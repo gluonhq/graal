@@ -32,19 +32,20 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.heap.VMOperationInfos;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
 import com.oracle.svm.core.jfr.JfrEvent;
 import com.oracle.svm.core.jfr.JfrStackWalker;
 import com.oracle.svm.core.jfr.JfrThreadLocal;
 import com.oracle.svm.core.jfr.SubstrateJVM;
 import com.oracle.svm.core.thread.JavaVMOperation;
-import com.oracle.svm.core.thread.ThreadListener;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.guest.staging.core.thread.ThreadListener;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.shared.Uninterruptible;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -77,18 +78,18 @@ public abstract class AbstractJfrExecutionSampler extends JfrExecutionSampler im
 
     private volatile boolean isSampling;
     private long curIntervalMillis;
-    protected long newIntervalMillis;
+    protected volatile long newIntervalMillis;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public AbstractJfrExecutionSampler() {
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static AbstractJfrExecutionSampler singleton() {
         return (AbstractJfrExecutionSampler) ImageSingletons.lookup(JfrExecutionSampler.class);
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     protected static UninterruptibleUtils.AtomicInteger threadsInSignalHandler() {
         return singleton().threadsInSignalHandler;
     }
@@ -155,7 +156,7 @@ public abstract class AbstractJfrExecutionSampler extends JfrExecutionSampler im
         ExecutionSamplerInstallation.disallow(thread);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "This method executes during signal handling.")
     protected static boolean isExecutionSamplingAllowedInCurrentThread() {
         boolean disallowed = singleton().isSignalHandlerDisabledGlobally.get() > 0 ||
                         isDisabledForCurrentThread.get() > 0 ||
@@ -170,26 +171,28 @@ public abstract class AbstractJfrExecutionSampler extends JfrExecutionSampler im
 
     protected abstract void updateInterval();
 
+    @Uninterruptible(reason = "Prevent VM operations that modify the recurring callbacks.")
     protected abstract void uninstall(IsolateThread thread);
 
-    @Uninterruptible(reason = "The method executes during signal handling.", callerMustBe = true)
-    protected static void tryUninterruptibleStackWalk(CodePointer ip, Pointer sp, boolean isAsync) {
+    @Uninterruptible(reason = "This method executes during signal handling.", callerMustBe = true)
+    protected static boolean tryUninterruptibleStackWalk(CodePointer ip, Pointer sp, boolean isAsync) {
         /*
          * To prevent races, it is crucial that the thread count is incremented before we do any
          * other checks.
          */
         threadsInSignalHandler().incrementAndGet();
         try {
-            if (isExecutionSamplingAllowedInCurrentThread()) {
-                /* Prevent recursive sampler invocations during the stack walk. */
-                JfrExecutionSampler.singleton().preventSamplingInCurrentThread();
-                try {
-                    JfrStackWalker.walkCurrentThread(ip, sp, isAsync);
-                } finally {
-                    JfrExecutionSampler.singleton().allowSamplingInCurrentThread();
-                }
-            } else {
+            if (!isExecutionSamplingAllowedInCurrentThread()) {
                 JfrThreadLocal.increaseMissedSamples();
+                return false;
+            }
+
+            /* Prevent recursive sampler invocations during the stack walk. */
+            JfrExecutionSampler.singleton().preventSamplingInCurrentThread();
+            try {
+                return JfrStackWalker.walkCurrentThread(ip, sp, isAsync);
+            } finally {
+                JfrExecutionSampler.singleton().allowSamplingInCurrentThread();
             }
         } finally {
             threadsInSignalHandler().decrementAndGet();

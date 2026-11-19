@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,25 +26,27 @@ package com.oracle.svm.truffle.api;
 
 import java.lang.ref.WeakReference;
 
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.RuntimeCodeInfoHistory;
-import com.oracle.svm.core.code.UntetheredCodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
 import com.oracle.svm.core.code.UntetheredCodeInfoAccess;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
 import com.oracle.svm.core.deopt.SubstrateSpeculationLog;
 import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.graal.meta.SubstrateInstalledCodeImpl;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.truffle.compiler.OptimizedAssumptionDependency;
 import com.oracle.truffle.compiler.TruffleCompilable;
 
 import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.graal.compiler.truffle.TruffleCompilerImpl;
 import jdk.vm.ci.code.InstalledCode;
+import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -53,13 +55,26 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * Assume that methods return stale values because internal state can change at any safepoint (see
  * {@link SubstrateInstalledCode}).
  */
-public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode implements SubstrateInstalledCode, OptimizedAssumptionDependency {
-    protected final WeakReference<SubstrateOptimizedCallTarget> callTargetRef;
+public final class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode implements SubstrateInstalledCode, OptimizedAssumptionDependency {
+    private final WeakCallTargetRef<SubstrateOptimizedCallTarget> callTargetRef;
     private String nameSuffix = "";
+    private TypedEntryMethod method;
 
-    protected SubstrateOptimizedCallTargetInstalledCode(SubstrateOptimizedCallTarget callTarget) {
+    /**
+     * Final subclass to ensure <code>{@link #callTargetRef}.get()</code> can be statically bound in
+     * open type world. This also works around the native image build breaking with allocating
+     * implementations of {@link java.lang.ref.Reference#get()}.
+     */
+    private static final class WeakCallTargetRef<T> extends WeakReference<T> {
+        // Avoid nest-host resolution before JVMCI module exports are established.
+        WeakCallTargetRef(T referent) {
+            super(referent);
+        }
+    }
+
+    SubstrateOptimizedCallTargetInstalledCode(SubstrateOptimizedCallTarget callTarget) {
         super(null);
-        this.callTargetRef = new WeakReference<>(callTarget);
+        this.callTargetRef = new WeakCallTargetRef<>(callTarget);
     }
 
     @Override
@@ -81,7 +96,7 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     @Override
-    public final void invalidate() {
+    public void invalidate() {
         CodeInfoTable.invalidateInstalledCode(this); // calls clearAddress
         SubstrateOptimizedCallTarget callTarget = callTargetRef.get();
         if (callTarget != null) {
@@ -105,10 +120,10 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     /**
-     * Returns false if not valid, including if {@linkplain #invalidateWithoutDeoptimization
-     * previously invalidated without deoptimization} in which case there can still be
-     * {@linkplain #isAlive live activations}. In order to entirely invalidate code in such cases,
-     * {@link #invalidate} must still be called even when this method returns false.
+     * Returns false if not valid, including if {@linkplain #makeNonEntrant previously made
+     * non-entrant} in which case there can still be {@linkplain #isAlive live activations}. In
+     * order to entirely invalidate code in such cases, {@link #invalidate} must still be called
+     * even when this method returns false.
      */
     @Override
     public boolean isValid() {
@@ -131,6 +146,17 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     @Override
+    public void reprofile() {
+        // Not used for encoded graph based runtime compilation
+    }
+
+    @Override
+    public void recordDeoptimization(DeoptimizationReason reason) {
+        // Truffle installed code tracks invalidation and profiling through its call target and
+        // speculation log rather than through Substrate ProfilingInfo deoptimization counters.
+    }
+
+    @Override
     public void setCompilationId(CompilationIdentifier id) {
         nameSuffix = " (" + id.toString(CompilationIdentifier.Verbosity.ID) + ')';
     }
@@ -148,13 +174,14 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     @Override
-    public ResolvedJavaMethod getMethod() {
-        return null;
+    public TypedEntryMethod getMethod() {
+        return method;
     }
 
     @Override
     public void setAddress(long address, long entryPoint, ResolvedJavaMethod method) {
-        assert VMOperation.isInProgressAtSafepoint();
+        VMOperation.guaranteeInProgressAtSafepoint("Must be at a safepoint");
+        this.method = (TypedEntryMethod) method;
         this.address = address;
         this.entryPoint = entryPoint;
 
@@ -177,6 +204,7 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     @Override
     public void clearAddress() {
         assert VMOperation.isInProgressAtSafepoint();
+        this.method = null;
         this.entryPoint = 0;
         this.address = 0;
 
@@ -187,18 +215,18 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
     }
 
     @Override
-    public void invalidateWithoutDeoptimization() {
+    public void makeNonEntrant() {
         assert VMOperation.isInProgressAtSafepoint();
         if (isValid()) {
-            invalidateWithoutDeoptimization0();
+            makeNonEntrant0();
         }
     }
 
     @Uninterruptible(reason = "Must tether the CodeInfo.")
-    private void invalidateWithoutDeoptimization0() {
+    private void makeNonEntrant0() {
         this.entryPoint = 0;
 
-        UntetheredCodeInfo untetheredInfo = CodeInfoTable.lookupCodeInfo(WordFactory.pointer(this.address));
+        UntetheredCodeInfo untetheredInfo = CodeInfoTable.lookupCodeInfo(Word.pointer(this.address));
         assert untetheredInfo.isNonNull() && !UntetheredCodeInfoAccess.isAOTImageCode(untetheredInfo);
 
         Object tether = CodeInfoAccess.acquireTether(untetheredInfo);
@@ -216,21 +244,9 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
         RuntimeCodeInfoHistory.singleton().logMakeNonEntrant(codeInfo);
     }
 
-    @Uninterruptible(reason = "Must be safepoint free")
-    static Object doInvoke(SubstrateOptimizedCallTarget callTarget, Object[] args) {
-        /*
-         * The calling code must be uninterruptible, i.e., must not have a safepoint between the
-         * read of the entry point address and the indirect call to this address. Otherwise, the
-         * code can be invalidated concurrently and we invoke an address that no longer contains
-         * executable code.
-         */
-        long start = callTarget.installedCode.entryPoint;
-        if (start != 0) {
-            SubstrateOptimizedCallTarget.CallBoundaryFunctionPointer target = WordFactory.pointer(start);
-            return target.invoke(callTarget, args);
-        } else {
-            return callTarget.invokeCallBoundary(args);
-        }
+    @Uninterruptible(reason = "Prevent safepoint.", callerMustBe = true)
+    long getEntryPointUninterruptible() {
+        return entryPoint;
     }
 
     @Uninterruptible(reason = "Prevent the GC from freeing the CodeInfo object.")
@@ -238,7 +254,7 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
         if (entryPoint == 0) {
             return false; // not valid
         }
-        UntetheredCodeInfo info = CodeInfoTable.lookupCodeInfo(WordFactory.pointer(entryPoint));
+        UntetheredCodeInfo info = CodeInfoTable.lookupCodeInfo(Word.pointer(entryPoint));
         return info.isNonNull() && !UntetheredCodeInfoAccess.isAOTImageCode(info) &&
                         UntetheredCodeInfoAccess.getTier(info) == TruffleCompilerImpl.LAST_TIER_INDEX;
     }
@@ -250,14 +266,22 @@ public class SubstrateOptimizedCallTargetInstalledCode extends InstalledCode imp
 
     private static final String NOT_CALLED_IN_SUBSTRATE_VM = "No implementation in Substrate VM";
 
+    /**
+     * This method is used by the compiler debugging feature
+     * {@code jdk.graal.PrintCompilation=true}.
+     */
     @Override
     public long getStart() {
-        throw VMError.shouldNotReachHere(NOT_CALLED_IN_SUBSTRATE_VM);
+        return getAddress();
     }
 
+    /**
+     * This method is used by the compiler debugging feature {@code jdk.graal.Dump=CodeInstall} to
+     * dump a code at the point of code installation.
+     */
     @Override
     public byte[] getCode() {
-        throw VMError.shouldNotReachHere(NOT_CALLED_IN_SUBSTRATE_VM);
+        return SubstrateInstalledCodeImpl.getCode(Word.pointer(entryPoint));
     }
 
     @Override

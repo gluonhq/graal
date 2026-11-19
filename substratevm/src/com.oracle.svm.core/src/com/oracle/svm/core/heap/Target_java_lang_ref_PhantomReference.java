@@ -26,7 +26,7 @@ package com.oracle.svm.core.heap;
 
 import java.lang.ref.PhantomReference;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 
@@ -36,4 +36,10 @@ public final class Target_java_lang_ref_PhantomReference<T> {
     boolean refersTo0(Object obj) {
         return ReferenceInternals.refersTo(SubstrateUtil.cast(this, PhantomReference.class), obj);
     }
+
+    @Substitute
+    private void clear0() {
+        ReferenceInternals.clear(SubstrateUtil.cast(this, PhantomReference.class));
+    }
+
 }

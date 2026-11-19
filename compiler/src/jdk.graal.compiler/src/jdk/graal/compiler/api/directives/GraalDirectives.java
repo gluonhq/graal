@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,9 @@
  */
 package jdk.graal.compiler.api.directives;
 
+import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
+import jdk.graal.compiler.phases.common.FloatingReadPhase;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.SpeculationLog.SpeculationReason;
@@ -44,6 +46,13 @@ public final class GraalDirectives {
 
     public static final double SLOWPATH_PROBABILITY = 0.0001;
     public static final double FASTPATH_PROBABILITY = 1.0 - SLOWPATH_PROBABILITY;
+
+    /**
+     * Forces a safepoint in the compiled code.
+     */
+    public static void safepoint() {
+
+    }
 
     /**
      * Directive for the compiler to fall back to the bytecode interpreter at this point. All
@@ -104,6 +113,17 @@ public final class GraalDirectives {
 
     /**
      * Directive for the compiler to fall back to the bytecode interpreter at this point.
+     *
+     * This is equivalent to calling
+     * {@link #deoptimize(DeoptimizationAction, DeoptimizationReason, boolean)} with
+     * {@link DeoptimizationAction#InvalidateRecompile},
+     * {@link DeoptimizationReason#TransferToInterpreter} and {@code false} as arguments.
+     */
+    public static void deoptimizeAndRecompile() {
+    }
+
+    /**
+     * Directive for the compiler to fall back to the bytecode interpreter at this point.
      * <p/>
      *
      * This is similar to calling {@link #deoptimize()}, but the deoptimization will use a precise
@@ -149,6 +169,13 @@ public final class GraalDirectives {
     }
 
     /**
+     * Like {@link #controlFlowAnchor()} except this node can be optimized away if its
+     * {@code  condition} argument becomes constant {@code 0}.
+     */
+    public static void controlFlowAnchor(@SuppressWarnings("unused") long condition) {
+    }
+
+    /**
      * A call to this method will disable strip mining of the enclosing loop in the compiler.
      */
     public static void neverStripMine() {
@@ -185,6 +212,16 @@ public final class GraalDirectives {
     }
 
     /**
+     * Casts a non-null value without a run-time null or type check. The caller must guarantee that
+     * {@code value} is non-null and assignable to {@code type}. The {@code type} argument must be a
+     * compile-time constant.
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> T uncheckedCast(Object value, @SuppressWarnings("unused") Class<T> type) {
+        return (T) value;
+    }
+
+    /**
      * A call to this method will force the compiler to assume this instruction has a visible memory
      * effect killing all memory locations.
      */
@@ -214,6 +251,39 @@ public final class GraalDirectives {
      */
     public static long positivePi(long n) {
         return n;
+    }
+
+    /**
+     * Declares an impossible execution path. The compiler may propagate this marker backward and
+     * discard preceding operations, including operations that could throw or deoptimize. Exceptions
+     * and side effects from discarded operations are not guaranteed to occur. Unlike deoptimization,
+     * this directive does not resume Java execution or reconstruct execution state.
+     * For example:
+     *
+     * <pre>{@code
+     * possiblyThrowingCall();
+     * GraalDirectives.unreachable();
+     * }</pre>
+     *
+     * The compiler may eliminate {@code possiblyThrowingCall()}, including any exception it would
+     * have thrown and any side effects it would have performed.
+     * <p>
+     * This is not a runtime error check. It must not be used to express a normal continuation that
+     * is unreachable only because a preceding operation always throws. When executed without
+     * intrinsification, this method throws an {@link AssertionError} to diagnose the unreachable
+     * path. An intrinsified invocation emits a hardware halt if it survives compilation.
+     */
+    public static void unreachable() {
+        throw new AssertionError("Unreachable execution path");
+    }
+
+    /**
+     * Returns a {@code long} whose value must not be observed. When used as an additional return
+     * value, the compiler may leave the corresponding fixed return register unchanged. The
+     * result has no input dependency. In interpreted execution this method returns zero.
+     */
+    public static long unconstrainedValue() {
+        return 0;
     }
 
     /**
@@ -260,7 +330,36 @@ public final class GraalDirectives {
      * @param iterations the expected number of iterations that should be injected
      */
     public static boolean injectIterationCount(double iterations, boolean condition) {
-        return injectBranchProbability(1. - 1. / iterations, condition);
+        // the plugin handles the semantics
+        return condition;
+    }
+
+    /** Combines two boolean values with a short circuit OR in the compiler graph. */
+    public static boolean shortCircuitOr(boolean x, boolean y) {
+        return x || y;
+    }
+
+    /**
+     * Combines two boolean values with a short circuit OR in the compiler graph. The probability
+     * describes how often the second operand is not evaluated because the first operand is true.
+     */
+    public static boolean shortCircuitOr(double shortCircuitProbability, boolean x, boolean y) {
+        assert shortCircuitProbability >= 0.0 && shortCircuitProbability <= 1.0 : "Probability must be between [0D;1D] but is " + shortCircuitProbability;
+        return x || y;
+    }
+
+    /** Combines two boolean values with a short circuit AND in the compiler graph. */
+    public static boolean shortCircuitAnd(boolean x, boolean y) {
+        return x && y;
+    }
+
+    /**
+     * Combines two boolean values with a short circuit AND in the compiler graph. The probability
+     * describes how often the second operand is not evaluated because the first operand is false.
+     */
+    public static boolean shortCircuitAnd(double shortCircuitProbability, boolean x, boolean y) {
+        assert shortCircuitProbability >= 0.0 && shortCircuitProbability <= 1.0 : "Probability must be between [0D;1D] but is " + shortCircuitProbability;
+        return x && y;
     }
 
     /**
@@ -534,6 +633,123 @@ public final class GraalDirectives {
         return value;
     }
 
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static boolean opaqueUntilAfter(boolean value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static byte opaqueUntilAfter(byte value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static short opaqueUntilAfter(short value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static char opaqueUntilAfter(char value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static int opaqueUntilAfter(int value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static long opaqueUntilAfter(long value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static float opaqueUntilAfter(float value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static double opaqueUntilAfter(double value, StageFlag stage) {
+        return value;
+    }
+
+    /**
+     * Do nothing, but also make sure the compiler doesn't do any optimizations across this call
+     * until the specified {@link StageFlag} has been applied.
+     *
+     * For example, if {@code stage == StageFlag.FLOATING_READS}, the compiler will not constant
+     * fold the expression 5 * opaqueUntilAfter(3, stage) until {@link FloatingReadPhase} has been
+     * applied. After that, the optimization barrier will fall away.
+     */
+    @SuppressWarnings("unused")
+    public static <T> T opaqueUntilAfter(T value, StageFlag stage) {
+        return value;
+    }
+
     public static <T> T guardingNonNull(T value) {
         if (value == null) {
             deoptimize();
@@ -711,5 +927,84 @@ public final class GraalDirectives {
     @SuppressWarnings("unused")
     public static void log(String format, long v1, long v2, long v3) {
         System.out.printf(format, v1, v2, v3);
+    }
+
+    /**
+     * Marks a switch statement within a loop as a candidate for threaded switch optimization.
+     * Threaded switch replicates the switch statement at the end of each case, improving branch
+     * prediction at the processor level.
+     *
+     * Usage example:
+     *
+     * <pre>
+     * while (cond) {
+     *   input = inlinedNextOpcode();
+     *   switch (markThreadedSwitch(input)) {
+     *     case op1: { body1; }
+     *     case op2: { body2; }
+     *   }
+     * }
+     * </pre>
+     *
+     * The compiler recognizes the code blocks from the loop header up to the switch and duplicates
+     * them into each case that continues the while loop. This effectively transforms the structure
+     * as follows:
+     *
+     * <pre>
+     * if (cond) {
+     *   input = inlinedNextOpcode();
+     *   switch (markThreadedSwitch(input)) {
+     *     case op1: {
+     *         body1;
+     *         if (cond) {
+     *           input = inlinedNextOpcode();
+     *           switch (markThreadedSwitch(input)) // go to matching case of outer switch
+     *         }
+     *     }
+     *     case op2: {
+     *         body2;
+     *         if (cond) {
+     *           input = inlinedNextOpcode();
+     *           switch (markThreadedSwitch(input)) // go to matching case of outer switch
+     *         }
+     *     }
+     *   }
+     * }
+     * </pre>
+     *
+     * When additional statements follow the switch block within a loop, the compiler may trigger an
+     * optimization to duplicate these statements into each case block. If this duplication does not
+     * occur, the compiler can still identify the loop as a candidate for threaded switch
+     * optimization and apply relevant optimizations to minimize overhead in the loop header, such
+     * as postponing register spilling from the loop header to cases with actual register pressure,
+     * even at the cost of code bloat. However, due to the presence of these tail statements, the
+     * loop has only one back edge, which effectively disables threading.
+     *
+     * The compiler may also reject candidates for threaded switch optimization if the identified
+     * code blocks, after inlining, contain complex control flow or operations beyond memory reads.
+     * To log decisions related to threaded switch optimization, use the Graal option
+     * {@code TraceThreadedSwitchOptimization}.
+     *
+     * @since 25.1
+     */
+    public static int markThreadedSwitch(int input) {
+        return input;
+    }
+
+    /**
+     * Directive for the compiler to fall back to the bytecode interpreter at this point.
+     *
+     * Deoptimizes and invalidates the compiled code at this bytecode location only while the
+     * associated speculation has not failed. The first deoptimization records a failed speculation
+     * in the compiled method's speculation log; subsequent compilations using that log omit the
+     * deoptimization at this location. The speculation identifies the method and bytecode position,
+     * so distinct bytecode locations fail independently. Inline copies of the same location share
+     * failures within the compilation root's speculation log. In interpreted code, this directive has
+     * no effect.
+     *
+     * Unlike {@link #deoptimizeAndInvalidate()}, this directive requires a speculation log during
+     * compilation.
+     */
+    public static void speculativeDeoptimizeAndInvalidate() {
     }
 }

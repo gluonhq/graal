@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -59,7 +59,6 @@ import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.JavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
-import jdk.vm.ci.services.Services;
 
 /**
  * Observes compilation events and uses {@link CFGPrinter} to produce a control flow graph for the
@@ -80,7 +79,7 @@ public class CFGPrinterObserver implements DebugDumpHandler {
             dumpSandboxed(debug, object, forced, message);
         } catch (Throwable ex) {
             TTY.println("CFGPrinter: Exception during output of " + message + ": " + ex);
-            ex.printStackTrace();
+            ex.printStackTrace(TTY.out);
         }
     }
 
@@ -120,6 +119,8 @@ public class CFGPrinterObserver implements DebugDumpHandler {
         }
 
         if (compilation != null) {
+            // Keep derived graphs in the diagnostic scope of their root compilation.
+            compilation = compilation.getRootCompilationIdentifier();
             if (!compilation.equals(curCompilation) || !curDecorators.equals(decorators)) {
                 cfgPrinter.printCompilation(compilation);
             }
@@ -235,7 +236,7 @@ public class CFGPrinterObserver implements DebugDumpHandler {
 
     private static DisassemblerProvider selectDisassemblerProvider(OptionValues options) {
         DisassemblerProvider selected = null;
-        String arch = Services.getSavedProperty("os.arch");
+        String arch = GraalServices.getSavedProperty("os.arch");
         final boolean isAArch64 = arch.equals("aarch64");
         Iterator<DisassemblerProvider> load = GraalServices.load(DisassemblerProvider.class).iterator();
         while (load.hasNext()) {
@@ -254,7 +255,7 @@ public class CFGPrinterObserver implements DebugDumpHandler {
                     }
                 }
             } catch (ServiceConfigurationError e) {
-                e.printStackTrace();
+                e.printStackTrace(TTY.out);
             }
         }
         if (selected == null) {

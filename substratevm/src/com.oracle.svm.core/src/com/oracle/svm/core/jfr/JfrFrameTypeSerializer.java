@@ -27,22 +27,27 @@ package com.oracle.svm.core.jfr;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+
 /**
  * Used to serialize all predefined frame types into the chunk.
  */
 public class JfrFrameTypeSerializer implements JfrSerializer {
+    private final JfrFrameType[] frameTypes;
+
     @Platforms(Platform.HOSTED_ONLY.class)
     public JfrFrameTypeSerializer() {
+        frameTypes = JfrFrameType.values();
     }
 
     @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
     public void write(JfrChunkWriter writer) {
-        JfrFrameType[] values = JfrFrameType.values();
         writer.writeCompressedLong(JfrType.FrameType.getId());
-        writer.writeCompressedLong(values.length);
-        for (JfrFrameType value : values) {
-            writer.writeCompressedLong(value.getId());
-            writer.writeString(value.getText());
+        writer.writeCompressedLong(frameTypes.length);
+        for (JfrFrameType frameType : frameTypes) {
+            writer.writeCompressedLong(frameType.getId());
+            writer.writeString(frameType.getText());
         }
     }
 }

@@ -31,21 +31,23 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.RuntimeJNIAccess;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.JNIRegistrationUtil;
-import com.oracle.svm.core.jdk.JavaNetHttpFeature;
-import com.oracle.svm.core.jdk.NativeLibrarySupport;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.FeatureImpl;
-import com.oracle.svm.hosted.c.NativeLibraries;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.HostModuleUtil;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeJNIAccess;
+
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 @Platforms({InternalPlatform.PLATFORM_JNI.class})
 @AutomaticallyRegisteredFeature
 public class JNIRegistrationPrefs extends JNIRegistrationUtil implements InternalFeature {
 
-    private static Optional<Module> requiredModule() {
-        return ModuleLayer.boot().findModule("java.prefs");
+    private static Optional<ResolvedJavaModule> requiredModule() {
+        return JVMCIReflectionUtil.bootModuleLayer().findModule("java.prefs");
     }
 
     @Override
@@ -55,7 +57,7 @@ public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Interna
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        JavaNetHttpFeature.class.getModule().addReads(requiredModule().get());
+        HostModuleUtil.addReads(JNIRegistrationPrefs.class, requiredModule().get());
     }
 
     @Override
@@ -67,13 +69,15 @@ public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Interna
          */
         String preferencesImplementation = getPlatformPreferencesClassName();
         initializeAtRunTime(access, preferencesImplementation);
-        ArrayList<Class<?>> triggers = new ArrayList<>();
-        triggers.add(clazz(access, preferencesImplementation));
+        ArrayList<ResolvedJavaType> triggers = new ArrayList<>();
+        triggers.add(type(access, preferencesImplementation));
 
         if (isDarwin()) {
             String darwinSpecificClass = "java.util.prefs.MacOSXPreferencesFile";
             initializeAtRunTime(access, darwinSpecificClass);
-            triggers.add(clazz(access, darwinSpecificClass));
+            /* present on Darwin in the JDK */
+            initializeAtRunTime(access, "java.util.prefs.FileSystemPreferences");
+            triggers.add(type(access, darwinSpecificClass));
         }
 
         access.registerReachabilityHandler(JNIRegistrationPrefs::handlePreferencesClassReachable, triggers.toArray());
@@ -90,14 +94,12 @@ public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Interna
         throw VMError.shouldNotReachHere("Unexpected platform");
     }
 
-    private static void handlePreferencesClassReachable(@SuppressWarnings("unused") DuringAnalysisAccess access) {
-        NativeLibraries nativeLibraries = ((FeatureImpl.DuringAnalysisAccessImpl) access).getNativeLibraries();
-
-        NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary("prefs");
-        nativeLibraries.addStaticJniLibrary("prefs");
+    private static void handlePreferencesClassReachable(DuringAnalysisAccess access) {
         if (isDarwin()) {
             /* Darwin allocates a string array from native code */
             RuntimeJNIAccess.register(String[].class);
+            /* Called by libprefs on Darwin */
+            JVMCIRuntimeJNIAccess.register(method(access, "java.lang.System", "arraycopy", Object.class, int.class, Object.class, int.class, int.class));
         }
     }
 }

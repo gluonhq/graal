@@ -28,13 +28,10 @@ package com.oracle.objectfile.elf;
 import static java.lang.Math.toIntExact;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 
@@ -53,6 +50,7 @@ import com.oracle.objectfile.elf.ELFObjectFile.ELFSectionFlag;
 import com.oracle.objectfile.elf.ELFObjectFile.SectionType;
 import com.oracle.objectfile.io.AssemblyBuffer;
 import com.oracle.objectfile.io.OutputAssembler;
+import org.graalvm.collections.EconomicSet;
 
 public class ELFSymtab extends ELFObjectFile.ELFSection implements SymbolTable {
 
@@ -296,16 +294,12 @@ public class ELFSymtab extends ELFObjectFile.ELFSection implements SymbolTable {
         flags.add(ELFSectionFlag.ALLOC);
         flags.addAll(extraFlags);
         // NOTE: our SHT info and link entries are handled by overrides below.
-        // NOTE: we create a default strtab for ourselves, but the user can replace it
-        // FIXME: hmm, this is unclean, because in the case where the user replaces it,
-        // a reference to this unwanted section might get into some other sections... maybe?
+        // NOTE: we create a default strtab for ourselves.
 
         if (!dynamic) {
             strtab = new DefaultStrtabImpl(owner, ".strtab");
         } else {
             strtab = new DefaultStrtabImpl(owner, ".dynstr");
-            flags.add(ELFSectionFlag.ALLOC);
-            strtab.flags.add(ELFSectionFlag.ALLOC);
             // the ELFDynamicSection will call setDynamic() when it's constructed
         }
     }
@@ -313,7 +307,7 @@ public class ELFSymtab extends ELFObjectFile.ELFSection implements SymbolTable {
     class DefaultStrtabImpl extends ELFStrtab {
 
         DefaultStrtabImpl(ELFObjectFile owner, String name) {
-            super(owner, name);
+            super(owner, name, ELFObjectFile.SectionType.STRTAB, ELFSymtab.this.isDynamic());
             assert owner == getOwner();
             addContentProvider(entriesByName.keySet());
         }
@@ -407,12 +401,12 @@ public class ELFSymtab extends ELFObjectFile.ELFSection implements SymbolTable {
 
     @Override
     public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-        ArrayList<BuildDependency> ourDeps = new ArrayList<>(ObjectFile.defaultDependencies(decisions, this));
+        EconomicSet<BuildDependency> ourDeps = ObjectFile.defaultDependencies(decisions, this);
         // we depend on the contents of our strtab
         ourDeps.add(BuildDependency.createOrGet(decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT), decisions.get(strtab).getDecision(LayoutDecision.Kind.CONTENT)));
         // if we're dynamic, we also depend on vaddrs of any sections into which our symbols refer
         if (isDynamic()) {
-            Set<ELFSection> referencedSections = new HashSet<>();
+            EconomicSet<ELFSection> referencedSections = EconomicSet.create();
             for (Entry ent : entries) {
                 ELFSection es = ent.referencedSection;
                 if (es != null) {
@@ -431,7 +425,7 @@ public class ELFSymtab extends ELFObjectFile.ELFSection implements SymbolTable {
     }
 
     @Override
-    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode) {
+    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode, boolean isExported) {
         return addEntry(new Entry(name, referencedOffset, size, isGlobal ? SymBinding.GLOBAL : SymBinding.LOCAL, isCode ? SymType.FUNC : SymType.OBJECT, (ELFSection) referencedSection));
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -42,6 +42,7 @@ import jdk.graal.compiler.nodes.AbstractEndNode;
 import jdk.graal.compiler.nodes.AbstractMergeNode;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.ControlSplitNode;
+import jdk.graal.compiler.nodes.DeoptBarrier;
 import jdk.graal.compiler.nodes.DeoptimizeNode;
 import jdk.graal.compiler.nodes.EndNode;
 import jdk.graal.compiler.nodes.FixedGuardNode;
@@ -57,6 +58,7 @@ import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ProxyNode;
 import jdk.graal.compiler.nodes.StartNode;
 import jdk.graal.compiler.nodes.StaticDeoptimizingNode;
+import jdk.graal.compiler.nodes.StaticDeoptimizingNode.GuardPriority;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.ValuePhiNode;
@@ -92,8 +94,15 @@ import jdk.vm.ci.meta.TriState;
  */
 public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<CoreProviders> implements RecursivePhase {
 
+    private final boolean considerCountedExits;
+
     public ConvertDeoptimizeToGuardPhase(CanonicalizerPhase canonicalizer) {
+        this(canonicalizer, true);
+    }
+
+    public ConvertDeoptimizeToGuardPhase(CanonicalizerPhase canonicalizer, boolean considerCountedExits) {
         super(canonicalizer);
+        this.considerCountedExits = considerCountedExits;
     }
 
     @Override
@@ -110,26 +119,81 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
     protected void run(final StructuredGraph graph, final CoreProviders context) {
         LazyValue<LoopsData> lazyLoops = new LazyValue<>(() -> context.getLoopsDataProvider().getLoopsData(graph));
 
-        for (DeoptimizeNode d : graph.getNodes(DeoptimizeNode.TYPE)) {
-            assert d.isAlive();
-            if (!d.mayConvertToGuard()) {
-                continue;
+        if (GraalOptions.GuardPriorities.getValue(graph.getOptions())) {
+            /**
+             * Visit deopts ordered by priority, higher priorities first. This is necessary to make this transformation
+             * deterministic. Consider the following code, assuming that the condition is always false:
+             *
+             * <pre>
+             *     if (condition) {
+             *         lowPriorityDeopt();
+             *     } else {
+             *         highPriorityDeopt();
+             *     }
+             * </pre>
+             *
+             * Depending on which deopt we propagate first, we can end up with one of two graph shapes:
+             * <pre>
+             *     highPriorityFixedGuard(condition);
+             *     lowPriorityDeopt();
+             * </pre>
+             * or
+             * <pre>
+             *     lowPriorityFixedGuard(condition);
+             *     highPriorityDeopt();
+             * </pre>
+             *
+             * In the first case, the low-priority deopt is not propagated further (due to the priority check in
+             * {@link #propagateFixed}), so the graph remains like this. If the condition never triggers the
+             * high-priority guard, we will always take the low-priority deopt.
+             * </p>
+             *
+             * In the latter case, we would continue propagating the high-priority deopt further upwards, completely
+             * eliminating the low-priority guard and the check of the condition. This could lead to deopt loops if
+             * the high-priority deopt invalidates and has no speculation (as is the case for many Truffle guards)
+             * while the low-priority deopt does not invalidate.
+             */
+            for (GuardPriority priority : GuardPriority.values()) {
+                propagateDeoptimizationsUpwards(graph, context, lazyLoops, priority);
             }
-            try (DebugCloseable closable = d.withNodeSourcePosition()) {
-                propagateFixed(d, d, context, lazyLoops);
-            }
+        } else {
+            propagateDeoptimizationsUpwards(graph, context, lazyLoops, null);
         }
         if (context != null) {
             for (FixedGuardNode fixedGuard : graph.getNodes(FixedGuardNode.TYPE)) {
                 try (DebugCloseable closable = fixedGuard.withNodeSourcePosition()) {
-                    trySplitFixedGuard(fixedGuard, context, lazyLoops);
+                    trySplitFixedGuard(fixedGuard, context, lazyLoops, considerCountedExits);
                 }
             }
         }
         new DeadCodeEliminationPhase(Optional).apply(graph);
     }
 
-    private static void trySplitFixedGuard(FixedGuardNode fixedGuard, CoreProviders context, LazyValue<LoopsData> lazyLoops) {
+    /**
+     * Call {@link #propagateFixed} for {@link DeoptimizeNode}s in the graph. If {@code priority} is not {@code null},
+     * only deopts with that priority will be propagated. Otherwise, all deopts will be propagated.
+     * </p>
+     *
+     * {@link #propagateFixed} may add one or more new {@link DeoptimizeNode}s to the graph. Those will copy the
+     * current deopt's metadata and will therefore have the same priority. The traversal will visit them too.
+     */
+    @SuppressWarnings("try")
+    private void propagateDeoptimizationsUpwards(StructuredGraph graph, CoreProviders context, LazyValue<LoopsData> lazyLoops, GuardPriority priority) {
+        for (DeoptimizeNode d : graph.getNodes(DeoptimizeNode.TYPE)) {
+            assert d.isAlive();
+            if (!d.mayConvertToGuard()) {
+                continue;
+            }
+            if (priority != null && priority != d.computePriority()) {
+                continue;
+            }
+            try (DebugCloseable closable = d.withNodeSourcePosition()) {
+                propagateFixed(d, d, context, lazyLoops, considerCountedExits);
+            }
+        }
+    }
+
+    private static void trySplitFixedGuard(FixedGuardNode fixedGuard, CoreProviders context, LazyValue<LoopsData> lazyLoops, boolean considerCountedExits) {
         LogicNode condition = fixedGuard.condition();
         if (condition instanceof CompareNode) {
             CompareNode compare = (CompareNode) condition;
@@ -139,14 +203,14 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                 ValueNode y = compare.getY();
                 ValuePhiNode yPhi = (y instanceof ValuePhiNode) ? (ValuePhiNode) y : null;
                 if (y instanceof ConstantNode || yPhi != null) {
-                    processFixedGuardAndPhis(fixedGuard, context, compare, x, xPhi, y, yPhi, lazyLoops);
+                    processFixedGuardAndPhis(fixedGuard, context, compare, x, xPhi, y, yPhi, lazyLoops, considerCountedExits);
                 }
             }
         }
     }
 
     private static void processFixedGuardAndPhis(FixedGuardNode fixedGuard, CoreProviders context, CompareNode compare, ValueNode x, ValuePhiNode xPhi, ValueNode y, ValuePhiNode yPhi,
-                    LazyValue<LoopsData> lazyLoops) {
+                    LazyValue<LoopsData> lazyLoops, boolean considerCountedExits) {
         AbstractBeginNode pred = AbstractBeginNode.prevBegin(fixedGuard);
         if (pred instanceof AbstractMergeNode) {
             AbstractMergeNode merge = (AbstractMergeNode) pred;
@@ -157,13 +221,13 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                 return;
             }
 
-            processFixedGuardAndMerge(fixedGuard, context, compare, x, xPhi, y, yPhi, merge, lazyLoops);
+            processFixedGuardAndMerge(fixedGuard, context, compare, x, xPhi, y, yPhi, merge, lazyLoops, considerCountedExits);
         }
     }
 
     @SuppressWarnings("try")
     private static void processFixedGuardAndMerge(FixedGuardNode fixedGuard, CoreProviders context, CompareNode compare, ValueNode x, ValuePhiNode xPhi, ValueNode y, ValuePhiNode yPhi,
-                    AbstractMergeNode merge, LazyValue<LoopsData> lazyLoops) {
+                    AbstractMergeNode merge, LazyValue<LoopsData> lazyLoops, boolean considerCountedExits) {
         List<EndNode> mergePredecessors = merge.cfgPredecessors().snapshot();
         for (AbstractEndNode mergePredecessor : mergePredecessors) {
             if (!mergePredecessor.isAlive()) {
@@ -186,7 +250,7 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                 TriState compareResult = compare.condition().foldCondition(compareStamp, xs, ys, context.getConstantReflection(), compare.unorderedIsTrue());
                 if (compareResult.isKnown() && compareResult.toBoolean() == fixedGuard.isNegated()) {
                     try (DebugCloseable position = fixedGuard.withNodeSourcePosition()) {
-                        propagateFixed(mergePredecessor, fixedGuard, context, lazyLoops);
+                        propagateFixed(mergePredecessor, fixedGuard, context, lazyLoops, considerCountedExits);
                     }
                 }
             }
@@ -194,7 +258,7 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
     }
 
     @SuppressWarnings("try")
-    public static void propagateFixed(FixedNode from, StaticDeoptimizingNode deopt, CoreProviders providers, LazyValue<LoopsData> lazyLoops) {
+    public static void propagateFixed(FixedNode from, StaticDeoptimizingNode deopt, CoreProviders providers, LazyValue<LoopsData> lazyLoops, boolean considerCountedExits) {
         Node current = from;
         while (current != null) {
             if (GraalOptions.GuardPriorities.getValue(from.getOptions()) && current instanceof FixedGuardNode) {
@@ -209,16 +273,16 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                     FixedNode next = mergeNode.next();
                     while (mergeNode.isAlive()) {
                         AbstractEndNode end = mergeNode.forwardEnds().first();
-                        propagateFixed(end, deopt, providers, lazyLoops);
+                        propagateFixed(end, deopt, providers, lazyLoops, considerCountedExits);
                     }
                     if (next.isAlive()) {
-                        propagateFixed(next, deopt, providers, lazyLoops);
+                        propagateFixed(next, deopt, providers, lazyLoops, considerCountedExits);
                     }
                     return;
                 } else if (current.predecessor() instanceof IfNode) {
                     AbstractBeginNode begin = (AbstractBeginNode) current;
                     IfNode ifNode = (IfNode) current.predecessor();
-                    if (isOsrLoopExit(begin) || isCountedLoopExit(ifNode, lazyLoops)) {
+                    if (isOsrLoopExit(begin) || (considerCountedExits && isCountedLoopExit(ifNode, lazyLoops))) {
                         moveAsDeoptAfter(begin, deopt);
                     } else {
                         if (begin instanceof LoopExitNode && ifNode.condition() instanceof IntegerEqualsNode) {
@@ -243,27 +307,55 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                             FixedGuardNode guard = graph.add(
                                             new FixedGuardNode(conditionNode, deopt.getReason(), deopt.getAction(), deopt.getSpeculation(), negateGuardCondition, survivingSuccessorPosition));
                             FixedWithNextNode pred = (FixedWithNextNode) ifNode.predecessor();
+                            /**
+                             * We may have the following special case if pred is a LoopBegin:
+                             *
+                             * <pre>
+                             *     LoopBegin (= pred) <--------+
+                             *         |                       |
+                             *         | <- guard insert pos   |
+                             *         |                       |
+                             *       ifNode                    |
+                             *       |     \                   |
+                             *  surviving   LoopEnd -----------+
+                             *       |
+                             *      ...
+                             * </pre>
+                             *
+                             * If the only loop end is on the non-surviving successor path, then
+                             * killing that CFG path will also kill the LoopBegin, i.e., the pred
+                             * node. We would lose our place in the graph for inserting the guard.
+                             * Therefore, insert the guard before killing anything.
+                             */
+                            pred.setNext(guard);
+                            guard.setNext(ifNode);
+
                             AbstractBeginNode survivingSuccessor;
                             if (negateGuardCondition) {
                                 survivingSuccessor = ifNode.falseSuccessor();
                             } else {
                                 survivingSuccessor = ifNode.trueSuccessor();
                             }
+                            /**
+                             * Note that we may be dealing with a semi canonicalized graph - cutting
+                             * off a branch here can canonicalize enclosing loops as well. This can
+                             * lead to situations where surviving successor will be dead.
+                             */
                             graph.removeSplitPropagate(ifNode, survivingSuccessor);
 
                             Node newGuard = guard;
-                            if (survivingSuccessor instanceof LoopExitNode) {
-                                newGuard = ProxyNode.forGuard(guard, (LoopExitNode) survivingSuccessor);
+                            if (survivingSuccessor.isAlive()) {
+                                if (survivingSuccessor instanceof LoopExitNode) {
+                                    newGuard = ProxyNode.forGuard(guard, (LoopExitNode) survivingSuccessor);
+                                }
+                                survivingSuccessor.replaceAtUsages(newGuard, InputType.Guard);
                             }
-                            survivingSuccessor.replaceAtUsages(newGuard, InputType.Guard);
-
                             graph.getOptimizationLog().report(ConvertDeoptimizeToGuardPhase.class, "DeoptimizeToGuardConversion", deopt.asNode());
-                            FixedNode next = pred.next();
-                            pred.setNext(guard);
-                            guard.setNext(next);
                             assert providers != null;
                             SimplifierTool simplifierTool = GraphUtil.getDefaultSimplifier(providers, false, graph.getAssumptions(), graph.getOptions());
-                            ((Simplifiable) survivingSuccessor).simplify(simplifierTool);
+                            if (survivingSuccessor.isAlive()) {
+                                ((Simplifiable) survivingSuccessor).simplify(simplifierTool);
+                            }
                         }
                     }
                     return;
@@ -273,6 +365,9 @@ public class ConvertDeoptimizeToGuardPhase extends PostRunCanonicalizationPhase<
                     moveAsDeoptAfter((AbstractBeginNode) current, deopt);
                     return;
                 }
+            } else if (current instanceof DeoptBarrier && current instanceof FixedWithNextNode fixedWithNextNode) {
+                moveAsDeoptAfter(fixedWithNextNode, deopt);
+                return;
             } else if (current instanceof OSRMonitorEnterNode monitorEnterNode) {
                 /*
                  * OSR locals (including locks) need to remain in the graph and be lowered to LIR

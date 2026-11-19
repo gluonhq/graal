@@ -43,9 +43,11 @@ local common_json = import "../common.json";
     local _version_build_id = std.split(_parts[1], "+");
     _version_build_id[1]
     ,
+  local get_labsjdk_jvmci_build_id(jdk) =
+    local _parts = std.split(jdk.version, "-");
+    _parts[std.length(_parts) - 1]
+    ,
   local jdks_data = {
-    oraclejdk11: jdk_base + common_json.jdks["oraclejdk11"] + { jdk_version:: 11 },
-  } + {
     [name]: jdk_base + common_json.jdks[name] + { jdk_version:: 17 }
     for name in ["oraclejdk17"] + variants("labsjdk-ce-17") + variants("labsjdk-ee-17")
   } + {
@@ -58,13 +60,29 @@ local common_json = import "../common.json";
     [name]: jdk_base + common_json.jdks[name] + { jdk_version:: 21 }
     for name in ["oraclejdk21"] + variants("labsjdk-ce-21") + variants("labsjdk-ee-21")
   } + {
+    'oraclejdk24': jdk_base + common_json.jdks["oraclejdk24"] + { jdk_version:: 24 },
+  } + {
+    [name]: jdk_base + common_json.jdks[name] + { jdk_version:: 25 }
+    for name in ["oraclejdk25"]
+  } + {
+    # Synthesize labsjdk-*-25 from labsjdk-*-latest
+    # This is intended for jobs that specifically need the 25 LTS JDK (e.g., espresso for its guest).
+    # When running the compiler or the native image generator "latest" should be used instead.
+    # When latest moves past 25, jobs using 25 should be reviwed and if they are still needed labsjdk-(ce|ee)-25 should
+    # be added to common.json.
+    # Note that the assert below unfortunately doesn't work in the sjsonnet version used currently in the CI (GR-40975).
+    [std.strReplace(name, 'latest', '25')]: jdk_base + common_json.jdks[name] + { assert parse_labsjdk_version(self) == 25, jdk_version:: 25 }
+    for name in variants("labsjdk-ce-latest") + variants("labsjdk-ee-latest")
+  } + {
     [name]: jdk_base + common_json.jdks[name] + { jdk_version:: parse_labsjdk_version(self), jdk_name:: "jdk-latest"}
     for name in ["oraclejdk-latest"] + variants("labsjdk-ce-latest") + variants("labsjdk-ee-latest")
   } + {
     'graalvm-ee-21': jdk_base + common_json.jdks["graalvm-ee-21"] + { jdk_version:: 21 },
+    'graalvm-ee-25-ea': jdk_base + common_json.jdks["graalvm-ee-25-ea"] + { jdk_version:: 25 },
   },
-  # We do not want to expose galahad-jdk
-  assert std.assertEqual([x for x in std.objectFields(common_json.jdks) if x != "galahad-jdk"], std.objectFields(jdks_data)),
+  # We do not want to expose galahad-jdk, labsjdk-(ce|ee)-25 are synthetized from latest
+  local is_labsjdk_25(x) = std.startsWith(x, "labsjdk-ee-25") || std.startsWith(x, "labsjdk-ce-25"),
+  assert std.assertEqual([x for x in std.objectFields(common_json.jdks) if x != "galahad-jdk"], [x for x in std.objectFields(jdks_data) if !is_labsjdk_25(x)]),
   # Verify oraclejdk-latest and labsjdk-ee-latest versions match
   assert
     local _labsjdk = common_json.jdks["labsjdk-ee-latest"];
@@ -73,7 +91,24 @@ local common_json = import "../common.json";
     local _lv = std.strReplace(_labsjdk.version, "ee-", "jdk-");
     # Skip the check if we are not using a labsjdk. This can happen on JDK integration branches.
     local no_labsjdk = _labsjdk.name != "labsjdk";
-    assert no_labsjdk || std.startsWith(_lv, _ov) : "update oraclejdk-latest to match labsjdk-ee-latest: %s+%s vs %s" % [_oraclejdk.version, _oraclejdk.build_id, _labsjdk.version];
+    # Skip the check if we are using labsjdk with build number equal zero
+    local labsjdk_with_build_zero = std.findSubstr('+0-jvmci-', _lv) != [];
+    local oraclejdk_base_version = std.split(_ov, "+")[0];
+    local labsjdk_base_version = std.split(_lv, "+")[0];
+    # Labs JDK can include 5 digits in its base version.
+    # Skip the check when Labsjdk latest is dervied from Oracle JDK latest base-version.
+    local labsjdk_with_extra_base_version_component =
+      std.length(std.split(labsjdk_base_version, ".")) == std.length(std.split(oraclejdk_base_version, ".")) + 1 &&
+      std.startsWith(labsjdk_base_version, oraclejdk_base_version + ".");
+    assert no_labsjdk || std.startsWith(_lv, _ov) || labsjdk_with_build_zero || labsjdk_with_extra_base_version_component: "update oraclejdk-latest to match labsjdk-ee-latest: %s+%s vs %s" % [_oraclejdk.version, _oraclejdk.build_id, _labsjdk.version];
+    true,
+  # Verify labsjdk-ce-latest and labsjdk-ee-latest JVMCI build numbers match
+  assert
+    local _labsjdk_ce = common_json.jdks["labsjdk-ce-latest"];
+    local _labsjdk_ee = common_json.jdks["labsjdk-ee-latest"];
+    local _ce_jvmci_build_id = get_labsjdk_jvmci_build_id(_labsjdk_ce);
+    local _ee_jvmci_build_id = get_labsjdk_jvmci_build_id(_labsjdk_ee);
+    assert _ce_jvmci_build_id == _ee_jvmci_build_id : "labsjdk-ce-latest and labsjdk-ee-latest JVMCI build numbers differ: %s vs %s" % [_labsjdk_ce.version, _labsjdk_ee.version];
     true,
 
   # The raw jdk data, the same as common_json.jdks + { jdk_version:: }
@@ -106,13 +141,14 @@ local common_json = import "../common.json";
     oraclejdkLatest: self["oraclejdk-latest"],
   },
 
-  # The devkits versions reflect those used to build the JVMCI JDKs (e.g., see devkit_platform_revisions in <jdk>/make/conf/jib-profiles.js)
+  # The devkits versions reflect those used to build the JVMCI JDKs (e.g., see devkit_platform_revisions in <jdk>/make/conf/jib-profiles.js).
+  # See deps.windows_devkit to add a devkit on windows conveniently.
   devkits: {
     "windows-jdk17": { packages+: { "devkit:VS2022-17.1.0+1": "==0" }},
     "windows-jdk19": { packages+: { "devkit:VS2022-17.1.0+1": "==0" }},
     "windows-jdk20": { packages+: { "devkit:VS2022-17.1.0+1": "==0" }},
     "windows-jdk21": { packages+: { "devkit:VS2022-17.1.0+1": "==1" }},
-    "windows-jdk-latest": { packages+: { "devkit:VS2022-17.6.5+1": "==0" }},
+    "windows-jdk-latest": { packages+: { "devkit:VS2022-17.13.2+1": "==0" }},
     "windows-jdkLatest": self["windows-jdk-latest"],
     "linux-jdk17": { packages+: { "devkit:gcc11.2.0-OL6.4+1": "==0" }},
     "linux-jdk19": { packages+: { "devkit:gcc11.2.0-OL6.4+1": "==0" }},
@@ -142,16 +178,23 @@ local common_json = import "../common.json";
 
     common_catch_files: {
       catch_files+: [
+        # There are additional catch_files-like patterns in buildbot/graal/catcher.py for:
+        # * hs_err_pid*.log files
+        # * Dumping IGV graphs to (?P<filename>.+(\.gv\.xml|\.bgv))
+        # * CFGPrinter: Output to file (?P<filename>.*compilations-.+\.cfg)
+        # There are defined there for efficiency reasons.
         # Keep in sync with jdk.graal.compiler.debug.StandardPathUtilitiesProvider#DIAGNOSTIC_OUTPUT_DIRECTORY_MESSAGE_REGEXP
         "Graal diagnostic output saved in '(?P<filename>[^']+)'",
         # Keep in sync with jdk.graal.compiler.debug.DebugContext#DUMP_FILE_MESSAGE_REGEXP
         "Dumping debug output to '(?P<filename>[^']+)'",
-        # Keep in sync with com.oracle.svm.hosted.NativeImageOptions#DEFAULT_ERROR_FILE_NAME
-        " (?P<filename>.+/svm_err_b_\\d+T\\d+\\.\\d+_pid\\d+\\.md)",
+        # Keep in sync with com.oracle.svm.hosted.ProgressReporter#printErrorMessage
+        "Please inspect the generated error report at: '(?P<filename>[^']+)'",
         # Keep in sync with jdk.graal.compiler.test.SubprocessUtil#makeArgfile
         "@(?P<filename>.*SubprocessUtil-argfiles.*\\.argfile)",
         # Keep in sync with com.oracle.truffle.api.test.SubprocessTestUtils#makeArgfile
         "@(?P<filename>.*SubprocessTestUtils-argfiles.*\\.argfile)",
+        # Keep in sync with mx_gate.py:get_jacoco_agent_args
+        "JaCoCo agent config: '(?P<filename>[^']+)'",
       ],
     },
 
@@ -164,17 +207,10 @@ local common_json = import "../common.json";
 
     # These dependencies are not included by default in any platform object
 
-    eclipse: {
-      downloads+: {
-        ECLIPSE: {
-          name: "eclipse",
-          version: common_json.eclipse.version,
-          platformspecific: true,
-        }
-      },
-      environment+: {
-        ECLIPSE_EXE: "$ECLIPSE/eclipse",
-      },
+    # Not included by default in $.windows_amd64 and $.windows_server_2016_amd64 because it needs jdk_name.
+    # As a note, Native Image needs this to build.
+    windows_devkit:: {
+      packages+: if self.os == "windows" then $.devkits["windows-" + self.jdk_name].packages else {},
     },
 
     jdt: {
@@ -203,34 +239,59 @@ local common_json = import "../common.json";
       },
     },
 
-    local code_tools = {
+    cmake:: {
+      packages+: {
+        cmake: "==3.22.2",
+      },
+    },
+
+    gradle:: {
+      downloads+: {
+        GRADLE_JAVA_HOME: jdks_data["oraclejdk21"],
+      }
+    },
+
+    # ProGuard does not yet run on JDK 25
+    proguard: {
+      downloads+: if 'jdk_version' in self && self.jdk_version > 21 then {
+        TOOLS_JAVA_HOME: jdks_data['oraclejdk24'],
+        IGV_JAVA_HOME: jdks_data['oraclejdk21'],
+      } else {},
+    },
+    # GR-49566: SpotBugs does not yet run on JDK 22
+    spotbugs: {
       downloads+: if 'jdk_version' in self && self.jdk_version > 21 then {
         TOOLS_JAVA_HOME: jdks_data['oraclejdk21'],
       } else {},
     },
-    # GR-46676: ProGuard does not yet run on JDK 22
-    proguard: code_tools,
-    # GR-49566: SpotBugs does not yet run on JDK 22
-    spotbugs: code_tools,
 
-    sulong:: {
-      packages+: {
-        cmake: "==3.22.2",
-      } + if self.os == "windows" then {
-        msvc_source: "==14.0",
-      } else {},
+    maven:: {
+      local this = self,
+      packages+: (if self.os == "linux" && self.arch == "amd64" then {
+        maven: '==3.9.10',
+      } else {}),
+      # no maven package available on other platforms
+      downloads+: (if self.os != "linux" || self.arch != "amd64" then {
+        # GR-68921: 3.9.10 does not work on Windows
+        MAVEN_HOME: {name: 'maven', version: (if this.os == "windows" then '3.3.9' else '3.9.10'), platformspecific: false},
+      } else {}),
+      setup+: (if self.os != "linux" || self.arch != "amd64" then [
+        ['set-export', 'PATH', (if self.os == "windows" then '$MAVEN_HOME\\bin;$PATH' else '$MAVEN_HOME/bin:$PATH')],
+      ] else []),
     },
 
-    truffleruby:: {
-      packages+: (if self.os == "linux" && self.arch == "amd64" then {
-        ruby: "==3.2.2", # Newer version, also used for benchmarking
-      } else if (self.os == "windows") then
-        error('truffleruby is not supported on windows')
-      else {
-        ruby: "==3.0.2",
-      }) + (if self.os == "linux" then {
-        libyaml: "==0.2.5",
-      } else {}),
+    espresso:: {
+      downloads+: {
+       EXTRA_JAVA_HOMES+: {
+                pathlist+: [jdks_data["oraclejdk21"], jdks_data["oraclejdk25"]],
+           }
+       }
+    },
+
+    sulong:: self.cmake + {
+      packages+: if self.os == "windows" then {
+        msvc_source: "==14.0",
+      } else {},
     },
 
     graalnodejs:: {
@@ -251,63 +312,39 @@ local common_json = import "../common.json";
       } else {},
     },
 
-    graalpy:: {
+    graalpy:: self.gradle + self.cmake + self.maven + {
       packages+: if (self.os == "linux") then {
-        libffi: '>=3.2.1',
-        bzip2: '>=1.0.6',
-        maven: ">=3.3.9",
+        libffi: '==3.2.1',
+        bzip2: '==1.0.6',
+        zlib: '==1.2.11',
       } else {},
     },
 
-    fastr:: {
-      # Note: On both Linux and MacOS, FastR depends on the gnur module and on gfortran
-      # of a specific version (4.8.5 on Linux, 10.2.0 on MacOS)
-      # However, we do not need to load those modules, we only configure specific environment variables to
-      # point to these specific modules. These modules and the configuration is only necessary for installation of
-      # some R packages (that have Fortran code) and in order to run GNU-R
-      packages+:
-        if (self.os == "linux" && self.arch == "amd64") then {
-          readline: '==6.3',
-          pcre2: '==10.37',
-          curl: '>=7.50.1',
-          gnur: '==4.0.3-gcc4.8.5-pcre2',
-        }
-        else if (self.os == "darwin" && self.arch == "amd64") then {
-          'pcre2': '==10.37',
-        } else {},
-      environment+:
-        if (self.os == "linux" && self.arch == "amd64") then {
-          TZDIR: '/usr/share/zoneinfo',
-          PKG_INCLUDE_FLAGS_OVERRIDE : '-I/cm/shared/apps/bzip2/1.0.6/include -I/cm/shared/apps/xz/5.2.2/include -I/cm/shared/apps/pcre2/10.37/include -I/cm/shared/apps/curl/7.50.1/include',
-          PKG_LDFLAGS_OVERRIDE : '-L/cm/shared/apps/bzip2/1.0.6/lib -L/cm/shared/apps/xz/5.2.2/lib -L/cm/shared/apps/pcre2/10.37/lib -L/cm/shared/apps/curl/7.50.1/lib -L/cm/shared/apps/gcc/4.8.5/lib64',
-          FASTR_FC: '/cm/shared/apps/gcc/4.8.5/bin/gfortran',
-          FASTR_CC: '/cm/shared/apps/gcc/4.8.5/bin/gcc',
-          GNUR_HOME_BINARY: '/cm/shared/apps/gnur/4.0.3_gcc4.8.5_pcre2-10.37/R-4.0.3',
-          FASTR_RELEASE: 'true',
-        }
-        else if (self.os == "darwin" && self.arch == "amd64") then {
-          FASTR_FC: '/cm/shared/apps/gcc/8.3.0/bin/gfortran',
-          FASTR_CC: '/cm/shared/apps/gcc/8.3.0/bin/gcc',
-          TZDIR: '/usr/share/zoneinfo',
-          PKG_INCLUDE_FLAGS_OVERRIDE : '-I/cm/shared/apps/pcre2/pcre2-10.37/include -I/cm/shared/apps/bzip2/1.0.6/include -I/cm/shared/apps/xz/5.2.2/include -I/cm/shared/apps/curl/7.50.1/include',
-          PKG_LDFLAGS_OVERRIDE : '-L/cm/shared/apps/bzip2/1.0.6/lib -L/cm/shared/apps/xz/5.2.2/lib -L/cm/shared/apps/pcre2/pcre2-10.37/lib -L/cm/shared/apps/curl/7.50.1/lib -L/cm/shared/apps/gcc/10.2.0/lib -L/usr/lib',
-          FASTR_RELEASE: 'true',
-        } else {},
-      downloads+:
-        if (self.os == "linux" && self.arch == "amd64") then {
-          BLAS_LAPACK_DIR: { name: 'fastr-403-blas-lapack-gcc', version: '4.8.5', platformspecific: true },
-          F2C_BINARY: { name: 'f2c-binary', version: '7', platformspecific: true },
-          FASTR_RECOMMENDED_BINARY: { name: 'fastr-recommended-pkgs', version: '16', platformspecific: true },
-        }
-        else if (self.os == "darwin" && self.arch == "amd64") then {
-          BLAS_LAPACK_DIR: { name: "fastr-403-blas-lapack-gcc", version: "8.3.0", platformspecific: true },
-          F2C_BINARY: { name: 'f2c-binary', version: '7', platformspecific: true },
-          FASTR_RECOMMENDED_BINARY: { name: 'fastr-recommended-pkgs', version: '16', platformspecific: true },
-        } else {},
-      catch_files+: if (self.os != "windows" && self.arch == "amd64") then [
-        'GNUR_CONFIG_LOG = (?P<filename>.+\\.log)',
-        'GNUR_MAKE_LOG = (?P<filename>.+\\.log)',
-      ] else [],
+    wasm:: {
+      downloads+: {
+        WABT_DIR: {name: 'wabt', version: '1.0.41', platformspecific: true},
+      },
+      environment+: {
+        WABT_DIR: '$WABT_DIR/bin',
+      },
+    },
+
+    wasm_ol8:: {
+      downloads+: {
+        WABT_DIR: {name: 'wabt', version: '1.0.41-ol8', platformspecific: true},
+      },
+      environment+: {
+        WABT_DIR: '$WABT_DIR/bin',
+      },
+    },
+
+    emsdk_ol8:: {
+      downloads+: {
+        EMSDK_DIR: {name: 'emsdk', version: '4.0.10', platformspecific: true},
+      },
+      environment+: {
+        EMCC_DIR: '$EMSDK_DIR/upstream/emscripten/'
+      }
     },
 
     svm:: {
@@ -323,7 +360,6 @@ local common_json = import "../common.json";
         "*/*.log",
         "*/svmbuild/*.log",
         "*/svmbuild/images/*.log",
-        "*/*/stripped/*.map",
         "*/callgrind.*",
         "*.log",
       ],
@@ -333,6 +369,15 @@ local common_json = import "../common.json";
   # Job frequencies
   # ***************
   frequencies: {
+    tier1: {
+      targets+: ["tier1"],
+    },
+    tier2: {
+      targets+: ["tier2"],
+    },
+    tier3: {
+      targets+: ["tier3"],
+    },
     gate: {
       targets+: ["gate"],
     },
@@ -426,28 +471,30 @@ local common_json = import "../common.json";
     },
 
     local linux   = { os:: "linux",   capabilities+: [self.os] },
-    # Run darwin jobs on Big Sur or later by excluding all older versions
-    local darwin  = { os:: "darwin",  capabilities+: [self.os, "!darwin_sierra", "!darwin_mojave", "!darwin_catalina"] },
+    # Run darwin jobs on Sonoma or later by excluding all older versions
+    local darwin  = { os:: "darwin",  capabilities+: [self.os, "!darwin_bigsur", "!darwin_ventura", "!darwin_monterey"] },
     local windows = { os:: "windows", capabilities+: [self.os] },
 
     local amd64   = { arch:: "amd64",   capabilities+: [self.arch] },
     local aarch64 = { arch:: "aarch64", capabilities+: [self.arch] },
 
     local ol_distro = { os_distro:: "ol" },
+    local ol7_distro = ol_distro + { os_distro_version:: "7" },
+    local ol8_distro = ol_distro + { os_distro_version:: "8" },
+    local ol9_distro = ol_distro + { os_distro_version:: "9" },
 
     linux_amd64: self.linux_amd64_ol7,
-    linux_amd64_ol7: linux + amd64 + ol7 + ol_distro,
-    linux_amd64_ol8: linux + amd64 + ol8 + ol_distro,
-    linux_amd64_ol9: linux + amd64 + ol9 + ol_distro,
+    linux_amd64_ol7: linux + amd64 + ol7 + ol7_distro,
+    linux_amd64_ol8: linux + amd64 + ol8 + ol8_distro,
+    linux_amd64_ol9: linux + amd64 + ol9 + ol9_distro,
 
     linux_aarch64: self.linux_aarch64_ol7,
-    linux_aarch64_ol7: linux + aarch64 + ol7 + ol_distro,
-    linux_aarch64_ol8: linux + aarch64 + ol8 + ol_distro,
-    linux_aarch64_ol9: linux + aarch64 + ol9 + ol_distro,
+    linux_aarch64_ol7: linux + aarch64 + ol7 + ol7_distro,
+    linux_aarch64_ol8: linux + aarch64 + ol8 + ol8_distro,
+    linux_aarch64_ol9: linux + aarch64 + ol9 + ol9_distro,
 
-    linux_amd64_ubuntu: linux + amd64 + ubuntu22 + { os_distro:: "ubuntu" },
+    linux_amd64_ubuntu: linux + amd64 + ubuntu22 + { os_distro:: "ubuntu", os_distro_version:: "22" },
 
-    darwin_amd64: darwin + amd64,
     darwin_aarch64: darwin + aarch64,
 
     windows_amd64: windows + amd64,
@@ -459,11 +506,9 @@ local common_json = import "../common.json";
   local common = self.deps.mx + self.deps.common_catch_files + self.deps.common_env,
 
   local ol_devtoolset = {
-    packages+: (if self.arch == "aarch64" then {
-      "00:devtoolset": "==10", # GCC 10.2.1, make 4.2.1, binutils 2.35, valgrind 3.16.1
-    } else {
-      "00:devtoolset": "==11", # GCC 11.2, make 4.3, binutils 2.36, valgrind 3.17
-    }),
+    packages+: {
+      "00:devtoolset": "==12", # GCC 12.2.1, make 4.3, binutils 2.36, valgrind 3.19
+    },
   },
 
   linux_amd64: self.linux_amd64_ol7,
@@ -478,7 +523,6 @@ local common_json = import "../common.json";
 
   linux_amd64_ubuntu: self.bare.linux_amd64_ubuntu + common,
 
-  darwin_amd64: self.bare.darwin_amd64 + common,
   darwin_aarch64: self.bare.darwin_aarch64 + common,
 
   windows_amd64: self.bare.windows_amd64 + common,

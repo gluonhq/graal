@@ -26,8 +26,9 @@ package com.oracle.svm.hosted.foreign;
 
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.invoke.MethodHandle;
 
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 import org.graalvm.nativeimage.impl.RuntimeForeignAccessSupport;
 
 /**
@@ -54,34 +55,51 @@ public interface StronglyTypedRuntimeForeignAccessSupport extends RuntimeForeign
 
     @FunctionalInterface
     interface Recorder {
-        void apply(ConfigurationCondition condition, FunctionDescriptor desc, Linker.Option... options);
+        void apply(AccessCondition condition, FunctionDescriptor desc, Linker.Option... options);
     }
 
-    static StronglyTypedRuntimeForeignAccessSupport make(Recorder forDowncalls, Recorder forUpcalls) {
+    @FunctionalInterface
+    interface DirectUpcallRecorder {
+        void apply(AccessCondition condition, MethodHandle target, FunctionDescriptor desc, Linker.Option... options);
+    }
+
+    static StronglyTypedRuntimeForeignAccessSupport make(Recorder forDowncalls, Recorder forUpcalls, DirectUpcallRecorder forDirectUpcalls) {
         return new StronglyTypedRuntimeForeignAccessSupport() {
             @Override
-            public void registerForDowncall(ConfigurationCondition condition, FunctionDescriptor desc, Linker.Option... options) {
+            public void registerForDowncall(AccessCondition condition, FunctionDescriptor desc, Linker.Option... options) {
                 forDowncalls.apply(condition, desc, options);
             }
 
             @Override
-            public void registerForUpcall(ConfigurationCondition condition, FunctionDescriptor desc, Linker.Option... options) {
+            public void registerForUpcall(AccessCondition condition, FunctionDescriptor desc, Linker.Option... options) {
                 forUpcalls.apply(condition, desc, options);
+            }
+
+            @Override
+            public void registerForDirectUpcall(AccessCondition condition, MethodHandle target, FunctionDescriptor fd, Linker.Option... options) {
+                forDirectUpcalls.apply(condition, target, fd, options);
             }
         };
     }
 
     @Override
-    default void registerForDowncall(ConfigurationCondition condition, Object descO, Object... optionsO) {
+    default void registerForDowncall(AccessCondition condition, Object descO, Object... optionsO) {
         registerForDowncall(condition, castDesc(descO), castOptions(optionsO));
     }
 
-    void registerForDowncall(ConfigurationCondition condition, FunctionDescriptor desc, Linker.Option... options);
+    void registerForDowncall(AccessCondition condition, FunctionDescriptor desc, Linker.Option... options);
 
     @Override
-    default void registerForUpcall(ConfigurationCondition condition, Object descO, Object... optionsO) {
+    default void registerForUpcall(AccessCondition condition, Object descO, Object... optionsO) {
         registerForUpcall(condition, castDesc(descO), castOptions(optionsO));
     }
 
-    void registerForUpcall(ConfigurationCondition condition, FunctionDescriptor desc, Linker.Option... options);
+    void registerForUpcall(AccessCondition condition, FunctionDescriptor desc, Linker.Option... options);
+
+    @Override
+    default void registerForDirectUpcall(AccessCondition condition, MethodHandle target, Object desc, Object... options) {
+        registerForDirectUpcall(condition, target, castDesc(desc), castOptions(options));
+    }
+
+    void registerForDirectUpcall(AccessCondition condition, MethodHandle target, FunctionDescriptor desc, Linker.Option... options);
 }

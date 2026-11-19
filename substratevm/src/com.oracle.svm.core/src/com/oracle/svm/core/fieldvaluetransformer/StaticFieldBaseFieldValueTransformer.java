@@ -24,33 +24,33 @@
  */
 package com.oracle.svm.core.fieldvaluetransformer;
 
-import java.lang.reflect.Field;
-
+import com.oracle.svm.shared.BuildPhaseProvider;
 import com.oracle.svm.core.StaticFieldsSupport;
+import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.ResolvedJavaField;
 
-public final class StaticFieldBaseFieldValueTransformer implements FieldValueTransformerWithAvailability {
-    private final Field targetField;
+/**
+ * Implements the field value transformation semantics of {@link Kind#StaticFieldBase}.
+ */
+public record StaticFieldBaseFieldValueTransformer(ResolvedJavaField targetField) implements JVMCIFieldValueTransformerWithAvailability {
 
-    public StaticFieldBaseFieldValueTransformer(Field targetField) {
-        this.targetField = targetField;
+    @Override
+    public boolean isAvailable() {
+        return BuildPhaseProvider.isHostedUniverseBuilt();
     }
 
     @Override
-    public ValueAvailability valueAvailability() {
-        return ValueAvailability.AfterAnalysis;
-    }
-
-    @Override
-    public Object transform(Object receiver, Object originalValue) {
-        return targetField.getType().isPrimitive() ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields();
+    public JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
+        return StaticFieldsSupport.getStaticFieldBaseTransformation(targetField);
     }
 
     @Override
     public ValueNode intrinsify(CoreProviders providers, JavaConstant receiver) {
-        return StaticFieldsSupport.createStaticFieldBaseNode(targetField.getType().isPrimitive());
+        ResolvedJavaField resolvedJavaField = StaticFieldsSupport.toUniverseField(providers.getMetaAccess(), targetField);
+        return StaticFieldsSupport.createStaticFieldBaseNode(resolvedJavaField);
     }
 }

@@ -26,16 +26,19 @@ package com.oracle.svm.core.heap.dump;
 
 import java.io.IOException;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.impl.InternalPlatform.WINDOWS_BASE;
+
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.jdk.RuntimeSupport;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.log.Log;
 
 import jdk.internal.misc.Signal;
 
 public class HeapDumpStartupHook implements RuntimeSupport.Hook {
     @Override
     public void execute(boolean isFirstIsolate) {
-        if (isFirstIsolate && SubstrateOptions.EnableSignalHandling.getValue()) {
+        if (isFirstIsolate && SubstrateOptions.isSignalHandlingAllowed() && !Platform.includedIn(WINDOWS_BASE.class)) {
             DumpHeapReport.install();
         }
 

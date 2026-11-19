@@ -1,0 +1,261 @@
+/*
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package org.graalvm.wasm.nodes;
+
+import static org.graalvm.wasm.nodes.WasmFrame.pushDouble;
+import static org.graalvm.wasm.nodes.WasmFrame.pushFloat;
+import static org.graalvm.wasm.nodes.WasmFrame.pushInt;
+import static org.graalvm.wasm.nodes.WasmFrame.pushLong;
+import static org.graalvm.wasm.nodes.WasmFrame.pushReference;
+import static org.graalvm.wasm.nodes.WasmFrame.pushVector128;
+
+import java.util.Set;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.wasm.WasmArguments;
+import org.graalvm.wasm.WasmCodeEntry;
+import org.graalvm.wasm.WasmContext;
+import org.graalvm.wasm.WasmInstance;
+import org.graalvm.wasm.WasmLanguage;
+import org.graalvm.wasm.WasmModule;
+import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.debugging.data.DebugFunction;
+import org.graalvm.wasm.exception.Failure;
+import org.graalvm.wasm.exception.WasmException;
+import org.graalvm.wasm.vector.Vector128;
+import org.graalvm.wasm.vector.Vector128Ops;
+
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleStackTraceElement;
+import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.ExplodeLoop;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.NodeInfo;
+import com.oracle.truffle.api.source.SourceSection;
+
+@NodeInfo(language = WasmLanguage.ID, description = "The root node of all WebAssembly functions")
+public final class WasmFunctionRootNode extends WasmRootNode {
+
+    @Child private WasmFixedMemoryImplFunctionNode functionNode;
+    private final WasmCodeEntry codeEntry;
+
+    private SourceSection sourceSection;
+
+    public WasmFunctionRootNode(TruffleLanguage<?> language, FrameDescriptor frameDescriptor, WasmModule module, WasmFixedMemoryImplFunctionNode functionNode, WasmCodeEntry codeEntry) {
+        super(language, frameDescriptor, module);
+        this.functionNode = functionNode;
+        this.codeEntry = codeEntry;
+    }
+
+    int resultCount() {
+        return codeEntry.resultCount();
+    }
+
+    void enterErrorBranch() {
+        codeEntry.errorBranch();
+    }
+
+    int paramCount() {
+        return module().symbolTable().function(codeEntry.functionIndex()).paramCount();
+    }
+
+    int localType(int index) {
+        return codeEntry.localType(index);
+    }
+
+    @Override
+    protected Object translateStackTraceElement(TruffleStackTraceElement element) {
+        Node location = element.getLocation();
+        SourceSection sc = location != null ? location.getEncapsulatingSourceSection() : getSourceSection();
+        return new WasmStackTraceElementObject(this, sc, element.getBytecodeIndex());
+    }
+
+    // Keep the entry point declared on the concrete root for host-compiler inlining.
+    @Override
+    public Object execute(VirtualFrame frame) {
+        assert WasmArguments.isValid(frame.getArguments());
+        final WasmInstance instance = instance(frame);
+        tryInitialize(instance);
+        return executeWithInstance(frame, instance);
+    }
+
+    @Override
+    public Object executeWithInstance(VirtualFrame frame, WasmInstance instance) {
+        // WebAssembly structure dictates that a function's arguments are provided to the function
+        // as local variables, followed by any additional local variables that the function
+        // declares. A VirtualFrame contains a special array for the arguments, so we need to move
+        // the arguments to the array that holds the locals.
+        //
+        // The operand stack is also represented in the same long array.
+        //
+        // This combined array is kept inside a frame slot.
+        // The reason for this is that the operand stack cannot be passed
+        // as an argument to the loop-node's execute method,
+        // and must be restored at the beginning of the loop body.
+        moveArgumentsToLocals(frame);
+
+        // WebAssembly rules dictate that a function's locals must be initialized to zero before
+        // function invocation. For more information, check the specification:
+        // https://webassembly.github.io/spec/core/exec/instructions.html#function-calls
+        WasmFrame.initializeLocals(frame, paramCount(), codeEntry);
+
+        final int resultCount = resultCount();
+        CompilerAsserts.partialEvaluationConstant(resultCount);
+        if (resultCount > 1) {
+            WasmLanguage.get(this).multiValueStack().resize(resultCount);
+        }
+
+        try {
+            return functionNode.execute(frame, instance);
+        } catch (StackOverflowError e) {
+            enterErrorBranch();
+            throw WasmException.create(Failure.CALL_STACK_EXHAUSTED);
+        }
+    }
+
+    @ExplodeLoop
+    private void moveArgumentsToLocals(VirtualFrame frame) {
+        Object[] args = frame.getArguments();
+        int paramCount = paramCount();
+        assert WasmArguments.getArgumentCount(args) == paramCount : "Expected number of params " + paramCount + ", actual " + WasmArguments.getArgumentCount(args);
+        for (int i = 0; i != paramCount; ++i) {
+            final Object arg = WasmArguments.getArgument(args, i);
+            int type = localType(i);
+            switch (type) {
+                case WasmType.I32_TYPE -> pushInt(frame, i, (int) arg);
+                case WasmType.I64_TYPE -> pushLong(frame, i, (long) arg);
+                case WasmType.F32_TYPE -> pushFloat(frame, i, (float) arg);
+                case WasmType.F64_TYPE -> pushDouble(frame, i, (double) arg);
+                case WasmType.V128_TYPE -> pushVector128(frame, i, Vector128Ops.SINGLETON_IMPLEMENTATION.fromVector128((Vector128) arg));
+                default -> {
+                    assert WasmType.isReferenceType(type);
+                    pushReference(frame, i, arg);
+                }
+            }
+        }
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private DebugFunction debugFunction() {
+        if (module().hasDebugInfo()) {
+            int functionSourceLocation = module().functionSourceCodeStartOffset(codeEntry.functionIndex());
+            final EconomicMap<Integer, DebugFunction> debugFunctions = module().debugFunctions();
+            if (debugFunctions.containsKey(functionSourceLocation)) {
+                return debugFunctions.get(functionSourceLocation);
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public String getName() {
+        final DebugFunction function = debugFunction();
+        return function != null ? function.name() : codeEntry.function().name();
+    }
+
+    @Override
+    public String getQualifiedName() {
+        return codeEntry.function().moduleName() + "." + getName();
+    }
+
+    @Override
+    @CompilerDirectives.TruffleBoundary
+    protected boolean isInstrumentable() {
+        final DebugFunction debugFunction = debugFunction();
+        if (debugFunction == null) {
+            return false;
+        }
+        return debugFunction.filePath() != null;
+    }
+
+    @Override
+    protected void prepareForInstrumentation(Set<Class<?>> tags) {
+        if (sourceSection == null) {
+            final DebugFunction debugFunction = debugFunction();
+            if (debugFunction == null) {
+                sourceSection = module().source().createUnavailableSection();
+                return;
+            }
+            if (debugFunction.hasSourceSection()) {
+                sourceSection = debugFunction.getSourceSection();
+                return;
+            }
+            WasmContext context = getContextOrNull();
+            if (context != null && !context.getContextOptions().debugTestMode()) {
+                sourceSection = debugFunction.loadSourceSection(context.environment());
+            }
+            if (sourceSection == null) {
+                sourceSection = debugFunction.createSourceSection(context == null ? null : context.environment());
+            }
+        }
+    }
+
+    @Override
+    @CompilerDirectives.TruffleBoundary
+    public SourceSection getSourceSection() {
+        if (sourceSection == null) {
+            final DebugFunction debugFunction = debugFunction();
+            if (debugFunction == null) {
+                sourceSection = module().source().createUnavailableSection();
+                return sourceSection;
+            }
+            if (debugFunction.hasSourceSection()) {
+                sourceSection = debugFunction.getSourceSection();
+                return sourceSection;
+            }
+            WasmContext context = getContextOrNull();
+            sourceSection = debugFunction.createSourceSection(context == null ? null : context.environment());
+        }
+        return sourceSection;
+    }
+
+    public WasmFunctionRootNode[] getDirectCallTargets() {
+        return functionNode.getDirectCallTargets();
+    }
+
+    @Override
+    public boolean isInternal() {
+        return false;
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,31 +40,43 @@
  */
 package org.graalvm.wasm.test;
 
+import org.graalvm.wasm.test.gc.GCSuite;
 import org.graalvm.wasm.test.suites.WasmImplementationLimitationsSuite;
 import org.graalvm.wasm.test.suites.arithmetic.Float32Suite;
 import org.graalvm.wasm.test.suites.arithmetic.Float64Suite;
 import org.graalvm.wasm.test.suites.arithmetic.Integer32Suite;
 import org.graalvm.wasm.test.suites.arithmetic.Integer64Suite;
 import org.graalvm.wasm.test.suites.arithmetic.ReferenceTypeSuite;
+import org.graalvm.wasm.test.suites.arithmetic.WideArithmeticSuite;
+import org.graalvm.wasm.test.suites.bytecode.BranchHintSuite;
 import org.graalvm.wasm.test.suites.bytecode.BytecodeSuite;
 import org.graalvm.wasm.test.suites.bytecode.MultiInstantiationSuite;
+import org.graalvm.wasm.test.suites.bytecode.WasmBranchTargetSuite;
+import org.graalvm.wasm.test.suites.bytecode.WasmLegacyCatchOSRSuite;
+import org.graalvm.wasm.test.suites.bytecode.WasmOSRSuite;
+import org.graalvm.wasm.test.suites.compiler.CompilationSuite;
 import org.graalvm.wasm.test.suites.control.BlockWithLocalsSuite;
 import org.graalvm.wasm.test.suites.control.BranchBlockSuite;
+import org.graalvm.wasm.test.suites.control.ExceptionSuite;
 import org.graalvm.wasm.test.suites.control.IfThenElseSuite;
 import org.graalvm.wasm.test.suites.control.LoopBlockSuite;
 import org.graalvm.wasm.test.suites.control.MultiValueSuite;
 import org.graalvm.wasm.test.suites.control.MultipleFunctionsSuite;
 import org.graalvm.wasm.test.suites.control.SimpleBlockSuite;
+import org.graalvm.wasm.test.suites.control.TailCallSuite;
 import org.graalvm.wasm.test.suites.debugging.DebugObjectFactorySuite;
+import org.graalvm.wasm.test.suites.debugging.DebugSourceLoadSuite;
 import org.graalvm.wasm.test.suites.debugging.DebugValidationSuite;
 import org.graalvm.wasm.test.suites.linker.LinkerSuite;
 import org.graalvm.wasm.test.suites.memory.Memory64Suite;
+import org.graalvm.wasm.test.suites.memory.MemoryFillSuite;
 import org.graalvm.wasm.test.suites.memory.MemorySuite;
 import org.graalvm.wasm.test.suites.memory.MultiMemorySuite;
 import org.graalvm.wasm.test.suites.memory.ThreadsSuite;
-import org.graalvm.wasm.test.suites.validation.ReferenceTypesValidationSuite;
+import org.graalvm.wasm.test.suites.table.Table64Suite;
 import org.graalvm.wasm.test.suites.table.TableSuite;
 import org.graalvm.wasm.test.suites.validation.MultiValueValidationSuite;
+import org.graalvm.wasm.test.suites.validation.ReferenceTypesValidationSuite;
 import org.graalvm.wasm.test.suites.validation.ValidationSuite;
 import org.graalvm.wasm.test.suites.wasi.WasiSuite;
 import org.graalvm.wasm.test.suites.webassembly.EmscriptenSuite;
@@ -80,6 +92,7 @@ import org.junit.runners.Suite;
                 Float32Suite.class,
                 Float64Suite.class,
                 ReferenceTypeSuite.class,
+                WideArithmeticSuite.class,
                 SimpleBlockSuite.class,
                 BlockWithLocalsSuite.class,
                 BranchBlockSuite.class,
@@ -87,7 +100,9 @@ import org.junit.runners.Suite;
                 IfThenElseSuite.class,
                 MemorySuite.class,
                 Memory64Suite.class,
+                MemoryFillSuite.class,
                 TableSuite.class,
+                Table64Suite.class,
                 IssueSuite.class,
                 MultipleFunctionsSuite.class,
                 MultiValueSuite.class,
@@ -96,17 +111,29 @@ import org.junit.runners.Suite;
                 LinkerSuite.class,
                 WasmPolyglotTestSuite.class,
                 WasmJsApiSuite.class,
+                WasmStackTraceTest.class,
+                WasmIndirectCallTest.class,
+                WasmReturnCallTest.class,
+                GCSuite.class,
                 ValidationSuite.class,
                 MultiValueValidationSuite.class,
                 ReferenceTypesValidationSuite.class,
                 WasmLateLinkingSuite.class,
                 WasmImplementationLimitationsSuite.class,
+                BranchHintSuite.class,
                 BytecodeSuite.class,
                 MultiInstantiationSuite.class,
+                WasmBranchTargetSuite.class,
+                WasmLegacyCatchOSRSuite.class,
+                WasmOSRSuite.class,
+                CompilationSuite.class,
                 MultiMemorySuite.class,
                 ThreadsSuite.class,
+                ExceptionSuite.class,
                 DebugValidationSuite.class,
-                DebugObjectFactorySuite.class
+                DebugSourceLoadSuite.class,
+                DebugObjectFactorySuite.class,
+                TailCallSuite.class
 })
 
 public class WasmTestSuite {

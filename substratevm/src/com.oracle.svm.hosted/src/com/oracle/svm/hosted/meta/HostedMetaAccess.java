@@ -24,10 +24,11 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import static com.oracle.svm.core.config.ConfigurationValues.getObjectLayout;
+import static com.oracle.svm.shared.config.ObjectLayout.singleton;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -35,12 +36,14 @@ import java.util.stream.Stream;
 
 import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
 import com.oracle.svm.core.deopt.Deoptimizer;
 
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class HostedMetaAccess extends UniverseMetaAccess {
@@ -52,6 +55,11 @@ public class HostedMetaAccess extends UniverseMetaAccess {
     @Override
     public HostedType lookupJavaType(Class<?> clazz) {
         return (HostedType) super.lookupJavaType(clazz);
+    }
+
+    @Override
+    public ResolvedJavaRecordComponent lookupJavaRecordComponent(RecordComponent recordComponent) {
+        return wrapped.lookupJavaRecordComponent(recordComponent);
     }
 
     @Override
@@ -119,12 +127,12 @@ public class HostedMetaAccess extends UniverseMetaAccess {
 
     @Override
     public int getArrayBaseOffset(JavaKind elementKind) {
-        return getObjectLayout().getArrayBaseOffset(elementKind);
+        return ObjectLayoutCompilerSupport.getArrayBaseOffset(singleton(), elementKind);
     }
 
     @Override
     public int getArrayIndexScale(JavaKind elementKind) {
-        return getObjectLayout().getArrayIndexScale(elementKind);
+        return ObjectLayoutCompilerSupport.getArrayIndexScale(singleton(), elementKind);
     }
 
     @Override

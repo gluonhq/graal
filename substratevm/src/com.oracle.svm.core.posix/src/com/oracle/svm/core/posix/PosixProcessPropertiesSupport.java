@@ -37,11 +37,11 @@ import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.BaseProcessPropertiesSupport;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
-import com.oracle.svm.core.memory.UntrackedNullableNativeMemory;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.headers.LibC;
 import com.oracle.svm.core.posix.headers.Dlfcn;
 import com.oracle.svm.core.posix.headers.Signal;
 import com.oracle.svm.core.posix.headers.Stdlib;
@@ -96,20 +96,15 @@ public abstract class PosixProcessPropertiesSupport extends BaseProcessPropertie
         if (Dlfcn.dladdr(symbolAddress, info) == 0) {
             return null;
         }
-        CCharPointer realpath = Stdlib.realpath(info.dli_fname(), WordFactory.nullPointer());
+        CCharPointer realpath = Stdlib.realpath(info.dli_fname(), Word.nullPointer());
         if (realpath.isNull()) {
             return null;
         }
         try {
             return CTypeConversion.toJavaString(realpath);
         } finally {
-            UntrackedNullableNativeMemory.free(realpath);
+            LibC.free(realpath);
         }
-    }
-
-    @Override
-    public String setLocale(String category, String locale) {
-        return PosixUtils.setLocale(category, locale);
     }
 
     @Override
@@ -120,10 +115,9 @@ public abstract class PosixProcessPropertiesSupport extends BaseProcessPropertie
 
         try (CTypeConversion.CCharPointerHolder pathHolder = CTypeConversion.toCString(executable.toString());
                         CTypeConversion.CCharPointerPointerHolder argvHolder = CTypeConversion.toCStrings(args)) {
-            if (Unistd.execv(pathHolder.get(), argvHolder.get()) != 0) {
-                String msg = PosixUtils.lastErrorString("Executing " + executable + " with arguments " + String.join(" ", args) + " failed");
-                throw new RuntimeException(msg);
-            }
+            int errno = Unistd.execv(pathHolder.get(), argvHolder.get());
+            String errnoString = PosixUtils.strerror(errno);
+            throw new RuntimeException(String.format("Executing %s with arguments %s failed: %s", executable, String.join(" ", args), errnoString));
         }
     }
 
@@ -142,11 +136,10 @@ public abstract class PosixProcessPropertiesSupport extends BaseProcessPropertie
         try (CTypeConversion.CCharPointerHolder pathHolder = CTypeConversion.toCString(executable.toString());
                         CTypeConversion.CCharPointerPointerHolder argvHolder = CTypeConversion.toCStrings(args);
                         CTypeConversion.CCharPointerPointerHolder envpHolder = CTypeConversion.toCStrings(envArray)) {
-            if (Unistd.execve(pathHolder.get(), argvHolder.get(), envpHolder.get()) != 0) {
-                String envString = env.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.joining(" "));
-                String msg = PosixUtils.lastErrorString("Executing " + executable + " with arguments " + String.join(" ", args) + " and environment " + envString + " failed");
-                throw new RuntimeException(msg);
-            }
+            int errno = Unistd.execve(pathHolder.get(), argvHolder.get(), envpHolder.get());
+            String errnoString = PosixUtils.strerror(errno);
+            String envString = env.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.joining(" "));
+            throw new RuntimeException(String.format("Executing %s with arguments %s and environment %s failed: %s", executable, String.join(" ", args), envString, errnoString));
         }
     }
 
@@ -157,15 +150,17 @@ public abstract class PosixProcessPropertiesSupport extends BaseProcessPropertie
          * pointer to it, so I have to free it.
          */
         try (CCharPointerHolder pathHolder = CTypeConversion.toCString(path)) {
-            CCharPointer realpath = Stdlib.realpath(pathHolder.get(), WordFactory.nullPointer());
+            CCharPointer realpath = Stdlib.realpath(pathHolder.get(), Word.nullPointer());
             if (realpath.isNull()) {
                 /* Failure to find a real path. */
                 return null;
-            } else {
+            }
+
+            try {
                 /* Success */
-                String result = CTypeConversion.toJavaString(realpath);
-                UntrackedNullableNativeMemory.free(realpath);
-                return result;
+                return CTypeConversion.toJavaString(realpath);
+            } finally {
+                LibC.free(realpath);
             }
         }
     }

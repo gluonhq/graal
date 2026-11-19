@@ -22,30 +22,6 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-/*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the "Classpath" exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
 package com.oracle.svm.hosted.classinitialization;
 
 import java.util.List;
@@ -58,12 +34,15 @@ import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.heap.ImageHeapArray;
 import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapInstance;
+import com.oracle.graal.pointsto.heap.ImageHeapPrimitiveArray;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.phases.InlineBeforeAnalysisGraphDecoder;
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
-import com.oracle.svm.core.config.ObjectLayout;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.ameta.AnalysisConstantReflectionProvider;
 import com.oracle.svm.hosted.classinitialization.SimulateClassInitializerPolicy.SimulateClassInitializerInlineScope;
 import com.oracle.svm.hosted.fieldfolding.IsStaticFinalFieldInitializedNode;
@@ -94,6 +73,7 @@ import jdk.graal.compiler.nodes.virtual.VirtualInstanceNode;
 import jdk.graal.compiler.nodes.virtual.VirtualObjectNode;
 import jdk.graal.compiler.replacements.arraycopy.ArrayCopyNode;
 import jdk.graal.compiler.replacements.nodes.ObjectClone;
+import jdk.graal.compiler.vector.replacements.CopyOfNode;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -103,7 +83,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 /**
  * The graph decoder that performs the partial evaluation of a single class initializer and all
  * methods invoked by that class initializer.
- * 
+ *
  * See {@link SimulateClassInitializerSupport} for an overview of class initializer simulation.
  */
 public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGraphDecoder {
@@ -123,7 +103,7 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
     protected final EconomicMap<AnalysisField, Boolean> isStaticFinalFieldInitializedStates = EconomicMap.create();
 
     protected SimulateClassInitializerGraphDecoder(BigBang bb, SimulateClassInitializerPolicy policy, SimulateClassInitializerClusterMember clusterMember, StructuredGraph graph) {
-        super(bb, policy, graph, clusterMember.cluster.providers, unused -> LoopExplosionKind.FULL_UNROLL);
+        super(bb, policy, graph, clusterMember.cluster.providers, _ -> LoopExplosionKind.FULL_UNROLL);
 
         this.support = clusterMember.cluster.support;
         this.clusterMember = clusterMember;
@@ -214,6 +194,8 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
             node = handleStoreIndexedNode(storeIndexedNode);
         } else if (node instanceof LoadIndexedNode loadIndexedNode) {
             node = handleLoadIndexedNode(loadIndexedNode);
+        } else if (node instanceof CopyOfNode copyOfNode) {
+            node = handleCopyOfNode(countersScope, copyOfNode);
         } else if (node instanceof ArrayCopyNode arrayCopyNode) {
             node = handleArrayCopyNode(arrayCopyNode);
         } else if (node instanceof EnsureClassInitializedNode ensureClassInitializedNode) {
@@ -336,6 +318,45 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
         return node;
     }
 
+    /**
+     * Simulates {@link CopyOfNode} when the source array, offsets, and lengths are constants known
+     * during class initialization. The allocation counter is updated before creating the image heap
+     * array so the simulated allocation observes the same limits as normal array creation.
+     */
+    private ValueNode handleCopyOfNode(SimulateClassInitializerInlineScope countersScope, CopyOfNode node) {
+        AnalysisType newArrayType;
+        if (node.getElementKind() == JavaKind.Object) {
+            var constantType = node.getNewObjectArrayType().asConstant();
+            if (constantType == null) {
+                /* Object array copy where the new array element type is not a constant. */
+                return node;
+            }
+            newArrayType = (AnalysisType) providers.getConstantReflection().asJavaType(constantType);
+        } else {
+            /* For a primitive array copy, the array type is derived from the element kind. */
+            newArrayType = (AnalysisType) metaAccess.lookupJavaType(node.getElementKind().toJavaClass()).getArrayClass();
+        }
+
+        int from = asIntegerOrMinusOne(node.getFrom());
+        int sourceLength = asIntegerOrMinusOne(node.getSourceLength());
+        int newLength = asIntegerOrMinusOne(node.getNewLength());
+        if (from >= 0 && sourceLength >= 0 && accumulateNewArraySize(countersScope, newArrayType, newLength, node)) {
+            var newArray = createNewArray(newArrayType, newLength);
+            int readLength = Math.min(newLength, sourceLength - from);
+            if (handleArrayCopy(asActiveImageHeapArray(node.getSource()), from, newArray, 0, readLength)) {
+                return ConstantNode.forConstant(newArray, metaAccess);
+            }
+        }
+        return node;
+    }
+
+    /**
+     * Simulates {@link System#arraycopy(Object, int, Object, int, int)} for active image-heap
+     * arrays. The implementation first enforces the same bounds and assignability checks that the
+     * runtime copy would observe and then performs an element-wise copy through the
+     * {@link ImageHeapArray} abstraction. For overlapping self-copies it iterates backwards to
+     * preserve the original source values.
+     */
     protected boolean handleArrayCopy(ImageHeapArray source, int sourcePos, ImageHeapArray dest, int destPos, int length) {
         if (source == null || sourcePos < 0 || sourcePos >= source.getLength() ||
                         dest == null || destPos < 0 || destPos >= dest.getLength() ||
@@ -360,9 +381,17 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
             }
         }
 
-        /* All checks passed, we can now copy array elements. */
-        if (source == dest && sourcePos < destPos) {
-            /* Must copy backwards to avoid losing elements. */
+        /* All checks passed, so the copy matches arraycopy semantics for the active snapshot. */
+        if (sourceComponentType.getJavaKind().isPrimitive()) {
+            /*
+             * Primitive arrays are already backed by guest-side storage, so we can delegate the
+             * copy to GuestAccess and preserve the normal arraycopy overlap semantics.
+             */
+            var sourceArray = ((ImageHeapPrimitiveArray) source).getArray();
+            var destArray = ((ImageHeapPrimitiveArray) dest).getArray();
+            GuestAccess.get().copyArray(sourceArray, sourcePos, destArray, destPos, length);
+        } else if (source.equals(dest) && sourcePos < destPos) {
+            /* Copy backwards for overlapping self-copies to preserve unread source elements. */
             for (int i = length - 1; i >= 0; i--) {
                 dest.setElement(destPos + i, (JavaConstant) source.getElement(sourcePos + i));
             }
@@ -376,13 +405,23 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
 
     private Node handleEnsureClassInitializedNode(EnsureClassInitializedNode node) {
         var aConstantReflection = (AnalysisConstantReflectionProvider) providers.getConstantReflection();
-        var classInitType = (AnalysisType) node.constantTypeOrNull(aConstantReflection);
-        if (classInitType != null) {
-            if (support.trySimulateClassInitializer(graph.getDebug(), classInitType, clusterMember) && !aConstantReflection.initializationCheckRequired(classInitType)) {
+        var initializationTargetType = (AnalysisType) node.constantTypeOrNull(aConstantReflection);
+        if (initializationTargetType != null) {
+            boolean requiresInitializationCheck = aConstantReflection.initializationCheckRequired(initializationTargetType);
+            if (requiresInitializationCheck) {
+                /*
+                 * A required initialization check means that the initializer currently being decoded
+                 * cannot be simulated. The EnsureClassInitializedNode must remain in the graph and
+                 * execute at run time. For a type-reached check, executing the node marks the
+                 * target's DynamicHub as reached and makes conditional metadata available.
+                 */
+                return node;
+            }
+            if (support.trySimulateClassInitializer(graph.getDebug(), initializationTargetType, clusterMember)) {
                 /* Class is already simulated initialized, no need for a run-time check. */
                 return null;
             }
-            var classInitTypeMember = clusterMember.cluster.clusterMembers.get(classInitType);
+            var classInitTypeMember = clusterMember.cluster.clusterMembers.get(initializationTargetType);
             if (classInitTypeMember != null && !classInitTypeMember.status.published) {
                 /*
                  * The class is part of the same cycle as our class. We optimistically remove the
@@ -421,7 +460,7 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
             /*
              * Objects allocated within the class initializer are similar to escape analyzed
              * objects, so we can eliminate such synchronization.
-             * 
+             *
              * Note that we cannot eliminate all synchronization in general: an object that was
              * present before class initialization started could be permanently locked by another
              * thread, in which case the class initializer must never complete. We cannot detect
@@ -466,9 +505,18 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
 
     protected ImageHeapArray createNewArray(AnalysisType arrayType, int length) {
         var array = ImageHeapArray.create(arrayType, length);
-        var defaultValue = JavaConstant.defaultForKind(arrayType.getComponentType().getStorageKind());
-        for (int i = 0; i < length; i++) {
-            array.setElement(i, defaultValue);
+        if (arrayType.getComponentType().getJavaKind() == JavaKind.Object) {
+            /*
+             * ImageHeapObjectArray stores builder-side references. Empty slots must therefore be
+             * materialized as NULL_POINTER, not host null, so later load-indexed simulation still
+             * sees a JavaConstant.
+             *
+             * Primitive arrays keep their language-default zero/false values in guest-side backing
+             * storage and do not need an explicit fill here.
+             */
+            for (int i = 0; i < length; i++) {
+                array.setElement(i, JavaConstant.NULL_POINTER);
+            }
         }
         currentActiveObjects.add(array);
         return array;
@@ -679,7 +727,7 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
         var objectLayout = ImageSingletons.lookup(ObjectLayout.class);
         long allocationSize = objectLayout.getFirstFieldOffset();
         for (var field : type.getInstanceFields(true)) {
-            allocationSize += objectLayout.sizeInBytes(((AnalysisField) field).getStorageKind());
+            allocationSize += ObjectLayoutCompilerSupport.sizeInBytes(objectLayout, ((AnalysisField) field).getStorageKind());
         }
         return accumulatedNewObjectSize(countersScope, allocationSize, reason);
     }
@@ -689,7 +737,7 @@ public class SimulateClassInitializerGraphDecoder extends InlineBeforeAnalysisGr
             return false;
         }
         var objectLayout = ImageSingletons.lookup(ObjectLayout.class);
-        long allocationSize = objectLayout.getArraySize(arrayType.getComponentType().getStorageKind(), (int) length, true);
+        long allocationSize = ObjectLayoutCompilerSupport.getArraySize(objectLayout, arrayType.getComponentType().getStorageKind(), (int) length, true);
         return accumulatedNewObjectSize(countersScope, allocationSize, reason);
     }
 

@@ -24,8 +24,6 @@
  */
 package org.graalvm.profdiff.command;
 
-import org.graalvm.profdiff.core.inlining.InliningTreeNode;
-
 import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.Deleted;
 import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.Devirtualized;
 import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.Direct;
@@ -33,8 +31,9 @@ import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.I
 import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.Inlined;
 import static org.graalvm.profdiff.core.inlining.InliningTreeNode.CallsiteKind.Root;
 
-import org.graalvm.profdiff.diff.EditScript;
 import org.graalvm.profdiff.core.Writer;
+import org.graalvm.profdiff.core.inlining.InliningTreeNode;
+import org.graalvm.profdiff.diff.EditScript;
 
 /**
  * Writes an explanation of the output. Explains only what is printed, i.e., the output depends on
@@ -57,6 +56,11 @@ public class ExplanationWriter {
     private final boolean onlyHotMethods;
 
     /**
+     * {@code true} if compilations are paired by compilation ID rather than by hotness.
+     */
+    private final boolean compilationIdPairing;
+
+    /**
      * Constructs an explanation writer.
      *
      * @param writer the destination writer
@@ -64,9 +68,22 @@ public class ExplanationWriter {
      * @param onlyHotMethods only hot methods are displayed
      */
     public ExplanationWriter(Writer writer, boolean singleExperiment, boolean onlyHotMethods) {
+        this(writer, singleExperiment, onlyHotMethods, false);
+    }
+
+    /**
+     * Constructs an explanation writer.
+     *
+     * @param writer the destination writer
+     * @param singleExperiment the output consists of only one experiment
+     * @param onlyHotMethods only hot methods are displayed
+     * @param compilationIdPairing compilations are paired by compilation ID
+     */
+    public ExplanationWriter(Writer writer, boolean singleExperiment, boolean onlyHotMethods, boolean compilationIdPairing) {
         this.writer = writer;
         this.singleExperiment = singleExperiment;
         this.onlyHotMethods = onlyHotMethods;
+        this.compilationIdPairing = compilationIdPairing;
     }
 
     /**
@@ -82,7 +99,7 @@ public class ExplanationWriter {
             writer.writeln("each compiled method is printed in a separate section below");
         }
         if (!singleExperiment && writer.getOptionValues().shouldDiffCompilations()) {
-            writer.writeln("hot compilations are paired by their fraction of execution");
+            writer.writeln(compilationIdPairing ? "compilations are paired only when they have the same compilation ID" : "hot compilations are paired by their fraction of execution");
         }
         if (writer.getOptionValues().shouldCreateFragments()) {
             writer.writeln("a compilation refers to either a compilation unit or a compilation fragment");

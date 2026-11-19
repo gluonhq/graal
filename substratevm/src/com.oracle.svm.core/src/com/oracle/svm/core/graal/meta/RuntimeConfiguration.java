@@ -32,23 +32,25 @@ import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.graal.code.SubstrateBackend;
 import com.oracle.svm.core.graal.meta.SubstrateRegisterConfig.ConfigKind;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
 
-import jdk.graal.compiler.debug.DebugHandlersFactory;
+import jdk.graal.compiler.debug.DebugDumpHandlersFactory;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
- * Configuration used by Graal at runtime to compile and install code in the same runtime.
+ * Configuration used by Graal at runtime to compile and install code in the same runtime. A
+ * {@code RuntimeConfiguration} is also used at build-time to carry the configuration of the AOT
+ * compiler.
  */
 public final class RuntimeConfiguration {
 
     private final Providers providers;
     private final EnumMap<ConfigKind, SubstrateBackend> backends;
-    private final Iterable<DebugHandlersFactory> debugHandlersFactories;
+    private final Iterable<DebugDumpHandlersFactory> debugHandlersFactories;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public RuntimeConfiguration(Providers providers, EnumMap<ConfigKind, SubstrateBackend> backends, Iterable<DebugHandlersFactory> debugHandlersFactories) {
+    public RuntimeConfiguration(Providers providers, EnumMap<ConfigKind, SubstrateBackend> backends, Iterable<DebugDumpHandlersFactory> debugHandlersFactories) {
         this.providers = providers;
         this.backends = backends;
         this.debugHandlersFactories = debugHandlersFactories;
@@ -58,7 +60,7 @@ public final class RuntimeConfiguration {
         }
     }
 
-    public Iterable<DebugHandlersFactory> getDebugHandlersFactories() {
+    public Iterable<DebugDumpHandlersFactory> getDebugHandlersFactories() {
         return debugHandlersFactories;
     }
 

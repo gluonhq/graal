@@ -31,32 +31,48 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
-import com.oracle.graal.pointsto.util.GraalAccess;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.graal.pointsto.heap.TypedConstant;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.svm.core.fieldvaluetransformer.JavaConstantWrapper;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.hosted.ameta.ReadableJavaField;
-import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIFieldValueTransformer;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.OriginalClassProvider;
+import com.oracle.svm.util.OriginalFieldProvider;
 
 import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
+/**
+ * Internal representation of a field value transformation. Values returned by
+ * {@link JVMCIFieldValueTransformer#transform} are cached by {@link #readValue} for each receiver;
+ * all reads of a static field share one cache entry. Transformation computations for a field are
+ * serialized so that a transformer executes at most once for each receiver. Once a value is cached,
+ * later changes to the original hosted field are not observed through this transformation.
+ */
 public class FieldValueTransformation {
-    protected final FieldValueTransformer fieldValueTransformer;
-    protected final Class<?> transformedValueAllowedType;
+    protected final JVMCIFieldValueTransformer fieldValueTransformer;
+    protected final ResolvedJavaType transformedValueAllowedType;
 
     private final EconomicMap<JavaConstant, JavaConstant> valueCache = EconomicMap.create();
     private final ReentrantReadWriteLock valueCacheLock = new ReentrantReadWriteLock();
 
-    public FieldValueTransformation(Class<?> transformedValueAllowedType, FieldValueTransformer fieldValueTransformer) {
+    public FieldValueTransformation(ResolvedJavaType transformedValueAllowedType, JVMCIFieldValueTransformer fieldValueTransformer) {
         this.fieldValueTransformer = fieldValueTransformer;
         this.transformedValueAllowedType = transformedValueAllowedType;
     }
 
-    public FieldValueTransformer getFieldValueTransformer() {
+    public JVMCIFieldValueTransformer getFieldValueTransformer() {
         return fieldValueTransformer;
     }
 
-    public JavaConstant readValue(ClassInitializationSupport classInitializationSupport, ResolvedJavaField field, JavaConstant receiver) {
+    public JavaConstant readValue(AnalysisField field, JavaConstant receiver) {
         ReadLock readLock = valueCacheLock.readLock();
         try {
             readLock.lock();
@@ -81,9 +97,9 @@ public class FieldValueTransformation {
             }
             /*
              * Note that the value computation must be inside the lock, because we want to guarantee
-             * that field-value computers are only executed once per unique receiver.
+             * that field-value transformers are only executed once per unique receiver.
              */
-            result = computeValue(classInitializationSupport, field, receiver);
+            result = computeValue(field, receiver);
             putCached(receiver, result);
             return result;
         } finally {
@@ -91,20 +107,24 @@ public class FieldValueTransformation {
         }
     }
 
-    protected JavaConstant computeValue(ClassInitializationSupport classInitializationSupport, ResolvedJavaField field, JavaConstant receiver) {
-        Object receiverValue = receiver == null ? null : GraalAccess.getOriginalSnippetReflection().asObject(Object.class, receiver);
-        Object originalValue = fetchOriginalValue(classInitializationSupport, field, receiver);
-        Object newValue = fieldValueTransformer.transform(receiverValue, originalValue);
-        checkValue(newValue, field);
-        JavaConstant result = GraalAccess.getOriginalSnippetReflection().forBoxed(field.getJavaKind(), newValue);
+    private JavaConstant computeValue(AnalysisField field, JavaConstant receiver) {
+        var originalValue = fetchOriginalValue(field, receiver);
 
-        assert result.getJavaKind() == field.getJavaKind();
+        VMError.guarantee(originalValue != null, "Original value must not be `null`. Use `JavaConstant.NULL_POINTER`instead");
+        VMError.guarantee(receiver == null || !receiver.isNull(), "Receiver should not be a boxed `null` (`JavaConstant.isNull()`) for static fields. Use `null`instead");
+        JavaConstant result = getUnboxedConstant(fieldValueTransformer.transform(receiver, originalValue));
+        checkValue(result, field);
+
+        assert result.getJavaKind() == field.getJavaKind() : result.getJavaKind() + " vs " + field.getJavaKind();
         return result;
     }
 
-    private void checkValue(Object newValue, ResolvedJavaField field) {
-        boolean primitive = transformedValueAllowedType.isPrimitive();
+    private void checkValue(JavaConstant newValue, AnalysisField field) {
         if (newValue == null) {
+            throw UserError.abort("JVMCIFieldValueTransformer must not return `null`. Use `JavaConstant.NULL_POINTER`instead");
+        }
+        boolean primitive = transformedValueAllowedType.isPrimitive();
+        if (newValue.isNull()) {
             if (primitive) {
                 throw UserError.abort("Field value transformer returned null for primitive %s", field.format("%H.%n"));
             } else {
@@ -116,26 +136,66 @@ public class FieldValueTransformation {
          * The compute/transform methods autobox primitive values. We unbox them here, but only if
          * the original field is primitive.
          */
-        Class<?> actualType = primitive ? SubstrateUtil.toUnboxedClass(newValue.getClass()) : newValue.getClass();
+        ResolvedJavaType actualType = getActualType(newValue);
+        VMError.guarantee(actualType != null);
+        if (actualType.equals(GuestAccess.get().lookupType(JavaConstantWrapper.class))) {
+            throw UserError.abort("Field value transformer %s returned %s value instead of returning the JavaConstant directly.",
+                            fieldValueTransformer.getClass().getName(), JavaConstantWrapper.class.getSimpleName(), JVMCIReflectionUtil.getTypeName(transformedValueAllowedType), field.format("%H.%n"));
+        }
         if (!transformedValueAllowedType.isAssignableFrom(actualType)) {
             throw UserError.abort("Field value transformer returned value of type `%s` that is not assignable to declared type `%s` of %s",
-                            actualType.getTypeName(), transformedValueAllowedType.getTypeName(), field.format("%H.%n"));
+                            JVMCIReflectionUtil.getTypeName(actualType), JVMCIReflectionUtil.getTypeName(transformedValueAllowedType), field.format("%H.%n"));
         }
     }
 
-    protected Object fetchOriginalValue(ClassInitializationSupport classInitializationSupport, ResolvedJavaField field, JavaConstant receiver) {
-        JavaConstant originalValueConstant = ReadableJavaField.readFieldValue(classInitializationSupport, field, receiver);
+    /**
+     * Gets the {@linkplain OriginalClassProvider#getOriginalType(JavaType) original} type of a
+     * constant.
+     */
+    private static ResolvedJavaType getActualType(JavaConstant newValue) {
+        GuestAccess access = GuestAccess.get();
+        if (newValue.getJavaKind().isPrimitive()) {
+            VMError.guarantee(newValue.getJavaKind().isPrimitive());
+            return access.lookupType(newValue.getJavaKind().toJavaClass());
+        }
+        if (newValue instanceof TypedConstant typedConstant) {
+            return OriginalClassProvider.getOriginalType(typedConstant.getType());
+        }
+        return access.getProviders().getMetaAccess().lookupJavaType(newValue);
+    }
+
+    private JavaConstant getUnboxedConstant(JavaConstant newValue) {
+        if (transformedValueAllowedType.isPrimitive() && !newValue.getJavaKind().isPrimitive()) {
+            if (fieldValueTransformer instanceof FieldValueTransformer || fieldValueTransformer instanceof FieldValueInterceptionSupport.WrappedFieldValueTransformer) {
+                /* Legacy transformer that needs to return boxed values. Try to unbox. */
+                JavaConstant unboxed = GuestAccess.get().getProviders().getConstantReflection().unboxPrimitive(newValue);
+                if (unboxed != null) {
+                    return unboxed;
+                }
+            }
+            throw VMError.shouldNotReachHere("Type %s is primitive but new value not %s (transformer: %s)",
+                            JVMCIReflectionUtil.getTypeName(transformedValueAllowedType),
+                            JVMCIReflectionUtil.getTypeName(GuestAccess.get().getProviders().getMetaAccess().lookupJavaType(newValue)),
+                            ClassUtil.getUnqualifiedName(fieldValueTransformer.getClass()));
+        }
+        return newValue;
+    }
+
+    protected JavaConstant fetchOriginalValue(AnalysisField aField, JavaConstant receiver) {
+        ResolvedJavaField oField = OriginalFieldProvider.getOriginalField(aField);
+        if (oField == null) {
+            return JavaConstant.NULL_POINTER;
+        }
+        JavaConstant originalValueConstant = GuestAccess.get().getProviders().getConstantReflection().readFieldValue(oField, receiver);
         if (originalValueConstant == null) {
             /*
              * The class is still uninitialized, so static fields cannot be read. Or it is an
              * instance field in a substitution class, i.e., a field that does not exist in the
              * hosted object.
              */
-            return null;
-        } else if (originalValueConstant.getJavaKind().isPrimitive()) {
-            return originalValueConstant.asBoxedPrimitive();
+            return JavaConstant.NULL_POINTER;
         } else {
-            return GraalAccess.getOriginalSnippetReflection().asObject(Object.class, originalValueConstant);
+            return originalValueConstant;
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,9 +24,13 @@
  */
 package jdk.graal.compiler.core.test;
 
-import jdk.graal.compiler.printer.CanonicalStringGraphPrinter;
 import org.junit.Test;
 
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.StructuredGraph.AllowAssumptions;
+import jdk.graal.compiler.phases.util.GraphSignature;
+import jdk.graal.compiler.printer.CanonicalStringGraphPrinter;
 import jdk.vm.ci.meta.JavaConstant;
 
 /**
@@ -51,5 +55,27 @@ public class GraphPrinterTest extends GraalCompilerTest {
         lastArray[0] = topArray;
         JavaConstant constant = getSnippetReflection().forObject(topArray);
         printer.format(constant);
+    }
+
+    public static int snippet(int value) {
+        return value + 1;
+    }
+
+    @Test
+    public void testCanonicalGraphPrintingDoesNotDeleteUnusedNodes() {
+        StructuredGraph graph = parseEager("snippet", AllowAssumptions.YES);
+        ConstantNode unused = graph.addWithoutUnique(ConstantNode.forInt(42));
+        assertTrue(unused.isAlive());
+        CanonicalStringGraphPrinter.getCanonicalGraphString(graph, false, false);
+        assertTrue(unused.isAlive());
+    }
+
+    @Test
+    public void testGraphSignatureDoesNotDeleteUnusedNodes() {
+        StructuredGraph graph = parseEager("snippet", AllowAssumptions.YES);
+        ConstantNode unused = graph.addWithoutUnique(ConstantNode.forInt(42));
+        assertTrue(unused.isAlive());
+        assertTrue(new GraphSignature(graph).getSignatureString() != null);
+        assertTrue(unused.isAlive());
     }
 }

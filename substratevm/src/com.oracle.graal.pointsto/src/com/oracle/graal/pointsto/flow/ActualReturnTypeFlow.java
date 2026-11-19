@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,7 +37,7 @@ public class ActualReturnTypeFlow extends TypeFlow<BytecodePosition> {
     }
 
     public ActualReturnTypeFlow(BytecodePosition source, AnalysisType declaredType) {
-        super(source, filterUncheckedInterface(declaredType));
+        super(source, dropUncheckedInterfaceBound(declaredType));
     }
 
     public ActualReturnTypeFlow(ActualReturnTypeFlow original, MethodFlowsGraph methodFlows) {
@@ -53,7 +53,7 @@ public class ActualReturnTypeFlow extends TypeFlow<BytecodePosition> {
 
     @Override
     public String toString() {
-        return "ActualReturn<" + getState() + '>';
+        return "ActualReturn<" + getStateDescription() + '>';
     }
 
     public void setInvokeFlow(InvokeTypeFlow invokeFlow) {
@@ -68,7 +68,7 @@ public class ActualReturnTypeFlow extends TypeFlow<BytecodePosition> {
     public String format(boolean withState, boolean withSource) {
         return "Actual return of call to " + invokeFlow.targetMethod.format("%H.%n(%p)") +
                         (withSource ? " at " + formatSource() : "") +
-                        (withState ? " with state <" + getState() + ">" : "");
+                        (withState ? " with state <" + getStateDescription() + ">" : "");
     }
 
 }

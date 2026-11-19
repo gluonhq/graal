@@ -30,16 +30,16 @@ import org.graalvm.nativeimage.c.function.CEntryPoint.Publish;
 import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.function.CEntryPointActions;
-import com.oracle.svm.core.c.function.CEntryPointErrors;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
-import com.oracle.svm.core.c.function.CEntryPointOptions.ReturnNullPointer;
-import com.oracle.svm.core.c.function.CEntryPointSetup.LeaveDetachThreadEpilogue;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions.ReturnNullPointer;
+import com.oracle.svm.guest.staging.c.function.CEntryPointSetup.LeaveDetachThreadEpilogue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
 import com.oracle.svm.truffle.nfi.NativeAPI.AttachCurrentThreadFunction;
 import com.oracle.svm.truffle.nfi.NativeAPI.DetachCurrentThreadFunction;
 import com.oracle.svm.truffle.nfi.NativeAPI.ExceptionCheckFunction;
@@ -155,7 +155,7 @@ final class NativeAPIImpl {
     static NativeTruffleEnv getTruffleEnv(NativeTruffleContext context) {
         TruffleNFISupport support = ImageSingletons.lookup(TruffleNFISupport.class);
         Target_com_oracle_truffle_nfi_backend_libffi_LibFFIContext ctx = support.resolveContextHandle(context.contextHandle());
-        return WordFactory.pointer(ctx.getNativeEnv());
+        return Word.pointer(ctx.getNativeEnv());
     }
 
     static class GetTruffleEnvPrologue implements CEntryPointOptions.Prologue {
@@ -171,16 +171,16 @@ final class NativeAPIImpl {
         TruffleNFISupport support = ImageSingletons.lookup(TruffleNFISupport.class);
         Target_com_oracle_truffle_nfi_backend_libffi_LibFFIContext ctx = support.resolveContextHandle(context.contextHandle());
         if (ctx.attachThread()) {
-            return WordFactory.pointer(ctx.getNativeEnv());
+            return Word.pointer(ctx.getNativeEnv());
         } else {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
     }
 
     static class AttachCurrentThreadPrologue implements CEntryPointOptions.Prologue {
         @Uninterruptible(reason = "prologue")
         static int enter(NativeTruffleContext context) {
-            return CEntryPointActions.enterAttachThread(context.isolate(), false, true);
+            return CEntryPointActions.enterAttachThread(context.isolate(), true);
         }
     }
 

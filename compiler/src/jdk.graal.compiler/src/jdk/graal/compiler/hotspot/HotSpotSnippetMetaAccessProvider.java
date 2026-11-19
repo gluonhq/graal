@@ -24,11 +24,13 @@
  */
 package jdk.graal.compiler.hotspot;
 
-import static jdk.vm.ci.services.Services.IS_IN_NATIVE_IMAGE;
+import static jdk.graal.compiler.core.common.NativeImageSupport.inRuntimeCode;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
 
+import jdk.graal.compiler.debug.GraalError;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.JavaConstant;
@@ -36,6 +38,7 @@ import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 import jdk.vm.ci.meta.SpeculationLog;
@@ -49,7 +52,7 @@ public class HotSpotSnippetMetaAccessProvider implements MetaAccessProvider {
 
     @Override
     public ResolvedJavaType lookupJavaType(Class<?> clazz) {
-        if (IS_IN_NATIVE_IMAGE) {
+        if (inRuntimeCode()) {
             ResolvedJavaType type = HotSpotReplacementsImpl.getEncodedSnippets().lookupSnippetType(clazz);
             if (type != null) {
                 return type;
@@ -70,12 +73,21 @@ public class HotSpotSnippetMetaAccessProvider implements MetaAccessProvider {
 
     @Override
     public ResolvedJavaType lookupJavaType(JavaConstant constant) {
-        if (constant instanceof SnippetObjectConstant) {
-            SnippetObjectConstant objectConstant = (SnippetObjectConstant) constant;
+        if (constant instanceof SnippetObjectConstant objectConstant) {
             Class<?> clazz = objectConstant.asObject(Object.class).getClass();
-            return lookupJavaType(clazz);
+            if (HotSpotReplacementsImpl.isGraalClass(clazz)) {
+                ResolvedJavaType type = HotSpotReplacementsImpl.getEncodedSnippets().lookupSnippetType(clazz);
+                GraalError.guarantee(type != null, "Type of compiler object %s missing from encoded snippet types: %s", constant, clazz.getName());
+                return type;
+            }
+            return delegate.lookupJavaType(clazz);
         }
         return delegate.lookupJavaType(constant);
+    }
+
+    @Override
+    public ResolvedJavaRecordComponent lookupJavaRecordComponent(RecordComponent recordComponent) {
+        return delegate.lookupJavaRecordComponent(recordComponent);
     }
 
     @Override

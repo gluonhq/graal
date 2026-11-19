@@ -28,50 +28,66 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
-import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.spi.CoreProviders;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+
+import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.vmaccess.VMAccess;
 import jdk.vm.ci.meta.JavaConstant;
 
+/**
+ * Temporary implementation of {@link JVMCIFieldValueTransformerWithAvailability}, that falls back
+ * to {@link FieldValueTransformer}. Usages should be migrated to
+ * {@link JVMCIFieldValueTransformerWithAvailability} (GR-72015).
+ */
 @Platforms(Platform.HOSTED_ONLY.class)
-public interface FieldValueTransformerWithAvailability extends FieldValueTransformer {
+public interface FieldValueTransformerWithAvailability extends FieldValueTransformer, JVMCIFieldValueTransformerWithAvailability {
 
     /**
-     * Controls when the transformed value is available at image build time.
+     * Returns true when the value for this custom computation is available.
      */
-    enum ValueAvailability {
-        /**
-         * The value is available without time constraints, i.e., it is independent of static
-         * analysis or compilation.
-         */
-        BeforeAnalysis,
+    @Override
+    boolean isAvailable();
 
-        /**
-         * The value depends on data computed by the static analysis and is therefore not yet
-         * available to the static analysis. The value still might be constant folded during
-         * compilation.
-         */
-        AfterAnalysis,
+    @Override
+    Object transform(Object receiver, Object originalValue);
 
-        /**
-         * Value depends on data computed during compilation and is therefore available only when
-         * writing out the image heap into the native image. Such a value is never available for
-         * constant folding.
-         */
-        AfterCompilation
+    @Override
+    default JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
+        return transformAndConvert(this, receiver, originalValue);
     }
 
     /**
-     * Returns information about when the value for this custom computation is available.
+     * Transform a field value using a {@linkplain FieldValueTransformer core reflection based field
+     * value transformer}. The {@link JavaConstant} inputs are unwrapped, the returned
+     * {@link Object} is wrapped. This is only a temporary helper. Eventually, core reflection based
+     * field value transformers will be executed via {@link VMAccess}.
      */
-    ValueAvailability valueAvailability();
-
-    /**
-     * Optionally provide a Graal IR node to intrinsify the field access before the static analysis.
-     * This allows the compiler to optimize field values that are not available yet, as long as
-     * there is a dedicated high-level node available.
-     */
-    @SuppressWarnings("unused")
-    default ValueNode intrinsify(CoreProviders providers, JavaConstant receiver) {
-        return null;
+    static JavaConstant transformAndConvert(FieldValueTransformer fieldValueTransformer, JavaConstant receiver, JavaConstant originalValue) {
+        SnippetReflectionProvider originalSnippetReflection = GuestAccess.get().getSnippetReflection();
+        VMError.guarantee(originalValue != null, "Original value should not be `null`. Use `JavaConstant.NULL_POINTER`.");
+        VMError.guarantee(receiver == null || !receiver.isNull(), "Receiver should not be a boxed `null` (`JavaConstant.isNull()`) for static fields. Use `null`instead");
+        Object reflectionReceiver = toObject(receiver);
+        Object reflectionOriginalValue = toObject(originalValue);
+        Object newObject = fieldValueTransformer.transform(reflectionReceiver, reflectionOriginalValue);
+        if (newObject == null) {
+            return JavaConstant.NULL_POINTER;
+        }
+        if (newObject instanceof JavaConstantWrapper constantWrapper) {
+            return constantWrapper.constant();
+        }
+        return originalSnippetReflection.forObject(newObject);
     }
+
+    private static Object toObject(JavaConstant javaConstant) {
+        if (javaConstant == null || javaConstant.isNull()) {
+            return null;
+        }
+        if (javaConstant.getJavaKind().isObject()) {
+            SnippetReflectionProvider originalSnippetReflection = GuestAccess.get().getSnippetReflection();
+            return originalSnippetReflection.asObject(Object.class, javaConstant);
+        }
+        return javaConstant.asBoxedPrimitive();
+    }
+
 }

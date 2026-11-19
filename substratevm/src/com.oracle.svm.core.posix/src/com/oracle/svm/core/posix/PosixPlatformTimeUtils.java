@@ -26,20 +26,28 @@ package com.oracle.svm.core.posix;
 
 import org.graalvm.nativeimage.StackValue;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.posix.headers.Time;
-import com.oracle.svm.core.util.BasedOnJDKFile;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 import com.oracle.svm.core.util.PlatformTimeUtils;
 
 @AutomaticallyRegisteredImageSingleton(PlatformTimeUtils.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class PosixPlatformTimeUtils extends PlatformTimeUtils {
 
     @Override
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+3/src/hotspot/os/posix/os_posix.cpp#L1409-L1415")
-    protected SecondsNanos javaTimeSystemUTC() {
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+3/src/hotspot/os/posix/os_posix.cpp#L1409-L1415")
+    @Uninterruptible(reason = "Must not migrate platform threads when executing on a virtual thread.")
+    protected void javaTimeSystemUTC0(SecondsNanosBuffer result) {
         Time.timespec ts = StackValue.get(Time.timespec.class);
         int status = PosixUtils.clock_gettime(Time.CLOCK_REALTIME(), ts);
         PosixUtils.checkStatusIs0(status, "javaTimeSystemUTC: clock_gettime(CLOCK_REALTIME) failed.");
-        return new SecondsNanos(ts.tv_sec(), ts.tv_nsec());
+        result.setSeconds(ts.tv_sec());
+        result.setNanos(ts.tv_nsec());
     }
 }

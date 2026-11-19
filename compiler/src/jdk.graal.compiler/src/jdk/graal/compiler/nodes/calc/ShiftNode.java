@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,13 +27,10 @@ package jdk.graal.compiler.nodes.calc;
 import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_1;
 import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_1;
 
-import java.util.Set;
-
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable.ShiftOp;
 import jdk.graal.compiler.core.common.type.IntegerStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
-import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
@@ -43,9 +40,9 @@ import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.ArithmeticLIRLowerable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
+import jdk.graal.compiler.util.CollectionsUtil;
 import jdk.vm.ci.code.CodeUtil;
-import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.Constant;
 
 /**
  * The {@code ShiftOp} class represents shift operations.
@@ -62,8 +59,7 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
      * @param s the second input value
      */
     protected ShiftNode(NodeClass<? extends ShiftNode<OP>> c, ShiftOp<OP> opForStampComputation, ValueNode x, ValueNode s) {
-        super(c, opForStampComputation.foldStamp(x.stamp(NodeView.DEFAULT), (IntegerStamp) s.stamp(NodeView.DEFAULT)), x, s);
-        assert ((IntegerStamp) s.stamp(NodeView.DEFAULT)).getBits() == 32 : Assertions.errorMessageContext("x", x, "s", s);
+        super(c, opForStampComputation.foldStamp(x.stamp(NodeView.DEFAULT), s.stamp(NodeView.DEFAULT)), x, s);
     }
 
     protected abstract ShiftOp<OP> getOp(ArithmeticOpTable table);
@@ -79,7 +75,7 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
 
     @Override
     public Stamp foldStamp(Stamp stampX, Stamp stampY) {
-        return getArithmeticOp().foldStamp(stampX, (IntegerStamp) stampY);
+        return getArithmeticOp().foldStamp(stampX, stampY);
     }
 
     @Override
@@ -92,12 +88,25 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
         return this;
     }
 
-    @SuppressWarnings("unused")
+    /**
+     * Canonicalizes a shift whose operands are constants or where distributing the shift over a
+     * conditional allows at least one of its values to fold.
+     *
+     * <pre>{@code
+     * (condition ? 4 : value) << 1  ->  condition ? 8 : value << 1
+     * 8 << (condition ? 1 : value)  ->  condition ? 16 : 8 << value
+     * }</pre>
+     *
+     * @return the canonical value, or {@code null} when no canonicalization applies
+     */
     public static <OP> ValueNode canonical(ShiftOp<OP> op, Stamp stamp, ValueNode forX, ValueNode forY, NodeView view) {
         if (forX.isConstant() && forY.isConstant()) {
-            JavaConstant amount = forY.asJavaConstant();
-            assert amount.getJavaKind() == JavaKind.Int : Assertions.errorMessage(op, stamp, forX, forY, amount);
-            return ConstantNode.forPrimitive(stamp, op.foldConstant(forX.asConstant(), amount.asInt()));
+            Constant amount = forY.asConstant();
+            return ConstantNode.forPrimitive(stamp, op.foldConstant(forX.asConstant(), amount));
+        } else if (stamp instanceof IntegerStamp) {
+            return foldConditional(forX, forY, view,
+                            (x, y) -> ConstantNode.forPrimitive(stamp, op.foldConstant(x.asConstant(), y.asConstant())),
+                            (x, y) -> shiftOp(x, y, view, op));
         }
         return null;
     }
@@ -109,7 +118,7 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
             return RightShiftNode.create(x, y, view);
         } else if (IntegerStamp.OPS.getUShr().equals(op)) {
             return UnsignedRightShiftNode.create(x, y, view);
-        } else if (Set.of(IntegerStamp.OPS.getShiftOps()).contains(op)) {
+        } else if (CollectionsUtil.setOf(IntegerStamp.OPS.getShiftOps()).contains(op)) {
             GraalError.unimplemented(String.format("creating %s via ShiftNode#shiftOp is not implemented yet", op));
         } else {
             GraalError.shouldNotReachHere(String.format("%s is not a shift operation!", op));
@@ -119,6 +128,23 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
 
     public int getShiftAmountMask() {
         return getArithmeticOp().getShiftAmountMask(stamp(NodeView.DEFAULT));
+    }
+
+    /// Gets the constant shift distance with the implicit mask of this operation applied, as specified
+    /// in [JLS 15.19 (Shift Operators)](https://docs.oracle.com/javase/specs/jls/se25/html/jls-15.html#jls-15.19).
+    ///
+    /// A graph need not be fully canonicalized, so `getY()` can contain a negative or
+    /// oversized constant. Code that interprets that constant must use this method rather than
+    /// read its raw value. For example, an int shift by -1 has distance 31, and an int shift by
+    /// 33 has distance 1 even when the caller performs its calculation in long arithmetic.
+    /// For SIMD shifts by a scalar constant, this method masks the distance according to the width
+    /// of each vector element.
+    ///
+    /// @return the masked distance
+    /// @throws AssertionError if `getY()` is not a Java constant
+    public final int getConstantShiftAmount() {
+        assert getY().isJavaConstant() : getY();
+        return getY().asJavaConstant().asInt() & getShiftAmountMask();
     }
 
     @Override
@@ -133,7 +159,9 @@ public abstract class ShiftNode<OP> extends BinaryNode implements ArithmeticOper
          * amount. We can narrow only if (y & wideMask) == (y & narrowMask) for all possible values
          * of y.
          */
-        IntegerStamp yStamp = (IntegerStamp) getY().stamp(NodeView.DEFAULT);
+        if (!(getY().stamp(NodeView.DEFAULT) instanceof IntegerStamp yStamp)) {
+            return false;
+        }
         return (yStamp.mayBeSet() & (wideMask & ~narrowMask)) == 0;
     }
 }

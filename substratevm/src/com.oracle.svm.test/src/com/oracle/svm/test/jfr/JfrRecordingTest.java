@@ -26,18 +26,28 @@
 
 package com.oracle.svm.test.jfr;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.fail;
+
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
 import org.junit.After;
 
+import com.oracle.svm.core.log.StringBuilderLog;
+
 import jdk.jfr.Configuration;
 import jdk.jfr.Recording;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordedFrame;
 
 /** Base class for JFR unit tests. */
 public abstract class JfrRecordingTest extends AbstractJfrTest {
@@ -83,6 +93,27 @@ public abstract class JfrRecordingTest extends AbstractJfrTest {
         return recording;
     }
 
+    protected static void checkTopStackFrame(RecordedEvent event, String... expectedTopMethod) {
+        List<RecordedFrame> frames = event.getStackTrace().getFrames();
+        assertFalse(frames.isEmpty());
+
+        String topMethod = frames.getFirst().getMethod().getName();
+        for (String expected : expectedTopMethod) {
+            if (expected.equals(topMethod)) {
+                return;
+            }
+        }
+
+        StringBuilderLog log = new StringBuilderLog();
+        log.string("Expected one of the following methods at the top of the event stack trace: ").string(Arrays.toString(expectedTopMethod)).newline();
+        log.string("but found: ").indent(true);
+        for (var frame : frames) {
+            log.string(frame.getMethod().getType().getName()).string(".").string(frame.getMethod().getName()).string(frame.getMethod().getDescriptor()).newline();
+        }
+        log.indent(false);
+        fail(log.getResult());
+    }
+
     private static Recording createRecording(Configuration config) {
         if (config == null) {
             return new Recording();
@@ -108,5 +139,12 @@ public abstract class JfrRecordingTest extends AbstractJfrTest {
 
         JfrRecordingState state = recordingStates.get(recording);
         checkRecording(validator, recording.getDestination(), state, validateTestedEventsOnly);
+    }
+
+    protected void assertNoResidualTestedEvents(String[] events) throws Throwable {
+        Recording recording = startRecording(events);
+        recording.stop();
+        recording.close();
+        assertEquals(0, getEvents(recording.getDestination(), events, true).size());
     }
 }

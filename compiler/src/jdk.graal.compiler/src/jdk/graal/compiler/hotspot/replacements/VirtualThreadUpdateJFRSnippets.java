@@ -24,22 +24,22 @@
  */
 package jdk.graal.compiler.hotspot.replacements;
 
-import static jdk.graal.compiler.hotspot.GraalHotSpotVMConfig.INJECTED_VMCONFIG;
 import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HOTSPOT_CARRIER_THREAD_OOP_HANDLE_LOCATION;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.JAVA_THREAD_CARRIER_THREAD_OBJECT_LOCATION;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.javaLangThreadJFREpochOffset;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.javaLangThreadTIDOffset;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.jfrThreadLocalVthreadEpochOffset;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.jfrThreadLocalVthreadExcludedOffset;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.jfrThreadLocalVthreadIDOffset;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.jfrThreadLocalVthreadOffset;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JAVA_LANG_THREAD_JFR_EPOCH;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JAVA_LANG_THREAD_TID;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JAVA_THREAD_CARRIER_THREAD_OBJECT_LOCATION;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JFR_THREAD_LOCAL_VTHREAD;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JFR_THREAD_LOCAL_VTHREAD_EPOCH;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JFR_THREAD_LOCAL_VTHREAD_EXCLUDED;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.JFR_THREAD_LOCAL_VTHREAD_ID;
 import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.registerAsWord;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.threadCarrierThreadOffset;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.LIKELY_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 import static jdk.graal.compiler.nodes.extended.MembarNode.memoryBarrier;
 import static jdk.graal.compiler.replacements.SnippetTemplate.DEFAULT_REPLACER;
-import static jdk.graal.compiler.word.Word.objectToTrackedPointer;
+import static org.graalvm.word.impl.Word.objectToTrackedWord;
+
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.api.replacements.Snippet.ConstantParameter;
@@ -47,7 +47,6 @@ import jdk.graal.compiler.hotspot.meta.HotSpotProviders;
 import jdk.graal.compiler.hotspot.meta.HotSpotRegistersProvider;
 import jdk.graal.compiler.hotspot.nodes.VirtualThreadUpdateJFRNode;
 import jdk.graal.compiler.lir.SyncPort;
-import jdk.graal.compiler.nodes.NamedLocationIdentity;
 import jdk.graal.compiler.nodes.extended.MembarNode;
 import jdk.graal.compiler.nodes.spi.LoweringTool;
 import jdk.graal.compiler.options.OptionValues;
@@ -55,17 +54,14 @@ import jdk.graal.compiler.replacements.SnippetTemplate.AbstractTemplates;
 import jdk.graal.compiler.replacements.SnippetTemplate.Arguments;
 import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
 import jdk.graal.compiler.replacements.Snippets;
-import jdk.graal.compiler.word.Word;
-import org.graalvm.word.LocationIdentity;
-
 import jdk.vm.ci.code.Register;
 
 /**
  * Snippet for updating JFR thread local data on {@code Thread#setCurrentThread} events.
  */
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/aaaa86b57172d45d1126c50efc270c6e49aba7a5/src/hotspot/share/opto/library_call.cpp#L3514-L3640",
-          sha1 = "1f980401f5d7d9a363577635fd57fc1e24505d91")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/b8aa130bab715f187476181acc5021b27958833f/src/hotspot/share/opto/library_call.cpp#L3591-L3719",
+          sha1 = "59f07096cdbe1aac79b1248db345e9616b54f4a4")
 // @formatter:on
 public class VirtualThreadUpdateJFRSnippets implements Snippets {
 
@@ -74,14 +70,6 @@ public class VirtualThreadUpdateJFRSnippets implements Snippets {
 
     private static final byte BOOL_TRUE = (byte) 1;
     private static final byte BOOL_FALSE = (byte) 0;
-
-    public static final LocationIdentity JAVA_LANG_THREAD_JFR_EPOCH = NamedLocationIdentity.mutable("java/lang/Thread.jfrEpoch");
-    public static final LocationIdentity JAVA_LANG_THREAD_TID = NamedLocationIdentity.mutable("java/lang/Thread.tid");
-
-    public static final LocationIdentity JFR_THREAD_LOCAL_VTHREAD_ID = NamedLocationIdentity.mutable("JfrThreadLocal::_vthread_id");
-    public static final LocationIdentity JFR_THREAD_LOCAL_VTHREAD_EPOCH = NamedLocationIdentity.mutable("JfrThreadLocal::_vthread_epoch");
-    public static final LocationIdentity JFR_THREAD_LOCAL_VTHREAD_EXCLUDED = NamedLocationIdentity.mutable("JfrThreadLocal::_vthread_excluded");
-    public static final LocationIdentity JFR_THREAD_LOCAL_VTHREAD = NamedLocationIdentity.mutable("JfrThreadLocal::_vthread");
 
     /*
      * The intrinsic is a model of this pseudo-code:
@@ -108,25 +96,25 @@ public class VirtualThreadUpdateJFRSnippets implements Snippets {
         // LibraryCallKit::extend_setCurrentThread, but does not match the memory access order as
         // the pseudo-code.
         Word javaThread = registerAsWord(javaThreadRegister);
-        Word carrierThreadHandle = javaThread.readWord(threadCarrierThreadOffset(INJECTED_VMCONFIG), JAVA_THREAD_CARRIER_THREAD_OBJECT_LOCATION);
-        Word thread = objectToTrackedPointer(threadObj);
+        Word carrierThreadHandle = JAVA_THREAD_CARRIER_THREAD_OBJECT_LOCATION.readWord(javaThread);
+        Word thread = objectToTrackedWord(threadObj);
 
         if (probability(LIKELY_PROBABILITY, thread.notEqual(carrierThreadHandle.readWord(0, HOTSPOT_CARRIER_THREAD_OOP_HANDLE_LOCATION)))) {
-            int vthreadEpochRaw = thread.readShort(javaLangThreadJFREpochOffset(INJECTED_VMCONFIG), JAVA_LANG_THREAD_JFR_EPOCH);
-            Word tid = thread.readWord(javaLangThreadTIDOffset(INJECTED_VMCONFIG), JAVA_LANG_THREAD_TID);
-            javaThread.writeWord(jfrThreadLocalVthreadIDOffset(INJECTED_VMCONFIG), tid, JFR_THREAD_LOCAL_VTHREAD_ID);
+            int vthreadEpochRaw = JAVA_LANG_THREAD_JFR_EPOCH.readShort(thread);
+            Word tid = JAVA_LANG_THREAD_TID.readWord(thread);
+            JFR_THREAD_LOCAL_VTHREAD_ID.writeWord(javaThread, tid);
 
             if (probability(LIKELY_PROBABILITY, (vthreadEpochRaw & EXCLUDED_MASK) == 0)) {
-                javaThread.writeChar(jfrThreadLocalVthreadEpochOffset(INJECTED_VMCONFIG), (char) (vthreadEpochRaw & EPOCH_MASK), JFR_THREAD_LOCAL_VTHREAD_EPOCH);
-                javaThread.writeByte(jfrThreadLocalVthreadExcludedOffset(INJECTED_VMCONFIG), BOOL_FALSE, JFR_THREAD_LOCAL_VTHREAD_EXCLUDED);
+                JFR_THREAD_LOCAL_VTHREAD_EPOCH.writeChar(javaThread, (char) (vthreadEpochRaw & EPOCH_MASK));
+                JFR_THREAD_LOCAL_VTHREAD_EXCLUDED.writeByte(javaThread, BOOL_FALSE);
             } else {
-                javaThread.writeByte(jfrThreadLocalVthreadExcludedOffset(INJECTED_VMCONFIG), BOOL_TRUE, JFR_THREAD_LOCAL_VTHREAD_EXCLUDED);
+                JFR_THREAD_LOCAL_VTHREAD_EXCLUDED.writeByte(javaThread, BOOL_TRUE);
             }
             memoryBarrier(MembarNode.FenceKind.STORE_RELEASE);
-            javaThread.writeByte(jfrThreadLocalVthreadOffset(INJECTED_VMCONFIG), BOOL_TRUE, JFR_THREAD_LOCAL_VTHREAD);
+            JFR_THREAD_LOCAL_VTHREAD.writeByte(javaThread, BOOL_TRUE);
         } else {
             memoryBarrier(MembarNode.FenceKind.STORE_RELEASE);
-            javaThread.writeByte(jfrThreadLocalVthreadOffset(INJECTED_VMCONFIG), BOOL_FALSE, JFR_THREAD_LOCAL_VTHREAD);
+            JFR_THREAD_LOCAL_VTHREAD.writeByte(javaThread, BOOL_FALSE);
         }
     }
 
@@ -152,8 +140,8 @@ public class VirtualThreadUpdateJFRSnippets implements Snippets {
         }
 
         public void lower(VirtualThreadUpdateJFRNode virtualThreadUpdateJFRNode, HotSpotRegistersProvider registers, LoweringTool tool) {
-            Arguments args = new Arguments(virtualThreadUpdateJFR, virtualThreadUpdateJFRNode.graph().getGuardsStage(), tool.getLoweringStage());
-            args.addConst("javaThreadRegister", registers.getThreadRegister());
+            Arguments args = new Arguments(virtualThreadUpdateJFR, virtualThreadUpdateJFRNode.graph(), tool.getLoweringStage());
+            args.add("javaThreadRegister", registers.getThreadRegister());
             args.add("threadObj", virtualThreadUpdateJFRNode.getThread());
 
             template(tool, virtualThreadUpdateJFRNode, args).instantiate(tool.getMetaAccess(), virtualThreadUpdateJFRNode, DEFAULT_REPLACER, args);

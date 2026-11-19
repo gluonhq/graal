@@ -24,21 +24,27 @@
  */
 package com.oracle.svm.core.genscavenge.compacting;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CORE_GC_CODE;
 
-import com.oracle.svm.core.util.VMError;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.shared.config.ObjectLayout;
 import com.oracle.svm.core.genscavenge.AlignedHeapChunk;
+import com.oracle.svm.core.genscavenge.GCImpl;
 import com.oracle.svm.core.genscavenge.HeapChunk;
 import com.oracle.svm.core.genscavenge.ObjectHeaderImpl;
+import com.oracle.svm.core.genscavenge.Space;
+import com.oracle.svm.core.genscavenge.remset.AlignedChunkRememberedSet;
 import com.oracle.svm.core.genscavenge.remset.BrickTable;
+import com.oracle.svm.core.genscavenge.remset.FirstObjectTable;
 import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.NumUtil;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -56,7 +62,8 @@ import jdk.graal.compiler.api.replacements.Fold;
  * <ul>
  * <li>New location:<br>
  * Provides the new address of the sequence of objects after compaction. This address can be outside
- * of the current chunk.</li>
+ * of the current chunk. With compressed references, it is stored as an unsigned offset from the
+ * heap base.</li>
  * <li>Size:<br>
  * The number of live object bytes that the sequence consists of.</li>
  * <li>Next sequence offset:<br>
@@ -66,7 +73,7 @@ import jdk.graal.compiler.api.replacements.Fold;
  * </ul>
  * The binary layout is as follows, with sizes given for both 8-byte/4-byte object references. The
  * fields are arranged so that accesses to them are aligned.
- * 
+ *
  * <pre>
  * ------------------------+======================+==============+=========================+-------------------
  *  ... gap (unused bytes) | new location (8B/4B) | size (4B/2B) | next seq offset (4B/2B) | live objects ...
@@ -82,11 +89,12 @@ public final class ObjectMoveInfo {
      */
     public static final int MAX_CHUNK_SIZE = ~(~0xffff * 8) + 1;
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static void setNewAddress(Pointer objSeqStart, Pointer newAddress) {
         if (useCompressedLayout()) {
-            long offset = newAddress.subtract(objSeqStart).rawValue();
-            offset /= ConfigurationValues.getObjectLayout().getAlignment();
-            objSeqStart.writeInt(-8, (int) offset);
+            long offset = newAddress.subtract(KnownIntrinsics.heapBase()).rawValue();
+            offset /= ObjectLayout.singleton().getAlignment();
+            objSeqStart.writeInt(-8, NumUtil.safeToUInt(offset));
         } else {
             objSeqStart.writeWord(-16, newAddress);
         }
@@ -96,17 +104,18 @@ public final class ObjectMoveInfo {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static Pointer getNewAddress(Pointer objSeqStart) {
         if (useCompressedLayout()) {
-            long offset = objSeqStart.readInt(-8);
-            offset *= ConfigurationValues.getObjectLayout().getAlignment();
-            return objSeqStart.add(WordFactory.signed(offset));
+            long offset = objSeqStart.readInt(-8) & 0xffff_ffffL;
+            offset *= ObjectLayout.singleton().getAlignment();
+            return KnownIntrinsics.heapBase().add(Word.unsigned(offset));
         } else {
             return objSeqStart.readWord(-16);
         }
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static void setObjectSeqSize(Pointer objSeqStart, UnsignedWord nbytes) {
         if (useCompressedLayout()) {
-            UnsignedWord value = nbytes.unsignedDivide(ConfigurationValues.getObjectLayout().getAlignment());
+            UnsignedWord value = nbytes.unsignedDivide(ObjectLayout.singleton().getAlignment());
             objSeqStart.writeShort(-4, (short) value.rawValue());
         } else {
             objSeqStart.writeInt(-8, (int) nbytes.rawValue());
@@ -117,16 +126,17 @@ public final class ObjectMoveInfo {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static UnsignedWord getObjectSeqSize(Pointer objSeqStart) {
         if (useCompressedLayout()) {
-            UnsignedWord value = WordFactory.unsigned(objSeqStart.readShort(-4) & 0xffff);
-            return value.multiply(ConfigurationValues.getObjectLayout().getAlignment());
+            UnsignedWord value = Word.unsigned(objSeqStart.readShort(-4) & 0xffff);
+            return value.multiply(ObjectLayout.singleton().getAlignment());
         } else {
-            return WordFactory.unsigned(objSeqStart.readInt(-8));
+            return Word.unsigned(objSeqStart.readInt(-8));
         }
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static void setNextObjectSeqOffset(Pointer objSeqStart, UnsignedWord offset) {
         if (useCompressedLayout()) {
-            UnsignedWord value = offset.unsignedDivide(ConfigurationValues.getObjectLayout().getAlignment());
+            UnsignedWord value = offset.unsignedDivide(ObjectLayout.singleton().getAlignment());
             objSeqStart.writeShort(-2, (short) value.rawValue());
         } else {
             objSeqStart.writeInt(-4, (int) offset.rawValue());
@@ -137,10 +147,10 @@ public final class ObjectMoveInfo {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static UnsignedWord getNextObjectSeqOffset(Pointer objSeqStart) {
         if (useCompressedLayout()) {
-            UnsignedWord value = WordFactory.unsigned(objSeqStart.readShort(-2) & 0xffff);
-            return value.multiply(ConfigurationValues.getObjectLayout().getAlignment());
+            UnsignedWord value = Word.unsigned(objSeqStart.readShort(-2) & 0xffff);
+            return value.multiply(ObjectLayout.singleton().getAlignment());
         } else {
-            return WordFactory.unsigned(objSeqStart.readInt(-4));
+            return Word.unsigned(objSeqStart.readInt(-4));
         }
     }
 
@@ -148,14 +158,14 @@ public final class ObjectMoveInfo {
     static Pointer getNextObjectSeqAddress(Pointer objSeqStart) {
         UnsignedWord offset = getNextObjectSeqOffset(objSeqStart);
         if (offset.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         return objSeqStart.add(offset);
     }
 
     @Fold
     static boolean useCompressedLayout() {
-        return ConfigurationValues.getObjectLayout().getReferenceSize() == Integer.BYTES;
+        return ObjectLayout.singleton().getReferenceSize() == Integer.BYTES;
     }
 
     /**
@@ -164,21 +174,44 @@ public final class ObjectMoveInfo {
      * @see HeapChunk#walkObjectsFrom
      * @see AlignedHeapChunk#walkObjects
      */
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    public static void walkObjects(AlignedHeapChunk.AlignedHeader chunkHeader, ObjectFixupVisitor visitor) {
-        Pointer p = AlignedHeapChunk.getObjectsStart(chunkHeader);
+    @Uninterruptible(reason = CORE_GC_CODE)
+    public static void walkObjectsForFixup(AlignedHeapChunk.AlignedHeader chunk, Space space, ObjectFixupVisitor visitor) {
+        FirstObjectTable.initializeTable(AlignedChunkRememberedSet.getFirstObjectTableStart(chunk), AlignedChunkRememberedSet.getFirstObjectTableSize());
+
+        Pointer p = AlignedHeapChunk.getObjectsStart(chunk);
         do {
-            Pointer nextObjSeq = getNextObjectSeqAddress(p);
-            Pointer objSeqEnd = p.add(getObjectSeqSize(p));
-            assert objSeqEnd.belowOrEqual(HeapChunk.getTopPointer(chunkHeader));
+            Pointer objSeq = p;
+            Pointer nextObjSeq = getNextObjectSeqAddress(objSeq);
+            Pointer objSeqNewAddress = getNewAddress(objSeq);
+            AlignedHeapChunk.AlignedHeader objSeqNewChunk = AlignedHeapChunk.getEnclosingChunkFromObjectPointer(objSeqNewAddress);
+            Pointer objSeqEnd = objSeq.add(getObjectSeqSize(objSeq));
+            assert objSeqEnd.belowOrEqual(HeapChunk.getTopPointer(chunk));
             while (p.notEqual(objSeqEnd)) {
                 assert p.belowThan(objSeqEnd);
-                Object obj = p.toObject();
+                Object obj = p.toObjectNonNull();
+                ObjectHeaderImpl.unsetMarkedAndKeepRememberedSetBit(obj);
                 UnsignedWord objSize = LayoutEncoding.getSizeFromObjectInlineInGC(obj);
-                if (!visitor.visitObjectInline(obj)) {
-                    throw VMError.shouldNotReachHereAtRuntime();
-                }
+
+                /*
+                 * Add the object's new location to the first object table of the target chunk. Note
+                 * that we have already encountered that chunk and initialized its table earlier.
+                 *
+                 * Rebuilding the table is also required for swept chunks, where dead objects can
+                 * mean that another object is now the first object in a range.
+                 */
+                Pointer newAddress = objSeqNewAddress.add(p.subtract(objSeq));
+                UnsignedWord offset = newAddress.subtract(AlignedHeapChunk.getObjectsStart(objSeqNewChunk));
+                FirstObjectTable.setTableForObject(AlignedChunkRememberedSet.getFirstObjectTableStart(objSeqNewChunk), offset, offset.add(objSize));
+
+                visitor.visitObject(obj);
                 p = p.add(objSize);
+            }
+            if (nextObjSeq.isNonNull() && GCImpl.getGCImpl().mustSweep(chunk, space)) {
+                // We will write a filler object here, add the location to the first object table.
+                assert p.belowThan(nextObjSeq);
+                UnsignedWord offset = p.subtract(AlignedHeapChunk.getObjectsStart(chunk));
+                UnsignedWord size = nextObjSeq.subtract(p);
+                FirstObjectTable.setTableForObject(AlignedChunkRememberedSet.getFirstObjectTableStart(chunk), offset, offset.add(size));
             }
             p = nextObjSeq;
         } while (p.isNonNull());
@@ -190,12 +223,12 @@ public final class ObjectMoveInfo {
 
         AlignedHeapChunk.AlignedHeader chunk = AlignedHeapChunk.getEnclosingChunkFromObjectPointer(objPointer);
         if (objPointer.aboveOrEqual(HeapChunk.getTopPointer(chunk))) {
-            return WordFactory.nullPointer(); // object did not survive, is in gap at chunk end
+            return Word.nullPointer(); // object did not survive, is in gap at chunk end
         }
 
         Pointer objSeq = BrickTable.getEntry(chunk, BrickTable.getIndex(chunk, objPointer));
         if (objSeq.aboveThan(objPointer)) { // object not alive, in gap across brick table entries
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         Pointer nextObjSeq = getNextObjectSeqAddress(objSeq);
@@ -204,7 +237,7 @@ public final class ObjectMoveInfo {
             nextObjSeq = getNextObjectSeqAddress(objSeq);
         }
         if (objPointer.aboveOrEqual(objSeq.add(getObjectSeqSize(objSeq)))) {
-            return WordFactory.nullPointer(); // object did not survive, in gap between objects
+            return Word.nullPointer(); // object did not survive, in gap between objects
         }
 
         Pointer newObjSeqAddress = getNewAddress(objSeq);
@@ -212,11 +245,13 @@ public final class ObjectMoveInfo {
         return newObjSeqAddress.add(objOffset);
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static int getSize() {
         return useCompressedLayout() ? 8 : 16;
     }
 
     @AlwaysInline("GC performance: enables non-virtual visitor call")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void visit(AlignedHeapChunk.AlignedHeader chunk, Visitor visitor) {
         Pointer p = AlignedHeapChunk.getObjectsStart(chunk);
         UnsignedWord size = getObjectSeqSize(p);
@@ -224,11 +259,11 @@ public final class ObjectMoveInfo {
         Pointer next = getNextObjectSeqAddress(p);
         do {
             // The visitor might overwrite the current and/or next move info, so read it eagerly.
-            UnsignedWord nextSize = next.isNonNull() ? getObjectSeqSize(next) : WordFactory.zero();
-            Pointer nextNewAddress = next.isNonNull() ? getNewAddress(next) : WordFactory.nullPointer();
-            Pointer nextNext = next.isNonNull() ? getNextObjectSeqAddress(next) : WordFactory.nullPointer();
+            UnsignedWord nextSize = next.isNonNull() ? getObjectSeqSize(next) : Word.zero();
+            Pointer nextNewAddress = next.isNonNull() ? getNewAddress(next) : Word.nullPointer();
+            Pointer nextNext = next.isNonNull() ? getNextObjectSeqAddress(next) : Word.nullPointer();
 
-            if (!visitor.visit(p, size, newAddress, next)) {
+            if (!visitor.visit(chunk, p, size, newAddress, next)) {
                 return;
             }
 
@@ -247,7 +282,8 @@ public final class ObjectMoveInfo {
          *
          * @return {@code true} if visiting should continue, {@code false} if visiting should stop.
          */
-        boolean visit(Pointer objSeq, UnsignedWord size, Pointer newAddress, Pointer nextObjSeq);
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        boolean visit(AlignedHeapChunk.AlignedHeader chunk, Pointer objSeq, UnsignedWord size, Pointer newAddress, Pointer nextObjSeq);
     }
 
     private ObjectMoveInfo() {

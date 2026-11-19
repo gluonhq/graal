@@ -92,6 +92,7 @@ public final class VerifyingMoveFactory extends MoveFactory {
         private final Value input;
 
         private int tempCount = 0;
+        private int useKillCount = 0;
         private int aliveCount = 0;
         private int stateCount = 0;
         private int inputCount = 0;
@@ -105,6 +106,11 @@ public final class VerifyingMoveFactory extends MoveFactory {
         void tempProc(LIRInstruction op, Value value, LIRInstruction.OperandMode mode, EnumSet<LIRInstruction.OperandFlag> flags) {
             assert false : String.format("SpillMoveFactory: Instruction %s is not allowed to contain operand %s of mode %s", op, value, mode);
             tempCount++;
+        }
+
+        void useKillProc(LIRInstruction op, Value value, LIRInstruction.OperandMode mode, EnumSet<LIRInstruction.OperandFlag> flags) {
+            assert false : String.format("SpillMoveFactory: Instruction %s is not allowed to contain operand %s of mode %s", op, value, mode);
+            useKillCount++;
         }
 
         void stateProc(LIRInstruction op, Value value, LIRInstruction.OperandMode mode, EnumSet<LIRInstruction.OperandFlag> flags) {
@@ -135,10 +141,10 @@ public final class VerifyingMoveFactory extends MoveFactory {
     private static boolean checkResult(LIRInstruction inst, AllocatableValue result, Value input) {
 
         VerifyingMoveFactory.CheckClosure c = new CheckClosure(result, input);
-        inst.visitEachInput(c::inputProc);
-        inst.visitEachOutput(c::outputProc);
-        inst.visitEachAlive(c::aliveProc);
-        inst.visitEachTemp(c::tempProc);
+        // MoveFactory validation is a single forward structural walk over operand buckets. Buckets
+        // that are not legal for moves, including use-kill, are rejected explicitly instead of
+        // being modeled like allocation-time liveness.
+        inst.visitEachValueForward(c::inputProc, c::aliveProc, c::useKillProc, c::tempProc, c::outputProc);
         inst.visitEachState(c::stateProc);
 
         assert c.outputCount >= 1 : "no output produced" + inst;

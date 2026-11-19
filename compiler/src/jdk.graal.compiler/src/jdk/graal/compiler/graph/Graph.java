@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -36,6 +36,7 @@ import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Equivalence;
 import org.graalvm.collections.UnmodifiableEconomicMap;
 
+import jdk.graal.compiler.core.common.CancellationBailoutException;
 import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.core.common.util.CompilationAlarm;
 import jdk.graal.compiler.core.common.util.EventCounter;
@@ -49,6 +50,7 @@ import jdk.graal.compiler.graph.Node.NodeInsertionStackTrace;
 import jdk.graal.compiler.graph.Node.ValueNumberable;
 import jdk.graal.compiler.graph.iterators.NodeIterable;
 import jdk.graal.compiler.graph.iterators.NodePredicate;
+import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
@@ -62,7 +64,15 @@ public class Graph implements EventCounter {
 
     public static class Options {
         @Option(help = "Verify graphs often during compilation when assertions are turned on", type = OptionType.Debug)//
-        public static final OptionKey<Boolean> VerifyGraalGraphs = new OptionKey<>(true);
+        public static final OptionKey<Boolean> VerifyGraalGraphs = new OptionKey<>(true) {
+            @Override
+            public Boolean getValue(OptionValues values) {
+                if (!Assertions.assertionsEnabled()) {
+                    return false;
+                }
+                return super.getValue(values);
+            }
+        };
         @Option(help = "Perform expensive verification of graph inputs, usages, successors and predecessors", type = OptionType.Debug)//
         public static final OptionKey<Boolean> VerifyGraalGraphEdges = new OptionKey<>(false);
         @Option(help = "Graal graph compression is performed when percent of live nodes falls below this value", type = OptionType.Debug)//
@@ -83,6 +93,13 @@ public class Graph implements EventCounter {
      */
     public final boolean verifyGraphs;
     public final boolean verifyGraphEdges;
+    public final boolean verifyKillCFGUnusedNodes;
+
+    /**
+     * Cached actual value of {@link GraalOptions#TrackNodeInsertion} to avoid expensive map lookup
+     * every time a node is registered.
+     */
+    public final boolean trackNodeInsertion;
 
     /**
      * The set of nodes in the graph, ordered by {@linkplain #register(Node) registration} time.
@@ -183,16 +200,23 @@ public class Graph implements EventCounter {
      */
     private int eventCounter;
     private final EventCounterMarker eventCounterMarker = new EventCounterMarker();
+    private final Cancellable cancellable;
 
     @Override
     public EventCounterMarker getEventCounterMarker() {
         return eventCounterMarker;
     }
 
+    /**
+     * Increments the event counter and checks cancellation when it overflows.
+     *
+     * @throws CancellationBailoutException if the counter overflows and cancellation was requested
+     */
     @Override
     public boolean eventCounterOverflows(int max) {
         if (eventCounter++ > max) {
             eventCounter = 0;
+            checkCancellation();
             return true;
         }
         return false;
@@ -200,11 +224,7 @@ public class Graph implements EventCounter {
 
     @Override
     public String eventCounterToString() {
-        return toString() + " eventCounter=" + eventCounter;
-    }
-
-    public int getEventCounter() {
-        return eventCounter;
+        return this + " eventCounter=" + eventCounter;
     }
 
     public int getCompressions() {
@@ -278,6 +298,7 @@ public class Graph implements EventCounter {
      */
     public void getDebugProperties(Map<Object, Object> properties) {
         properties.put("graph", toString());
+        properties.put("nodeIdCount", nodeIdCount());
     }
 
     /**
@@ -316,9 +337,23 @@ public class Graph implements EventCounter {
      * @param name the name of the graph, used for debugging purposes
      */
     public Graph(String name, OptionValues options, DebugContext debug, boolean trackNodeSourcePosition) {
+        this(name, options, debug, trackNodeSourcePosition, null);
+    }
+
+    /**
+     * Creates an empty graph with an optional cooperative cancellation token.
+     *
+     * @param name the graph name for debugging, or {@code null}
+     * @param options the graph options
+     * @param debug the debugging context
+     * @param trackNodeSourcePosition whether to track node source positions
+     * @param cancellable the cancellation token, or {@code null} if cancellation is not supported
+     */
+    public Graph(String name, OptionValues options, DebugContext debug, boolean trackNodeSourcePosition, Cancellable cancellable) {
+        this.cancellable = cancellable;
         nodes = new Node[INITIAL_NODES_SIZE];
-        iterableNodesFirst = new ArrayList<>(NodeClass.allocatedNodeIterabledIds());
-        iterableNodesLast = new ArrayList<>(NodeClass.allocatedNodeIterabledIds());
+        iterableNodesFirst = new ArrayList<>(NodeClass.allocatedNodeIterableIds());
+        iterableNodesLast = new ArrayList<>(NodeClass.allocatedNodeIterableIds());
         this.name = name;
         this.options = options;
         this.trackNodeSourcePosition = trackNodeSourcePosition || trackNodeSourcePositionDefault(options, debug);
@@ -332,6 +367,9 @@ public class Graph implements EventCounter {
 
         verifyGraphs = Options.VerifyGraalGraphs.getValue(options);
         verifyGraphEdges = Options.VerifyGraalGraphEdges.getValue(options);
+        verifyKillCFGUnusedNodes = GraphUtil.Options.VerifyKillCFGUnusedNodes.getValue(options);
+
+        trackNodeInsertion = TrackNodeInsertion.getValue(options);
     }
 
     int extractOriginalNodeId(Node node) {
@@ -391,7 +429,7 @@ public class Graph implements EventCounter {
     }
 
     /**
-     * Creates a copy of this graph.
+     * Creates a copy of this graph sharing its cancellation token.
      *
      * @param debugForCopy the debug context for the graph copy. This must not be the debug for this
      *            graph if this graph can be accessed from multiple threads (e.g., it's in a cache
@@ -402,7 +440,7 @@ public class Graph implements EventCounter {
     }
 
     /**
-     * Creates a copy of this graph.
+     * Creates a copy of this graph sharing its cancellation token.
      *
      * @param duplicationMapCallback consumer of the duplication map created during the copying
      * @param debugForCopy the debug context for the graph copy. This must not be the debug for this
@@ -414,7 +452,7 @@ public class Graph implements EventCounter {
     }
 
     /**
-     * Creates a copy of this graph.
+     * Creates a copy of this graph sharing its cancellation token.
      *
      * @param newName the name of the copy, used for debugging purposes (can be null)
      * @param duplicationMapCallback consumer of the duplication map created during the copying
@@ -423,12 +461,22 @@ public class Graph implements EventCounter {
      *            accessed by multiple threads).
      */
     protected Graph copy(String newName, Consumer<UnmodifiableEconomicMap<Node, Node>> duplicationMapCallback, DebugContext debugForCopy) {
-        Graph copy = new Graph(newName, options, debugForCopy, trackNodeSourcePosition());
+        Graph copy = new Graph(newName, options, debugForCopy, trackNodeSourcePosition(), cancellable);
         UnmodifiableEconomicMap<Node, Node> duplicates = copy.addDuplicates(getNodes(), this, this.getNodeCount(), (EconomicMap<Node, Node>) null);
         if (duplicationMapCallback != null) {
             duplicationMapCallback.accept(duplicates);
         }
         return copy;
+    }
+
+    public Cancellable getCancellable() {
+        return cancellable;
+    }
+
+    public void checkCancellation() {
+        if (cancellable != null && cancellable.isCancelled()) {
+            CancellationBailoutException.cancelCompilation();
+        }
     }
 
     public final OptionValues getOptions() {
@@ -632,7 +680,7 @@ public class Graph implements EventCounter {
 
     }
 
-    private AddInputsFilter addInputsFilter = new AddInputsFilter();
+    private final AddInputsFilter addInputsFilter = new AddInputsFilter();
 
     private <T extends Node> void addInputs(T node, NodePredicate predicate) {
         if (predicate == null) {
@@ -671,6 +719,11 @@ public class Graph implements EventCounter {
          * A node's input is changed.
          */
         INPUT_CHANGED,
+
+        /**
+         * A node's control flow edge (i.e., predecessor or any successor) has changed.
+         */
+        CONTROL_FLOW_CHANGED,
 
         /**
          * A node's {@linkplain Node#usages() usages} count dropped to zero.
@@ -740,6 +793,9 @@ public class Graph implements EventCounter {
          */
         final void event(NodeEvent e, Node node) {
             switch (e) {
+                case CONTROL_FLOW_CHANGED:
+                    controlFlowChanged(node);
+                    break;
                 case INPUT_CHANGED:
                     inputChanged(node);
                     break;
@@ -776,7 +832,17 @@ public class Graph implements EventCounter {
         }
 
         /**
-         * Notifies this listener about a change in a node's inputs.
+         * Notifies this listener about a change in a node's control flow edges, i.e., its
+         * predecessor or any of its successor edges.
+         *
+         * @param node a node who has had its predecessor or one of its successors changed
+         */
+        public void controlFlowChanged(Node node) {
+        }
+
+        /**
+         * Notifies this listener about a change in a node's inputs (successor or predecessor edges
+         * not included).
          *
          * @param node a node who has had one of its inputs changed
          */
@@ -859,7 +925,6 @@ public class Graph implements EventCounter {
                     cur = cur.next;
                 }
 
-                assert cur == listener : "Listener not found";
                 last.next = listener.next;
             }
 
@@ -969,7 +1034,6 @@ public class Graph implements EventCounter {
         return result;
     }
 
-    @SuppressWarnings("unchecked")
     public <T extends Node> T findDuplicate(T node) {
         return findDuplicate(node, null);
     }
@@ -1024,6 +1088,7 @@ public class Graph implements EventCounter {
     }
 
     public boolean isNew(Mark mark, Node node) {
+        assert mark.verifyIdsAreStable();
         return node.id >= mark.getValue();
     }
 
@@ -1040,9 +1105,8 @@ public class Graph implements EventCounter {
 
         @Override
         public boolean equals(Object obj) {
-            if (obj instanceof Mark) {
-                Mark other = (Mark) obj;
-                return other.getValue() == getValue() && other.getGraph() == getGraph();
+            if (obj instanceof Mark other) {
+                return other.getValue() == getValue() && other.getGraph() == getGraph() && other.epoch == epoch;
             }
             return false;
         }
@@ -1062,10 +1126,10 @@ public class Graph implements EventCounter {
 
         /**
          * Determines if this mark still represents the {@linkplain Graph#getNodeCount() live node
-         * count} of the graph.
+         * count} of the graph and node ids have not been reassigned by graph compression.
          */
         public boolean isCurrent() {
-            return value == graph.nodeIdCount();
+            return value == graph.nodeIdCount() && epoch == graph.compressions;
         }
     }
 
@@ -1081,6 +1145,7 @@ public class Graph implements EventCounter {
      * mark}.
      */
     public NodeIterable<Node> getNewNodes(Mark mark) {
+        assert mark == null || mark.verifyIdsAreStable();
         final int index = mark == null ? 0 : mark.getValue();
         return () -> new GraphNodeIterator(Graph.this, index);
     }
@@ -1249,7 +1314,7 @@ public class Graph implements EventCounter {
          */
         iterableNodesFirst.set(iterableId, start);
         if (start == null) {
-            iterableNodesLast.set(iterableId, start);
+            iterableNodesLast.set(iterableId, null);
         }
         return start;
     }
@@ -1316,7 +1381,7 @@ public class Graph implements EventCounter {
         if (currentNodeSourcePosition != null && trackNodeSourcePosition()) {
             node.setNodeSourcePosition(currentNodeSourcePosition);
         }
-        if (TrackNodeInsertion.getValue(getOptions()) && node.getInsertionPosition() == null) {
+        if (trackNodeInsertion && node.getInsertionPosition() == null) {
             node.setInsertionPosition(new NodeInsertionStackTrace());
         }
 
@@ -1393,9 +1458,9 @@ public class Graph implements EventCounter {
                 try {
                     try {
                         assert node.verify(verifyInputs);
-                    } catch (AssertionError t) {
-                        throw new GraalError(t);
-                    } catch (RuntimeException t) {
+                    } catch (CancellationBailoutException e) {
+                        throw e;
+                    } catch (AssertionError | RuntimeException t) {
                         throw new GraalError(t);
                     }
                 } catch (GraalError e) {
@@ -1486,10 +1551,14 @@ public class Graph implements EventCounter {
 
     private static final TimerKey DuplicateGraph = DebugContext.timer("DuplicateGraph");
 
-    @SuppressWarnings({"all", "try"})
     public EconomicMap<Node, Node> addDuplicates(Iterable<? extends Node> newNodes, final Graph oldGraph, int estimatedNodeCount, DuplicationReplacement replacements) {
+        return addDuplicates(newNodes, oldGraph, estimatedNodeCount, replacements, true);
+    }
+
+    @SuppressWarnings({"all", "try"})
+    public EconomicMap<Node, Node> addDuplicates(Iterable<? extends Node> newNodes, final Graph oldGraph, int estimatedNodeCount, DuplicationReplacement replacements, boolean applyGVN) {
         try (DebugCloseable s = DuplicateGraph.start(getDebug())) {
-            return NodeClass.addGraphDuplicate(this, oldGraph, estimatedNodeCount, newNodes, replacements);
+            return NodeClass.addGraphDuplicate(this, oldGraph, estimatedNodeCount, newNodes, replacements, applyGVN);
         }
     }
 

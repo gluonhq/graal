@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,7 +33,11 @@ import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_64;
 
 import java.util.EnumSet;
 
+import org.graalvm.word.LocationIdentity;
+import org.graalvm.word.Pointer;
+
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
+import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.lir.GenerateStub;
@@ -41,9 +45,6 @@ import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodes.NamedLocationIdentity;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
-import org.graalvm.word.LocationIdentity;
-import org.graalvm.word.Pointer;
-
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.code.Architecture;
@@ -61,11 +62,19 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
         return new ForeignCallDescriptor(name, void.class, new Class<?>[]{Pointer.class, Pointer.class}, HAS_SIDE_EFFECT, KILLED_LOCATIONS, false, false);
     }
 
+    private static ForeignCallDescriptor multiBlockForeignCallDescriptor(String name) {
+        return new ForeignCallDescriptor(name, int.class, new Class<?>[]{Pointer.class, Pointer.class, int.class, int.class}, HAS_SIDE_EFFECT, KILLED_LOCATIONS, false, false);
+    }
+
     @Input protected ValueNode buf;
     @Input protected ValueNode state;
 
     public MessageDigestNode(NodeClass<? extends MessageDigestNode> c, ValueNode buf, ValueNode state, EnumSet<?> runtimeCheckedCPUFeatures) {
-        super(c, StampFactory.forVoid(), runtimeCheckedCPUFeatures, LocationIdentity.any());
+        this(c, StampFactory.forVoid(), buf, state, runtimeCheckedCPUFeatures);
+    }
+
+    protected MessageDigestNode(NodeClass<? extends MessageDigestNode> c, Stamp stamp, ValueNode buf, ValueNode state, EnumSet<?> runtimeCheckedCPUFeatures) {
+        super(c, stamp, runtimeCheckedCPUFeatures, LocationIdentity.any());
         this.buf = buf;
         this.state = state;
     }
@@ -78,6 +87,27 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
     @Override
     public ValueNode[] getForeignCallArguments() {
         return new ValueNode[]{buf, state};
+    }
+
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_64)
+    public abstract static class MessageDigestMultiBlockNode extends MessageDigestNode {
+
+        public static final NodeClass<MessageDigestMultiBlockNode> TYPE = NodeClass.create(MessageDigestMultiBlockNode.class);
+
+        @Input protected ValueNode ofs;
+        @Input protected ValueNode limit;
+
+        protected MessageDigestMultiBlockNode(NodeClass<? extends MessageDigestMultiBlockNode> c, ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit,
+                        EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(c, StampFactory.forKind(JavaKind.Int), buf, state, runtimeCheckedCPUFeatures);
+            this.ofs = ofs;
+            this.limit = limit;
+        }
+
+        @Override
+        public ValueNode[] getForeignCallArguments() {
+            return new ValueNode[]{buf, state, ofs, limit};
+        }
     }
 
     /**
@@ -107,17 +137,11 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @SuppressWarnings("unlikely-arg-type")
         public static boolean isSupported(Architecture arch) {
-            if (arch instanceof AMD64) {
-                return ((AMD64) arch).getFeatures().containsAll(minFeaturesAMD64());
-            } else if (arch instanceof AArch64) {
-                return ((AArch64) arch).getFeatures().containsAll(minFeaturesAARCH64());
-            }
-            return false;
-        }
-
-        @Override
-        public boolean canBeEmitted(Architecture arch) {
-            return isSupported(arch);
+            return switch (arch) {
+                case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+                case AArch64 aarch64 -> aarch64.getFeatures().containsAll(minFeaturesAARCH64());
+                default -> false;
+            };
         }
 
         @Override
@@ -127,7 +151,7 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @Override
         public void emitIntrinsic(NodeLIRBuilderTool gen) {
-            gen.getLIRGeneratorTool().emitSha1ImplCompress(gen.operand(buf), gen.operand(state));
+            gen.getLIRGeneratorTool().emitSha1ImplCompress(runtimeCheckedCPUFeatures, gen.operand(buf), gen.operand(state));
         }
 
         @NodeIntrinsic
@@ -136,6 +160,50 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @NodeIntrinsic
         public static native void sha1ImplCompress(Pointer buf, Pointer state, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
+    }
+
+    /**
+     * Intrinsification for {@code sun.security.provider.DigestBase.implCompressMultiBlock0}
+     * with a {@code sun.security.provider.SHA} receiver.
+     */
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_64)
+    public static final class SHA1MultiBlockNode extends MessageDigestMultiBlockNode {
+
+        public static final NodeClass<SHA1MultiBlockNode> TYPE = NodeClass.create(SHA1MultiBlockNode.class);
+        public static final ForeignCallDescriptor STUB = multiBlockForeignCallDescriptor("sha1ImplCompressMB");
+
+        public SHA1MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit) {
+            super(TYPE, buf, state, ofs, limit, null);
+        }
+
+        public SHA1MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit, EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(TYPE, buf, state, ofs, limit, runtimeCheckedCPUFeatures);
+        }
+
+        public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
+            return SHA1Node.minFeaturesAMD64();
+        }
+
+        public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
+            return SHA1Node.minFeaturesAARCH64();
+        }
+
+        @Override
+        public ForeignCallDescriptor getForeignCallDescriptor() {
+            return STUB;
+        }
+
+        @Override
+        public void emitIntrinsic(NodeLIRBuilderTool gen) {
+            gen.setResult(this, gen.getLIRGeneratorTool().emitSha1ImplCompressMB(runtimeCheckedCPUFeatures, gen.operand(buf), gen.operand(state), gen.operand(ofs), gen.operand(limit)));
+        }
+
+        @NodeIntrinsic
+        @GenerateStub(name = "sha1ImplCompressMB", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+        public static native int sha1ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit);
+
+        @NodeIntrinsic
+        public static native int sha1ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
     }
 
     /**
@@ -165,17 +233,11 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @SuppressWarnings("unlikely-arg-type")
         public static boolean isSupported(Architecture arch) {
-            if (arch instanceof AMD64) {
-                return ((AMD64) arch).getFeatures().containsAll(minFeaturesAMD64());
-            } else if (arch instanceof AArch64) {
-                return ((AArch64) arch).getFeatures().containsAll(minFeaturesAARCH64());
-            }
-            return false;
-        }
-
-        @Override
-        public boolean canBeEmitted(Architecture arch) {
-            return isSupported(arch);
+            return switch (arch) {
+                case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+                case AArch64 aarch64 -> aarch64.getFeatures().containsAll(minFeaturesAARCH64());
+                default -> false;
+            };
         }
 
         @Override
@@ -185,7 +247,7 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @Override
         public void emitIntrinsic(NodeLIRBuilderTool gen) {
-            gen.getLIRGeneratorTool().emitSha256ImplCompress(gen.operand(buf), gen.operand(state));
+            gen.getLIRGeneratorTool().emitSha256ImplCompress(runtimeCheckedCPUFeatures, gen.operand(buf), gen.operand(state));
         }
 
         @NodeIntrinsic
@@ -194,6 +256,50 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         @NodeIntrinsic
         public static native void sha256ImplCompress(Pointer buf, Pointer state, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
+    }
+
+    /**
+     * Intrinsification for {@code sun.security.provider.DigestBase.implCompressMultiBlock0}
+     * with a {@code sun.security.provider.SHA2} receiver.
+     */
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_64)
+    public static final class SHA256MultiBlockNode extends MessageDigestMultiBlockNode {
+
+        public static final NodeClass<SHA256MultiBlockNode> TYPE = NodeClass.create(SHA256MultiBlockNode.class);
+        public static final ForeignCallDescriptor STUB = multiBlockForeignCallDescriptor("sha256ImplCompressMB");
+
+        public SHA256MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit) {
+            super(TYPE, buf, state, ofs, limit, null);
+        }
+
+        public SHA256MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit, EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(TYPE, buf, state, ofs, limit, runtimeCheckedCPUFeatures);
+        }
+
+        public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
+            return SHA256Node.minFeaturesAMD64();
+        }
+
+        public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
+            return SHA256Node.minFeaturesAARCH64();
+        }
+
+        @Override
+        public ForeignCallDescriptor getForeignCallDescriptor() {
+            return STUB;
+        }
+
+        @Override
+        public void emitIntrinsic(NodeLIRBuilderTool gen) {
+            gen.setResult(this, gen.getLIRGeneratorTool().emitSha256ImplCompressMB(runtimeCheckedCPUFeatures, gen.operand(buf), gen.operand(state), gen.operand(ofs), gen.operand(limit)));
+        }
+
+        @NodeIntrinsic
+        @GenerateStub(name = "sha256ImplCompressMB", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+        public static native int sha256ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit);
+
+        @NodeIntrinsic
+        public static native int sha256ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
     }
 
     /**
@@ -220,23 +326,21 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
             this.blockSize = blockSize;
         }
 
+        public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
+            return EnumSet.of(AMD64.CPUFeature.AVX, AMD64.CPUFeature.AVX2, AMD64.CPUFeature.AVX512F, AMD64.CPUFeature.AVX512BW);
+        }
+
         public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
             return EnumSet.of(AArch64.CPUFeature.SHA3);
         }
 
         @SuppressWarnings("unlikely-arg-type")
         public static boolean isSupported(Architecture arch) {
-            if (arch instanceof AMD64) {
-                return false;
-            } else if (arch instanceof AArch64) {
-                return ((AArch64) arch).getFeatures().containsAll(minFeaturesAARCH64());
-            }
-            return false;
-        }
-
-        @Override
-        public boolean canBeEmitted(Architecture arch) {
-            return isSupported(arch);
+            return switch (arch) {
+                case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+                case AArch64 aarch64 -> aarch64.getFeatures().containsAll(minFeaturesAARCH64());
+                default -> false;
+            };
         }
 
         @Override
@@ -250,16 +354,75 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
         }
 
         @Override
+        public boolean needsExplicitZeroExtension(Architecture arch) {
+            return false;
+        }
+
+        @Override
         public void emitIntrinsic(NodeLIRBuilderTool gen) {
             gen.getLIRGeneratorTool().emitSha3ImplCompress(gen.operand(buf), gen.operand(state), gen.operand(blockSize));
         }
 
         @NodeIntrinsic
-        @GenerateStub(name = "sha3ImplCompress", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+        @GenerateStub(name = "sha3ImplCompress", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
         public static native void sha3ImplCompress(Pointer buf, Pointer state, int blockSize);
 
         @NodeIntrinsic
         public static native void sha3ImplCompress(Pointer buf, Pointer state, int blockSize, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
+    }
+
+    /**
+     * Intrinsification for {@code sun.security.provider.DigestBase.implCompressMultiBlock0}
+     * with a {@code sun.security.provider.SHA3} receiver.
+     */
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_128)
+    public static final class SHA3MultiBlockNode extends MessageDigestMultiBlockNode {
+
+        public static final NodeClass<SHA3MultiBlockNode> TYPE = NodeClass.create(SHA3MultiBlockNode.class);
+        public static final ForeignCallDescriptor STUB = new ForeignCallDescriptor("sha3ImplCompressMB", int.class,
+                        new Class<?>[]{Pointer.class, Pointer.class, int.class, int.class, int.class}, HAS_SIDE_EFFECT, KILLED_LOCATIONS, false, false);
+
+        @Input protected ValueNode blockSize;
+
+        public SHA3MultiBlockNode(ValueNode buf, ValueNode state, ValueNode blockSize, ValueNode ofs, ValueNode limit) {
+            super(TYPE, buf, state, ofs, limit, null);
+            this.blockSize = blockSize;
+        }
+
+        public SHA3MultiBlockNode(ValueNode buf, ValueNode state, ValueNode blockSize, ValueNode ofs, ValueNode limit, EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(TYPE, buf, state, ofs, limit, runtimeCheckedCPUFeatures);
+            this.blockSize = blockSize;
+        }
+
+        public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
+            return SHA3Node.minFeaturesAMD64();
+        }
+
+        public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
+            return SHA3Node.minFeaturesAARCH64();
+        }
+
+        @Override
+        public ForeignCallDescriptor getForeignCallDescriptor() {
+            return STUB;
+        }
+
+        @Override
+        public ValueNode[] getForeignCallArguments() {
+            return new ValueNode[]{buf, state, blockSize, ofs, limit};
+        }
+
+        @Override
+        public void emitIntrinsic(NodeLIRBuilderTool gen) {
+            gen.setResult(this, gen.getLIRGeneratorTool().emitSha3ImplCompressMB(gen.operand(buf), gen.operand(state), gen.operand(blockSize), gen.operand(ofs), gen.operand(limit)));
+        }
+
+        @NodeIntrinsic
+        @GenerateStub(name = "sha3ImplCompressMB", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+        public static native int sha3ImplCompressMB(Pointer buf, Pointer state, int blockSize, int ofs, int limit);
+
+        @NodeIntrinsic
+        public static native int sha3ImplCompressMB(Pointer buf, Pointer state, int blockSize, int ofs, int limit, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
     }
 
     /**
@@ -283,23 +446,31 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
             return EnumSet.of(AMD64.CPUFeature.AVX, AMD64.CPUFeature.AVX2, AMD64.CPUFeature.BMI2);
         }
 
+        /*
+         * Substrate VM currently chooses minFeaturesAMD64() as the runtime-compilation variant
+         * because SHA512 is not widely adopted yet. Native targets with BMI2 and SHA512 can still
+         * use this feature set.
+         */
+        public static EnumSet<AMD64.CPUFeature> maxFeaturesAMD64() {
+            return EnumSet.of(AMD64.CPUFeature.AVX, AMD64.CPUFeature.AVX2, AMD64.CPUFeature.BMI2, AMD64.CPUFeature.SHA512);
+        }
+
         public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
             return EnumSet.of(AArch64.CPUFeature.SHA512);
         }
 
         @SuppressWarnings("unlikely-arg-type")
         public static boolean isSupported(Architecture arch) {
-            if (arch instanceof AMD64) {
-                return ((AMD64) arch).getFeatures().containsAll(minFeaturesAMD64());
-            } else if (arch instanceof AArch64) {
-                return ((AArch64) arch).getFeatures().containsAll(minFeaturesAARCH64());
-            }
-            return false;
-        }
-
-        @Override
-        public boolean canBeEmitted(Architecture arch) {
-            return isSupported(arch);
+            return switch (arch) {
+                /*
+                 * HotSpot supports AVX2 with either BMI2 or SHA512, but SVM currently models the
+                 * runtime-compilation variant with minFeaturesAMD64(). Requiring BMI2 here keeps
+                 * the public support predicate aligned with that generated-stub feature model.
+                 */
+                case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+                case AArch64 aarch64 -> aarch64.getFeatures().containsAll(minFeaturesAARCH64());
+                default -> false;
+            };
         }
 
         @Override
@@ -321,6 +492,54 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
     }
 
     /**
+     * Intrinsification for {@code sun.security.provider.DigestBase.implCompressMultiBlock0}
+     * with a {@code sun.security.provider.SHA5} receiver.
+     */
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_256)
+    public static final class SHA512MultiBlockNode extends MessageDigestMultiBlockNode {
+
+        public static final NodeClass<SHA512MultiBlockNode> TYPE = NodeClass.create(SHA512MultiBlockNode.class);
+        public static final ForeignCallDescriptor STUB = multiBlockForeignCallDescriptor("sha512ImplCompressMB");
+
+        public SHA512MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit) {
+            super(TYPE, buf, state, ofs, limit, null);
+        }
+
+        public SHA512MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit, EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(TYPE, buf, state, ofs, limit, runtimeCheckedCPUFeatures);
+        }
+
+        public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
+            return SHA512Node.minFeaturesAMD64();
+        }
+
+        public static EnumSet<AMD64.CPUFeature> maxFeaturesAMD64() {
+            return SHA512Node.maxFeaturesAMD64();
+        }
+
+        public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
+            return SHA512Node.minFeaturesAARCH64();
+        }
+
+        @Override
+        public ForeignCallDescriptor getForeignCallDescriptor() {
+            return STUB;
+        }
+
+        @Override
+        public void emitIntrinsic(NodeLIRBuilderTool gen) {
+            gen.setResult(this, gen.getLIRGeneratorTool().emitSha512ImplCompressMB(gen.operand(buf), gen.operand(state), gen.operand(ofs), gen.operand(limit)));
+        }
+
+        @NodeIntrinsic
+        @GenerateStub(name = "sha512ImplCompressMB", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+        public static native int sha512ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit);
+
+        @NodeIntrinsic
+        public static native int sha512ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
+    }
+
+    /**
      * Intrinsification for {@code sun.security.provider.MD5.implCompress0}.
      */
     @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_64)
@@ -335,6 +554,10 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
 
         public MD5Node(ValueNode buf, ValueNode state, EnumSet<?> runtimeCheckedCPUFeatures) {
             super(TYPE, buf, state, runtimeCheckedCPUFeatures);
+        }
+
+        public static boolean isSupported(Architecture arch) {
+            return arch instanceof AMD64 || arch instanceof AArch64;
         }
 
         @Override
@@ -354,5 +577,46 @@ public abstract class MessageDigestNode extends MemoryKillStubIntrinsicNode {
         @NodeIntrinsic
         public static native void md5ImplCompress(Pointer buf, Pointer state, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
 
+    }
+
+    /**
+     * Intrinsification for {@code sun.security.provider.DigestBase.implCompressMultiBlock0}
+     * with a {@code sun.security.provider.MD5} receiver.
+     */
+    @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_UNKNOWN, cyclesRationale = "Cannot estimate the time of a loop", size = SIZE_64)
+    public static final class MD5MultiBlockNode extends MessageDigestMultiBlockNode {
+
+        public static final NodeClass<MD5MultiBlockNode> TYPE = NodeClass.create(MD5MultiBlockNode.class);
+        public static final ForeignCallDescriptor STUB = multiBlockForeignCallDescriptor("md5ImplCompressMB");
+
+        public MD5MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit) {
+            super(TYPE, buf, state, ofs, limit, null);
+        }
+
+        public MD5MultiBlockNode(ValueNode buf, ValueNode state, ValueNode ofs, ValueNode limit, EnumSet<?> runtimeCheckedCPUFeatures) {
+            super(TYPE, buf, state, ofs, limit, runtimeCheckedCPUFeatures);
+        }
+
+        @Override
+        public ForeignCallDescriptor getForeignCallDescriptor() {
+            return STUB;
+        }
+
+        @Override
+        public boolean needsExplicitZeroExtension(Architecture arch) {
+            return !(arch instanceof AMD64);
+        }
+
+        @Override
+        public void emitIntrinsic(NodeLIRBuilderTool gen) {
+            gen.setResult(this, gen.getLIRGeneratorTool().emitMD5ImplCompressMB(gen.operand(buf), gen.operand(state), gen.operand(ofs), gen.operand(limit)));
+        }
+
+        @NodeIntrinsic
+        @GenerateStub(name = "md5ImplCompressMB")
+        public static native int md5ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit);
+
+        @NodeIntrinsic
+        public static native int md5ImplCompressMB(Pointer buf, Pointer state, int ofs, int limit, @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
     }
 }

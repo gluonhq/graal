@@ -25,9 +25,6 @@
 
 package com.oracle.svm.core.jdk;
 
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-
 import org.graalvm.nativeimage.Platform.LINUX;
 import org.graalvm.nativeimage.Platforms;
 
@@ -35,9 +32,8 @@ import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.jfr.Name_jdk_jfr_internal_JDKEvents_helper;
 
-@TargetClass(classNameProvider = Name_jdk_jfr_internal_JDKEvents_helper.class)
+@TargetClass(jdk.jfr.internal.JDKEvents.class)
 @Platforms(LINUX.class)
 final class Target_jdk_jfr_internal_JDKEvents {
     @Alias //
@@ -47,15 +43,6 @@ final class Target_jdk_jfr_internal_JDKEvents {
     @Alias //
     @RecomputeFieldValue(kind = Kind.Reset) //
     private static boolean initializationTriggered;
-}
-
-@TargetClass(className = "jdk.jfr.internal.periodic.JVMEventTask")
-@Platforms(LINUX.class)
-final class Target_jdk_jfr_internal_periodic_JVMEventTask {
-    @Alias //
-    @RecomputeFieldValue(kind = Kind.NewInstance, declClass = ReentrantLock.class) //
-    private static Lock lock;
-
 }
 
 @TargetClass(className = "jdk.internal.platform.Metrics")

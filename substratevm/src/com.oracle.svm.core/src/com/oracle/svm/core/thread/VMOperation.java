@@ -24,19 +24,21 @@
  */
 package com.oracle.svm.core.thread;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.heap.VMOperationInfo;
 import com.oracle.svm.core.jfr.JfrTicks;
 import com.oracle.svm.core.jfr.events.ExecuteVMOperationEvent;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.thread.VMOperationControl.OpInProgress;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Only one thread at a time can execute {@linkplain VMOperation}s (see
@@ -56,27 +58,27 @@ public abstract class VMOperation {
         this.info = info;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final int getId() {
         return info.getId();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final String getName() {
         return info.getName();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public boolean isGC() {
         return false;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final boolean getCausesSafepoint() {
         return info.getCausesSafepoint();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final boolean isBlocking() {
         return info.isBlocking();
     }
@@ -111,62 +113,70 @@ public abstract class VMOperation {
             trace.string("[VMOperation.execute caught: ").string(t.getClass().getName()).string("]").newline();
             throw VMError.shouldNotReachHere(t);
         } finally {
-            ExecuteVMOperationEvent.emit(this, getQueuingThreadId(data), startTicks);
+            ExecuteVMOperationEvent.emit(this, requestingThread, startTicks);
             control.setInProgress(prevOperation, prevQueuingThread, prevExecutingThread, false);
         }
     }
 
     /**
-     * Returns true if the current thread is currently executing a VM operation.
+     * Returns true if the current thread is in the middle of executing a VM operation. Note that
+     * this includes VM operations that do not need a safepoint.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isInProgress() {
         OpInProgress inProgress = VMOperationControl.get().getInProgress();
         return isInProgress(inProgress);
     }
 
     /**
-     * Returns true if the current thread is currently executing a VM operation that causes a
+     * Returns true if the current thread is in the middle of executing a VM operation that needs a
      * safepoint.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isInProgressAtSafepoint() {
         OpInProgress inProgress = VMOperationControl.get().getInProgress();
         return isInProgress(inProgress) && inProgress.operation.getCausesSafepoint();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    /**
+     * Returns true if the current thread is in the middle of executing a VM operation. Note that
+     * this includes VM operations that do not need a safepoint.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static boolean isInProgress(OpInProgress inProgress) {
         return inProgress.getExecutingThread() == CurrentIsolate.getCurrentThread();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    /** Returns true if the current thread is in the middle of performing a garbage collection. */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isGCInProgress() {
         VMOperation op = VMOperationControl.get().getInProgress().getOperation();
         return op != null && op.isGC();
     }
 
-    /** Check that there is a VMOperation in progress. */
-    public static void guaranteeInProgress(String message) {
-        if (!isInProgress()) {
-            throw VMError.shouldNotReachHere(message);
-        }
-    }
-
-    /** Check that there is not a VMOperation in progress. */
+    /**
+     * Throws a fatal error if the current thread is in the middle of executing a VM operation. Note
+     * that this includes VM operations that do not need a safepoint.
+     */
     public static void guaranteeNotInProgress(String message) {
         if (isInProgress()) {
             throw VMError.shouldNotReachHere(message);
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    /**
+     * Verifies that the current thread is in the middle of executing a VM operation that needs a
+     * safepoint.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void guaranteeInProgressAtSafepoint(String message) {
         if (!isInProgressAtSafepoint()) {
             throw VMError.shouldNotReachHere(message);
         }
     }
 
+    /** Verifies that the current thread is in the middle of performing a garbage collection. */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void guaranteeGCInProgress(String message) {
         if (!isGCInProgress()) {
             throw VMError.shouldNotReachHere(message);
@@ -182,14 +192,12 @@ public abstract class VMOperation {
         return true;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     protected abstract void markAsQueued(NativeVMOperationData data);
 
     protected abstract void markAsFinished(NativeVMOperationData data);
 
     protected abstract IsolateThread getQueuingThread(NativeVMOperationData data);
-
-    protected abstract long getQueuingThreadId(NativeVMOperationData data);
 
     protected abstract boolean isFinished(NativeVMOperationData data);
 
@@ -200,7 +208,7 @@ public abstract class VMOperation {
         NONE,
         SAFEPOINT;
 
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
         public static boolean getCausesSafepoint(SystemEffect value) {
             return value == SAFEPOINT;
         }

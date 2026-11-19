@@ -27,15 +27,15 @@ package jdk.graal.compiler.core.test;
 import java.lang.reflect.Method;
 
 import org.graalvm.collections.EconomicSet;
+
 import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.hotspot.HotSpotGraalServices;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.spi.ProfileProvider;
 import jdk.graal.compiler.nodes.spi.ResolvedJavaMethodProfileProvider;
 import jdk.graal.compiler.nodes.spi.StableProfileProvider;
-import jdk.graal.compiler.phases.VerifyPhase;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -55,10 +55,11 @@ public class VerifyProfileMethodUsage extends VerifyPhase<CoreProviders> {
         } catch (NoSuchMethodException e) {
             throw new GraalError(e);
         }
-
+        ALLOWED_CLASSES.add(StableProfileProvider.class);
         ALLOWED_CLASSES.add(StableProfileProvider.CachingProfilingInfo.class);
         ALLOWED_CLASSES.add(ResolvedJavaMethodProfileProvider.class);
         ALLOWED_CLASSES.add(ResolvedJavaMethod.class);
+        ALLOWED_CLASSES.add(HotSpotGraalServices.class);
     }
 
     @Override

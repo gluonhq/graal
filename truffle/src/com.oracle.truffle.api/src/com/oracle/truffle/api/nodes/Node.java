@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -68,10 +68,46 @@ import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
 
 /**
- * Abstract base class for all Truffle nodes.
+ * Abstract base class for all nodes in the Truffle Abstract Syntax Tree (AST).
+ * <p>
+ * The {@code Node} class serves as the foundational class for all nodes within the Truffle
+ * framework. It provides the core functionality required to build interpreters for guest languages
+ * by allowing language implementers to define custom nodes representing language constructs.
+ * <p>
+ * Key responsibilities and features of the {@code Node} class include:
+ * <ul>
+ * <li>Managing the parent-child relationships between nodes, ensuring the integrity of the
+ * AST.</li>
+ * <li>Providing mechanisms for adopting and replacing child nodes within the AST, facilitating
+ * dynamic language features and optimizations.</li>
+ * <li>Handling source code associations, allowing nodes to represent specific segments of the guest
+ * language source code via {@link #getSourceSection()}.</li>
+ * <li>Supporting node cloning and deep copying, enabling the creation of modified copies of node
+ * trees.</li>
+ * <li>Facilitating node visitation patterns through the {@link #accept(NodeVisitor)} method and
+ * providing iteration over child nodes via {@link #getChildren()}.</li>
+ * <li>Ensuring thread safety and synchronization for modifications to the AST with atomic
+ * operations and locks via {@link #atomic(Runnable)} and {@link #getLock()}.</li>
+ * <li>Integrating with Truffle's instrumentation and debugging facilities, allowing for runtime
+ * observation and modification of AST nodes.</li>
+ * <li>Reporting polymorphic specializations through {@link #reportPolymorphicSpecialize()}, aiding
+ * in the optimization processes of the Truffle framework.</li>
+ * </ul>
+ * <p>
+ * Language implementers typically create subclasses of {@code Node} to represent specific language
+ * constructs and operations. Subclasses can use the {@link Child} and {@link Children} annotations
+ * to declare child nodes, which the Truffle framework manages automatically.
+ * <p>
+ * The {@code Node} class also provides important methods such as {@link #replace(Node)} for
+ * replacing nodes in the AST, {@link #getParent()} and {@link #getRootNode()} for navigating the
+ * tree, and {@link #getDescription()} for obtaining a user-readable description of the node.
  *
+ * @see RootNode
+ * @see NodeVisitor
+ * @see NodeInterface
  * @since 0.8 or earlier
  */
+// Bind.DefaultExpression("$node")
 public abstract class Node implements NodeInterface, Cloneable {
 
     @CompilationFinal private volatile Node parent;
@@ -416,7 +452,13 @@ public abstract class Node implements NodeInterface, Cloneable {
 
     /**
      * Returns properties of this node interesting for debugging and can be overwritten by
-     * subclasses to add their own custom properties.
+     * subclasses to add their own custom properties. This method may be called on a compiler thread
+     * without an entered guest context. Implementations must not execute guest code or rely on a
+     * guest context being entered.
+     * <p>
+     * Debug property values should be strings, boxed primitive values, classes, or enums. Other
+     * values may be represented using an opaque identity string; their {@link Object#toString()}
+     * method is not invoked implicitly.
      *
      * @return the properties as a key/value hash map
      * @since 0.8 or earlier
@@ -494,7 +536,16 @@ public abstract class Node implements NodeInterface, Cloneable {
         return NodeUtil.isReplacementSafe(getParent(), this, newNode);
     }
 
-    private void reportReplace(Node oldNode, Node newNode, CharSequence reason) {
+    /**
+     * Reports that {@code oldNode} was replaced with {@code newNode}, notifying any
+     * {@link ReplaceObserver replace observers} and invalidating any compiled call targets.
+     * <p>
+     * This method does not actually replace the nodes. Use {@link Node#replace(Node, CharSequence)}
+     * to replace nodes.
+     *
+     * @since 24.2
+     */
+    protected final void reportReplace(Node oldNode, Node newNode, CharSequence reason) {
         Node node = this;
         while (node != null) {
             boolean consumed = false;
@@ -745,9 +796,7 @@ public abstract class Node implements NodeInterface, Cloneable {
             }
             node = node.getParent();
         }
-        if (node == null) {
-            checkAdoptable();
-        }
+        checkAdoptable();
         return null;
     }
 

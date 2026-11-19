@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2021, Arm Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -25,6 +25,8 @@
  */
 package jdk.graal.compiler.lir.aarch64;
 
+import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDInstruction.LD1_MULTIPLE_2R;
+import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDInstruction.LD1_MULTIPLE_4R;
 import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDInstruction.LD2_MULTIPLE_2R;
 import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDInstruction.LD4_MULTIPLE_4R;
 import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDSize.FullReg;
@@ -44,7 +46,9 @@ import jdk.graal.compiler.asm.aarch64.AArch64Assembler.ExtendType;
 import jdk.graal.compiler.asm.aarch64.AArch64Assembler.ShiftType;
 import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
 import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler.ScratchRegister;
+import jdk.graal.compiler.code.DataSection;
 import jdk.graal.compiler.core.common.Stride;
+import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
@@ -81,12 +85,12 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         super(TYPE);
 
         int nValues = searchValues.length;
-        GraalError.guarantee(result.getPlatformKind() == AArch64Kind.DWORD, "int value expected");
+        GraalError.guarantee(result.getPlatformKind() == (variant.returnsLong() ? AArch64Kind.QWORD : AArch64Kind.DWORD), "%s value expected", variant.returnsLong() ? "long" : "int");
         GraalError.guarantee(arrayPtr.getPlatformKind() == AArch64Kind.QWORD, "pointer value expected");
         GraalError.guarantee(arrayOffset.getPlatformKind() == AArch64Kind.QWORD, "long value expected");
         GraalError.guarantee(arrayLength.getPlatformKind() == AArch64Kind.DWORD, "int value expected");
         GraalError.guarantee(fromIndex.getPlatformKind() == AArch64Kind.DWORD, "int value expected");
-        if (variant == ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             GraalError.guarantee(searchValues.length == 1 && searchValues[0].getPlatformKind() == AArch64Kind.QWORD, "single pointer value expected");
         } else {
             GraalError.guarantee(Arrays.stream(searchValues).allMatch(sv -> sv.getPlatformKind() == AArch64Kind.DWORD), "int values expected");
@@ -104,21 +108,31 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         this.searchValues = searchValues;
 
         temp = allocateTempRegisters(tool, 5);
-        vectorTemp = allocateVectorRegisters(tool, getNumberOfRequiredVectorRegisters(variant, stride, nValues), variant == ArrayIndexOfVariant.Table);
+        vectorTemp = allocateVectorRegisters(tool, getNumberOfRequiredVectorRegisters(variant, stride, nValues), variant.isTable());
     }
 
     private static int getNumberOfRequiredVectorRegisters(ArrayIndexOfVariant variant, Stride stride, int nValues) {
+        if (variant.returnsLong()) {
+            int tableCount = variant.tableCount();
+            return switch (stride) {
+                case S1 -> (3 * tableCount) + 9;
+                case S2 -> (3 * tableCount) + 11;
+                case S4 -> (3 * tableCount) + 15;
+                default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+            };
+        }
+        // Checkstyle: stop FallThrough
         switch (variant) {
             case MatchAny:
                 return nValues + (nValues > 1 ? 6 : 3);
-            case MatchRange:
+            case MatchRange, MatchRangeForeignEndian:
                 return nValues + 6;
             case WithMask:
                 return nValues + 3;
             case FindTwoConsecutive:
             case FindTwoConsecutiveWithMask:
                 return nValues + 5;
-            case Table:
+            case Table, TableForeignEndian:
                 switch (stride) {
                     case S1:
                         return 7;
@@ -132,6 +146,11 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
             default:
                 throw GraalError.shouldNotReachHereUnexpectedValue(variant); // ExcludeFromJacocoGeneratedReport
         }
+        // Checkstyle: resume FallThrough
+    }
+
+    private boolean isConsecutiveTableVariant() {
+        return variant.returnsLong();
     }
 
     private void emitScalarCode(AArch64MacroAssembler masm, Register baseAddress, Register searchLength) {
@@ -194,6 +213,12 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         masm.align(AArch64MacroAssembler.PREFERRED_LOOP_ALIGNMENT);
         masm.bind(searchByElementLoop);
         masm.ldr(memAccessSize, curValue, AArch64Address.createRegisterOffsetAddress(memAccessSize, baseAddress, curIndex, false));
+        if (variant == ArrayIndexOfVariant.MatchRangeForeignEndian || variant == ArrayIndexOfVariant.TableForeignEndian) {
+            switch (stride) {
+                case S2 -> masm.rev16(32, curValue, curValue);
+                case S4, S8 -> masm.rev(stride.getBitCount(), curValue, curValue);
+            }
+        }
         switch (variant) {
             case MatchAny:
                 for (AllocatableValue searchValue : searchValues) {
@@ -201,7 +226,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
                     masm.branchConditionally(ConditionFlag.EQ, match);
                 }
                 break;
-            case MatchRange:
+            case MatchRange, MatchRangeForeignEndian:
                 for (int i = 0; i < searchValues.length; i += 2) {
                     Label noMatch = new Label();
                     masm.cmp(compareSize, curValue, asRegister(searchValues[i]));
@@ -221,7 +246,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
                 masm.cmp(compareSize, searchValueReg, curValue);
                 masm.branchConditionally(ConditionFlag.EQ, match);
                 break;
-            case Table:
+            case Table, TableForeignEndian:
                 Label greaterThan0xff = new Label();
                 try (ScratchRegister sc = masm.getScratchRegister()) {
                     Register tmp = sc.getRegister();
@@ -320,7 +345,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         Register vecTableHi;
         Register vecTableLo;
 
-        if (variant == ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             vecMask0x0f = asRegister(vectorTemp[0]);
             vecTableHi = asRegister(vectorTemp[1]);
             vecTableLo = asRegister(vectorTemp[2]);
@@ -376,7 +401,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         Label end = new Label();
 
         ElementSize eSize = ElementSize.fromStride(stride);
-        if (variant == ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             // in the table variant, searchValue0 is actually a pointer to a 32-byte array
             masm.fldp(128, vecTableHi, vecTableLo, AArch64Address.createPairBaseRegisterOnlyAddress(128, asRegister(searchValues[0])));
             masm.neon.moveVI(FullReg, ElementSize.Byte, vecMask0x0f, 0x0f);
@@ -421,7 +446,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         masm.bind(searchByChunkLoopTail);
         masm.sub(64, currOffset, array, baseAddress);
 
-        if (variant != ArrayIndexOfVariant.Table) {
+        if (!variant.isTable()) {
             masm.fldp(128, vecArray1, vecArray2, AArch64Address.createImmediateAddress(128, AddressingMode.IMMEDIATE_PAIR_POST_INDEXED, array, 32));
         }
         emitSIMDMatch(masm, eSize, array, vecSearchValues, vecTmp, vecArray1, vecArray2, vecLastArray2, vecMask0x0f, vecTableHi, vecTableLo, matchInChunk);
@@ -456,7 +481,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         /* 4. If the element is found in a 32-byte chunk then find its position. */
         masm.align(AArch64MacroAssembler.PREFERRED_BRANCH_TARGET_ALIGNMENT);
         masm.bind(matchInChunk);
-        if (variant == ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             // convert matching bytes to 0xff
             masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vecArray1, vecArray1, vecArray1);
             masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vecArray2, vecArray2, vecArray2);
@@ -465,7 +490,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
             Register tmp = scratchReg.getRegister();
             initCalcIndexOfFirstMatchMask(masm, vecTmp[0], tmp);
             calcIndexOfFirstMatch(masm, tmp, vecArray1, vecArray2, vecTmp[0], false);
-            if (variant == ArrayIndexOfVariant.Table) {
+            if (variant.isTable()) {
                 masm.asr(64, currOffset, currOffset, stride.log2);
             }
             masm.add(64, result, currOffset, tmp, ShiftType.ASR, 1);
@@ -480,6 +505,7 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         masm.bind(end);
     }
 
+    @SuppressWarnings("fallthrough")
     private void emitSIMDMatch(AArch64MacroAssembler masm,
                     ElementSize eSize,
                     Register array,
@@ -522,6 +548,10 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
                     }
                 }
                 break;
+            case MatchRangeForeignEndian:
+                masm.neon.revVV(FullReg, eSize, vecArray1, vecArray1);
+                masm.neon.revVV(FullReg, eSize, vecArray2, vecArray2);
+                // fallthrough
             case MatchRange:
                 // match first range
                 // check if array elements are greater or equal to lower bound
@@ -581,51 +611,78 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
                 masm.neon.andVVV(FullReg, vecArray1, vecArray1, vecTmp[0]);
                 masm.neon.andVVV(FullReg, vecArray2, vecArray2, vecTmp[1]);
                 break;
-            case Table:
+            case Table, TableForeignEndian:
                 switch (stride) {
-                    case S1:
+                    case S1 -> {
                         masm.fldp(128, vecArray1, vecArray2, AArch64Address.createImmediateAddress(128, AddressingMode.IMMEDIATE_PAIR_POST_INDEXED, array, 32));
                         performTableLookup(masm, vecMask0x0f, vecTableHi, vecTableLo, vecArray1, vecArray2, vecTmp[0], vecTmp[1]);
-                        break;
-                    case S2:
+                    }
+                    case S2 -> {
                         // de-structuring load: get array element's upper and lower bytes into
                         // separate vectors
                         masm.neon.ld2MultipleVV(FullReg, ElementSize.Byte, vecArray1, vecTmp[0], createStructureImmediatePostIndexAddress(LD2_MULTIPLE_2R, FullReg, eSize, array, 32));
                         masm.neon.ld2MultipleVV(FullReg, ElementSize.Byte, vecArray2, vecTmp[1], createStructureImmediatePostIndexAddress(LD2_MULTIPLE_2R, FullReg, eSize, array, 32));
+                        Register vecArray1B0 = vecArray1;
+                        Register vecArray1B1 = vecTmp[0];
+                        Register vecArray2B0 = vecArray2;
+                        Register vecArray2B1 = vecTmp[1];
+                        if (variant.isForeignEndian()) {
+                            vecArray1B0 = vecTmp[0];
+                            vecArray1B1 = vecArray1;
+                            vecArray2B0 = vecTmp[1];
+                            vecArray2B1 = vecArray2;
+                        }
                         // compare upper bytes to zero
                         masm.neon.moveVI(FullReg, ElementSize.Byte, vecTmp[2], 0);
-                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecTmp[0], vecTmp[0], vecTmp[2]);
-                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecTmp[1], vecTmp[1], vecTmp[2]);
+                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecArray1B1, vecArray1B1, vecTmp[2]);
+                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecArray2B1, vecArray2B1, vecTmp[2]);
                         // perform table lookup on lower bytes
-                        performTableLookup(masm, vecMask0x0f, vecTableHi, vecTableLo, vecArray1, vecArray2, vecTmp[2], vecTmp[3]);
+                        performTableLookup(masm, vecMask0x0f, vecTableHi, vecTableLo, vecArray1B0, vecArray2B0, vecTmp[2], vecTmp[3]);
                         // eliminate all matches where the corresponding high byte is not zero
-                        masm.neon.andVVV(FullReg, vecArray1, vecArray1, vecTmp[0]);
-                        masm.neon.andVVV(FullReg, vecArray2, vecArray2, vecTmp[1]);
-                        break;
-                    case S4:
+                        masm.neon.andVVV(FullReg, vecArray1, vecArray1B0, vecArray1B1);
+                        masm.neon.andVVV(FullReg, vecArray2, vecArray2B0, vecArray2B1);
+                    }
+                    case S4 -> {
                         // de-structuring load: get array element's upper and lower bytes into
                         // separate vectors
                         masm.neon.ld4MultipleVVVV(FullReg, ElementSize.Byte, vecArray1, vecTmp[0], vecTmp[1], vecTmp[2],
                                         createStructureImmediatePostIndexAddress(LD4_MULTIPLE_4R, FullReg, eSize, array, 64));
                         masm.neon.ld4MultipleVVVV(FullReg, ElementSize.Byte, vecArray2, vecTmp[3], vecTmp[4], vecTmp[5],
                                         createStructureImmediatePostIndexAddress(LD4_MULTIPLE_4R, FullReg, eSize, array, 64));
+                        Register vecArray1B0 = vecArray1;
+                        Register vecArray1B1 = vecTmp[0];
+                        Register vecArray1B2 = vecTmp[1];
+                        Register vecArray1B3 = vecTmp[2];
+                        Register vecArray2B0 = vecArray2;
+                        Register vecArray2B1 = vecTmp[3];
+                        Register vecArray2B2 = vecTmp[4];
+                        Register vecArray2B3 = vecTmp[5];
+                        if (variant.isForeignEndian()) {
+                            vecArray1B0 = vecTmp[2];
+                            vecArray1B1 = vecTmp[1];
+                            vecArray1B2 = vecTmp[0];
+                            vecArray1B3 = vecArray1;
+                            vecArray2B0 = vecTmp[5];
+                            vecArray2B1 = vecTmp[4];
+                            vecArray2B2 = vecTmp[3];
+                            vecArray2B3 = vecArray2;
+                        }
                         // merge upper bytes
-                        masm.neon.orrVVV(FullReg, vecTmp[0], vecTmp[0], vecTmp[1]);
-                        masm.neon.orrVVV(FullReg, vecTmp[3], vecTmp[3], vecTmp[4]);
-                        masm.neon.orrVVV(FullReg, vecTmp[0], vecTmp[0], vecTmp[2]);
-                        masm.neon.orrVVV(FullReg, vecTmp[1], vecTmp[3], vecTmp[5]);
+                        masm.neon.orrVVV(FullReg, vecArray1B1, vecArray1B1, vecArray1B2);
+                        masm.neon.orrVVV(FullReg, vecArray2B1, vecArray2B1, vecArray2B2);
+                        masm.neon.orrVVV(FullReg, vecArray1B1, vecArray1B1, vecArray1B3);
+                        masm.neon.orrVVV(FullReg, vecArray2B1, vecArray2B1, vecArray2B3);
                         // compare upper bytes to zero
-                        masm.neon.moveVI(FullReg, ElementSize.Byte, vecTmp[2], 0);
-                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecTmp[0], vecTmp[0], vecTmp[2]);
-                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecTmp[1], vecTmp[1], vecTmp[2]);
+                        masm.neon.moveVI(FullReg, ElementSize.Byte, vecArray1B3, 0);
+                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecArray1B1, vecArray1B1, vecArray1B3);
+                        masm.neon.cmeqVVV(FullReg, ElementSize.Byte, vecArray2B1, vecArray2B1, vecArray1B3);
                         // perform table lookup on lower bytes
-                        performTableLookup(masm, vecMask0x0f, vecTableHi, vecTableLo, vecArray1, vecArray2, vecTmp[2], vecTmp[3]);
+                        performTableLookup(masm, vecMask0x0f, vecTableHi, vecTableLo, vecArray1B0, vecArray2B0, vecArray1B3, vecArray2B3);
                         // eliminate all matches where the corresponding upper bytes are not zero
-                        masm.neon.andVVV(FullReg, vecArray1, vecArray1, vecTmp[0]);
-                        masm.neon.andVVV(FullReg, vecArray2, vecArray2, vecTmp[1]);
-                        break;
-                    default:
-                        throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+                        masm.neon.andVVV(FullReg, vecArray1, vecArray1B0, vecArray1B1);
+                        masm.neon.andVVV(FullReg, vecArray2, vecArray2B0, vecArray2B1);
+                    }
+                    default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
                 }
                 break;
         }
@@ -633,16 +690,16 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         try (ScratchRegister sc = masm.getScratchRegister()) {
             Register tmp = sc.getRegister();
             /* If value != 0, then there was a match somewhere. */
-            cbnzVector(masm, ElementSize.fromStride(getMatchResultStride()), vecTmp[0], vecTmp[0], tmp, variant != ArrayIndexOfVariant.Table, matchInChunk);
+            cbnzVector(masm, ElementSize.fromStride(getMatchResultStride()), vecTmp[0], vecTmp[0], tmp, !variant.isTable(), matchInChunk);
         }
     }
 
     private Stride getMatchResultStride() {
-        return variant == ArrayIndexOfVariant.Table ? Stride.S1 : stride;
+        return variant.isTable() ? Stride.S1 : stride;
     }
 
     private int getSIMDLoopChunkSize() {
-        return variant == ArrayIndexOfVariant.Table ? 32 * stride.value : 32;
+        return variant.isTable() ? 32 * stride.value : 32;
     }
 
     private static void performTableLookup(AArch64MacroAssembler masm,
@@ -670,6 +727,13 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
 
     @Override
     public void emitCode(CompilationResultBuilder crb, AArch64MacroAssembler masm) {
+        if (isConsecutiveTableVariant()) {
+            // Consecutive-table variants are only emitted for search windows of at least 16
+            // elements, so they can always start in the dedicated vectorized path.
+            emitFindConsecutiveTablesCode(crb, masm);
+            return;
+        }
+
         Register result = asRegister(resultValue);
         Register arrayLength = asRegister(arrayLengthValue);
         Register fromIndex = asRegister(fromIndexValue);
@@ -717,5 +781,462 @@ public final class AArch64ArrayIndexOfOp extends AArch64ComplexVectorOp {
         emitSIMDCode(masm, baseAddress);
 
         masm.bind(done);
+    }
+
+    private void emitFindConsecutiveTablesCode(CompilationResultBuilder crb, AArch64MacroAssembler masm) {
+        int tableCount = variant.tableCount();
+        Register result = asRegister(resultValue);
+        Register arrayLength = asRegister(arrayLengthValue);
+        Register fromIndex = asRegister(fromIndexValue);
+        Register baseAddress = asRegister(temp[0]);
+        Register searchLength = asRegister(temp[1]);
+        Register endAddress = asRegister(temp[2]);
+        Register array = asRegister(temp[3]);
+        Register tmp = asRegister(temp[4]);
+
+        Register[] v = new Register[vectorTemp.length];
+        for (int i = 0; i < vectorTemp.length; i++) {
+            v[i] = asRegister(vectorTemp[i]);
+        }
+        Register[] vLut = Arrays.copyOfRange(v, 0, tableCount * 2);
+        Register vMask0x0f = v[tableCount * 2];
+        int base = (tableCount * 2) + 1;
+        Register[] vPrevCandidate;
+        Register vReduce;
+        Register vCandidate1;
+        Register vCandidate2;
+        Register[] vScratch;
+        Register vBytes1;
+        Register vBytes2;
+        Register vValid1;
+        Register vValid2;
+
+        Register[] s2Load = null;
+        Register[] s4Load = null;
+
+        final boolean fe = variant.isForeignEndian();
+        switch (stride) {
+            case S1 -> {
+                vBytes1 = v[base];
+                vBytes2 = v[base + 1];
+                vScratch = Arrays.copyOfRange(v, base + 2, base + 7);
+                vCandidate1 = v[base + 7];
+                vCandidate2 = v[base + 8];
+                vPrevCandidate = Arrays.copyOfRange(v, base + 9, base + 9 + (tableCount - 1));
+                vValid1 = null;
+                vValid2 = null;
+            }
+            case S2 -> {
+                s2Load = Arrays.copyOfRange(v, base, base + 4);
+                vScratch = Arrays.copyOfRange(v, base + 4, base + 9);
+                vCandidate1 = v[base + 9];
+                vCandidate2 = v[base + 10];
+                vPrevCandidate = Arrays.copyOfRange(v, base + 11, base + 11 + (tableCount - 1));
+                vBytes1 = s2Load[fe ? 1 : 0];
+                vValid1 = s2Load[fe ? 0 : 1];
+                vBytes2 = s2Load[fe ? 3 : 2];
+                vValid2 = s2Load[fe ? 2 : 3];
+            }
+            case S4 -> {
+                s4Load = Arrays.copyOfRange(v, base, base + 8);
+                vScratch = Arrays.copyOfRange(v, base + 8, base + 13);
+                vCandidate1 = v[base + 13];
+                vCandidate2 = v[base + 14];
+                vPrevCandidate = Arrays.copyOfRange(v, base + 15, base + 15 + (tableCount - 1));
+                vBytes1 = s4Load[fe ? 3 : 0];
+                vValid1 = s4Load[fe ? 2 : 1];
+                vBytes2 = s4Load[fe ? 7 : 4];
+                vValid2 = s4Load[fe ? 6 : 5];
+            }
+            default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+        }
+        vReduce = vScratch[4];
+
+        Label loop32 = new Label();
+        Label tail = new Label();
+        Label tailGreater16 = new Label();
+        Label tailLessThan16 = new Label();
+        Label found32 = new Label();
+        Label found16 = new Label();
+        Label done = new Label();
+        DataSection.Data extractCandidateMask = writeToDataSection(crb, createCTExtractCandidateMask());
+
+        // searchLength counts elements, not bytes. Consecutive-table variants are only emitted for
+        // windows of at least 16 elements, so they can always start in the vectorized path.
+        masm.sub(32, searchLength, arrayLength, fromIndex);
+        masm.add(64, baseAddress, asRegister(arrayPtrValue), asRegister(arrayOffsetValue));
+
+        // Load the hi/lo lookup tables once and clear the carry vectors used for cross-iteration
+        // matches.
+        emitCTLoadLUT(masm, asRegister(searchValues[0]), vLut);
+        masm.neon.moveVI(FullReg, ElementSize.Byte, vMask0x0f, 0x0f);
+        for (Register vPrev : vPrevCandidate) {
+            masm.neon.moveVI(FullReg, ElementSize.Byte, vPrev, 0);
+        }
+
+        // array points at the first searchable element and endAddress points one element past the
+        // end of the search window.
+        masm.add(64, endAddress, baseAddress, arrayLength, ExtendType.SXTW, stride.log2);
+        masm.add(64, array, baseAddress, fromIndex, ExtendType.SXTW, stride.log2);
+
+        masm.compare(32, searchLength, 32);
+        masm.branchConditionally(ConditionFlag.LO, tail);
+
+        // Main 32-byte loop. The dedicated 32-byte matcher evaluates two 16-byte halves in parallel
+        // and keeps one previous-candidate vector per non-final table.
+        masm.sub(64, searchLength, endAddress, 32 * stride.value);
+        masm.align(AArch64MacroAssembler.PREFERRED_LOOP_ALIGNMENT);
+        masm.bind(loop32);
+        switch (stride) {
+            case S1 -> masm.fldp(128, vBytes1, vBytes2, AArch64Address.createImmediateAddress(128, AddressingMode.IMMEDIATE_PAIR_POST_INDEXED, array, 32));
+            case S2 -> emitCTNarrow32S2(masm, array, s2Load);
+            case S4 -> emitCTNarrow32S4(masm, array, s4Load);
+            default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+        }
+        emitCTMatch32(masm, vLut, vMask0x0f, vBytes1, vBytes2, vValid1, vValid2, vScratch[0], vScratch[1], vScratch[2], vScratch[3], vScratch[4], vCandidate1, vCandidate2, vPrevCandidate);
+        masm.neon.orrVVV(FullReg, vReduce, vCandidate1, vCandidate2);
+        cbnzVector(masm, ElementSize.Byte, vReduce, vReduce, tmp, false, found32);
+        masm.cmp(64, array, searchLength);
+        masm.branchConditionally(ConditionFlag.LS, loop32);
+
+        // Tail handling: use a dedicated 16-byte matcher for 16..31-byte search windows and for the
+        // tail after the 32-byte loop. If less than 16 bytes remain, rewind to the overlapping
+        // final 16-byte window and adjust the carry state first.
+        masm.bind(tail);
+        masm.sub(64, tmp, endAddress, 16 * stride.value);
+        masm.cmp(64, array, tmp);
+        masm.branchConditionally(ConditionFlag.LO, tailGreater16);
+        masm.bind(tailLessThan16);
+        masm.sub(64, tmp, endAddress, array);
+        if (stride.log2 != 0) {
+            masm.asr(64, tmp, tmp, stride.log2);
+        }
+        emitCTAdjustTailCarry16(crb, masm, tmp, vPrevCandidate, vScratch[4]);
+        masm.sub(64, array, endAddress, 16 * stride.value);
+        masm.bind(tailGreater16);
+        switch (stride) {
+            case S1 -> masm.fldr(128, vBytes1, AArch64Address.createImmediateAddress(128, AddressingMode.IMMEDIATE_POST_INDEXED, array, 16));
+            case S2 -> emitCTNarrow16S2(masm, array, s2Load);
+            case S4 -> emitCTNarrow16S4(masm, array, s4Load);
+            default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+        }
+        emitCTMatch16(masm, vLut, vMask0x0f, vBytes1, vValid1, vScratch[0], vScratch[1], vScratch[2], vCandidate1, vPrevCandidate);
+        masm.neon.moveVV(FullReg, vReduce, vCandidate1);
+        cbnzVector(masm, ElementSize.Byte, vReduce, vReduce, tmp, false, found16);
+
+        masm.cmp(64, array, endAddress);
+        masm.mov(result, -1); // no match
+        masm.branchConditionally(ConditionFlag.HS, done);
+        masm.jmp(tailLessThan16);
+
+        masm.bind(found32);
+        // Extract the first matching byte from the 32-byte candidate pair and pack the result into
+        // [high 32 bits = byte, low 32 bits = index].
+        emitCTExtractFirstMatchAndPackResult32(crb, masm, baseAddress, array, result, vCandidate1, vCandidate2, vScratch[0], vScratch[1], vScratch[2], vScratch[3], extractCandidateMask);
+        masm.jmp(done);
+
+        masm.bind(found16);
+        // Same extraction logic for the single-vector tail path.
+        emitCTExtractFirstMatchAndPackResult16(crb, masm, baseAddress, array, result, vCandidate1, vScratch[0], vScratch[1], vScratch[2], vScratch[3], extractCandidateMask);
+
+        masm.bind(done);
+    }
+
+    private void emitCTLoadLUT(AArch64MacroAssembler masm, Register tablePtr, Register[] vLut) {
+        int tableCount = variant.tableCount();
+        try (ScratchRegister sc = masm.getScratchRegister()) {
+            Register ptr = sc.getRegister();
+            masm.mov(64, ptr, tablePtr);
+            // Load one hi/lo lookup-table pair per logical table. Keeping the LUT vectors
+            // consecutive lets us use LD1-multiple loads for both the 2-table and 4-table cases.
+            masm.neon.ld1MultipleVVVV(FullReg, ElementSize.Byte, vLut[0], vLut[1], vLut[2], vLut[3], createStructureImmediatePostIndexAddress(LD1_MULTIPLE_4R, FullReg, ElementSize.Byte, ptr, 64));
+            if (tableCount == 3) {
+                masm.neon.ld1MultipleVV(FullReg, ElementSize.Byte, vLut[4], vLut[5], createStructureImmediatePostIndexAddress(LD1_MULTIPLE_2R, FullReg, ElementSize.Byte, ptr, 32));
+            } else if (tableCount == 4) {
+                masm.neon.ld1MultipleVVVV(FullReg, ElementSize.Byte, vLut[4], vLut[5], vLut[6], vLut[7], createStructureImmediatePostIndexAddress(LD1_MULTIPLE_4R, FullReg, ElementSize.Byte, ptr, 64));
+            }
+        }
+    }
+
+    private void emitCTNarrow32S2(AArch64MacroAssembler masm, Register array, Register[] vLoad) {
+        boolean fe = variant.isForeignEndian();
+        // Destructure 16-bit input into low-byte/high-byte vectors. The low-byte vectors are the
+        // narrowed input, while the high-byte vectors become invalid-byte masks after CMTST.
+        masm.neon.ld2MultipleVV(FullReg, ElementSize.Byte, vLoad[0], vLoad[1], createStructureImmediatePostIndexAddress(LD2_MULTIPLE_2R, FullReg, ElementSize.Byte, array, 32));
+        masm.neon.ld2MultipleVV(FullReg, ElementSize.Byte, vLoad[2], vLoad[3], createStructureImmediatePostIndexAddress(LD2_MULTIPLE_2R, FullReg, ElementSize.Byte, array, 32));
+        Register vValid1 = vLoad[fe ? 0 : 1];
+        Register vValid2 = vLoad[fe ? 2 : 3];
+        // CMTST turns all non-zero upper bytes into 0xff, which lets the lookup stage clear
+        // matches whose original 16-bit value was > 0xff via BIC.
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid1, vValid1, vValid1);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid2, vValid2, vValid2);
+    }
+
+    private void emitCTNarrow16S2(AArch64MacroAssembler masm, Register array, Register[] vLoad) {
+        boolean fe = variant.isForeignEndian();
+        // Half variant of emitCTNarrow32S2, used by the 16-byte tail.
+        masm.neon.ld2MultipleVV(FullReg, ElementSize.Byte, vLoad[0], vLoad[1], createStructureImmediatePostIndexAddress(LD2_MULTIPLE_2R, FullReg, ElementSize.Byte, array, 32));
+        Register vValid = vLoad[fe ? 0 : 1];
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid, vValid, vValid);
+    }
+
+    private void emitCTNarrow32S4(AArch64MacroAssembler masm, Register array, Register[] vLoad) {
+        boolean fe = variant.isForeignEndian();
+        // Destructure 32-bit input into four byte vectors. The selected byte-0 vectors are the
+        // narrowed input. OR the remaining bytes together and turn them into 0xff masks so the
+        // lookup stage can eliminate values above 0xff.
+        masm.neon.ld4MultipleVVVV(FullReg, ElementSize.Byte, vLoad[0], vLoad[1], vLoad[2], vLoad[3], createStructureImmediatePostIndexAddress(LD4_MULTIPLE_4R, FullReg, ElementSize.Byte, array, 64));
+        masm.neon.ld4MultipleVVVV(FullReg, ElementSize.Byte, vLoad[4], vLoad[5], vLoad[6], vLoad[7], createStructureImmediatePostIndexAddress(LD4_MULTIPLE_4R, FullReg, ElementSize.Byte, array, 64));
+        Register vValid1 = vLoad[fe ? 2 : 1];
+        Register vValid2 = vLoad[fe ? 6 : 5];
+        masm.neon.orrVVV(FullReg, vValid1, vValid1, vLoad[fe ? 1 : 2]);
+        masm.neon.orrVVV(FullReg, vValid1, vValid1, vLoad[fe ? 0 : 3]);
+        masm.neon.orrVVV(FullReg, vValid2, vValid2, vLoad[fe ? 5 : 6]);
+        masm.neon.orrVVV(FullReg, vValid2, vValid2, vLoad[fe ? 4 : 7]);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid1, vValid1, vValid1);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid2, vValid2, vValid2);
+    }
+
+    private void emitCTNarrow16S4(AArch64MacroAssembler masm, Register array, Register[] vLoad) {
+        boolean fe = variant.isForeignEndian();
+        // Half variant of emitCTNarrow32S4, used by the 16-byte tail.
+        masm.neon.ld4MultipleVVVV(FullReg, ElementSize.Byte, vLoad[0], vLoad[1], vLoad[2], vLoad[3], createStructureImmediatePostIndexAddress(LD4_MULTIPLE_4R, FullReg, ElementSize.Byte, array, 64));
+        Register vValid = vLoad[fe ? 2 : 1];
+        masm.neon.orrVVV(FullReg, vValid, vValid, vLoad[fe ? 1 : 2]);
+        masm.neon.orrVVV(FullReg, vValid, vValid, vLoad[fe ? 0 : 3]);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vValid, vValid, vValid);
+    }
+
+    private static void emitCTSplitIntoNibbles(AArch64MacroAssembler masm, Register vMask0x0f, Register vBytes, Register vHiNibble) {
+        // Split the byte input into hi/lo nibble indices for table lookup.
+        masm.neon.ushrVVI(FullReg, ElementSize.Byte, vHiNibble, vBytes, 4);
+        masm.neon.andVVV(FullReg, vBytes, vBytes, vMask0x0f);
+    }
+
+    private static void emitCTLookup(AArch64MacroAssembler masm,
+                    Register[] vLut,
+                    int lutIndex,
+                    Register vHiNibble,
+                    Register vLoNibble,
+                    Register vCandidateOut,
+                    Register vScratch,
+                    Register vValidByteMask) {
+        // Look up the hi- and low-nibble masks and intersect them.
+        masm.neon.tblVVV(FullReg, vCandidateOut, vLut[lutIndex * 2], vHiNibble);
+        masm.neon.tblVVV(FullReg, vScratch, vLut[(lutIndex * 2) + 1], vLoNibble);
+        masm.neon.andVVV(FullReg, vCandidateOut, vCandidateOut, vScratch);
+        if (vValidByteMask != null) {
+            // Clear matches of narrowed elements whose original value was > 0xff.
+            masm.neon.bicVVV(FullReg, vCandidateOut, vCandidateOut, vValidByteMask);
+        }
+    }
+
+    private void emitCTMatch32(AArch64MacroAssembler masm,
+                    Register[] vLut,
+                    Register vMask0x0f,
+                    Register vBytes1,
+                    Register vBytes2,
+                    Register vValid1,
+                    Register vValid2,
+                    Register vNibbleHi1,
+                    Register vNibbleHi2,
+                    Register vCurCandidate1,
+                    Register vCurCandidate2,
+                    Register vScratch,
+                    Register vCandidate1,
+                    Register vCandidate2,
+                    Register[] vPrevCandidate) {
+        int tableCount = variant.tableCount();
+        // Split both 16-byte vectors once, then evaluate one logical table at a time.
+        // vPrevCandidate carries the previous iteration's second-half lookup result so the first
+        // half can still match sequences crossing the 32-byte loop boundary.
+        emitCTSplitIntoNibbles(masm, vMask0x0f, vBytes1, vNibbleHi1);
+        emitCTSplitIntoNibbles(masm, vMask0x0f, vBytes2, vNibbleHi2);
+        for (int i = 0; i < tableCount; i++) {
+            int shiftCount = tableCount - (i + 1);
+            emitCTLookup(masm, vLut, i, vNibbleHi1, vBytes1, vCurCandidate1, vScratch, vValid1);
+            emitCTLookup(masm, vLut, i, vNibbleHi2, vBytes2, vCurCandidate2, vScratch, vValid2);
+            if (i == 0) {
+                assert (shiftCount != 0) : Assertions.errorMessage(shiftCount);
+                // The first table initializes both accumulated candidate vectors by shifting in the
+                // previous chunk's carry for the first half and the current first half for the
+                // second half.
+                masm.neon.extVVV(FullReg, vCandidate1, vPrevCandidate[i], vCurCandidate1, FullReg.bytes() - shiftCount);
+                masm.neon.extVVV(FullReg, vCandidate2, vCurCandidate1, vCurCandidate2, FullReg.bytes() - shiftCount);
+                masm.neon.moveVV(FullReg, vPrevCandidate[i], vCurCandidate2);
+            } else if (i < tableCount - 1) {
+                // Intermediate tables contribute one shifted candidate stream per half and update
+                // their carry register for the next 32-byte iteration.
+                masm.neon.extVVV(FullReg, vScratch, vPrevCandidate[i], vCurCandidate1, FullReg.bytes() - shiftCount);
+                masm.neon.andVVV(FullReg, vCandidate1, vCandidate1, vScratch);
+                masm.neon.extVVV(FullReg, vScratch, vCurCandidate1, vCurCandidate2, FullReg.bytes() - shiftCount);
+                masm.neon.andVVV(FullReg, vCandidate2, vCandidate2, vScratch);
+                masm.neon.moveVV(FullReg, vPrevCandidate[i], vCurCandidate2);
+            } else {
+                // The last table already lines up with the sequence end positions, so it can be
+                // ANDed into both accumulated candidate vectors directly.
+                masm.neon.andVVV(FullReg, vCandidate1, vCandidate1, vCurCandidate1);
+                masm.neon.andVVV(FullReg, vCandidate2, vCandidate2, vCurCandidate2);
+            }
+        }
+    }
+
+    private void emitCTMatch16(AArch64MacroAssembler masm,
+                    Register[] vLut,
+                    Register vMask0x0f,
+                    Register vBytes,
+                    Register vValid,
+                    Register vNibbleHi,
+                    Register vCurCandidate,
+                    Register vScratch,
+                    Register vCandidate,
+                    Register[] vPrevCandidate) {
+        int tableCount = variant.tableCount();
+        // Half variant of emitCTMatch32. This is used for 16..31 byte windows and for the
+        // post-loop tail handling.
+        emitCTSplitIntoNibbles(masm, vMask0x0f, vBytes, vNibbleHi);
+        for (int i = 0; i < tableCount; i++) {
+            int shiftCount = tableCount - (i + 1);
+            emitCTLookup(masm, vLut, i, vNibbleHi, vBytes, vCurCandidate, vScratch, vValid);
+            if (i == 0) {
+                assert (shiftCount != 0) : Assertions.errorMessage(shiftCount);
+                // The first table initializes the accumulated candidate by shifting in the previous
+                // iteration's carry.
+                masm.neon.extVVV(FullReg, vCandidate, vPrevCandidate[i], vCurCandidate, FullReg.bytes() - shiftCount);
+                masm.neon.moveVV(FullReg, vPrevCandidate[i], vCurCandidate);
+            } else if (i < tableCount - 1) {
+                // Intermediate tables shift in their previous carry, accumulate into vCandidate,
+                // and store the current lookup result for the next 16-byte iteration.
+                masm.neon.extVVV(FullReg, vScratch, vPrevCandidate[i], vCurCandidate, FullReg.bytes() - shiftCount);
+                masm.neon.andVVV(FullReg, vCandidate, vCandidate, vScratch);
+                masm.neon.moveVV(FullReg, vPrevCandidate[i], vCurCandidate);
+            } else {
+                // The last table doesn't need any carry-over from the previous iteration.
+                masm.neon.andVVV(FullReg, vCandidate, vCandidate, vCurCandidate);
+            }
+        }
+    }
+
+    private void emitCTAdjustTailCarry16(CompilationResultBuilder crb,
+                    AArch64MacroAssembler masm,
+                    Register tailLength,
+                    Register[] vPrevCandidate,
+                    Register vMask) {
+        if (variant.tableCount() == 2) {
+            // In two-table mode, the overlapping 16-byte tail always re-checks the only possible
+            // cross-boundary match, so no carry needs to be preserved.
+            masm.neon.moveVI(FullReg, ElementSize.Byte, vPrevCandidate[0], 0);
+            return;
+        }
+        try (ScratchRegister sc = masm.getScratchRegister()) {
+            Register tmp = sc.getRegister();
+            // Keep only the last three candidate bytes. At most three start positions can still
+            // cross into the final overlapping 16-byte iteration because we handle up to four
+            // consecutive tables.
+            loadDataSectionAddress(crb, masm, tmp, writeToDataSection(crb, createCTTailPrevShuffleMask()));
+            masm.fldr(128, vMask, AArch64Address.createRegisterOffsetAddress(128, tmp, tailLength, false));
+            for (Register vPrev : vPrevCandidate) {
+                masm.neon.tblVVV(FullReg, vPrev, vPrev, vMask);
+            }
+        }
+    }
+
+    private void emitCTExtractFirstMatchAndPackResult32(CompilationResultBuilder crb,
+                    AArch64MacroAssembler masm,
+                    Register baseAddress,
+                    Register array,
+                    Register result,
+                    Register vCandidate1,
+                    Register vCandidate2,
+                    Register vMaskVec,
+                    Register vCanon1,
+                    Register vCanon2,
+                    Register vExtract,
+                    DataSection.Data extractCandidateMask) {
+        Register matchIndex = asRegister(temp[1]);
+        Register tmp = asRegister(temp[2]);
+        // vCandidate1/2 contain non-zero bytes at every end position of a matching sequence.
+        // Canonicalize those bytes to 0xff so calcIndexOfFirstMatch can locate the first one.
+        masm.neon.moveVV(FullReg, vCanon1, vCandidate1);
+        masm.neon.moveVV(FullReg, vCanon2, vCandidate2);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vCanon1, vCanon1, vCanon1);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vCanon2, vCanon2, vCanon2);
+        initCalcIndexOfFirstMatchMask(masm, vMaskVec, tmp);
+        calcIndexOfFirstMatch(masm, matchIndex, vCanon1, vCanon2, vMaskVec, false);
+        masm.asr(64, matchIndex, matchIndex, 1);
+        // Extract the matching byte by loading a TBL index vector offset by the first-match index.
+        loadDataSectionAddress(crb, masm, tmp, extractCandidateMask);
+        masm.fldr(128, vMaskVec, AArch64Address.createRegisterOffsetAddress(128, tmp, matchIndex, false));
+        masm.neon.tblVVVV(FullReg, vExtract, vCandidate1, vCandidate2, vMaskVec);
+        masm.neon.umovGX(ElementSize.Byte, tmp, vExtract, 0);
+        masm.and(64, tmp, tmp, 0xff);
+        // Convert the byte offset back to an array index and adjust to the start of the sequence.
+        masm.sub(64, result, array, baseAddress);
+        if (stride.log2 != 0) {
+            masm.asr(64, result, result, stride.log2);
+        }
+        masm.sub(64, result, result, 32);
+        masm.add(64, result, result, matchIndex);
+        masm.sub(64, result, result, variant.tableCount() - 1);
+        masm.lsl(64, tmp, tmp, 32);
+        masm.orr(64, result, result, tmp);
+    }
+
+    private void emitCTExtractFirstMatchAndPackResult16(CompilationResultBuilder crb,
+                    AArch64MacroAssembler masm,
+                    Register baseAddress,
+                    Register array,
+                    Register result,
+                    Register vCandidate,
+                    Register vMaskVec,
+                    Register vCanon,
+                    Register vZero,
+                    Register vExtract,
+                    DataSection.Data extractCandidateMask) {
+        Register matchIndex = asRegister(temp[1]);
+        Register tmp = asRegister(temp[2]);
+        // Single-vector variant of emitCTExtractFirstMatchAndPackResult32.
+        masm.neon.moveVV(FullReg, vCanon, vCandidate);
+        masm.neon.cmtstVVV(FullReg, ElementSize.Byte, vCanon, vCanon, vCanon);
+        masm.neon.moveVI(FullReg, ElementSize.Byte, vZero, 0);
+        initCalcIndexOfFirstMatchMask(masm, vMaskVec, tmp);
+        calcIndexOfFirstMatch(masm, matchIndex, vCanon, vZero, vMaskVec, false);
+        masm.asr(64, matchIndex, matchIndex, 1);
+        loadDataSectionAddress(crb, masm, tmp, extractCandidateMask);
+        masm.fldr(128, vMaskVec, AArch64Address.createRegisterOffsetAddress(128, tmp, matchIndex, false));
+        masm.neon.tblVVV(FullReg, vExtract, vCandidate, vMaskVec);
+        masm.neon.umovGX(ElementSize.Byte, tmp, vExtract, 0);
+        masm.and(64, tmp, tmp, 0xff);
+        masm.sub(64, result, array, baseAddress);
+        if (stride.log2 != 0) {
+            masm.asr(64, result, result, stride.log2);
+        }
+        masm.sub(64, result, result, 16);
+        masm.add(64, result, result, matchIndex);
+        masm.sub(64, result, result, variant.tableCount() - 1);
+        masm.lsl(64, tmp, tmp, 32);
+        masm.orr(64, result, result, tmp);
+    }
+
+    private static byte[] createCTTailPrevShuffleMask() {
+        // Keep the last three bytes from the previous candidate vector. At most three start
+        // positions can cross from one 16-byte iteration into the next.
+        byte[] mask = new byte[32];
+        Arrays.fill(mask, (byte) 0xff);
+        mask[29] = 0x0d;
+        mask[30] = 0x0e;
+        mask[31] = 0x0f;
+        return mask;
+    }
+
+    private static byte[] createCTExtractCandidateMask() {
+        // After locating the first matching byte, this mask extracts exactly that byte so it can be
+        // moved into a general-purpose register.
+        byte[] mask = new byte[48];
+        for (int i = 0; i < 32; i++) {
+            mask[i] = (byte) i;
+        }
+        Arrays.fill(mask, 32, mask.length, (byte) 0xff);
+        return mask;
     }
 }

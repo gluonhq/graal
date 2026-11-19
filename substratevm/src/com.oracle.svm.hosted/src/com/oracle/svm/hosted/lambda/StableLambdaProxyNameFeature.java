@@ -24,42 +24,37 @@
  */
 package com.oracle.svm.hosted.lambda;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+
+import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.BaseLayerType;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.hosted.FeatureImpl.AfterAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
 
 import jdk.graal.compiler.java.LambdaUtils;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * @see LambdaProxyRenamingSubstitutionProcessor
  */
 @AutomaticallyRegisteredFeature
 public final class StableLambdaProxyNameFeature implements InternalFeature {
-
-    private LambdaProxyRenamingSubstitutionProcessor lSubst;
-
     @Override
     public void duringSetup(DuringSetupAccess a) {
         DuringSetupAccessImpl access = (DuringSetupAccessImpl) a;
-        lSubst = new LambdaProxyRenamingSubstitutionProcessor(access.getBigBang());
-        access.registerSubstitutionProcessor(lSubst);
+        LambdaProxyRenamingSubstitutionProcessor substitutionProcessor = new LambdaProxyRenamingSubstitutionProcessor();
+        ImageSingletons.add(LambdaProxyRenamingSubstitutionProcessor.class, substitutionProcessor);
+        access.registerSubstitutionProcessor(substitutionProcessor);
     }
 
     @Override
     public void afterAnalysis(AfterAnalysisAccess access) {
         assert checkLambdaNames(((AfterAnalysisAccessImpl) access).getUniverse().getTypes());
-    }
-
-    public LambdaProxyRenamingSubstitutionProcessor getLambdaSubstitutionProcessor() {
-        return lSubst;
     }
 
     private static boolean checkLambdaNames(List<AnalysisType> types) {
@@ -72,7 +67,7 @@ public final class StableLambdaProxyNameFeature implements InternalFeature {
         }
 
         /* Lambda names should be unique. */
-        Set<String> lambdaNames = new HashSet<>();
+        EconomicSet<String> lambdaNames = EconomicSet.create();
         types.stream()
                         .map(AnalysisType::getName)
                         .filter(LambdaUtils::isLambdaClassName)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,8 +42,11 @@ package org.graalvm.nativeimage;
 
 import java.io.Serial;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+
+import org.graalvm.nativeimage.impl.ReflectionIntrospector;
 
 /**
  * This exception is thrown when a reflective query (such as
@@ -91,7 +94,7 @@ import java.lang.reflect.Method;
  *
  * @since 23.0
  */
-public final class MissingReflectionRegistrationError extends Error {
+public final class MissingReflectionRegistrationError extends LinkageError {
     @Serial private static final long serialVersionUID = 2764341882856270640L;
 
     private final Class<?> elementType;
@@ -151,5 +154,15 @@ public final class MissingReflectionRegistrationError extends Error {
      */
     public Class<?>[] getParameterTypes() {
         return parameterTypes;
+    }
+
+    /**
+     * @return Whether the executable can be invoked without throwing a
+     *         {@link MissingReflectionRegistrationError}.
+     *
+     * @since 25.1
+     */
+    public static boolean isInvocable(Executable executable) {
+        return !ImageSingletons.contains(ReflectionIntrospector.class) || ImageSingletons.lookup(ReflectionIntrospector.class).isInvocable(executable);
     }
 }

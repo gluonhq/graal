@@ -24,16 +24,18 @@
  */
 package com.oracle.svm.hosted.reflect;
 
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
-import org.graalvm.nativeimage.impl.UnresolvedConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+import org.graalvm.nativeimage.impl.TypeReachabilityCondition;
 
-import com.oracle.svm.core.TypeResult;
-import com.oracle.svm.core.configure.ConfigurationConditionResolver;
-import com.oracle.svm.core.configure.ConfigurationTypeDescriptor;
+import com.oracle.svm.configure.ClassNameSupport;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
+import com.oracle.svm.configure.config.conditional.AccessConditionResolver;
 import com.oracle.svm.hosted.ImageClassLoader;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.TypeResult;
 
-public class NativeImageConditionResolver implements ConfigurationConditionResolver<ConfigurationCondition> {
+public class NativeImageConditionResolver implements AccessConditionResolver<AccessCondition> {
     private final ImageClassLoader classLoader;
     @SuppressWarnings({"FieldCanBeLocal", "unused"}) private final ClassInitializationSupport classInitializationSupport;
 
@@ -43,24 +45,22 @@ public class NativeImageConditionResolver implements ConfigurationConditionResol
     }
 
     @Override
-    public TypeResult<ConfigurationCondition> resolveCondition(UnresolvedConfigurationCondition unresolvedCondition) {
-        String canonicalizedName = ConfigurationTypeDescriptor.canonicalizeTypeName(unresolvedCondition.getTypeName());
-        TypeResult<Class<?>> clazz = classLoader.findClass(canonicalizedName);
+    public TypeResult<AccessCondition> resolveCondition(UnresolvedAccessCondition unresolvedCondition) {
+        String reflectionName = ClassNameSupport.typeNameToReflectionName(unresolvedCondition.getTypeName());
+        TypeResult<Class<?>> clazz = classLoader.findClass(reflectionName);
         return clazz.map(type -> {
             /*
              * We don't want to track always reached types: we convert them into build-time
              * reachability checks.
              */
-            var runtimeChecked = !classInitializationSupport.isAlwaysReached(type) && unresolvedCondition.isRuntimeChecked();
-            if (runtimeChecked) {
-                classInitializationSupport.addForTypeReachedTracking(type);
-            }
-            return ConfigurationCondition.create(type, runtimeChecked);
+            var runtimeChecked = !classInitializationSupport.isAlwaysReached(GuestAccess.get().lookupType(type)) && unresolvedCondition.isRuntimeChecked();
+            /* This condition might be typeReachable */
+            return TypeReachabilityCondition.create(type, runtimeChecked);
         });
     }
 
     @Override
-    public ConfigurationCondition alwaysTrue() {
-        return ConfigurationCondition.alwaysTrue();
+    public AccessCondition alwaysTrue() {
+        return AccessCondition.unconditional();
     }
 }

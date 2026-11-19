@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,8 +24,7 @@
  */
 package jdk.graal.compiler.nodes.calc;
 
-import java.util.Set;
-
+import java.util.Arrays;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable.UnaryOp;
 import jdk.graal.compiler.core.common.type.FloatStamp;
@@ -39,8 +38,10 @@ import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.extended.GuardedNode;
 import jdk.graal.compiler.nodes.spi.ArithmeticLIRLowerable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
+import jdk.vm.ci.meta.Constant;
 
 @NodeInfo
 public abstract class UnaryArithmeticNode<OP> extends UnaryNode implements ArithmeticOperation, ArithmeticLIRLowerable {
@@ -79,7 +80,7 @@ public abstract class UnaryArithmeticNode<OP> extends UnaryNode implements Arith
             return NotNode.create(v);
         } else if (IntegerStamp.OPS.getAbs().equals(op)) {
             return AbsNode.create(v, view);
-        } else if (Set.of(IntegerStamp.OPS.getUnaryOps()).contains(op)) {
+        } else if (Arrays.asList(IntegerStamp.OPS.getUnaryOps()).contains(op)) {
             GraalError.unimplemented(String.format("creating %s via UnaryArithmeticNode#unaryIntegerOp is not implemented yet", op));
         } else {
             GraalError.shouldNotReachHere(String.format("%s is not a unary operation!", op));
@@ -100,7 +101,7 @@ public abstract class UnaryArithmeticNode<OP> extends UnaryNode implements Arith
             return AbsNode.create(v, view);
         } else if (FloatStamp.OPS.getSqrt().equals(op)) {
             return SqrtNode.create(v, view);
-        } else if (Set.of(FloatStamp.OPS.getUnaryOps()).contains(op)) {
+        } else if (Arrays.asList(FloatStamp.OPS.getUnaryOps()).contains(op)) {
             GraalError.unimplemented(String.format("creating %s via UnaryArithmeticNode#unaryFloatOp is not implemented yet", op));
         } else {
             GraalError.shouldNotReachHere(String.format("%s is not a unary operation!", op));
@@ -110,9 +111,20 @@ public abstract class UnaryArithmeticNode<OP> extends UnaryNode implements Arith
 
     @Override
     public ValueNode canonical(CanonicalizerTool tool, ValueNode forValue) {
-        ValueNode synonym = findSynonym(forValue, getOp(forValue));
+        UnaryOp<OP> op = getOp(forValue);
+        ValueNode synonym = findSynonym(forValue, op);
         if (synonym != null) {
             return synonym;
+        }
+        NodeView view = NodeView.from(tool);
+        if (!(this instanceof GuardedNode) && stamp(view) instanceof IntegerStamp) {
+            ValueNode folded = foldConditional(forValue, view, constantValue -> {
+                Constant result = op.foldConstant(constantValue.asConstant());
+                return result == null ? null : ConstantNode.forPrimitive(stamp(view), result);
+            });
+            if (folded != null) {
+                return folded;
+            }
         }
         return this;
     }

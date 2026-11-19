@@ -29,19 +29,20 @@ import java.util.Collection;
 import java.util.Deque;
 import java.util.Map;
 
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.graph.NodeSourcePosition;
-import jdk.graal.compiler.options.Option;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.heap.RestrictHeapAccess.Access;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess.Access;
 import com.oracle.svm.core.heap.RestrictHeapAccessCallees;
-import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.shared.option.HostedOptionKey;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.code.RestrictHeapAccessCalleesImpl.RestrictionInfo;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedUniverse;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.graph.NodeSourcePosition;
+import jdk.graal.compiler.options.Option;
 
 public final class RestrictHeapAccessAnnotationChecker {
 
@@ -84,7 +85,6 @@ public final class RestrictHeapAccessAnnotationChecker {
             this.restrictHeapAccessCallees = (RestrictHeapAccessCalleesImpl) ImageSingletons.lookup(RestrictHeapAccessCallees.class);
         }
 
-        @SuppressWarnings("try")
         public void visitMethod(DebugContext debug, HostedMethod method) {
             /* If this is not a method that must not allocate, then everything is fine. */
             RestrictionInfo info = restrictHeapAccessCallees.getRestrictionInfo(method);
@@ -94,7 +94,7 @@ public final class RestrictHeapAccessAnnotationChecker {
             /* Look through the graph for this method and see if it allocates. */
             final CompilationGraph graph = method.compilationInfo.getCompilationGraph();
             if (RestrictHeapAccessAnnotationChecker.checkViolatingNode(graph) != null) {
-                try (DebugContext.Scope s = debug.scope("RestrictHeapAccessAnnotationChecker", graph, method, this)) {
+                try (DebugContext.Scope _ = debug.scope("RestrictHeapAccessAnnotationChecker", graph, method, this)) {
                     postRestrictHeapAccessWarning(method.getWrapped(), restrictHeapAccessCallees.getCallerMap());
                 } catch (Throwable t) {
                     throw debug.handle(t);
@@ -137,17 +137,17 @@ public final class RestrictHeapAccessAnnotationChecker {
                     message += "Restricted method: '" + first.getMethod().format("%h.%n(%p)") + "' calls '" +
                                     last.getMethod().format("%h.%n(%p)") + "' that violates restriction " + violatedAccess + ".";
                     if (Options.PrintRestrictHeapAccessPath.getValue()) {
-                        message += "\n" + "  [Path:";
+                        message += System.lineSeparator() + "  [Path:";
                         for (RestrictionInfo element : allocationList) {
                             if (element != first) { // first element has no caller
-                                message += "\n" + "    " + element.getInvocationStackTraceElement().toString();
+                                message += System.lineSeparator() + "    " + element.getInvocationStackTraceElement().toString();
                             }
                         }
                         final StackTraceElement allocationStackTraceElement = getViolatingStackTraceElement(last.getMethod());
                         if (allocationStackTraceElement != null) {
-                            message += "\n" + "    " + allocationStackTraceElement.toString();
+                            message += System.lineSeparator() + "    " + allocationStackTraceElement.toString();
                         } else {
-                            message += "\n" + "    " + last.getMethod().format("%H.%n(%p)");
+                            message += System.lineSeparator() + "    " + last.getMethod().format("%H.%n(%p)");
                         }
                         message += "]";
                     }

@@ -24,7 +24,6 @@ package com.oracle.truffle.espresso.nodes;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
@@ -34,7 +33,6 @@ import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.espresso.EspressoLanguage;
 import com.oracle.truffle.espresso.classfile.ConstantPool;
 import com.oracle.truffle.espresso.classfile.attributes.MethodParametersAttribute;
-import com.oracle.truffle.espresso.descriptors.Symbol;
 import com.oracle.truffle.espresso.impl.Method;
 
 @ExportLibrary(InteropLibrary.class)
@@ -62,14 +60,14 @@ final class SubstitutionScope implements TruffleObject {
 
     @ExportMessage
     @SuppressWarnings("static-method")
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @ExportMessage
     @SuppressWarnings("static-method")
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return EspressoLanguage.class;
+    String getLanguageId() {
+        return EspressoLanguage.ID;
     }
 
     @ExportMessage
@@ -99,15 +97,16 @@ final class SubstitutionScope implements TruffleObject {
     }
 
     private String[] fetchNames() {
-        MethodParametersAttribute methodParameters = (MethodParametersAttribute) method.getAttribute(Symbol.Name.MethodParameters);
+        MethodParametersAttribute methodParameters = method.getAttribute(MethodParametersAttribute.NAME, MethodParametersAttribute.class);
 
         if (methodParameters == null) {
             return new String[0];
         }
         // verify parameter attribute first
-        MethodParametersAttribute.Entry[] entries = methodParameters.getEntries();
+        int entryCount = methodParameters.entryCount();
         int cpLength = method.getConstantPool().length();
-        for (MethodParametersAttribute.Entry entry : entries) {
+        for (int i = 0; i < entryCount; i++) {
+            MethodParametersAttribute.Entry entry = methodParameters.entryAt(i);
             int nameIndex = entry.getNameIndex();
             if (nameIndex < 0 || nameIndex >= cpLength) {
                 return new String[0];
@@ -116,13 +115,13 @@ final class SubstitutionScope implements TruffleObject {
                 return new String[0];
             }
         }
-        String[] result = new String[entries.length];
-        for (int i = 0; i < entries.length; i++) {
-            MethodParametersAttribute.Entry entry = entries[i];
+        String[] result = new String[entryCount];
+        for (int i = 0; i < entryCount; i++) {
+            MethodParametersAttribute.Entry entry = methodParameters.entryAt(i);
             // For a 0 index, give an empty name.
             String name;
             if (entry.getNameIndex() != 0) {
-                name = method.getConstantPool().symbolAt(entry.getNameIndex(), "parameter name").toString();
+                name = method.getConstantPool().utf8At(entry.getNameIndex(), "parameter name").toString();
             } else {
                 name = "";
             }

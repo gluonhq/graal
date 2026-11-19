@@ -1,0 +1,5 @@
+[[rule]]
+files = ["CConstantValueSupportImpl.java", "CInterfaceWrapper.java"]
+all = [
+    "christian.haeubl@oracle.com"
+]

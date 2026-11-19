@@ -29,7 +29,6 @@ package com.oracle.svm.test.jfr;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assume.assumeTrue;
 
 import java.util.Collections;
 import java.util.HashSet;
@@ -37,12 +36,10 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.junit.Before;
 import org.junit.Test;
 
 import com.oracle.svm.core.jfr.JfrEvent;
 
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 import jdk.jfr.Recording;
 import jdk.jfr.consumer.RecordedClass;
 import jdk.jfr.consumer.RecordedEvent;
@@ -58,15 +55,10 @@ public class TestVirtualThreadsChunkRotation extends JfrRecordingTest {
     private static final int THREADS = 3;
     private static final int EXPECTED_EVENTS = THREADS;
     private final AtomicInteger emittedEventsPerType = new AtomicInteger(0);
-    private final Set<Long> expectedThreads = Collections.synchronizedSet(new HashSet<>());
+    private final Set<Long> expectedThreads = Collections.synchronizedSet(new HashSet<>()); // noEconomicSet(synchronization)
     private final MonitorWaitHelper helper = new MonitorWaitHelper();
 
     private volatile boolean proceed;
-
-    @Before
-    public void checkJavaVersion() {
-        assumeTrue("skipping JFR virtual thread tests", JavaVersionUtil.JAVA_SPEC >= 19);
-    }
 
     @Test
     public void test() throws Throwable {

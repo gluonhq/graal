@@ -24,16 +24,18 @@
  */
 package com.oracle.svm.core.collections;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
 import com.oracle.svm.core.memory.NullableNativeMemory;
 import com.oracle.svm.core.nmt.NmtCategory;
+import org.graalvm.word.impl.Word;
 
 /**
  * An uninterruptible hashtable with a fixed size that uses chaining in case of a collision.
@@ -74,7 +76,7 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
             UnmanagedMemoryUtil.copy((Pointer) pointerOnStack, (Pointer) pointerOnHeap, sizeToAlloc);
             return pointerOnHeap;
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -94,14 +96,14 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
             size++;
             return newEntry;
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean remove(UninterruptibleEntry valueOnStack) {
         int index = Integer.remainderUnsigned(valueOnStack.getHash(), DEFAULT_TABLE_LENGTH);
         UninterruptibleEntry entry = table[index];
-        UninterruptibleEntry prev = WordFactory.nullPointer();
+        UninterruptibleEntry prev = Word.nullPointer();
         while (entry.isNonNull()) {
             if (isEqual(valueOnStack, entry)) {
                 if (prev.isNull()) {
@@ -131,8 +133,9 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public UninterruptibleEntry get(UninterruptibleEntry valueOnStack) {
+        assert valueOnStack.isNonNull();
         int index = Integer.remainderUnsigned(valueOnStack.getHash(), DEFAULT_TABLE_LENGTH);
         UninterruptibleEntry entry = table[index];
         while (entry.isNonNull()) {
@@ -141,7 +144,7 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
             }
             entry = entry.getNext();
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     @Override
@@ -171,6 +174,12 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
         }
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean contains(UninterruptibleEntry valueOnStack) {
+        UninterruptibleEntry existingEntry = get(valueOnStack);
+        return existingEntry.isNonNull();
+    }
+
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public UninterruptibleEntry putNew(UninterruptibleEntry valueOnStack) {
@@ -189,7 +198,7 @@ public abstract class AbstractUninterruptibleHashtable implements Uninterruptibl
                 entry = entry.getNext();
                 free(tmp);
             }
-            table[i] = WordFactory.nullPointer();
+            table[i] = Word.nullPointer();
         }
         assert size == 0 : "The table is not empty!";
     }

@@ -98,6 +98,15 @@ public abstract class BasicBlock<T extends BasicBlock<T>> {
         this.cfg = cfg;
     }
 
+    public void resetDominators() {
+        dominator = AbstractControlFlowGraph.INVALID_BLOCK_ID;
+        firstDominated = AbstractControlFlowGraph.INVALID_BLOCK_ID;
+        dominatedSibling = AbstractControlFlowGraph.INVALID_BLOCK_ID;
+        domDepth = 0;
+        domNumber = AbstractControlFlowGraph.INVALID_BLOCK_ID;
+        maxChildDomNumber = AbstractControlFlowGraph.INVALID_BLOCK_ID;
+    }
+
     public void setDominatorNumber(int domNumber) {
         this.domNumber = domNumber;
     }
@@ -273,6 +282,13 @@ public abstract class BasicBlock<T extends BasicBlock<T>> {
     public abstract boolean isLoopHeader();
 
     /**
+     * Returns whether this block is considered part of a fast path. Register allocators may use
+     * this hint to avoid propagating spill decisions made on other control-flow paths into the
+     * block. The block may still require spills of its own.
+     */
+    public abstract boolean isFastPathBlock();
+
+    /**
      * If this block {@linkplain #isLoopHeader() is a loop header}, returns the number of the loop's
      * backedges. Note that due to control flow optimizations after computing loops this value may
      * differ from that computed via {@link #getLoop()}. Returns -1 if this is not a loop header.
@@ -284,6 +300,10 @@ public abstract class BasicBlock<T extends BasicBlock<T>> {
     public abstract double getRelativeFrequency();
 
     public abstract T getDominator(int distance);
+
+    public abstract boolean canUseBlockAsSpillTarget();
+
+    public abstract void setCanUseBlockAsSpillTarget(boolean canUseBlockAsSpillTarget);
 
     /**
      * Determine if this block is modifiable in the context of its {@link AbstractControlFlowGraph}.

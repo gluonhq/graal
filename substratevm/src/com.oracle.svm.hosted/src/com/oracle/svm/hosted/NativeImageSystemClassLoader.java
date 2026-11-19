@@ -30,12 +30,17 @@ import java.net.URL;
 import java.security.SecureClassLoader;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinWorkerThread;
 
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.util.GuestAccess;
+import jdk.vm.ci.meta.JavaConstant;
 
 /**
  * NativeImageCustomSystemClassLoader is a minimal {@link ClassLoader} that forwards loading of a
@@ -65,6 +70,10 @@ public final class NativeImageSystemClassLoader extends SecureClassLoader {
         systemIOWrappers.replaceSystemOutErr();
     }
 
+    /*
+     * Note this is not an image singleton; this ClassLoader is installed while starting
+     * NativeImageGeneratorRunner.
+     */
     public static NativeImageSystemClassLoader singleton() {
         ClassLoader loader = ClassLoader.getSystemClassLoader();
         if (loader instanceof NativeImageSystemClassLoader) {
@@ -72,7 +81,7 @@ public final class NativeImageSystemClassLoader extends SecureClassLoader {
         }
 
         throw UserError.abort("NativeImageSystemClassLoader is not the default system class loader. This might create problems when using reflection during class initialization at build-time." +
-                        "To fix this error add -Djava.system.class.loader=%s", NativeImageSystemClassLoader.class.getCanonicalName());
+                        "To fix this error add -Djava.system.class.loader=%s", NativeImageSystemClassLoader.class.getName());
     }
 
     public void setNativeImageClassLoader(ClassLoader nativeImageClassLoader) {
@@ -84,31 +93,83 @@ public final class NativeImageSystemClassLoader extends SecureClassLoader {
              */
             disallowedClassLoaders.add(this.nativeImageClassLoader);
         }
-        this.nativeImageClassLoader = nativeImageClassLoader;
+        synchronized (NativeImageForkJoinWorkerThread.activeThreads) {
+            this.nativeImageClassLoader = nativeImageClassLoader;
+            for (NativeImageForkJoinWorkerThread activeThread : NativeImageForkJoinWorkerThread.activeThreads) {
+                activeThread.setContextClassLoader();
+            }
+        }
     }
 
-    private boolean isNativeImageClassLoader(ClassLoader current, ClassLoader c) {
-        ClassLoader loader = current;
-        do {
-            if (loader == c) {
-                return true;
+    /**
+     * This thread factory ensures the fork-join pool uses the current native image class loader as
+     * {@linkplain Thread#getContextClassLoader() context class loader}.
+     * <p>
+     * It is applied to the common fork-join pool thanks to the
+     * {@code java.util.concurrent.ForkJoinPool.common.threadFactory} system property.
+     */
+    public static final class NativeImageForkJoinWorkerThreadFactory implements ForkJoinPool.ForkJoinWorkerThreadFactory {
+        @Override
+        public ForkJoinWorkerThread newThread(ForkJoinPool pool) {
+            return new NativeImageForkJoinWorkerThread(pool);
+        }
+    }
+
+    static final class NativeImageForkJoinWorkerThread extends ForkJoinWorkerThread {
+        static final Set<NativeImageForkJoinWorkerThread> activeThreads = new HashSet<>();
+        private static final ThreadGroup innocuousThreadGroup = createGroup();
+
+        NativeImageForkJoinWorkerThread(ForkJoinPool pool) {
+            super(innocuousThreadGroup, pool, false);
+        }
+
+        @Override
+        protected void onStart() {
+            super.onStart();
+            synchronized (activeThreads) {
+                activeThreads.add(this);
+                setContextClassLoader();
             }
-            loader = loader.getParent();
-        } while (loader != defaultSystemClassLoader);
-        return false;
+        }
+
+        @Override
+        protected void onTermination(Throwable exception) {
+            super.onTermination(exception);
+            synchronized (activeThreads) {
+                activeThreads.remove(this);
+            }
+        }
+
+        void setContextClassLoader() {
+            ClassLoader loader = NativeImageSystemClassLoader.singleton().getActiveClassLoader();
+            setContextClassLoader(loader);
+        }
+
+        static ThreadGroup createGroup() {
+            ThreadGroup group = Thread.currentThread().getThreadGroup();
+            for (ThreadGroup p; (p = group.getParent()) != null;) {
+                group = p;
+            }
+            return new ThreadGroup(group, "InnocuousNativeImageForkJoinWorkerThreadGroup");
+        }
     }
 
     public boolean isNativeImageClassLoader(ClassLoader c) {
-        ClassLoader loader = nativeImageClassLoader;
-        if (loader == null) {
+        ClassLoader currentNativeImageClassLoader = nativeImageClassLoader;
+        if (currentNativeImageClassLoader == null) {
             return false;
         }
-        return isNativeImageClassLoader(nativeImageClassLoader, c);
+        return currentNativeImageClassLoader == c;
     }
 
-    public boolean isDisallowedClassLoader(ClassLoader c) {
+    public boolean isDisallowedClassLoader(JavaConstant classloader) {
+        GuestAccess guestAccess = GuestAccess.get();
+        if (classloader == null || classloader.isNull() || guestAccess.isFullyIsolated()) {
+            return false;
+        }
+        ClassLoader c = guestAccess.getSnippetReflection().asObject(ClassLoader.class, classloader);
         for (ClassLoader disallowedClassLoader : disallowedClassLoaders) {
-            if (isNativeImageClassLoader(disallowedClassLoader, c)) {
+            if (disallowedClassLoader == c) {
                 return true;
             }
         }

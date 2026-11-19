@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,12 +35,12 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.ProcessProperties;
 import org.graalvm.nativeimage.impl.ProcessPropertiesSupport;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.NeverInline;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.util.StringUtil;
 
 /**
  * Base for holders of native libraries. The implemented methods provide different ways of loading a
@@ -58,7 +58,7 @@ public abstract class NativeLibraries {
                 return entry;
             }
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     /** The path of the directory containing the native image. */
@@ -68,7 +68,7 @@ public abstract class NativeLibraries {
 
     /** Returns the directory containing the native image, or {@code null}. */
     @NeverInline("Reads the return address.")
-    private static String getImageDirectory() {
+    public static String getImageDirectory() {
         /*
          * While one might expect code for shared libraries to work for executables as well, this is
          * not necessarily the case. For example, `dladdr` on Linux returns `argv[0]` for
@@ -106,8 +106,12 @@ public abstract class NativeLibraries {
     }
 
     public void loadLibraryRelative(String name) {
+        loadLibraryRelative(name, true);
+    }
+
+    protected void loadLibraryRelative(String name, boolean initialize) {
         // Test if this is a built-in library
-        if (loadLibrary0(new File(name), true)) {
+        if (loadLibrary0(new File(name), true, initialize)) {
             return;
         }
         if (usrPaths == null) {
@@ -116,7 +120,8 @@ public abstract class NativeLibraries {
              * case we effectively fall back to using only `usrPaths`.
              */
             sysPath = getImageDirectory();
-            String[] tokens = SubstrateUtil.split(System.getProperty("java.library.path", ""), File.pathSeparator);
+            String value = System.getProperty("java.library.path", "");
+            String[] tokens = StringUtil.split(value, File.pathSeparator);
             for (int i = 0; i < tokens.length; i++) {
                 if (tokens[i].isEmpty()) {
                     tokens[i] = ".";
@@ -125,16 +130,16 @@ public abstract class NativeLibraries {
             usrPaths = tokens;
         }
         String libname = System.mapLibraryName(name);
-        if (sysPath != null && loadLibrary0(new File(sysPath, libname), false)) {
+        if (sysPath != null && loadLibrary0(new File(sysPath, libname), false, initialize)) {
             return;
         }
         for (String path : usrPaths) {
             File libpath = new File(path, libname);
-            if (loadLibrary0(libpath, false)) {
+            if (loadLibrary0(libpath, false, initialize)) {
                 return;
             }
             File altpath = Target_jdk_internal_loader_ClassLoaderHelper.mapAlternativeName(libpath);
-            if (altpath != null && loadLibrary0(altpath, false)) {
+            if (altpath != null && loadLibrary0(altpath, false, initialize)) {
                 return;
             }
         }
@@ -142,12 +147,20 @@ public abstract class NativeLibraries {
     }
 
     private boolean loadLibrary0(File file, boolean builtin) {
+        return loadLibrary0(file, builtin, true);
+    }
+
+    private boolean loadLibrary0(File file, boolean builtin, boolean initialize) {
         try {
             String canonical = builtin ? file.getName() : file.getCanonicalPath();
-            return addLibrary(canonical, builtin);
+            return addLibrary(canonical, builtin, initialize);
         } catch (IOException e) {
             return false;
         }
+    }
+
+    protected boolean addLibrary(String canonical, boolean builtin, @SuppressWarnings("unused") boolean initialize) {
+        return addLibrary(canonical, builtin);
     }
 
     protected abstract boolean addLibrary(String canonical, boolean builtin);

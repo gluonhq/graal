@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -47,6 +47,8 @@ import jdk.graal.compiler.nodes.spi.VirtualizerTool;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 import org.graalvm.word.Pointer;
 
+import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.JavaKind;
 
 // JaCoCo Exclude
@@ -60,47 +62,34 @@ public class ArrayCompareToNode extends PureFunctionStubIntrinsicNode implements
     public static final NodeClass<ArrayCompareToNode> TYPE = NodeClass.create(ArrayCompareToNode.class);
 
     /** {@link Stride} of one array to compare. */
-    protected final Stride strideA;
+    private final Stride strideA;
 
     /** {@link Stride} of the other array to compare. */
-    protected final Stride strideB;
+    private final Stride strideB;
 
     /** One array to be tested for equality. */
-    @Input protected ValueNode arrayA;
+    @Input private ValueNode arrayA;
 
     /** Length of array A. */
-    @Input protected ValueNode lengthA;
+    @Input private ValueNode lengthA;
 
     /** The other array to be tested for equality. */
-    @Input protected ValueNode arrayB;
+    @Input private ValueNode arrayB;
 
     /** Length of array B. */
-    @Input protected ValueNode lengthB;
+    @Input private ValueNode lengthB;
 
     public ArrayCompareToNode(ValueNode arrayA, ValueNode lengthA, ValueNode arrayB, ValueNode lengthB,
                     @ConstantNodeParameter Stride strideA,
                     @ConstantNodeParameter Stride strideB) {
-        this(TYPE, arrayA, lengthA, arrayB, lengthB, strideA, strideB);
+        this(arrayA, lengthA, arrayB, lengthB, strideA, strideB, null);
     }
 
     public ArrayCompareToNode(ValueNode arrayA, ValueNode lengthA, ValueNode arrayB, ValueNode lengthB,
                     @ConstantNodeParameter Stride strideA,
                     @ConstantNodeParameter Stride strideB,
                     @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures) {
-        this(TYPE, arrayA, lengthA, arrayB, lengthB, strideA, strideB, runtimeCheckedCPUFeatures);
-    }
-
-    protected ArrayCompareToNode(NodeClass<? extends ArrayCompareToNode> c, ValueNode arrayA, ValueNode lengthA, ValueNode arrayB, ValueNode lengthB,
-                    @ConstantNodeParameter Stride strideA,
-                    @ConstantNodeParameter Stride strideB) {
-        this(c, arrayA, lengthA, arrayB, lengthB, strideA, strideB, null);
-    }
-
-    protected ArrayCompareToNode(NodeClass<? extends ArrayCompareToNode> c, ValueNode arrayA, ValueNode lengthA, ValueNode arrayB, ValueNode lengthB,
-                    @ConstantNodeParameter Stride strideA,
-                    @ConstantNodeParameter Stride strideB,
-                    @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures) {
-        super(c, StampFactory.forKind(JavaKind.Int), runtimeCheckedCPUFeatures, NamedLocationIdentity.getArrayLocation(JavaKind.Byte));
+        super(TYPE, StampFactory.forKind(JavaKind.Int), runtimeCheckedCPUFeatures, NamedLocationIdentity.getArrayLocation(JavaKind.Byte));
         this.strideA = strideA;
         this.strideB = strideB;
         this.arrayA = arrayA;
@@ -116,7 +105,7 @@ public class ArrayCompareToNode extends PureFunctionStubIntrinsicNode implements
         }
         ValueNode a1 = GraphUtil.unproxify(arrayA);
         ValueNode a2 = GraphUtil.unproxify(arrayB);
-        if (a1 == a2) {
+        if (a1 == a2 && strideA == strideB && GraphUtil.unproxify(lengthA) == GraphUtil.unproxify(lengthB)) {
             return ConstantNode.forInt(0);
         }
         return this;
@@ -126,13 +115,14 @@ public class ArrayCompareToNode extends PureFunctionStubIntrinsicNode implements
     public void virtualize(VirtualizerTool tool) {
         ValueNode alias1 = tool.getAlias(arrayA);
         ValueNode alias2 = tool.getAlias(arrayB);
-        if (alias1 == alias2) {
-            // the same virtual objects will always have the same contents
+        if (alias1 == alias2 && strideA == strideB && tool.getAlias(lengthA) == tool.getAlias(lengthB)) {
+            // Identical contents compare equal only with matching lengths and strides.
             tool.replaceWithValue(ConstantNode.forInt(0, graph()));
         }
     }
 
     @NodeIntrinsic
+    @GenerateStub.Default(runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
     @GenerateStub(name = "byteArrayCompareToByteArray", parameters = {"S1", "S1"})
     @GenerateStub(name = "byteArrayCompareToCharArray", parameters = {"S1", "S2"})
     @GenerateStub(name = "charArrayCompareToByteArray", parameters = {"S2", "S1"})
@@ -179,6 +169,11 @@ public class ArrayCompareToNode extends PureFunctionStubIntrinsicNode implements
     @Override
     public ValueNode[] getForeignCallArguments() {
         return new ValueNode[]{arrayA, lengthA, arrayB, lengthB};
+    }
+
+    @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return !(arch instanceof AMD64);
     }
 
     @Override

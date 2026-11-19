@@ -24,20 +24,26 @@
  */
 package com.oracle.svm.graal.meta;
 
-import static com.oracle.svm.core.config.ConfigurationValues.getObjectLayout;
-import static com.oracle.svm.core.util.VMError.intentionallyUnimplemented;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.deopt.Deoptimizer;
 import com.oracle.svm.core.deopt.SubstrateSpeculationLog.SubstrateSpeculation;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubUtils;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
@@ -52,16 +58,20 @@ import jdk.vm.ci.meta.SpeculationLog;
 import jdk.vm.ci.meta.SpeculationLog.Speculation;
 import jdk.vm.ci.meta.SpeculationLog.SpeculationReason;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public class SubstrateMetaAccess implements MetaAccessProvider {
 
     public static SubstrateMetaAccess singleton() {
         return ImageSingletons.lookup(SubstrateMetaAccess.class);
     }
 
-    @Platforms(Platform.HOSTED_ONLY.class)
     @SuppressWarnings("this-escape")
     public SubstrateMetaAccess() {
-        ImageSingletons.add(SubstrateMetaAccess.class, this);
+        if (SubstrateUtil.HOSTED) {
+            ImageSingletons.add(SubstrateMetaAccess.class, this);
+        } else {
+            assert SubstrateOptions.useRistretto();
+        }
     }
 
     @Override
@@ -70,7 +80,7 @@ public class SubstrateMetaAccess implements MetaAccessProvider {
     }
 
     public SubstrateType lookupJavaTypeFromHub(DynamicHub hub) {
-        SubstrateType type = (SubstrateType) hub.getMetaType();
+        SubstrateType type = (SubstrateType) DynamicHubUtils.getMetaType(hub);
         if (type == null) {
             /*
              * If the SubstrateType is not in the image heap, we always create a new type without
@@ -132,7 +142,7 @@ public class SubstrateMetaAccess implements MetaAccessProvider {
      */
     @Override
     public int getArrayBaseOffset(JavaKind kind) {
-        return getObjectLayout().getArrayBaseOffset(kind);
+        return ObjectLayoutCompilerSupport.getArrayBaseOffset(ObjectLayout.singleton(), kind);
     }
 
     /**
@@ -142,7 +152,7 @@ public class SubstrateMetaAccess implements MetaAccessProvider {
      */
     @Override
     public int getArrayIndexScale(JavaKind elementKind) {
-        return getObjectLayout().getArrayIndexScale(elementKind);
+        return ObjectLayoutCompilerSupport.getArrayIndexScale(ObjectLayout.singleton(), elementKind);
     }
 
     @Override

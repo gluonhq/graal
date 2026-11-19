@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,11 +24,26 @@
  */
 package com.oracle.svm.core.genscavenge.graal;
 
-import jdk.graal.compiler.core.common.memory.BarrierType;
-import jdk.graal.compiler.nodes.gc.CardTableBarrierSet;
+import org.graalvm.word.UnsignedWord;
 
 import com.oracle.svm.core.StaticFieldsSupport;
+import com.oracle.svm.core.genscavenge.HeapParameters;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
 
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.core.common.memory.BarrierType;
+import jdk.graal.compiler.core.common.type.IntegerStamp;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.nodes.NodeView;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.gc.CardTableBarrierSet;
+import jdk.graal.compiler.nodes.memory.FixedAccessNode;
+import jdk.graal.compiler.nodes.spi.ArrayLengthProvider;
+import jdk.graal.compiler.nodes.spi.CoreProviders;
+import jdk.graal.compiler.nodes.type.StampTool;
+import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -40,7 +55,7 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  */
 public class SubstrateCardTableBarrierSet extends CardTableBarrierSet {
     public SubstrateCardTableBarrierSet(ResolvedJavaType objectArrayType) {
-        super(objectArrayType);
+        super(objectArrayType, true);
     }
 
     @Override
@@ -49,5 +64,52 @@ public class SubstrateCardTableBarrierSet extends CardTableBarrierSet {
             return arrayWriteBarrierType(storageKind);
         }
         return super.fieldWriteBarrierType(field, storageKind);
+    }
+
+    /**
+     * On SVM, precise write barriers are only needed for object arrays that are located in
+     * unaligned chunks.
+     * <p>
+     * This method is conservative, that is it can return {@code true} even if in practice a precise
+     * barrier is not needed.
+     */
+    @Override
+    protected boolean barrierPrecise(FixedAccessNode node, ValueNode base, CoreProviders context) {
+        if (!super.barrierPrecise(node, base, context)) {
+            return false;
+        }
+
+        ResolvedJavaType baseType = StampTool.typeOrNull(base);
+        if (baseType == null) {
+            return true;
+        }
+
+        /*
+         * We know that instances (in contrast to arrays) are always in aligned chunks, except for
+         * StoredContinuation objects, but these are immutable and do not need barriers.
+         *
+         * Note that arrays can be assigned to values that have the type java.lang.Object, so that
+         * case is excluded. Arrays can also implement some interfaces, like Serializable. For
+         * simplicity, we exclude all interface types.
+         */
+        if (!baseType.isArray()) {
+            return baseType.isInterface() || baseType.isJavaLangObject();
+        }
+
+        ValueNode length = GraphUtil.arrayLength(base, ArrayLengthProvider.FindLengthMode.SEARCH_ONLY, context.getConstantReflection());
+        if (length == null) {
+            return true;
+        }
+
+        IntegerStamp lengthStamp = (IntegerStamp) length.stamp(NodeView.DEFAULT);
+        GraalError.guarantee(lengthStamp.getBits() == Integer.SIZE, "unexpected length %s", lengthStamp);
+        int lengthBound = NumUtil.safeToInt(lengthStamp.upperBound());
+        int layoutEncoding = DynamicHubUtils.getHub((SharedType) baseType).getLayoutEncoding();
+        /*
+         * Include optional identity hash storage for image heap arrays. The large array threshold
+         * also covers image arrays that do not fit in an aligned chunk.
+         */
+        UnsignedWord sizeBound = LayoutEncoding.getArraySize(layoutEncoding, lengthBound, true);
+        return sizeBound.aboveOrEqual(HeapParameters.getLargeArrayThreshold());
     }
 }

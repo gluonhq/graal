@@ -30,9 +30,9 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
 import com.oracle.svm.core.ParsingReason;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.thread.AddressOfVMThreadLocalNode;
 import com.oracle.svm.core.graal.thread.CompareAndSetVMThreadLocalNode;
@@ -40,10 +40,8 @@ import com.oracle.svm.core.graal.thread.LoadVMThreadLocalNode;
 import com.oracle.svm.core.graal.thread.StoreVMThreadLocalNode;
 import com.oracle.svm.core.heap.InstanceReferenceMapEncoder;
 import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
-import com.oracle.svm.core.layeredimagesingleton.FeatureSingleton;
-import com.oracle.svm.core.threadlocal.FastThreadLocal;
-import com.oracle.svm.core.threadlocal.FastThreadLocalBytes;
-import com.oracle.svm.core.threadlocal.FastThreadLocalWord;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocal;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalBytes;
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfo;
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfos;
 import com.oracle.svm.core.threadlocal.VMThreadLocalOffsetProvider;
@@ -67,7 +65,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  */
 @AutomaticallyRegisteredFeature
 @Platforms(InternalPlatform.NATIVE_ONLY.class)
-public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProvider, FeatureSingleton {
+public class VMThreadFeature implements InternalFeature {
 
     private VMThreadLocalCollector threadLocalCollector;
 
@@ -103,7 +101,7 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
      * <p>
      * When the {@link IsolateThread} is not passed in as a parameter, we use the
      * {@link LoadVMThreadLocalNode current thread}. We do not need read/write barriers since we
-     * access memory that we manage ourselfs.
+     * access memory that we manage ourselves.
      */
     @Override
     public void registerInvocationPlugins(Providers providers, Plugins plugins, ParsingReason reason) {
@@ -112,6 +110,7 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
             Class<?> valueClass = VMThreadLocalInfo.getValueClass(threadLocalClass);
             registerAccessors(r, valueClass, false);
             registerAccessors(r, valueClass, true);
+            registerAddressAccessors(r);
 
             /* compareAndSet() method without the VMThread parameter. */
             r.register(new RequiredInvocationPlugin("compareAndSet", Receiver.class, valueClass, valueClass) {
@@ -130,25 +129,25 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
             });
         }
 
-        Class<?>[] typesWithGetAddress = new Class<?>[]{FastThreadLocalBytes.class, FastThreadLocalWord.class};
-        for (Class<?> type : typesWithGetAddress) {
-            Registration r = new Registration(plugins.getInvocationPlugins(), type);
-            /* getAddress() method without the VMThread parameter. */
-            r.register(new RequiredInvocationPlugin("getAddress", Receiver.class) {
-                @Override
-                public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver) {
-                    ValueNode threadNode = currentThread(b);
-                    return handleGetAddress(b, targetMethod, receiver, threadNode);
-                }
-            });
-            /* getAddress() method with the VMThread parameter. */
-            r.register(new RequiredInvocationPlugin("getAddress", Receiver.class, IsolateThread.class) {
-                @Override
-                public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode threadNode) {
-                    return handleGetAddress(b, targetMethod, receiver, threadNode);
-                }
-            });
-        }
+        registerAddressAccessors(new Registration(plugins.getInvocationPlugins(), FastThreadLocalBytes.class));
+    }
+
+    private void registerAddressAccessors(Registration r) {
+        /* getAddress() method without the VMThread parameter. */
+        r.register(new RequiredInvocationPlugin("getAddress", Receiver.class) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver) {
+                ValueNode threadNode = currentThread(b);
+                return handleGetAddress(b, targetMethod, receiver, threadNode);
+            }
+        });
+        /* getAddress() method with the VMThread parameter. */
+        r.register(new RequiredInvocationPlugin("getAddress", Receiver.class, IsolateThread.class) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode threadNode) {
+                return handleGetAddress(b, targetMethod, receiver, threadNode);
+            }
+        });
     }
 
     private void registerAccessors(Registration r, Class<?> valueClass, boolean isVolatile) {
@@ -224,10 +223,13 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
 
     @Override
     public void beforeCompilation(BeforeCompilationAccess config) {
-        ImageSingletons.add(VMThreadLocalOffsetProvider.class, this);
-        int nextOffset = threadLocalCollector.sortAndAssignOffsets();
+        int nextOffset = threadLocalCollector.layoutThreadLocals();
 
         if (ImageLayerBuildingSupport.firstImageBuild()) {
+            /*
+             * Extension-layer builds restore the provider key from the loaded layer snapshot.
+             */
+            ImageSingletons.add(VMThreadLocalOffsetProvider.class, threadLocalCollector);
             /*
              * This information is installed always in the first image. In subsequent images we only
              * need to relay to thread local accesses the previously assigned offsets
@@ -239,7 +241,6 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
             NonmovableArray<Byte> referenceMapEncoding = encoder.encodeAll();
 
             var threadLocalSupport = ImageSingletons.lookup(VMThreadLocalSupport.class);
-
             threadLocalSupport.vmThreadReferenceMapEncoding = NonmovableArrays.getHostedArray(referenceMapEncoding);
             threadLocalSupport.vmThreadReferenceMapIndex = encoder.lookupEncoding(referenceMap);
             threadLocalSupport.vmThreadSize = nextOffset;
@@ -247,10 +248,5 @@ public class VMThreadFeature implements InternalFeature, VMThreadLocalOffsetProv
             /* Remember the final sorted list. */
             VMThreadLocalInfos.setInfos(threadLocalCollector.getSortedThreadLocalInfos());
         }
-    }
-
-    @Override
-    public int offsetOf(FastThreadLocal threadLocal) {
-        return threadLocalCollector.getOffset(threadLocal);
     }
 }

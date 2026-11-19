@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,6 +45,7 @@ import java.lang.ref.Reference;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.NodeInterface;
 import com.oracle.truffle.api.nodes.RootNode;
 
@@ -76,6 +77,41 @@ public abstract class BaseOSRRootNode extends RootNode {
             Reference.reachabilityFence(frame);
             Reference.reachabilityFence(this);
         }
+    }
+
+    @Override
+    protected final boolean prepareForCompilation(boolean rootCompilation, int compilationTier, boolean lastTier) {
+        return OptimizedRuntimeAccessor.NODES.prepareForCompilation(getOriginalRootNode(), rootCompilation, compilationTier, lastTier);
+    }
+
+    @Override
+    protected boolean isCaptureFramesForTrace(boolean compiledFrame) {
+        return OptimizedRuntimeAccessor.NODES.isCaptureFramesForTrace(getOriginalRootNode(), compiledFrame);
+    }
+
+    @Override
+    protected boolean countsTowardsStackTraceLimit() {
+        // OSR frames are combined with their non-OSR frames in stack traces.
+        return false;
+    }
+
+    final RootNode getOriginalRootNode() {
+        Node node = (Node) loopNode; // safe to cast, always a Node
+        RootNode root = node.getRootNode();
+        assert root != null : "Loop and OSR nodes must be adopted";
+        return root;
+    }
+
+    /**
+     * Returns the effective execution frame for this OSR root.
+     * <p>
+     * The frame passed to {@link #execute(VirtualFrame)} may differ from the frame used by
+     * {@link #executeOSR(VirtualFrame)} to execute guest code. The returned frame is used for
+     * operations that should reflect the effective execution frame, such as attaching lazy
+     * exception stack trace information.
+     */
+    protected VirtualFrame getFrame(VirtualFrame frame) {
+        return frame;
     }
 
     /**

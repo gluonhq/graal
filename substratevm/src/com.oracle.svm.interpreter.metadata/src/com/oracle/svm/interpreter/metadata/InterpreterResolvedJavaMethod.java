@@ -1,0 +1,1242 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.interpreter.metadata;
+
+import static com.oracle.svm.core.code.FrameSourceInfo.LINENUMBER_NATIVE;
+import static com.oracle.svm.core.code.FrameSourceInfo.LINENUMBER_UNKNOWN;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_CALLER_SENSITIVE;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_DONT_INLINE;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_FINAL;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_FORCE_INLINE;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_HIDDEN;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_LAMBDA_FORM_COMPILED;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_NATIVE;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_PUBLIC;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_SCOPED;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_SIGNATURE_POLYMORPHIC;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_STATIC;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_SYNTHETIC;
+import static com.oracle.svm.espresso.classfile.Constants.ACC_VARARGS;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_RECOGNIZED_METHOD_MODIFIERS;
+import static com.oracle.svm.interpreter.metadata.Bytecodes.BREAKPOINT;
+import static com.oracle.svm.interpreter.metadata.CremaMethodAccess.toJVMCI;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Executable;
+import java.lang.reflect.Modifier;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Function;
+
+import org.graalvm.nativeimage.ImageInfo;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.svm.core.MethodRefHolder;
+import com.oracle.svm.core.SubstrateMetadata;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.code.FrameSourceInfo;
+import com.oracle.svm.core.graal.code.PreparedSignature;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.interpreter.InterpreterJNIMethodIds;
+import com.oracle.svm.core.hub.crema.CremaSupport;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.core.hub.registry.SymbolsSupport;
+import com.oracle.svm.core.jni.headers.JNIMethodId;
+import com.oracle.svm.core.interpreter.InterpreterSupport;
+import com.oracle.svm.core.invoke.ResolvedMember;
+import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.espresso.classfile.Constants;
+import com.oracle.svm.espresso.classfile.JavaVersion;
+import com.oracle.svm.espresso.classfile.ParserMethod;
+import com.oracle.svm.espresso.classfile.attributes.CodeAttribute;
+import com.oracle.svm.espresso.classfile.descriptors.ByteSequence;
+import com.oracle.svm.espresso.classfile.descriptors.Name;
+import com.oracle.svm.espresso.classfile.descriptors.ParserSymbols;
+import com.oracle.svm.espresso.classfile.descriptors.Signature;
+import com.oracle.svm.espresso.classfile.descriptors.Symbol;
+import com.oracle.svm.espresso.classfile.descriptors.Type;
+import com.oracle.svm.espresso.shared.meta.SignaturePolymorphicIntrinsic;
+import com.oracle.svm.espresso.shared.resolver.CallKind;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.interpreter.metadata.serialization.VisibleForSerialization;
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAnnotationAccess;
+
+import jdk.vm.ci.meta.Constant;
+import jdk.vm.ci.meta.ExceptionHandler;
+import jdk.vm.ci.meta.LineNumberTable;
+import jdk.vm.ci.meta.Local;
+import jdk.vm.ci.meta.LocalVariableTable;
+import jdk.vm.ci.meta.ProfilingInfo;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.SpeculationLog;
+import jdk.vm.ci.meta.annotation.AnnotationsInfo;
+
+/**
+ * Encapsulates resolved methods used under close-world assumptions, compiled and interpretable, but
+ * also abstract methods for vtable calls.
+ */
+public class InterpreterResolvedJavaMethod extends InterpreterAnnotated implements ResolvedJavaMethod, CremaMethodAccess, CremaResolvedMember, ResolvedMember, SubstrateMetadata {
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    @SuppressWarnings("unchecked") //
+    private static final Class<? extends Annotation> CALLER_SENSITIVE_CLASS = (Class<? extends Annotation>) ReflectionUtil.lookupClass("jdk.internal.reflect.CallerSensitive");
+    @Platforms(Platform.HOSTED_ONLY.class)//
+    @SuppressWarnings("unchecked") //
+    private static final Class<? extends Annotation> LAMBDA_FORM_COMPILED_CLASS = (Class<? extends Annotation>) ReflectionUtil.lookupClass("java.lang.invoke.LambdaForm$Compiled");
+    @Platforms(Platform.HOSTED_ONLY.class)//
+    @SuppressWarnings("unchecked") //
+    private static final Class<? extends Annotation> SCOPED_MEMORY_SCOPED_CLASS = (Class<? extends Annotation>) ReflectionUtil.lookupClass("jdk.internal.misc.ScopedMemoryAccess$Scoped");
+    /**
+     * This flag denotes a method that was originally native but was substituted by a non-native
+     * method.
+     */
+    private static final int ACC_SUBSTITUTED_NATIVE = 0x80000000;
+    /**
+     * This flag denotes a method that is created by the VM. This method should never be seen
+     * by reflection or by stack walking.
+     */
+    private static final int ACC_INTERNAL = 0x40000000;
+
+    public static final InterpreterResolvedJavaMethod[] EMPTY_ARRAY = new InterpreterResolvedJavaMethod[0];
+    public static final LocalVariableTable EMPTY_LOCAL_VARIABLE_TABLE = new LocalVariableTable(new Local[0]);
+    public static final ExceptionHandler[] EMPTY_EXCEPTION_HANDLERS = new ExceptionHandler[0];
+
+    public static final int UNKNOWN_METHOD_ID = 0;
+
+    // dispatch index special values
+    /**
+     * This VTable index has not yet been set. Should never be seen at runtime.
+     */
+    public static final int VTBL_UNINITIALIZED = -1;
+    /**
+     * This method has a single implementation and is devirtualized in the image.
+     */
+    public static final int VTBL_ONE_IMPL = -2;
+    /**
+     * This method doesn't require dispatch.
+     */
+    public static final int VTBL_NO_DISPATCH = -3;
+    /**
+     * This is a synthetic method representing a selection failures in an ITable. These are never the result of
+     * method resolution (only of method selection).
+     */
+    public static final int ITBL_SELECTION_FAILURE = -4;
+    /**
+     * The VTable index is unavailable.
+     */
+    public static final int VTBL_INVALID = -99;
+
+    private final Symbol<Signature> signatureSymbol;
+
+    // Should be final (not its contents, it can be patched with BREAKPOINT).
+    // These are the bytecodes executed by the interpreter e.g. can be patched with BREAKPOINT.
+    private byte[] interpretedCode;
+    private final Symbol<Name> name;
+    private final int maxLocals;
+    private final int maxStackSize;
+    /**
+     * Contains standard modifiers in the low 16 bits, and non-standard flags in the upper 16 bits.
+     *
+     * @see #ACC_SUBSTITUTED_NATIVE
+     * @see Constants
+     */
+    private final int flags;
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private AnalysisMethod originalMethod;
+
+    private final InterpreterResolvedObjectType declaringClass;
+    private final InterpreterUnresolvedSignature signature;
+
+    private LineNumberTable lineNumberTable;
+
+    /**
+     * JVMCI exception handlers for image-built methods.
+     *
+     * Runtime-loaded Crema methods override {@link #getExceptionHandlers()} and derive their handlers
+     * lazily from parsed classfile metadata. Image-built AOT methods whose bytecodes are preserved for
+     * Ristretto runtime compilation have no such runtime classfile source, so
+     * BuildTimeConstantPool.hydrate fills this field after analysis.
+     */
+    @UnknownObjectField(availability = BuildPhaseProvider.AfterCompilation.class) //
+    protected ExceptionHandler[] exceptionHandlers;
+
+    private LocalVariableTable localVariableTable;
+
+    private ReferenceConstant<MethodRefHolder> nativeEntryPoint;
+
+    // Token set by the toggle of method enter/exit events.
+    private volatile Object interpreterExecToken;
+
+    // TODO move to crema once GR-71517 is resolved
+    private volatile ResolvedJavaMethod ristrettoMethod;
+    private static final AtomicReferenceFieldUpdater<InterpreterResolvedJavaMethod, ResolvedJavaMethod> RISTRETTO_METHOD_UPDATER = AtomicReferenceFieldUpdater.newUpdater(
+                    InterpreterResolvedJavaMethod.class, ResolvedJavaMethod.class, "ristrettoMethod");
+
+    @UnknownObjectField(availability = BuildPhaseProvider.ReadyForCompilation.class) //
+    private PreparedSignature preparedSignature;
+
+    public static class InlinedBy {
+        public InterpreterResolvedJavaMethod holder;
+        public Set<InterpreterResolvedJavaMethod> inliners;
+
+        public InlinedBy(InterpreterResolvedJavaMethod holder, Set<InterpreterResolvedJavaMethod> inliners) {
+            this.holder = holder;
+            this.inliners = inliners;
+        }
+    }
+
+    protected final InlinedBy inlinedBy;
+
+    private int vtableIndex = VTBL_UNINITIALIZED;
+
+    private InterpreterResolvedJavaMethod oneImplementation;
+
+    /* slot in GOT */
+    private int gotOffset;
+
+    public static final int EST_NO_ENTRY = -5;
+    /* slot in EST (EnterStubTable) */
+    private int enterStubOffset = EST_NO_ENTRY;
+
+    /**
+     * Unique identifier for methods in compiled frames.
+     * <p>
+     * Only valid if != 0, 0 means unknown. Allows to precisely extract the
+     * {@link InterpreterResolvedJavaMethod interpreter method instance} from a compiled frame.
+     */
+    private int methodId;
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    public boolean needMethodBody;
+
+    /*
+     * Method-body retention is layered. needMethodBody means the method may execute in the
+     * interpreter. methodBodyClosureRetained additionally means invoked method bodies were retained.
+     * runtimeCompilationBytecodesPreserved is narrower: it keeps only this AOT method's bytecodes so
+     * Ristretto can parse them at run time for compilation or deoptimization metadata.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private boolean methodBodyClosureRetained;
+
+    // The runtime compiler distinguishes preservation from ordinary interpreter-body retention.
+    private boolean runtimeCompilationBytecodesPreserved;
+
+    private final SignaturePolymorphicIntrinsic intrinsic;
+
+    // Only called during universe building
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private InterpreterResolvedJavaMethod(AnalysisMethod originalMethod, Symbol<Name> name, int maxLocals, int maxStackSize, int flags,
+                    InterpreterResolvedObjectType declaringClass, InterpreterUnresolvedSignature signature, PreparedSignature preparedSignature, Symbol<Signature> signatureSymbol,
+                    byte[] code, ExceptionHandler[] exceptionHandlers, LineNumberTable lineNumberTable, LocalVariableTable localVariableTable,
+                    ReferenceConstant<MethodRefHolder> nativeEntryPoint, int vtableIndex, int gotOffset, int enterStubOffset, int methodId) {
+        this.name = MetadataUtil.requireNonNull(name);
+        this.maxLocals = maxLocals;
+        this.maxStackSize = maxStackSize;
+        this.flags = flags;
+        this.declaringClass = MetadataUtil.requireNonNull(declaringClass);
+        this.signature = MetadataUtil.requireNonNull(signature);
+        this.signatureSymbol = MetadataUtil.requireNonNull(signatureSymbol);
+        this.preparedSignature = preparedSignature;
+        this.interpretedCode = code;
+        this.exceptionHandlers = exceptionHandlers;
+        this.lineNumberTable = lineNumberTable;
+        this.localVariableTable = localVariableTable;
+        this.nativeEntryPoint = nativeEntryPoint;
+        this.vtableIndex = vtableIndex;
+        this.gotOffset = gotOffset;
+        this.enterStubOffset = enterStubOffset;
+        this.methodId = methodId;
+        this.inlinedBy = new InlinedBy(this, new HashSet<>());
+        this.intrinsic = null;
+
+        this.originalMethod = originalMethod;
+    }
+
+    // Used at run-time for deserialization and virtual proxifying
+    protected InterpreterResolvedJavaMethod(Symbol<Name> name, int maxLocals, int maxStackSize, int flags,
+                    InterpreterResolvedObjectType declaringClass, InterpreterUnresolvedSignature signature, PreparedSignature preparedSignature, Symbol<Signature> signatureSymbol,
+                    byte[] code, ExceptionHandler[] exceptionHandlers, LineNumberTable lineNumberTable, LocalVariableTable localVariableTable,
+                    ReferenceConstant<MethodRefHolder> nativeEntryPoint, int vtableIndex, int gotOffset, int enterStubOffset, int methodId) {
+        this.name = MetadataUtil.requireNonNull(name);
+        this.maxLocals = maxLocals;
+        this.maxStackSize = maxStackSize;
+        this.flags = flags;
+        this.declaringClass = MetadataUtil.requireNonNull(declaringClass);
+        this.signature = MetadataUtil.requireNonNull(signature);
+        this.preparedSignature = MetadataUtil.requireNonNull(preparedSignature);
+        this.signatureSymbol = MetadataUtil.requireNonNull(signatureSymbol);
+        this.interpretedCode = code;
+        this.exceptionHandlers = exceptionHandlers;
+        this.lineNumberTable = lineNumberTable;
+        this.localVariableTable = localVariableTable;
+        this.nativeEntryPoint = nativeEntryPoint;
+        this.vtableIndex = vtableIndex;
+        this.gotOffset = gotOffset;
+        this.enterStubOffset = enterStubOffset;
+        this.methodId = methodId;
+        this.inlinedBy = new InlinedBy(this, new HashSet<>());
+        this.intrinsic = null;
+    }
+
+    // Used at run-time for signature-polymorphic instantiation
+    protected InterpreterResolvedJavaMethod(Symbol<Name> name, int maxLocals, int flags,
+                    InterpreterResolvedObjectType declaringClass, InterpreterUnresolvedSignature signature, Symbol<Signature> signatureSymbol,
+                    int vtableIndex, int gotOffset, int enterStubOffset, int methodId, SignaturePolymorphicIntrinsic intrinsic, PreparedSignature preparedSignature) {
+        this.name = MetadataUtil.requireNonNull(name);
+        this.maxLocals = maxLocals;
+        this.maxStackSize = 0;
+        this.flags = flags;
+        this.declaringClass = MetadataUtil.requireNonNull(declaringClass);
+        this.signature = MetadataUtil.requireNonNull(signature);
+        this.signatureSymbol = MetadataUtil.requireNonNull(signatureSymbol);
+        // not bytecode-interpretable
+        this.interpretedCode = null;
+        this.exceptionHandlers = null;
+        this.lineNumberTable = null;
+        this.localVariableTable = null;
+        this.nativeEntryPoint = null;
+        this.vtableIndex = vtableIndex;
+        this.gotOffset = gotOffset;
+        this.enterStubOffset = enterStubOffset;
+        this.methodId = methodId;
+        this.inlinedBy = null;
+        this.intrinsic = MetadataUtil.requireNonNull(intrinsic);
+        this.preparedSignature = MetadataUtil.requireNonNull(preparedSignature);
+    }
+
+    // Used at run-time for the crema sub-class
+    protected InterpreterResolvedJavaMethod(InterpreterResolvedObjectType declaringClass, ParserMethod m, int vtableIndex) {
+        assert RuntimeClassLoading.isSupported();
+        this.name = MetadataUtil.requireNonNull(m.getName());
+        this.signatureSymbol = MetadataUtil.requireNonNull(m.getSignature());
+        this.declaringClass = MetadataUtil.requireNonNull(declaringClass);
+        this.flags = m.getFlags();
+        assert (flags & ACC_SUBSTITUTED_NATIVE) == 0;
+        CodeAttribute codeAttribute = (CodeAttribute) m.getAttribute(CodeAttribute.NAME);
+        if (codeAttribute != null) {
+            this.maxLocals = codeAttribute.getMaxLocals();
+            this.maxStackSize = codeAttribute.getMaxStack() + 1;
+            this.interpretedCode = codeAttribute.getOriginalCode();
+            this.lineNumberTable = CremaMethodAccess.toJVMCI(codeAttribute.getLineNumberTableAttribute());
+        } else {
+            this.maxLocals = 0;
+            this.maxStackSize = 0;
+            this.interpretedCode = null;
+            this.lineNumberTable = null;
+        }
+        this.signature = CremaMethodAccess.toJVMCI(m.getSignature(), SymbolsSupport.getTypes());
+
+        this.vtableIndex = vtableIndex;
+
+        this.gotOffset = -2 /* -GOT_NO_ENTRY */;
+        this.enterStubOffset = EST_NO_ENTRY;
+        this.methodId = UNKNOWN_METHOD_ID;
+        this.inlinedBy = null;
+        this.intrinsic = null;
+        this.preparedSignature = InterpreterSupport.singleton().prepareSignature(this.signature, !Modifier.isStatic(flags), declaringClass);
+    }
+
+    @VisibleForSerialization
+    public static InterpreterResolvedJavaMethod createForDeserialization(String name, int maxLocals, int maxStackSize, int flags, InterpreterResolvedObjectType declaringClass,
+                    InterpreterUnresolvedSignature signature, PreparedSignature maybePreparedSignature,
+                    byte[] code, ExceptionHandler[] exceptionHandlers, LineNumberTable lineNumberTable, LocalVariableTable localVariableTable,
+                    ReferenceConstant<MethodRefHolder> nativeEntryPoint, int vtableIndex, int gotOffset, int enterStubOffset, int methodId) {
+        Symbol<Name> nameSymbol = SymbolsSupport.getNames().getOrCreate(name);
+        Symbol<Signature> signatureSymbol = toSymbol(signature);
+        PreparedSignature preparedSignature;
+        if (maybePreparedSignature != null) {
+            preparedSignature = maybePreparedSignature;
+        } else if (InterpreterSupport.isEnabled()) {
+            preparedSignature = InterpreterSupport.singleton().prepareSignature(signature, !Modifier.isStatic(flags), declaringClass);
+        } else {
+            preparedSignature = null;
+        }
+        return new InterpreterResolvedJavaMethod(nameSymbol, maxLocals, maxStackSize, flags, declaringClass, signature, preparedSignature, signatureSymbol, code,
+                        exceptionHandlers, lineNumberTable, localVariableTable, nativeEntryPoint, vtableIndex, gotOffset, enterStubOffset, methodId);
+    }
+
+    public InterpreterResolvedJavaMethod forFailing(InterpreterResolvedObjectType targetDeclaringClass, MethodRefHolder failingNativeEntryPoint, PreparedSignature entryPointSignature, int vtablePos) {
+        assert RuntimeClassLoading.isSupported();
+        return new InterpreterResolvedJavaMethod(name, 0, 0,
+                        ACC_PUBLIC | ACC_NATIVE | ACC_SYNTHETIC | ACC_HIDDEN | ACC_INTERNAL,
+                        targetDeclaringClass,
+                        signature,
+                        entryPointSignature,
+                        signatureSymbol,
+                        /*- code */ null,
+                        /*- exceptionHandlers */ null,
+                        /*- LineNumberTable */ null,
+                        /*- localVariableTable */ null,
+                        /*- nativeEntryPoint */ ReferenceConstant.createFromNonNullReference(failingNativeEntryPoint),
+                        vtablePos,
+                        -2 /*- GOT_NO_ENTRY */, EST_NO_ENTRY, UNKNOWN_METHOD_ID);
+    }
+
+    // Only called during universe building
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static InterpreterResolvedJavaMethod createAtBuildTime(AnalysisMethod originalMethod, String name, int maxLocals, int maxStackSize, int modifiers,
+                    InterpreterResolvedObjectType declaringClass,
+                    InterpreterUnresolvedSignature signature, boolean isSubstitutedNative,
+                    byte[] code, ExceptionHandler[] exceptionHandlers, LineNumberTable lineNumberTable, LocalVariableTable localVariableTable,
+                    ReferenceConstant<MethodRefHolder> nativeEntryPoint, int vtableIndex, int gotOffset, int enterStubOffset, int methodId) {
+        Symbol<Name> nameSymbol = SymbolsSupport.getNames().getOrCreate(name);
+        Symbol<Signature> signatureSymbol = toSymbol(signature);
+        int flags = createFlags(modifiers, declaringClass, signatureSymbol, isSubstitutedNative, originalMethod);
+        PreparedSignature preparedSignature = null;
+        return new InterpreterResolvedJavaMethod(originalMethod, nameSymbol, maxLocals, maxStackSize, flags, declaringClass, signature, preparedSignature, signatureSymbol, code,
+                        exceptionHandlers, lineNumberTable, localVariableTable, nativeEntryPoint, vtableIndex, gotOffset, enterStubOffset, methodId);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setLineNumberTable(LineNumberTable lineNumberTable) {
+        this.lineNumberTable = lineNumberTable;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static MethodRef createMethodRef(ResolvedJavaMethod method) {
+        return SubstrateOptions.useRelativeCodePointers() ? MethodRefSupport.createMethodOffset(method) : MethodRefSupport.createMethodPointer(method);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public ResolvedJavaMethod getRistrettoMethod() {
+        return this.ristrettoMethod;
+    }
+
+    public ResolvedJavaMethod getRistrettoMethod(Function<InterpreterResolvedJavaMethod, ResolvedJavaMethod> ristrettoMethodSupplier) {
+        if (this.ristrettoMethod != null) {
+            return this.ristrettoMethod;
+        }
+        /*
+         * We allow concurrent allocation of a ristretto method per interpreter method. Eventually
+         * however we CAS on the pointer in the interpreter representation, if another thread was
+         * faster return its method.
+         */
+        return getOrSetRistrettoMethod(ristrettoMethodSupplier.apply(this));
+    }
+
+    private ResolvedJavaMethod getOrSetRistrettoMethod(ResolvedJavaMethod newRistrettoMethod) {
+        if (RISTRETTO_METHOD_UPDATER.compareAndSet(this, null, newRistrettoMethod)) {
+            return newRistrettoMethod;
+        }
+        var method = this.ristrettoMethod;
+        assert method != null : "If CAS for null fails must have written a method already";
+        return method;
+    }
+
+    private static Symbol<Signature> toSymbol(InterpreterUnresolvedSignature jvmciSignature) {
+        // hidden classes and SVM stable proxy name contain a `.`, replace with a `+`
+        StringBuilder sb = new StringBuilder();
+        sb.append('(');
+        for (int i = 0; i < jvmciSignature.getParameterCount(false); i++) {
+            sb.append(jvmciSignature.getParameterType(i, null).getName().replace('.', '+'));
+        }
+        sb.append(')');
+        sb.append(jvmciSignature.getReturnType(null).getName().replace('.', '+'));
+        Symbol<Signature> symbol = SymbolsSupport.getSignatures().getOrCreateValidSignature(ByteSequence.create(sb.toString()));
+        assert symbol != null : jvmciSignature;
+        return symbol;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private static int createFlags(int modifiers, InterpreterResolvedObjectType declaringClass, Symbol<Signature> signatureSymbol, boolean isSubstitutedNative, ResolvedJavaMethod originalMethod) {
+        int newModifiers = modifiers;
+        if (ParserMethod.isDeclaredSignaturePolymorphic(declaringClass.getSymbolicType(), signatureSymbol, getOriginalModifiers(modifiers, isSubstitutedNative), JavaVersion.HOST_VERSION)) {
+            newModifiers |= ACC_SIGNATURE_POLYMORPHIC;
+        }
+        if (isSubstitutedNative) {
+            newModifiers |= ACC_SUBSTITUTED_NATIVE;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, CALLER_SENSITIVE_CLASS)) {
+            newModifiers |= ACC_CALLER_SENSITIVE;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, LAMBDA_FORM_COMPILED_CLASS)) {
+            newModifiers |= ACC_LAMBDA_FORM_COMPILED;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, jdk.internal.vm.annotation.Hidden.class)) {
+            newModifiers |= ACC_HIDDEN;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, jdk.internal.vm.annotation.ForceInline.class)) {
+            newModifiers |= ACC_FORCE_INLINE;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, jdk.internal.vm.annotation.DontInline.class)) {
+            newModifiers |= ACC_DONT_INLINE;
+        }
+        if (GuestAnnotationAccess.isAnnotationPresent(originalMethod, SCOPED_MEMORY_SCOPED_CLASS)) {
+            newModifiers |= ACC_SCOPED;
+        }
+        return newModifiers;
+    }
+
+    public final boolean isCallerSensitive() {
+        return (flags & ACC_CALLER_SENSITIVE) != 0;
+    }
+
+    @Override
+    public final boolean isScoped() {
+        return (flags & ACC_SCOPED) != 0;
+    }
+
+    /**
+     * Returns true if this method is hidden from user-visible stack walking, either directly or
+     * because it is declared by a hidden class.
+     */
+    public final boolean isHidden() {
+        // ClassfileParser sets ACC_HIDDEN on methods of runtime-loaded hidden classes.
+        return (flags & ACC_HIDDEN) != 0;
+    }
+
+    public final boolean isLambdaFormCompiled() {
+        return (flags & ACC_LAMBDA_FORM_COMPILED) != 0;
+    }
+
+    @Override
+    public final boolean isDeclaredSignaturePolymorphic() {
+        // Note: might not be true for the instantiation of polymorphic signature intrinsics.
+        return (flags & ACC_SIGNATURE_POLYMORPHIC) != 0;
+    }
+
+    @Override
+    public InterpreterResolvedJavaMethod findSignaturePolymorphicIntrinsic(Symbol<Signature> methodSignature) {
+        if (!RuntimeClassLoading.isSupported()) {
+            throw VMError.shouldNotReachHere("Signature polymorphic method handling is unsupported without runtime class loading enabled.");
+        }
+
+        return (InterpreterResolvedJavaMethod) CremaSupport.singleton().findMethodHandleIntrinsic(this, methodSignature);
+    }
+
+    @Override
+    public final InterpreterResolvedJavaMethod createSignaturePolymorphicIntrinsic(Symbol<Signature> newSignature) {
+        if (!RuntimeClassLoading.isSupported()) {
+            throw VMError.shouldNotReachHere("Unable to create signature polymorphic intrinsic when runtime class loading is disabled.");
+        }
+        SignaturePolymorphicIntrinsic iid = SignaturePolymorphicIntrinsic.getId(this);
+        assert iid != null;
+        assert intrinsic == null;
+        int newModifiers;
+        boolean isSubstitutedNative = (flags & ACC_SUBSTITUTED_NATIVE) != 0;
+        if (iid == SignaturePolymorphicIntrinsic.InvokeGeneric) {
+            newModifiers = getOriginalModifiers(flags, isSubstitutedNative) & ~(ACC_VARARGS | ACC_SUBSTITUTED_NATIVE | ACC_SIGNATURE_POLYMORPHIC);
+        } else {
+            newModifiers = ACC_NATIVE | ACC_SYNTHETIC | ACC_FINAL;
+            if (iid.isStaticSignaturePolymorphic()) {
+                newModifiers |= ACC_STATIC;
+            }
+        }
+        assert Modifier.isNative(newModifiers);
+        InterpreterUnresolvedSignature jvmciSignature = CremaMethodAccess.toJVMCI(newSignature, SymbolsSupport.getTypes());
+        PreparedSignature prepSignature = InterpreterSupport.singleton().prepareSignature(jvmciSignature, !Modifier.isStatic(newModifiers), getDeclaringClass());
+        return new InterpreterResolvedJavaMethod(name, jvmciSignature.slotsForParameters(true), newModifiers, declaringClass, jvmciSignature, newSignature,
+                        vtableIndex, gotOffset, enterStubOffset, methodId, iid, prepSignature);
+    }
+
+    private static int getOriginalModifiers(int modifiers, boolean isSubstitutedNative) {
+        return modifiers | (isSubstitutedNative ? Modifier.NATIVE : 0);
+    }
+
+    public final SignaturePolymorphicIntrinsic getSignaturePolymorphicIntrinsic() {
+        return intrinsic;
+    }
+
+    public final boolean isSignaturePolymorphicIntrinsic() {
+        return getSignaturePolymorphicIntrinsic() != null;
+    }
+
+    public final boolean isInternal() {
+        return (flags & ACC_INTERNAL) != 0;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final boolean needsMethodBody() {
+        return needMethodBody;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final boolean hasMethodBodyClosureRetained() {
+        return methodBodyClosureRetained;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setMethodBodyClosureRetained(boolean methodBodyClosureRetained) {
+        this.methodBodyClosureRetained = methodBodyClosureRetained;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final AnalysisMethod getOriginalMethod() {
+        return originalMethod;
+    }
+
+    /**
+     * Returns the bytecodes executed by the interpreter, may include BREAKPOINT and other
+     * non-standard bytecodes used by the interpreter. For a spec-compliant, without BREAKPOINT and
+     * non-standard bytecodes use {@link #getCode()}
+     */
+    public final byte[] getInterpretedCode() {
+        return interpretedCode;
+    }
+
+    /**
+     * Runtime-linked {@code invokedynamic} sites patch the published extra CPI only into the live
+     * interpreter bytecodes. The cached {@link #originalCode} view is initialized lazily from the
+     * interpreter bytecodes the first time {@link #getCode()} is requested and then keeps its own
+     * stable per-call-site encoding, so it deliberately does not mirror later runtime mutations.
+     */
+    public final void patchInvokeDynamicExtraCPI(int bci, int extraCPI) {
+        VMError.guarantee(interpretedCode != null);
+        BytecodeStream.patchIndyExtraCPI(interpretedCode, bci, extraCPI);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void preserveRuntimeCompilationBytecodes() {
+        runtimeCompilationBytecodesPreserved = true;
+    }
+
+    public final boolean hasRuntimeCompilationBytecodesPreserved() {
+        return runtimeCompilationBytecodesPreserved;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setCode(byte[] code) {
+        this.interpretedCode = code;
+        this.originalCode = null;
+    }
+
+    /**
+     * Cached spec-compliant bytecode view used by JVMCI/compiler consumers. Lazily derived from
+     * {@link #interpretedCode} on the first {@link #getCode()} access.
+     */
+    private volatile byte[] originalCode;
+
+    public final int getOriginalOpcodeAt(int bci) {
+        return getCode()[bci] & 0xFF;
+    }
+
+    @Override
+    public final byte[] getCode() {
+        if (interpretedCode == null) {
+            return null;
+        }
+        byte[] result = originalCode;
+        if (result == null) {
+            synchronized (this) {
+                result = originalCode;
+                if (result == null) {
+                    originalCode = result = createOriginalCode();
+                    verifySanitizedCode(result); // assert
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Builds the compiler-visible bytecode snapshot from the live interpreter bytecodes.
+     *
+     * <p>
+     * Runtime linking mutates only {@link #interpretedCode}. This snapshot rewrites quickened
+     * opcodes and each runtime {@code invokedynamic} operand into a stable compiler view so compiler
+     * consumers never observe interpreter-only bytecode rewrites or torn extra-CPI publication.
+     */
+    private byte[] createOriginalCode() {
+        byte[] result = getInterpretedCode().clone();
+        InterpreterConstantPool constantPool = getConstantPool();
+        for (int bci = 0; bci < BytecodeStream.endBCI(result); bci = BytecodeStream.nextBCI(result, bci)) {
+            int opcode = BytecodeStream.opcode(result, bci);
+            if (Bytecodes.isQuickened(opcode)) {
+                /*
+                 * Quickened bytecodes are only meaningful to the interpreter; JVMCI clients must
+                 * keep seeing the original class-file opcode and operands.
+                 */
+                BytecodeStream.patchOpcodeOpaque(result, bci, Bytecodes.unquickened(opcode));
+                continue;
+            }
+            if (opcode != Bytecodes.INVOKEDYNAMIC) {
+                continue;
+            }
+            int fullCpi = BytecodeStream.readCPI4(result, bci);
+            int indyCpi = fullCpi >>> 16;
+            if (indyCpi == 0) {
+                continue;
+            }
+            /* Building the compiler view must not link the runtime call site. */
+            Object indyEntry = constantPool.peekCachedEntry(indyCpi);
+            if (!(indyEntry instanceof InterpreterResolvedJavaMethod)) {
+                BytecodeStream.patchIndyExtraCPI(result, bci, encodeCompilerIndyBci(bci));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Encodes one compiler-visible {@code invokedynamic} call site as the current method plus an
+     * in-method BCI in the low 16 bits.
+     *
+     * <p>
+     * The enclosing {@link InterpreterResolvedJavaMethod} already fixes which bytecode array and
+     * constant-pool view we are talking about, so the per-call-site state only needs to preserve
+     * the {@code bci} within that method.
+     */
+    private static int encodeCompilerIndyBci(int bci) {
+        /*
+         * Store bci + 1 so zero remains the sentinel for "no compiler-visible BCI encoded yet".
+         * That makes 0xFFFF the only non-negative BCI value that does not fit this encoding.
+         */
+        if (!(0 <= bci && bci < 0xFFFF)) {
+            throw VMError.shouldNotReachHere("BCI does not fit into compiler indy encoding: " + bci);
+        }
+        return bci + 1;
+    }
+
+    private static void verifySanitizedCode(byte[] code) {
+        for (int bci = 0; bci < BytecodeStream.endBCI(code); bci = BytecodeStream.nextBCI(code, bci)) {
+            int currentBC = BytecodeStream.currentBC(code, bci);
+            VMError.guarantee(BREAKPOINT != currentBC);
+            VMError.guarantee(!Bytecodes.isQuickened(currentBC));
+        }
+    }
+
+    @Override
+    public final int getCodeSize() {
+        if (interpretedCode == null) {
+            return 0;
+        }
+        return interpretedCode.length;
+    }
+
+    @Override
+    public final Symbol<Name> getSymbolicName() {
+        return name;
+    }
+
+    @Override
+    public final Symbol<Signature> getSymbolicSignature() {
+        return signatureSymbol;
+    }
+
+    @Override
+    public final String getName() {
+        return name.toString();
+    }
+
+    @Override
+    public final InterpreterResolvedObjectType getDeclaringClass() {
+        return declaringClass;
+    }
+
+    @Override
+    public final InterpreterUnresolvedSignature getSignature() {
+        return signature;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public final int getMaxLocals() {
+        return maxLocals;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public final int getMaxStackSize() {
+        return maxStackSize;
+    }
+
+    @Override
+    public final boolean isDeclared() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean isClassInitializer() {
+        return ParserMethod.isClassInitializer(getModifiers(), getSymbolicName(), getSymbolicSignature());
+    }
+
+    @Override
+    public final boolean isConstructor() {
+        return ParserSymbols.ParserNames._init_ == getSymbolicName() && !isStatic();
+    }
+
+    @Override
+    public ExceptionHandler[] getExceptionHandlers() {
+        ExceptionHandler[] result = exceptionHandlers;
+        VMError.guarantee(result != null);
+        return result;
+    }
+
+    @Override
+    public final InterpreterConstantPool getConstantPool() {
+        return declaringClass.getConstantPool();
+    }
+
+    @Override
+    public final LineNumberTable getLineNumberTable() {
+        return lineNumberTable;
+    }
+
+    @Override
+    public final LocalVariableTable getLocalVariableTable() {
+        return localVariableTable;
+    }
+
+    /// Gets the modifiers of the executing method implementation.
+    /// For substitutions, these may differ from the reflection view.
+    ///
+    /// @see #getOriginalModifiers()
+    @Override
+    public final int getModifiers() {
+        return flags & JVM_RECOGNIZED_METHOD_MODIFIERS;
+    }
+
+    /// Gets the Java modifiers, retaining the native flag of methods implemented by substitutions.
+    public final int getOriginalModifiers() {
+        return getOriginalModifiers(getModifiers(), (flags & ACC_SUBSTITUTED_NATIVE) != 0);
+    }
+
+    public final int getFlags() {
+        return flags;
+    }
+
+    @Override
+    public final String toString() {
+        return "InterpreterResolvedJavaMethod<holder=" + getDeclaringClass().getName() + " name=" + getName() + " descriptor=" + getSignature().toMethodDescriptor() + " dispatchIndex=" +
+                        getVTableIndex() + ">";
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setExceptionHandlers(ExceptionHandler[] exceptionHandlers) {
+        this.exceptionHandlers = MetadataUtil.requireNonNull(exceptionHandlers);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setLocalVariableTable(LocalVariableTable localVariableTable) {
+        this.localVariableTable = MetadataUtil.requireNonNull(localVariableTable);
+    }
+
+    private void patchOpcode(int bci, int newOpcode) {
+        BytecodeStream.patchOpcodeOpaque(interpretedCode, bci, newOpcode);
+    }
+
+    public final void ensureCanSetBreakpointAt(int bci) {
+        if (!hasBytecodes()) {
+            throw new IllegalArgumentException("Cannot set breakpoint: method " + name + " doesn't have bytecodes");
+        }
+        if (bci < 0 || getCodeSize() <= bci) {
+            throw new IllegalArgumentException("Cannot set breakpoint: BCI out of bounds");
+        }
+        if (!isValidBCI(getCode(), bci)) {
+            throw new IllegalArgumentException("Cannot set breakpoint: targetBCI is not a valid first opcode");
+        }
+    }
+
+    public final void toggleBreakpoint(int bci, boolean enabled) {
+        ensureCanSetBreakpointAt(bci);
+        if (enabled) {
+            patchOpcode(bci, BREAKPOINT);
+        } else {
+            int originalOpcode = getOriginalOpcodeAt(bci);
+            patchOpcode(bci, originalOpcode);
+        }
+    }
+
+    public static boolean isValidBCI(byte[] code, int targetBCI) {
+        for (int bci = 0; bci < BytecodeStream.endBCI(code); bci = BytecodeStream.nextBCI(code, bci)) {
+            if (bci == targetBCI) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Unique identifier for methods in compiled frames.
+     * <p>
+     * Only valid if != 0, 0 means unknown. Allows to precisely extract the
+     * {@link InterpreterResolvedJavaMethod interpreter method instance} from a compiled frame.
+     */
+    public final int getMethodId() {
+        return methodId;
+    }
+
+    public final JNIMethodId getOrCreateJNIMethodId() {
+        ClassLoader loader = getDeclaringClass().getJavaClass().getClassLoader();
+        return InterpreterJNIMethodIds.forMethod(ClassRegistries.runtimeLastLayer().getRegistry(loader).getOrCreateInterpreterJNIMethodId(this));
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setMethodId(int methodId) {
+        assert methodId >= 0;
+        this.methodId = methodId;
+    }
+
+    public final void setGOTOffset(int gotOffset) {
+        this.gotOffset = gotOffset;
+    }
+
+    public final int getGOTOffset() {
+        return gotOffset;
+    }
+
+    public final void setEnterStubOffset(int offset) {
+        this.enterStubOffset = offset;
+    }
+
+    public final int getEnterStubOffset() {
+        return enterStubOffset;
+    }
+
+    public final boolean hasNativeEntryPoint() {
+        return nativeEntryPoint != null;
+    }
+
+    public final CFunctionPointer getNativeEntryPoint() {
+        if (nativeEntryPoint == null) {
+            return Word.nullPointer();
+        }
+        return nativeEntryPoint.getReferent().getFunctionPointer();
+    }
+
+    public final ReferenceConstant<MethodRefHolder> getNativeEntryPointHolderConstant() {
+        return nativeEntryPoint;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setNativeEntryPoint(MethodRef nativeEntryPoint) {
+        if (this.nativeEntryPoint != null && nativeEntryPoint != null) {
+            /* already set, verify if it's the same */
+            ResolvedJavaMethod setMethod = this.nativeEntryPoint.getReferent().getMethod();
+            VMError.guarantee(setMethod.equals(MethodRefSupport.getMethod(nativeEntryPoint)));
+            return;
+        }
+
+        if (nativeEntryPoint == null) {
+            this.nativeEntryPoint = null;
+        } else {
+            this.nativeEntryPoint = ReferenceConstant.createFromNonNullReference(new MethodRefHolder(nativeEntryPoint));
+        }
+    }
+
+    public final void setNativeEntryPoint(MethodRefHolder nativeEntryPoint) {
+        VMError.guarantee(this.nativeEntryPoint == null);
+        this.nativeEntryPoint = ReferenceConstant.createFromNonNullReference(nativeEntryPoint);
+    }
+
+    public final int getVTableIndex() {
+        return vtableIndex;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final void setVTableIndex(int vtableIndex) {
+        VMError.guarantee(vtableIndex == VTBL_UNINITIALIZED || (!isStatic() && !isConstructor()));
+        if (vtableIndex >= 0) {
+            VMError.guarantee(!isFinal());
+        }
+        this.vtableIndex = vtableIndex;
+    }
+
+    @Override
+    public final boolean requiresInterfaceDispatch(InterpreterResolvedJavaType holder) {
+        assert getDeclaringClass().isInterface();
+        return hasDispatchIndex() && ((holder.equals(getDeclaringClass())) || !(this.equals(holder.lookupVTableEntry(getVTableIndex()))));
+    }
+
+    public final boolean isDevirtualized() {
+        return VTBL_INVALID < vtableIndex && vtableIndex < VTBL_UNINITIALIZED;
+    }
+
+    public final InterpreterResolvedJavaMethod devirtualizationTarget() {
+        assert isDevirtualized();
+        if (vtableIndex == VTBL_ONE_IMPL) {
+            return getOneImplementation();
+        } else if (vtableIndex == VTBL_NO_DISPATCH) {
+            return this;
+        }
+        throw VMError.shouldNotReachHere("Unable to devirtualize.");
+    }
+
+    public final boolean hasDispatchIndex() {
+        return vtableIndex >= 0;
+    }
+
+    public final void setOneImplementation(InterpreterResolvedJavaMethod oneImplementation) {
+        this.oneImplementation = oneImplementation;
+    }
+
+    public final InterpreterResolvedJavaMethod getOneImplementation() {
+        /* if VTBL_ONE_IMPL is set, oneImplementation must have an assignment */
+        VMError.guarantee(vtableIndex != VTBL_ONE_IMPL || oneImplementation != null);
+        return oneImplementation;
+    }
+
+    @Override
+    public final boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof InterpreterResolvedJavaMethod)) {
+            return false;
+        }
+        InterpreterResolvedJavaMethod that = (InterpreterResolvedJavaMethod) other;
+        return name.equals(that.name) && declaringClass.equals(that.declaringClass) && signature.equals(that.signature);
+    }
+
+    @Override
+    public final int hashCode() {
+        int result = MetadataUtil.hashCode(name);
+        result = 31 * result + MetadataUtil.hashCode(declaringClass);
+        result = 31 * result + MetadataUtil.hashCode(signature);
+        return result;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public final boolean isInterpreterExecutable() {
+        return hasBytecodes();
+    }
+
+    public final Set<InterpreterResolvedJavaMethod> getInlinedBy() {
+        if (inlinedBy == null) {
+            return Set.of();
+        }
+        return inlinedBy.inliners;
+    }
+
+    public final void addInliner(InterpreterResolvedJavaMethod inliner) {
+        inlinedBy.inliners.add(inliner);
+    }
+
+    public final Object getInterpreterExecToken() {
+        return interpreterExecToken;
+    }
+
+    public final void setInterpreterExecToken(Object interpreterExecToken) {
+        this.interpreterExecToken = interpreterExecToken;
+    }
+
+    /**
+     * Installs the precomputed ABI-ready signature used by interpreter entry stubs and runtime-made
+     * method metadata that cannot rely on hosted initialization.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void setPreparedSignature(PreparedSignature preparedSignature) {
+        this.preparedSignature = preparedSignature;
+    }
+
+    /**
+     * Returns the precomputed ABI-ready signature consumed by interpreter stubs.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public PreparedSignature getPreparedSignature() {
+        return preparedSignature;
+    }
+
+    @Override
+    public final boolean canBeStaticallyBound() {
+        return (isFinal() || isPrivate() || isStatic() || getDeclaringClass().isLeaf() || isConstructor()) && isConcrete();
+    }
+
+    // region Unimplemented methods
+
+    @Override
+    public final boolean shouldSkipLoadingConstraints() {
+        return isSignaturePolymorphicIntrinsic();
+    }
+
+    @Override
+    public CodeAttribute getCodeAttribute() {
+        throw VMError.shouldNotReachHere("code attribute unavailable for AOT methods.");
+    }
+
+    @Override
+    public final void loadingConstraints(InterpreterResolvedJavaType accessingClass) {
+        /*
+         * Loading-constraint checks can update shared VM state and therefore must not be interrupted
+         * by a StackOverflowError. Make the yellow zone available before doing any constraint work
+         * so a check that starts near the regular stack boundary can finish. No application code is
+         * invoked while the yellow zone is available.
+         */
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
+        try {
+            ClassLoader loader1 = accessingClass.getClassLoader();
+            ClassLoader loader2 = getDeclaringClass().getClassLoader();
+            checkLoadingConstraints(loader1, loader2);
+        } finally {
+            StackOverflowCheck.singleton().protectYellowZone();
+        }
+    }
+
+    final void checkLoadingConstraints(ClassLoader loader1, ClassLoader loader2) {
+        assert StackOverflowCheck.singleton().isYellowZoneAvailable();
+        if (loader1 != loader2) {
+            for (Symbol<Type> type : SymbolsSupport.getSignatures().parsed(getSymbolicSignature())) {
+                CremaSupport.singleton().checkLoadingConstraint(type, loader1, loader2);
+            }
+        }
+    }
+
+    @Override
+    public com.oracle.svm.espresso.classfile.ExceptionHandler[] getSymbolicExceptionHandlers() {
+        throw VMError.unimplemented("symbolic exception handlers unavailable for AOT methods.");
+    }
+
+    @Override
+    public final java.lang.reflect.Type[] getGenericParameterTypes() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean canBeInlined() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean hasNeverInlineDirective() {
+        return (flags & ACC_DONT_INLINE) != 0;
+    }
+
+    @Override
+    public final boolean shouldBeInlined() {
+        return (flags & ACC_FORCE_INLINE) != 0;
+    }
+
+    @Override
+    public final Constant getEncoding() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean isInVirtualMethodTable(ResolvedJavaType resolved) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final SpeculationLog getSpeculationLog() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public AnnotationsInfo getParameterAnnotationInfo() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public AnnotationsInfo getAnnotationDefaultInfo() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean isSynthetic() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean isVarArgs() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final boolean isBridge() {
+        return (Constants.ACC_BRIDGE & getModifiers()) != 0;
+    }
+
+    @Override
+    public final boolean isDefault() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    /// Creates a source location for runtime, hosted, and opaque metadata.
+    @Override
+    public final StackTraceElement asStackTraceElement(int bci) {
+        int lineNumber;
+        if (Modifier.isNative(getModifiers())) {
+            lineNumber = LINENUMBER_NATIVE;
+        } else {
+            LineNumberTable methodLineNumberTable = getLineNumberTable();
+            if (methodLineNumberTable == null || bci < 0) {
+                /*
+                 * Missing line-table metadata or an unknown BCI means the source line is
+                 * unavailable, not that the method metadata is corrupt.
+                 */
+                lineNumber = LINENUMBER_UNKNOWN;
+            } else {
+                lineNumber = methodLineNumberTable.getLineNumber(bci);
+            }
+        }
+        InterpreterResolvedJavaType declaringType = getDeclaringClass();
+        if (ImageInfo.inImageRuntimeCode() && declaringType.clazz != null) {
+            // Runtime classes carry the same loader and module information as compiled frames.
+            return FrameSourceInfo.getSourceReference(declaringType.getJavaClass(), getName(), lineNumber);
+        }
+        // Hosted classes are not DynamicHubs, and opaque metadata has no local Class at all.
+        return new StackTraceElement(declaringType.toJavaName(), getName(), declaringType.getSourceFileName(), lineNumber);
+    }
+
+    @Override
+    public final ProfilingInfo getProfilingInfo(boolean includeNormal, boolean includeOSR) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public final void reprofile() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    // endregion Unimplemented methods
+
+    public static InterpreterResolvedJavaMethod fromMemberName(Target_java_lang_invoke_MemberName memberName) {
+        InterpreterResolvedJavaMethod invoker = (InterpreterResolvedJavaMethod) memberName.resolved;
+        if (invoker == null) {
+            Executable reflectInvoker = (Executable) memberName.reflectAccess;
+            if (reflectInvoker == null) {
+                /*
+                 * This should only happen on first use of image-heap MemberNames. Those don't have
+                 * a `resolved` target and their `reflectAccess` is reset to null. Unfortunately we
+                 * don't have a caller class to use for access checks.
+                 */
+                CremaSupport.singleton().resolveMemberName(memberName, null);
+                invoker = (InterpreterResolvedJavaMethod) memberName.resolved;
+                assert invoker != null;
+            } else {
+                invoker = toJVMCI(reflectInvoker);
+                memberName.resolved = invoker;
+            }
+        }
+        return invoker;
+    }
+
+    public final CallKind getCallKind() {
+        return CallKind.getCallKind(this);
+    }
+}

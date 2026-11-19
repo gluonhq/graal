@@ -24,7 +24,6 @@
  */
 package com.oracle.svm.core.jni.functions;
 
-import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
@@ -36,22 +35,28 @@ import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.c.CIsolateData;
-import com.oracle.svm.core.c.CIsolateDataFactory;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.guest.staging.core.c.CIsolateData;
+import com.oracle.svm.guest.staging.core.c.CIsolateDataFactory;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.LayoutEncoding;
 import com.oracle.svm.core.jni.headers.JNIInvokeInterface;
 import com.oracle.svm.core.jni.headers.JNIJavaVM;
 import com.oracle.svm.core.jni.headers.JNINativeInterface;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.internal.misc.Unsafe;
 
 /**
  * Performs the initialization of the JNI function table structures at runtime.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class JNIFunctionTables {
 
     public static void create() {
@@ -84,7 +89,7 @@ public final class JNIFunctionTables {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     private static int wordArrayLength(int sizeInBytes) {
-        int wordSize = FrameAccess.wordSize();
+        int wordSize = SubstrateTarget.getWordSize();
         VMError.guarantee(sizeInBytes % wordSize == 0);
         return sizeInBytes / wordSize;
     }
@@ -150,7 +155,7 @@ public final class JNIFunctionTables {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public void initInvokeInterfaceEntry(int offsetInBytes, CFunctionPointer value) {
-        int wordSize = FrameAccess.wordSize();
+        int wordSize = SubstrateTarget.getWordSize();
         VMError.guarantee(offsetInBytes % wordSize == 0);
         invokeInterfaceDataPrototype[offsetInBytes / wordSize] = value;
     }
@@ -162,7 +167,7 @@ public final class JNIFunctionTables {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public void initFunctionEntry(int offsetInBytes, CFunctionPointer value) {
-        int wordSize = FrameAccess.wordSize();
+        int wordSize = SubstrateTarget.getWordSize();
         VMError.guarantee(offsetInBytes % wordSize == 0);
         functionTableData[offsetInBytes / wordSize] = value;
     }

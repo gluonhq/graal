@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -36,19 +36,28 @@ import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 
 /*
  * To be kept in sync with:
  *  - substratevm/src/com.oracle.svm.native.libchelper/include/amd64hotspotcpuinfo.h
  *  - substratevm/src/com.oracle.svm.native.libchelper/src/cpuid.c
  */
-@BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+2/src/hotspot/cpu/x86/vm_version_x86.hpp#L41-L325")
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25.0.2+2/src/hotspot/cpu/x86/vm_version_x86.hpp#L41-L356")
 @CLibrary(value = "libchelper", requireStatic = true)
 public class AMD64LibCHelper {
     @Platforms(Platform.AMD64.class)
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native void determineCPUFeatures(CPUFeatures features);
+
+    /**
+     * Returns {@code 1} if the runtime CPU supports the AVX-512 SIMD sort implementation and
+     * {@code 0} otherwise. In particular, AVX-512 SIMD sort is disabled on AMD Zen 4 processors
+     * because it has a severe performance penalty there.
+     */
+    @Platforms(Platform.AMD64.class)
+    @CFunction(transition = Transition.NO_TRANSITION)
+    public static native int supportsAvx512SimdSort();
 
     @Platforms(Platform.AMD64.class)
     @CFunction(transition = Transition.NO_TRANSITION)
@@ -306,6 +315,22 @@ public class AMD64LibCHelper {
         @AllowNarrowingCast
         @CField
         boolean fAPX_F();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fSHA512();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_FP16();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX10_1();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX10_2();
     }
     // Checkstyle: resume
 }

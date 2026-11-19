@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2023, 2023, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,18 +26,19 @@
 
 package com.oracle.svm.core.jfr.oldobject;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import java.lang.ref.WeakReference;
 
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.collections.UninterruptibleComparable;
 import com.oracle.svm.core.collections.UninterruptibleLinkedList;
 import com.oracle.svm.core.heap.ReferenceInternals;
 import com.oracle.svm.core.jfr.JfrTicks;
+import com.oracle.svm.core.jfr.traceid.JfrEpoch;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * Holds information about a sampled object. This data may only be accessed while holding the
@@ -51,6 +52,8 @@ public final class JfrOldObject implements UninterruptibleComparable, Uninterrup
     private UnsignedWord objectSize;
     private long allocationTicks;
     private long threadId;
+    private String vthreadName;
+    private long vthreadEpochId;
     private long stackTraceId;
     private UnsignedWord heapUsedAfterLastGC;
     private int arrayLength;
@@ -61,12 +64,15 @@ public final class JfrOldObject implements UninterruptibleComparable, Uninterrup
 
     @SuppressWarnings("hiding")
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    void initialize(Object obj, UnsignedWord allocatedSize, long threadId, long stackTraceId, UnsignedWord heapUsedAfterLastGC, int arrayLength) {
+    void initialize(Object obj, UnsignedWord span, UnsignedWord allocatedSize, long threadId, String vthreadName, long vthreadEpochId, long stackTraceId, UnsignedWord heapUsedAfterLastGC,
+                    int arrayLength) {
         ReferenceInternals.setReferent(reference, obj);
-        this.span = allocatedSize;
+        this.span = span;
         this.objectSize = allocatedSize;
         this.allocationTicks = JfrTicks.elapsedTicks();
         this.threadId = threadId;
+        this.vthreadName = vthreadName;
+        this.vthreadEpochId = vthreadEpochId;
         this.stackTraceId = stackTraceId;
         this.heapUsedAfterLastGC = heapUsedAfterLastGC;
         this.arrayLength = arrayLength;
@@ -75,12 +81,14 @@ public final class JfrOldObject implements UninterruptibleComparable, Uninterrup
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     void reset() {
         ReferenceInternals.setReferent(reference, null);
-        this.span = WordFactory.zero();
-        this.objectSize = WordFactory.zero();
+        this.span = Word.zero();
+        this.objectSize = Word.zero();
         this.allocationTicks = 0L;
         this.threadId = 0L;
+        this.vthreadName = null;
+        this.vthreadEpochId = JfrEpoch.NO_EPOCH_ID;
         this.stackTraceId = 0L;
-        this.heapUsedAfterLastGC = WordFactory.zero();
+        this.heapUsedAfterLastGC = Word.zero();
         this.arrayLength = 0;
         this.next = null;
     }
@@ -123,6 +131,16 @@ public final class JfrOldObject implements UninterruptibleComparable, Uninterrup
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public String getVthreadName() {
+        return vthreadName;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public long getVthreadEpochId() {
+        return vthreadEpochId;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public long getStackTraceId() {
         return stackTraceId;
     }
@@ -155,7 +173,7 @@ public final class JfrOldObject implements UninterruptibleComparable, Uninterrup
         return ReferenceInternals.getReferent(reference);
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "Must be atomic with regard to garbage collection.")
     public boolean isAlive() {
         return ReferenceInternals.isReferentAlive(reference);
     }

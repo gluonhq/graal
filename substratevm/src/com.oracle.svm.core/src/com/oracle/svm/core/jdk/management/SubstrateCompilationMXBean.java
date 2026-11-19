@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,9 +32,15 @@ import javax.management.ObjectName;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
 import sun.management.Util;
 
-class SubstrateCompilationMXBean implements CompilationMXBean {
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+class SubstrateCompilationMXBean implements CompilationMXBean, VMManagementBean {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     SubstrateCompilationMXBean() {
@@ -57,6 +63,6 @@ class SubstrateCompilationMXBean implements CompilationMXBean {
 
     @Override
     public long getTotalCompilationTime() {
-        return 0;
+        throw new UnsupportedOperationException("Compilation time monitoring is not supported.");
     }
 }

@@ -24,23 +24,22 @@
  */
 package com.oracle.svm.core.genscavenge.compacting;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.SLOW_PATH_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 
 import java.lang.ref.Reference;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.ObjectVisitor;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.AlwaysInline;
 import com.oracle.svm.core.heap.ReferenceInternals;
+import com.oracle.svm.core.heap.UninterruptibleObjectVisitor;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.InteriorObjRefWalker;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
+import com.oracle.svm.shared.Uninterruptible;
 
 /** Visits surviving objects before compaction to update their references. */
-public final class ObjectFixupVisitor implements ObjectVisitor {
+public final class ObjectFixupVisitor implements UninterruptibleObjectVisitor {
     private final ObjectRefFixupVisitor refFixupVisitor;
 
     public ObjectFixupVisitor(ObjectRefFixupVisitor refFixupVisitor) {
@@ -49,20 +48,15 @@ public final class ObjectFixupVisitor implements ObjectVisitor {
 
     @Override
     @AlwaysInline("GC performance")
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    public boolean visitObjectInline(Object obj) {
-        DynamicHub hub = KnownIntrinsics.readHub(obj);
+    @Uninterruptible(reason = "Forced inlining (StoredContinuation objects must not move).", callerMustBe = true)
+    public void visitObject(Object obj) {
+        DynamicHub hub = DynamicHubIntrinsics.readHub(obj);
         if (probability(SLOW_PATH_PROBABILITY, hub.isReferenceInstanceClass())) {
             // update Target_java_lang_ref_Reference.referent
             Reference<?> dr = (Reference<?>) obj;
-            refFixupVisitor.visitObjectReferenceInline(ReferenceInternals.getReferentFieldAddress(dr), 0, true, dr);
+            int referenceSize = ObjectLayout.singleton().getReferenceSize();
+            refFixupVisitor.visitObjectReferences(ReferenceInternals.getReferentFieldAddress(dr), true, referenceSize, dr, 1);
         }
         InteriorObjRefWalker.walkObjectInline(obj, refFixupVisitor);
-        return true;
-    }
-
-    @Override
-    public boolean visitObject(Object o) {
-        throw VMError.shouldNotReachHere("for performance reasons");
     }
 }

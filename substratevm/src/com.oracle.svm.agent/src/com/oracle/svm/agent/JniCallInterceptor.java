@@ -24,6 +24,7 @@
  */
 package com.oracle.svm.agent;
 
+import static com.oracle.svm.agent.BreakpointInterceptor.getTypeDescriptor;
 import static com.oracle.svm.core.jni.JNIObjectHandles.nullHandle;
 import static com.oracle.svm.jvmtiagentbase.Support.check;
 import static com.oracle.svm.jvmtiagentbase.Support.checkJni;
@@ -51,7 +52,7 @@ import org.graalvm.nativeimage.c.type.WordPointer;
 
 import com.oracle.svm.agent.stackaccess.InterceptedState;
 import com.oracle.svm.agent.tracing.core.Tracer;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
 import com.oracle.svm.core.jni.headers.JNIEnvironment;
 import com.oracle.svm.core.jni.headers.JNIFieldId;
 import com.oracle.svm.core.jni.headers.JNIFunctionPointerTypes.DefineClassFunctionPointer;
@@ -94,8 +95,8 @@ final class JniCallInterceptor {
 
         tracer.traceCall("jni",
                         function,
-                        getClassNameOr(env, clazz, null, Tracer.UNKNOWN_VALUE),
-                        getClassNameOr(env, declaringClass, null, Tracer.UNKNOWN_VALUE),
+                        getTypeDescriptor(env, clazz),
+                        getTypeDescriptor(env, declaringClass),
                         getClassNameOr(env, callerClass, null, Tracer.UNKNOWN_VALUE),
                         result,
                         state.getFullStackTraceOrNull(),
@@ -137,7 +138,10 @@ final class JniCallInterceptor {
             result = nullHandle();
         }
         if (shouldTrace()) {
-            traceCall(env, "FindClass", nullHandle(), nullHandle(), callerClass, name.notEqual(nullHandle()), state, fromCString(name));
+            String className = fromCString(name);
+            if (className != null) {
+                traceCall(env, "FindClass", nullHandle(), nullHandle(), callerClass, name.notEqual(nullHandle()), state, className);
+            }
         }
         return result;
     }

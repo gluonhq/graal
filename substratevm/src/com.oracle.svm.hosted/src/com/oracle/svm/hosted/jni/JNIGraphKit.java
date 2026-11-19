@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,12 +26,12 @@ package com.oracle.svm.hosted.jni;
 
 import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.c.function.CEntryPointSetup.LeaveEpilogue;
-import com.oracle.svm.core.jni.JNIGeneratedMethodSupport;
+import com.oracle.svm.core.jni.JNIMethodSupport;
 import com.oracle.svm.core.jni.access.JNIAccessibleMethod;
 import com.oracle.svm.core.jni.access.JNIReflectionDictionary;
 import com.oracle.svm.core.jni.functions.JNIFunctions.Support.JNIEnvEnterFatalOnFailurePrologue;
 import com.oracle.svm.core.jni.headers.JNIMethodId;
+import com.oracle.svm.guest.staging.c.function.CEntryPointSetup.LeaveEpilogue;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
 
 import jdk.graal.compiler.core.common.type.ObjectStamp;
@@ -64,7 +64,7 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  */
 public class JNIGraphKit extends HostedGraphKit {
 
-    JNIGraphKit(DebugContext debug, HostedProviders providers, ResolvedJavaMethod method) {
+    public JNIGraphKit(DebugContext debug, HostedProviders providers, ResolvedJavaMethod method) {
         super(debug, providers, method);
     }
 
@@ -127,7 +127,7 @@ public class JNIGraphKit extends HostedGraphKit {
     }
 
     private InvokeWithExceptionNode createStaticInvoke(String name, ValueNode... args) {
-        return createInvokeWithExceptionAndUnwind(findMethod(JNIGeneratedMethodSupport.class, name, true), InvokeKind.Static, getFrameState(), bci(), args);
+        return createInvokeWithExceptionAndUnwind(findMethod(JNIMethodSupport.class, name, true), InvokeKind.Static, getFrameState(), bci(), args);
     }
 
     public InvokeWithExceptionNode invokeNativeCallAddress(ValueNode linkage) {
@@ -171,6 +171,10 @@ public class JNIGraphKit extends HostedGraphKit {
 
     public InvokeWithExceptionNode invokeGetJavaCallWrapperAddressFromMethodId(ValueNode methodId) {
         return invokeJNIMethodObjectMethod("getCallWrapperAddress", methodId);
+    }
+
+    public InvokeWithExceptionNode invokeIsConstructor(ValueNode methodId) {
+        return invokeJNIMethodObjectMethod("isConstructor", methodId);
     }
 
     public InvokeWithExceptionNode invokeIsStaticMethod(ValueNode methodId) {

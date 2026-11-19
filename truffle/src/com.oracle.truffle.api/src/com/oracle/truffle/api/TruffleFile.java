@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -48,6 +48,10 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
@@ -76,6 +80,7 @@ import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.GroupPrincipal;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.UserPrincipal;
+import java.security.SecureRandom;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -89,9 +94,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
-import java.util.Random;
 import java.util.Set;
 
+import org.graalvm.polyglot.io.FileChannel;
+import org.graalvm.polyglot.io.FileLock;
 import org.graalvm.polyglot.io.FileSystem;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
@@ -102,7 +108,7 @@ import com.oracle.truffle.api.TruffleLanguage.Env;
  *
  * @since 19.0
  */
-public final class TruffleFile {
+public final class TruffleFile extends TruffleFileLegacy {
 
     /**
      * The file's last modified time. Supported by all filesystems.
@@ -775,16 +781,18 @@ public final class TruffleFile {
     }
 
     /**
-     * Opens or creates a file returning a {@link SeekableByteChannel} to access the file content.
-     * In most cases, the returned {@link SeekableByteChannel} should be closed using
-     * try-with-resources construct. When the channel must keep being opened for the lifetime of a
-     * context it should be {@link Env#registerOnDispose(Closeable) registered} for automatic close
-     * on context dispose.
-     *
+     * Opens or creates a file returning a {@link FileChannel} to access the file content.
+     * In most cases, the returned channel should be closed using a try-with-resources construct.
+     * When the channel must remain open for the lifetime of a context, it should be
+     * {@link Env#registerOnDispose(Closeable) registered} for automatic close on context disposal.
+     * <p>
+     * The returned channel supports file locking when locking is supported by the underlying file
+     * system. On JDK 22 and later, it also supports mapping file regions when memory mapping is
+     * supported by the underlying file system.
      *
      * @param options the options specifying how the file should be opened
      * @param attributes the optional attributes to set atomically when creating the new file
-     * @return the created {@link SeekableByteChannel}
+     * @return the created {@link FileChannel}
      * @throws FileAlreadyExistsException if {@link StandardOpenOption#CREATE_NEW} option is set and
      *             a file already exists on given path
      * @throws IOException in case of IO error
@@ -795,10 +803,11 @@ public final class TruffleFile {
      * @since 19.0
      */
     @TruffleBoundary
-    public SeekableByteChannel newByteChannel(Set<? extends OpenOption> options, FileAttribute<?>... attributes) throws IOException {
+    @Override
+    public FileChannel newByteChannel(Set<? extends OpenOption> options, FileAttribute<?>... attributes) throws IOException {
         try {
             checkFileOperationPreconditions();
-            return ByteChannelDecorator.create(fileSystemContext.fileSystem.newByteChannel(normalizedPath, options, attributes));
+            return new FileChannelDecorator(fileSystemContext.fileSystem.newByteChannel(normalizedPath, options, attributes));
         } catch (IOException | UnsupportedOperationException | IllegalArgumentException | SecurityException e) {
             throw e;
         } catch (Throwable t) {
@@ -1128,7 +1137,7 @@ public final class TruffleFile {
      * Returns the file's Posix permissions.
      *
      * @param linkOptions the options determining how the symbolic links should be handled
-     * @return the the file's Posix permissions
+     * @return the file's Posix permissions
      * @throws IOException in case of IO error
      * @throws UnsupportedOperationException when the Posix permissions are not supported by
      *             filesystem
@@ -1617,22 +1626,6 @@ public final class TruffleFile {
     }
 
     /**
-     * Returns the {@link TruffleFile file} MIME type.
-     *
-     * @return the MIME type or {@code null} if the MIME type is not recognized
-     * @throws IOException in case of IO error
-     * @throws SecurityException if the {@link FileSystem} denied the operation
-     * @since 19.0
-     * @deprecated use {@link #detectMimeType()}
-     */
-    @TruffleBoundary
-    @Deprecated(since = "20.2")
-    @SuppressWarnings("unused")
-    public String getMimeType() throws IOException {
-        return detectMimeType(null);
-    }
-
-    /**
      * Detects the {@link TruffleFile file} MIME type.
      *
      * @return the MIME type or {@code null} if the MIME type is not recognized
@@ -1780,7 +1773,7 @@ public final class TruffleFile {
     private static TruffleFile createUniquePath(TruffleFile targetDirectory, String prefix, String suffix) {
         long n = TempFileRandomHolder.getRandom().nextLong();
         n = n == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(n);
-        String name = prefix + Long.toString(n) + suffix;
+        String name = prefix + n + suffix;
         TruffleFile result = targetDirectory.resolve(name);
         if (!targetDirectory.equals(result.getParent())) {
             throw new InvalidPathException(name, "Must be a simple name");
@@ -1806,12 +1799,12 @@ public final class TruffleFile {
     }
 
     private static final class TempFileRandomHolder {
-        private static Random RANDOM;
+        private static volatile SecureRandom RANDOM;
 
-        static Random getRandom() {
+        static SecureRandom getRandom() {
             if (RANDOM == null) {
                 /* We don't want RANDOM seeds in the image heap. */
-                RANDOM = new Random();
+                RANDOM = new SecureRandom();
             }
             return RANDOM;
         }
@@ -1925,7 +1918,7 @@ public final class TruffleFile {
         public <T> T get(AttributeDescriptor<T> descriptor) {
             Object value = delegate.get(descriptor.name);
             if (value != null) {
-                return descriptor.clazz.cast(value);
+                return castAttributeValue(descriptor.clazz, value);
             } else if (queriedAttributes.contains(descriptor)) {
                 return null;
             } else {
@@ -2024,6 +2017,19 @@ public final class TruffleFile {
     }
 
     /**
+     * Returns information about the file store that contains this file. The returned
+     * {@link FileStoreInfo} object provides access to disk-related metadata such as total size,
+     * usable space, and unallocated space.
+     *
+     * @see FileStoreInfo
+     * @since 25.0.0
+     */
+    @TruffleBoundary
+    public FileStoreInfo getFileStoreInfo() {
+        return new FileStoreInfo();
+    }
+
+    /**
      * A detector for finding {@link TruffleFile file}'s MIME type and encoding.
      *
      * <p>
@@ -2064,6 +2070,140 @@ public final class TruffleFile {
          * @since 19.0
          */
         Charset findEncoding(TruffleFile file) throws IOException;
+    }
+
+    /**
+     * Provides information about the file store. This class offers access to storage-related
+     * metrics, such as the total size of the file store, unallocated space, and the usable space
+     * available to the current Java virtual machine.
+     *
+     * @see TruffleFile#getFileStoreInfo()
+     * @since 25.0.0
+     */
+    public final class FileStoreInfo {
+
+        private FileStoreInfo() {
+        }
+
+        /**
+         * Returns the size, in bytes, of the file store. If the file store's size exceeds
+         * {@link Long#MAX_VALUE}, {@code Long.MAX_VALUE} is returned.
+         *
+         * @return the size of the file store in bytes
+         * @throws UnsupportedOperationException if the file system does not support retrieving file
+         *             store information
+         * @throws IOException if an I/O error occurs while accessing the file store
+         * @throws SecurityException if the {@link FileSystem} implementation denied the operation
+         * @since 25.0.0
+         */
+        @TruffleBoundary
+        public long getTotalSpace() throws IOException {
+            try {
+                return fileSystemContext.fileSystem.getFileStoreTotalSpace(normalizedPath);
+            } catch (IOException | SecurityException | UnsupportedOperationException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw wrapHostException(t);
+            }
+        }
+
+        /**
+         * Returns the number of unallocated bytes in the file store. The returned value represents
+         * the raw free space on the storage device, regardless of access permissions or user
+         * quotas. If the number of unallocated bytes exceeds {@link Long#MAX_VALUE},
+         * {@code Long.MAX_VALUE} is returned. Note that the value may be imprecise, as it can
+         * change at any time due to external I/O operations, including those performed outside this
+         * virtual machine.
+         *
+         * @return the number of unallocated bytes
+         * @throws UnsupportedOperationException if the file system does not support retrieving file
+         *             store information
+         * @throws IOException if an I/O error occurs while accessing the file store
+         * @throws SecurityException if the {@link FileSystem} implementation denied the operation
+         * @since 25.0.0
+         */
+        @TruffleBoundary
+        public long getUnallocatedSpace() throws IOException {
+            try {
+                return fileSystemContext.fileSystem.getFileStoreUnallocatedSpace(normalizedPath);
+            } catch (IOException | SecurityException | UnsupportedOperationException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw wrapHostException(t);
+            }
+        }
+
+        /**
+         * Returns the number of bytes available to this Java virtual machine on the file store.
+         * Unlike {@link #getUnallocatedSpace()}, this method accounts for operating system-level
+         * restrictions, user quotas, and file system permissions, and therefore may return a
+         * smaller value. If the available space exceeds {@link Long#MAX_VALUE},
+         * {@code Long.MAX_VALUE} is returned. Note that the returned value may be imprecise, as it
+         * can change at any time due to external I/O activity, including operations performed
+         * outside this virtual machine.
+         *
+         * @return the number of usable bytes available to this Java virtual machine
+         * @throws UnsupportedOperationException if the file system does not support retrieving file
+         *             store information
+         * @throws IOException if an I/O error occurs while accessing the file store
+         * @throws SecurityException if the {@link FileSystem} implementation denied the operation
+         * @since 25.0.0
+         */
+        @TruffleBoundary
+        public long getUsableSpace() throws IOException {
+            try {
+                return fileSystemContext.fileSystem.getFileStoreUsableSpace(normalizedPath);
+            } catch (IOException | SecurityException | UnsupportedOperationException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw wrapHostException(t);
+            }
+        }
+
+        /**
+         * Returns the number of bytes per block in the file store.
+         *
+         * @return the block size
+         * @throws UnsupportedOperationException if the file system does not support retrieving file
+         *             store information
+         * @throws IOException if an I/O error occurs while accessing the file store
+         * @throws SecurityException if the {@link FileSystem} implementation denied the operation
+         * @since 25.0.0
+         */
+        @TruffleBoundary
+        public long getBlockSize() throws IOException {
+            try {
+                return fileSystemContext.fileSystem.getFileStoreBlockSize(normalizedPath);
+            } catch (IOException | SecurityException | UnsupportedOperationException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw wrapHostException(t);
+            }
+        }
+
+        /**
+         * Determines whether the file store is read-only.
+         * <p>
+         * Note that even if the file store is not read-only, individual write operations may still
+         * be denied due to restrictions imposed by the {@link FileSystem} implementation, operating
+         * system level policies, user quotas, or file system permissions.
+         *
+         * @throws UnsupportedOperationException if the file system does not support retrieving file
+         *             store information
+         * @throws IOException if an I/O error occurs while accessing the file store
+         * @throws SecurityException if the {@link FileSystem} implementation denied the operation
+         * @since 25.0.0
+         */
+        @TruffleBoundary
+        public boolean isReadOnly() throws IOException {
+            try {
+                return fileSystemContext.fileSystem.isFileStoreReadOnly(normalizedPath);
+            } catch (IOException | SecurityException | UnsupportedOperationException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw wrapHostException(t);
+            }
+        }
     }
 
     static final class FileSystemContext {
@@ -2135,7 +2275,21 @@ public final class TruffleFile {
 
     private <T> T getAttributeImpl(Path forPath, String attribute, Class<T> type, LinkOption... options) throws IOException {
         final Object value = getAttributeImpl(forPath, attribute, options);
-        return value == null ? null : type.cast(value);
+        return value == null ? null : castAttributeValue(type, value);
+    }
+
+    /**
+     * Casts an attribute value provided by a {@link FileSystem} to the expected type. Custom file
+     * systems, such as in-memory file systems, may represent attributes declared as {@link Long},
+     * for example the {@code unix:ino} attribute, as an {@link Integer}. Such values are converted to
+     * {@link Long}.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T> T castAttributeValue(Class<T> type, Object value) {
+        if (type == Long.class && value instanceof Integer intValue) {
+            return (T) Long.valueOf(intValue.longValue());
+        }
+        return type.cast(value);
     }
 
     private Object getAttributeImpl(final Path forPath, final String attribute, final LinkOption... options) throws IOException {
@@ -2185,7 +2339,7 @@ public final class TruffleFile {
     }
 
     static <T extends Throwable> RuntimeException wrapHostException(T t, FileSystemContext fsContext) {
-        if (LanguageAccessor.engineAccess().isInternal(fsContext.engineObject, fsContext.fileSystem)) {
+        if (LanguageAccessor.engineAccess().isInternal(fsContext.fileSystem)) {
             throw Env.engineToLanguageException(t);
         }
         throw LanguageAccessor.engineAccess().wrapHostException(null, LanguageAccessor.engineAccess().getCurrentHostContext(), t);
@@ -2200,62 +2354,6 @@ public final class TruffleFile {
         @Override
         public boolean accept(Path entry) throws IOException {
             return true;
-        }
-    }
-
-    private static final class ByteChannelDecorator implements SeekableByteChannel {
-
-        private final SeekableByteChannel delegate;
-
-        ByteChannelDecorator(final SeekableByteChannel delegate) {
-            this.delegate = delegate;
-        }
-
-        @Override
-        public int read(ByteBuffer dst) throws IOException {
-            return delegate.read(dst);
-        }
-
-        @Override
-        public int write(ByteBuffer src) throws IOException {
-            return delegate.write(src);
-        }
-
-        @Override
-        public boolean isOpen() {
-            return delegate.isOpen();
-        }
-
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
-
-        @Override
-        public long position() throws IOException {
-            return delegate.position();
-        }
-
-        @Override
-        public SeekableByteChannel position(long newPosition) throws IOException {
-            delegate.position(newPosition);
-            return this;
-        }
-
-        @Override
-        public long size() throws IOException {
-            return delegate.size();
-        }
-
-        @Override
-        public SeekableByteChannel truncate(long size) throws IOException {
-            delegate.truncate(size);
-            return this;
-        }
-
-        static SeekableByteChannel create(final SeekableByteChannel delegate) {
-            Objects.requireNonNull(delegate, "Delegate must be non null.");
-            return new ByteChannelDecorator(delegate);
         }
     }
 
@@ -2567,4 +2665,235 @@ public final class TruffleFile {
             }
         }
     }
+
+    private static final class FileChannelDecorator implements FileChannel {
+
+        private static final MethodHandle MAP_METHOD_HANDLE = initializeMapMethodHandle();
+
+        final SeekableByteChannel delegate;
+
+        FileChannelDecorator(SeekableByteChannel delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "Delegate must not be null");
+        }
+
+        @Override
+        public int read(ByteBuffer dst) throws IOException {
+            return delegate.read(dst);
+        }
+
+        @Override
+        public int write(ByteBuffer src) throws IOException {
+            return delegate.write(src);
+        }
+
+        @Override
+        public boolean isOpen() {
+            return delegate.isOpen();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        @Override
+        public long position() throws IOException {
+            return delegate.position();
+        }
+
+        @Override
+        public FileChannel position(long newPosition) throws IOException {
+            delegate.position(newPosition);
+            return this;
+        }
+
+        @Override
+        public long size() throws IOException {
+            return delegate.size();
+        }
+
+        @Override
+        public FileChannel truncate(long size) throws IOException {
+            delegate.truncate(size);
+            return this;
+        }
+
+        @Override
+        public FileLock lock() throws IOException {
+            if (delegate instanceof java.nio.channels.FileChannel fileChannel) {
+                return new NIOFileLock(this, fileChannel.lock());
+            } else if (delegate instanceof FileChannel fileChannel) {
+                return new PolyglotFileLock(this, fileChannel.lock());
+            } else {
+                throw new UnsupportedOperationException("Channel does not support locking");
+            }
+        }
+
+        @Override
+        public FileLock lock(long position, long size, boolean shared) throws IOException {
+            if (delegate instanceof java.nio.channels.FileChannel fileChannel) {
+                return new NIOFileLock(this, fileChannel.lock(position, size, shared));
+            } else if (delegate instanceof FileChannel fileChannel) {
+                return new PolyglotFileLock(this, fileChannel.lock(position, size, shared));
+            } else {
+                throw new UnsupportedOperationException("Channel does not support locking");
+            }
+        }
+
+        @Override
+        public FileLock tryLock() throws IOException {
+            if (delegate instanceof java.nio.channels.FileChannel fileChannel) {
+                var impl = fileChannel.tryLock();
+                return impl != null ? new NIOFileLock(this, impl) : null;
+            } else if (delegate instanceof FileChannel fileChannel) {
+                var impl = fileChannel.tryLock();
+                return impl != null ? new PolyglotFileLock(this, impl) : null;
+            } else {
+                throw new UnsupportedOperationException("Channel does not support locking");
+            }
+        }
+
+        @Override
+        public FileLock tryLock(long position, long size, boolean shared) throws IOException {
+            if (delegate instanceof java.nio.channels.FileChannel fileChannel) {
+                var impl = fileChannel.tryLock(position, size, shared);
+                return impl != null ? new NIOFileLock(this, impl) : null;
+            } else if (delegate instanceof FileChannel fileChannel) {
+                var impl = fileChannel.tryLock(position, size, shared);
+                return impl != null ? new PolyglotFileLock(this, impl) : null;
+            } else {
+                throw new UnsupportedOperationException("Channel does not support locking");
+            }
+        }
+
+        @Override
+        public Object map(java.nio.channels.FileChannel.MapMode mode, long offset, long size, Object arena) throws IOException {
+            if (delegate instanceof FileChannel fileChannel) {
+                return fileChannel.map(mode, offset, size, arena);
+            } else if (delegate instanceof java.nio.channels.FileChannel fileChannel && MAP_METHOD_HANDLE != null) {
+                try {
+                    return MAP_METHOD_HANDLE.invokeExact(fileChannel, mode, offset, size, arena);
+                } catch (IOException | RuntimeException | Error e) {
+                    throw e;
+                } catch (Throwable e) {
+                    throw new AssertionError(e);
+                }
+            } else {
+                throw new UnsupportedOperationException("Channel does not support memory mapping");
+            }
+        }
+
+        private static MethodHandle initializeMapMethodHandle() {
+            if (Runtime.version().feature() >= 22) {
+                try {
+                    Class<?> arena = Class.forName("java.lang.foreign.Arena", false, TruffleFile.class.getClassLoader());
+                    Class<?>[] parameterTypes = new Class<?>[]{
+                                    java.nio.channels.FileChannel.MapMode.class,
+                                    long.class,
+                                    long.class,
+                                    arena
+                    };
+                    Method method = java.nio.channels.FileChannel.class.getDeclaredMethod("map", parameterTypes);
+                    MethodHandle mapHandle = MethodHandles.lookup().unreflect(method);
+                    return mapHandle.asType(MethodType.methodType(
+                                    Object.class,
+                                    java.nio.channels.FileChannel.class,
+                                    java.nio.channels.FileChannel.MapMode.class,
+                                    long.class,
+                                    long.class,
+                                    Object.class));
+                } catch (ReflectiveOperationException e) {
+                    throw new AssertionError("java.nio.channels.FileChannel.map(MapMode, long, long, Arena) method not found.", e);
+                }
+            }
+            return null;
+        }
+
+        private static final class NIOFileLock implements FileLock {
+
+            private final FileChannel owner;
+            private final java.nio.channels.FileLock impl;
+
+            NIOFileLock(FileChannel owner, java.nio.channels.FileLock impl) {
+                this.owner = Objects.requireNonNull(owner, "Owner must be non-null");
+                this.impl = Objects.requireNonNull(impl, "Impl must be non-null");
+            }
+
+            @Override
+            public FileChannel acquiredBy() {
+                return owner;
+            }
+
+            @Override
+            public long position() {
+                return impl.position();
+            }
+
+            @Override
+            public long size() {
+                return impl.size();
+            }
+
+            @Override
+            public boolean isShared() {
+                return impl.isShared();
+            }
+
+            @Override
+            public boolean isValid() {
+                return impl.isValid();
+            }
+
+            @Override
+            public void close() throws IOException {
+                impl.close();
+            }
+        }
+
+        private static final class PolyglotFileLock implements FileLock {
+
+            private final FileChannel owner;
+            private final FileLock impl;
+
+            PolyglotFileLock(FileChannel owner, FileLock impl) {
+                this.owner = Objects.requireNonNull(owner, "Owner must be non-null");
+                this.impl = Objects.requireNonNull(impl, "Impl must be non-null");
+            }
+
+            @Override
+            public FileChannel acquiredBy() {
+                return owner;
+            }
+
+            @Override
+            public long position() {
+                return impl.position();
+            }
+
+            @Override
+            public long size() {
+                return impl.size();
+            }
+
+            @Override
+            public boolean isShared() {
+                return impl.isShared();
+            }
+
+            @Override
+            public boolean isValid() {
+                return impl.isValid();
+            }
+
+            @Override
+            public void close() throws IOException {
+                impl.close();
+            }
+        }
+    }
+}
+
+abstract sealed class TruffleFileLegacy permits TruffleFile {
+
+    public abstract SeekableByteChannel newByteChannel(Set<? extends OpenOption> options, FileAttribute<?>... attributes) throws IOException;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,11 +45,12 @@ import static java.nio.charset.StandardCharsets.UTF_16;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import java.io.Closeable;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -63,11 +64,16 @@ import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.NonWritableChannelException;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.Charset;
 import java.nio.file.AccessMode;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileStore;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitOption;
 import java.nio.file.FileVisitResult;
@@ -75,6 +81,8 @@ import java.nio.file.FileVisitor;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.NotDirectoryException;
+import java.nio.file.NotLinkException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -105,12 +113,15 @@ import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.PolyglotException;
+import org.graalvm.polyglot.io.FileLock;
 import org.graalvm.polyglot.io.FileSystem;
 import org.graalvm.polyglot.io.IOAccess;
+import org.graalvm.polyglot.io.FileChannel;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -119,7 +130,9 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.InternalResource;
 import com.oracle.truffle.api.TruffleFile;
+import com.oracle.truffle.api.TruffleFile.FileStoreInfo;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Registration;
 import com.oracle.truffle.api.interop.InteropException;
@@ -130,33 +143,44 @@ import com.oracle.truffle.api.test.OSUtils;
 import com.oracle.truffle.api.test.TestAPIAccessor;
 import com.oracle.truffle.api.test.common.AbstractExecutableTestLanguage;
 import com.oracle.truffle.api.test.polyglot.FileSystemsTest.ForwardingFileSystem;
+import com.oracle.truffle.api.test.polyglot.InternalResourceTest.SetResourceRootInIsolate;
+import com.oracle.truffle.api.test.polyglot.InternalResourceTest.TemporaryResourceCacheRoot;
 import com.oracle.truffle.api.test.polyglot.TruffleFileTest.DuplicateMimeTypeLanguage1.Language1Detector;
 import com.oracle.truffle.api.test.polyglot.TruffleFileTest.DuplicateMimeTypeLanguage2.Language2Detector;
 
 public class TruffleFileTest {
 
-    private static Path languageHome;
-    private static Path languageHomeFile;
+    private static TemporaryResourceCacheRoot resourceCacheRoot;
+
+    private static Path internalResourceFile;
     private static Path stdLibFile;
-    private static Path nonLanguageHomeFile;
+    private static Path nonInternalResourceFile;
 
     @BeforeClass
     public static void setUpClass() throws Exception {
-        languageHome = Files.createTempDirectory(TruffleFileTest.class.getSimpleName()).toRealPath();
-        languageHomeFile = languageHome.resolve("homeFile");
-        Files.write(languageHomeFile, Collections.singleton(languageHomeFile.getFileName().toString()));
-        Path stdLib = Files.createDirectory(languageHome.resolve("stdlib"));
+
+        resourceCacheRoot = new TemporaryResourceCacheRoot(Files.createTempDirectory(TruffleFileTest.class.getSimpleName()).toRealPath(), true);
+        Path internalResourceRoot = TruffleFileTestInternalResource.resolveRoot(resourceCacheRoot.getRoot());
+        Files.createDirectories(internalResourceRoot);
+        internalResourceFile = internalResourceRoot.resolve("homeFile");
+        Files.write(internalResourceFile, Collections.singleton(internalResourceFile.getFileName().toString()));
+        Path stdLib = Files.createDirectory(internalResourceRoot.resolve("stdlib"));
         stdLibFile = stdLib.resolve("stdLibFile");
         Files.write(stdLibFile, Collections.singleton(stdLibFile.getFileName().toString()));
-        nonLanguageHomeFile = Files.createTempFile(TruffleFileTest.class.getSimpleName(), "").toRealPath();
-        Files.write(nonLanguageHomeFile, Collections.singleton(nonLanguageHomeFile.getFileName().toString()));
+        nonInternalResourceFile = Files.createTempFile(TruffleFileTest.class.getSimpleName(), "").toRealPath();
+        Files.write(nonInternalResourceFile, Collections.singleton(nonInternalResourceFile.getFileName().toString()));
     }
 
     @AfterClass
     public static void tearDownClass() throws Exception {
-        if (languageHome != null) {
-            delete(languageHome);
-            delete(nonLanguageHomeFile);
+        try {
+            if (nonInternalResourceFile != null) {
+                delete(nonInternalResourceFile);
+            }
+        } finally {
+            if (resourceCacheRoot != null) {
+                resourceCacheRoot.close();
+            }
         }
     }
 
@@ -476,16 +500,11 @@ public class TruffleFileTest {
     }
 
     @Test
-    public void testRelativePathToLanguageHome() throws IOException {
-        // reflection access
-        Path cwdPath = new File("").toPath().toRealPath();
-        Assume.assumeTrue(cwdPath.getNameCount() > 1);
-        Path langHome = cwdPath.getParent().resolve("home");
-        try (Engine engine = Engine.create()) {
-            FileSystemsTest.markAsLanguageHome(engine, TestRelativePathToLanguageHomeLanguage.class, langHome);
-            try (Context ctx = Context.newBuilder().engine(engine).build()) {
-                AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestRelativePathToLanguageHomeLanguage.class, "");
-            }
+    @SuppressWarnings("try")
+    public void testRelativePathToLanguageHome() {
+        try (Engine engine = Engine.create(); Context ctx = Context.newBuilder().engine(engine).build()) {
+            SetResourceRootInIsolate.set(ctx, resourceCacheRoot.getRoot());
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestRelativePathToLanguageHomeLanguage.class, "", internalResourceFile.toString());
         }
     }
 
@@ -494,9 +513,13 @@ public class TruffleFileTest {
         @Override
         @TruffleBoundary
         protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
-            TruffleFile file = env.getInternalTruffleFile("../home");
+            TruffleFile resourceFile = env.getInternalTruffleFile((String) contextArguments[0]);
+            TruffleFile resourceRoot = resourceFile.getParent();
+            env.setCurrentWorkingDirectory(resourceRoot);
+            String path = String.format("../%s", resourceFile.getName());
+            TruffleFile file = env.getInternalTruffleFile(path);
             file.exists();  // Language home should be accessible
-            file.resolve("file").exists();  // File in language home should be accessible
+            file.resolve(resourceFile.getName()).exists();  // File in language home should be accessible
             return null;
         }
     }
@@ -718,30 +741,14 @@ public class TruffleFileTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void testGetTruffleFileInternalAllowedIO() {
-        try (Engine engine = Engine.create()) {
-            FileSystemsTest.markAsLanguageHome(engine, TestGetTruffleFileInternalAllowedIOLanguage.class, languageHome);
-            try (Context ctx = Context.newBuilder().engine(engine).allowIO(IOAccess.ALL).build()) {
-                AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestGetTruffleFileInternalAllowedIOLanguage.class, "",
-                                languageHomeFile.toAbsolutePath().toString(), languageHomeFile.toUri().toString(),
-                                stdLibFile.toAbsolutePath().toString(), stdLibFile.toAbsolutePath().toString(), stdLibFile.toUri().toString(),
-                                nonLanguageHomeFile.toAbsolutePath().toString(), nonLanguageHomeFile.toUri().toString());
-            }
-        }
-    }
-
-    @Test
-    public void testGetTruffleFileInternalCustomFileSystem() {
-        // reflection access
-        IOAccess ioAccess = IOAccess.newBuilder().fileSystem(new ForwardingFileSystem(FileSystem.newDefaultFileSystem())).build();
-        try (Engine engine = Engine.create()) {
-            FileSystemsTest.markAsLanguageHome(engine, TestGetTruffleFileInternalAllowedIOLanguage.class, languageHome);
-            try (Context ctx = Context.newBuilder().engine(engine).allowIO(ioAccess).build()) {
-                AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestGetTruffleFileInternalAllowedIOLanguage.class, "",
-                                languageHomeFile.toAbsolutePath().toString(), languageHomeFile.toUri().toString(),
-                                stdLibFile.toAbsolutePath().toString(), stdLibFile.toAbsolutePath().toString(), stdLibFile.toUri().toString(),
-                                nonLanguageHomeFile.toAbsolutePath().toString(), nonLanguageHomeFile.toUri().toString());
-            }
+        try (Engine engine = Engine.create(); Context ctx = Context.newBuilder().engine(engine).allowIO(IOAccess.ALL).build()) {
+            SetResourceRootInIsolate.set(ctx, resourceCacheRoot.getRoot());
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestGetTruffleFileInternalAllowedIOLanguage.class, "",
+                            internalResourceFile.toAbsolutePath().toString(), internalResourceFile.toUri().toString(),
+                            stdLibFile.toAbsolutePath().toString(), stdLibFile.toAbsolutePath().toString(), stdLibFile.toUri().toString(),
+                            nonInternalResourceFile.toAbsolutePath().toString(), nonInternalResourceFile.toUri().toString());
         }
     }
 
@@ -781,15 +788,14 @@ public class TruffleFileTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void testGetTruffleFileInternalDeniedIO() {
-        try (Engine engine = Engine.create()) {
-            FileSystemsTest.markAsLanguageHome(engine, TestGetTruffleFileInternalDeniedIOLanguage.class, languageHome);
-            try (Context ctx = Context.newBuilder().engine(engine).build()) {
-                AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestGetTruffleFileInternalDeniedIOLanguage.class, "",
-                                languageHomeFile.toAbsolutePath().toString(), languageHomeFile.toUri().toString(),
-                                stdLibFile.toAbsolutePath().toString(), stdLibFile.toAbsolutePath().toString(), stdLibFile.toUri().toString(),
-                                nonLanguageHomeFile.toAbsolutePath().toString(), nonLanguageHomeFile.toUri().toString());
-            }
+        try (Engine engine = Engine.create(); Context ctx = Context.newBuilder().engine(engine).build()) {
+            SetResourceRootInIsolate.set(ctx, resourceCacheRoot.getRoot());
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestGetTruffleFileInternalDeniedIOLanguage.class, "",
+                            internalResourceFile.toAbsolutePath().toString(), internalResourceFile.toUri().toString(),
+                            stdLibFile.toAbsolutePath().toString(), stdLibFile.toAbsolutePath().toString(), stdLibFile.toUri().toString(),
+                            nonInternalResourceFile.toAbsolutePath().toString(), nonInternalResourceFile.toUri().toString());
         }
     }
 
@@ -1177,6 +1183,427 @@ public class TruffleFileTest {
         }
     }
 
+    @Test
+    public void testIntegerAttributeValues() throws IOException {
+        Path testFile = Files.createTempFile("integerAttributes", ".txt");
+        try {
+            Files.writeString(testFile, "content");
+            IOAccess ioAccess = IOAccess.newBuilder().fileSystem(new IntegerAttributesFileSystem()).build();
+            try (Context ctx = Context.newBuilder().allowIO(ioAccess).build()) {
+                AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestIntegerAttributeValuesLanguage.class, "", testFile.toAbsolutePath().toString());
+            }
+        } finally {
+            Files.deleteIfExists(testFile);
+        }
+    }
+
+    @Registration
+    static final class TestIntegerAttributeValuesLanguage extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile file = env.getPublicTruffleFile((String) contextArguments[0]);
+            assertEquals(Long.valueOf(7), file.getAttribute(TruffleFile.SIZE));
+            assertEquals(7L, file.size());
+            assertEquals(Long.valueOf(IntegerAttributesFileSystem.INODE), file.getAttribute(TruffleFile.UNIX_INODE));
+            TruffleFile.Attributes attributes = file.getAttributes(List.of(TruffleFile.UNIX_INODE, TruffleFile.UNIX_DEV, TruffleFile.UNIX_RDEV, TruffleFile.UNIX_UID));
+            assertEquals(Long.valueOf(IntegerAttributesFileSystem.INODE), attributes.get(TruffleFile.UNIX_INODE));
+            assertEquals(Long.valueOf(IntegerAttributesFileSystem.DEV), attributes.get(TruffleFile.UNIX_DEV));
+            assertEquals(Long.valueOf(IntegerAttributesFileSystem.RDEV), attributes.get(TruffleFile.UNIX_RDEV));
+            assertEquals(Integer.valueOf(IntegerAttributesFileSystem.UID), attributes.get(TruffleFile.UNIX_UID));
+            return null;
+        }
+    }
+
+    private static final class IntegerAttributesFileSystem extends ForwardingFileSystem {
+
+        static final int INODE = 42;
+        static final int DEV = 7;
+        static final int RDEV = 0;
+        static final int UID = 1000;
+
+        IntegerAttributesFileSystem() {
+            super(FileSystem.newDefaultFileSystem());
+        }
+
+        @Override
+        public Map<String, Object> readAttributes(Path path, String attributes, LinkOption... options) throws IOException {
+            String unixPrefix = "unix:";
+            if (attributes.startsWith(unixPrefix)) {
+                Map<String, Object> result = new HashMap<>();
+                for (String name : attributes.substring(unixPrefix.length()).split(",")) {
+                    switch (name) {
+                        case "ino" -> result.put(name, INODE);
+                        case "dev" -> result.put(name, DEV);
+                        case "rdev" -> result.put(name, RDEV);
+                        case "uid" -> result.put(name, UID);
+                        default -> throw new UnsupportedOperationException("Unsupported attribute " + name);
+                    }
+                }
+                return result;
+            }
+            Map<String, Object> result = new HashMap<>(super.readAttributes(path, attributes, options));
+            result.computeIfPresent("size", (k, v) -> Math.toIntExact((Long) v));
+            return result;
+        }
+    }
+
+    @Test
+    public void testFileStoreInfo() {
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.ALL).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestFileStoreInfoLanguage.class, "");
+        }
+    }
+
+    @Registration
+    static final class TestFileStoreInfoLanguage extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile cwd = env.getCurrentWorkingDirectory();
+            FileStoreInfo fsInfo = cwd.getFileStoreInfo();
+            Path path = Path.of(cwd.getAbsoluteFile().getPath());
+            FileStore fileStore = Files.getFileStore(path);
+            assertEquals(fileStore.getTotalSpace(), fsInfo.getTotalSpace());
+            // Unallocated space may change after retrieval; use a weak assertion to account for
+            // fluctuations.
+            assertInTolerance(fileStore.getUnallocatedSpace(), fsInfo.getUnallocatedSpace());
+            // Unallocated space may change after retrieval; use a weak assertion to account for
+            // fluctuations.
+            assertInTolerance(fileStore.getUsableSpace(), fsInfo.getUsableSpace());
+            assertEquals(fileStore.getBlockSize(), fsInfo.getBlockSize());
+            assertEquals(fileStore.isReadOnly(), fsInfo.isReadOnly());
+            return null;
+        }
+
+        /**
+         * Asserts that the {@code actual} value is within 10% of the {@code expected} value. This
+         * method computes a tolerance range of 10% around the expected value and verifies that the
+         * actual value falls within that range (inclusive).
+         */
+        private static void assertInTolerance(long expected, long actual) {
+            long delta = expected / 10;
+            long lowerBound = expected - delta;
+            long upperBound = expected + delta;
+            assertTrue(lowerBound <= actual);
+            assertTrue(upperBound >= actual);
+        }
+    }
+
+    @Test
+    public void testMemoryMap() throws Exception {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+        Assume.assumeTrue("Memory mapping is not supported on JDK < JDK-22", Runtime.version().feature() >= 22);
+
+        Path testFile = createTestFile();
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.ALL).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestMapToMemorySegment.class, "", testFile.toAbsolutePath().toString());
+        } finally {
+            try {
+                Files.delete(testFile);
+            } catch (IOException e) {
+                // Test uses automatic arena, the mapping is not guaranteed to be unmapped and delete may fail on Windows.
+                testFile.toFile().deleteOnExit();
+            }
+        }
+
+        testFile = createTestFile();
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.ALL).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestUnmap.class, "", testFile.toAbsolutePath().toString());
+        } finally {
+            Files.delete(testFile);
+        }
+
+        FileSystem memFileSystem = new MemoryFileSystem();
+        testFile = createTestFile(memFileSystem, memFileSystem.parsePath("/test.bin"));
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.newBuilder().fileSystem(memFileSystem).build()).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestMapToMemorySegment.class, "", testFile.toAbsolutePath().toString());
+        }
+
+        FileSystem readOnlyHostFs = FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem());
+        testFile = createTestFile();
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.newBuilder().fileSystem(readOnlyHostFs).build()).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestMapToMemorySegmentReadOnlyFileSystem.class, "", testFile.toAbsolutePath().toString());
+        } finally {
+            try {
+                Files.delete(testFile);
+            } catch (IOException e) {
+                // Test uses automatic arena, the mapping is not guaranteed to be unmapped and delete may fail on Windows.
+                testFile.toFile().deleteOnExit();
+            }
+        }
+    }
+
+    private static Path createTestFile() throws IOException {
+        return createTestFile(FileSystem.newDefaultFileSystem(), Files.createTempFile("test", ".bin"));
+    }
+
+    private static Path createTestFile(FileSystem fs, Path testFile) throws IOException {
+        byte[] fill = new byte[40 * 1024];
+        Arrays.fill(fill, (byte) 0x1);
+        try (SeekableByteChannel channel = fs.newByteChannel(testFile, Set.of(StandardOpenOption.WRITE, StandardOpenOption.CREATE))) {
+            Channels.newOutputStream(channel).write(fill);
+        }
+        return testFile;
+    }
+
+    @Registration
+    static final class TestMapToMemorySegment extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile testFile = env.getPublicTruffleFile((String) contextArguments[0]);
+            int bufferSize = 4 * 1024;
+            Object autoArena = MemorySegmentUtil.createArena(true);
+            Object segment;
+            try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ, StandardOpenOption.WRITE))) {
+                segment = MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_WRITE, bufferSize, bufferSize, autoArena);
+            }
+            assertEquals(bufferSize, MemorySegmentUtil.getByteSize(segment));
+            for (int i = 0; i < MemorySegmentUtil.getByteSize(segment); i++) {
+                assertEquals(0x01, MemorySegmentUtil.getByte(segment, i));
+                MemorySegmentUtil.setByte(segment, i, (byte) 0x02);
+            }
+            MemorySegmentUtil.force(segment);
+            try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ))) {
+                segment = MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, bufferSize * 3, autoArena);
+            }
+            assertEquals(bufferSize * 3, MemorySegmentUtil.getByteSize(segment));
+            for (int i = 0; i < bufferSize; i++) {
+                assertEquals(0x01, MemorySegmentUtil.getByte(segment, i));
+            }
+            for (int i = 0; i < bufferSize; i++) {
+                assertEquals(0x02, MemorySegmentUtil.getByte(segment, bufferSize + i));
+            }
+            for (int i = 0; i < bufferSize; i++) {
+                assertEquals(0x01, MemorySegmentUtil.getByte(segment, 2 * bufferSize + i));
+            }
+            return null;
+        }
+    }
+
+    @Registration
+    static final class TestUnmap extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile testFile = env.getPublicTruffleFile((String) contextArguments[0]);
+            int bufferSize = 4 * 1024;
+            Object segment;
+            try (AutoCloseable confinedArena = MemorySegmentUtil.createArena(false)) {
+                try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ, StandardOpenOption.WRITE))) {
+                    segment = MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_WRITE, bufferSize, bufferSize, confinedArena);
+                }
+                assertEquals(bufferSize, MemorySegmentUtil.getByteSize(segment));
+                for (int i = 0; i < MemorySegmentUtil.getByteSize(segment); i++) {
+                    assertEquals(0x01, MemorySegmentUtil.getByte(segment, i));
+                    MemorySegmentUtil.setByte(segment, i, (byte) 0x02);
+                }
+            }
+
+            // Mapped region is unmapped by arena close. Accessing it throws IllegalStateException.
+            Object segmentCapture = segment;
+            AbstractPolyglotTest.assertFails(() -> MemorySegmentUtil.getByte(segmentCapture, 0), IllegalStateException.class);
+
+            try (AutoCloseable confinedArena = MemorySegmentUtil.createArena(false)) {
+                try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ))) {
+                    segment = MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, bufferSize * 3, confinedArena);
+                }
+                assertEquals(bufferSize * 3, MemorySegmentUtil.getByteSize(segment));
+                for (int i = 0; i < bufferSize; i++) {
+                    assertEquals(0x01, MemorySegmentUtil.getByte(segment, i));
+                }
+                for (int i = 0; i < bufferSize; i++) {
+                    assertEquals(0x02, MemorySegmentUtil.getByte(segment, bufferSize + i));
+                }
+                for (int i = 0; i < bufferSize; i++) {
+                    assertEquals(0x01, MemorySegmentUtil.getByte(segment, 2 * bufferSize + i));
+                }
+            }
+            return null;
+        }
+    }
+
+    @Registration
+    static final class TestMapToMemorySegmentReadOnlyFileSystem extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile testFile = env.getPublicTruffleFile((String) contextArguments[0]);
+            int bufferSize = 4 * 1024;
+            Object autoArena = MemorySegmentUtil.createArena(true);
+            try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ))) {
+                AbstractPolyglotTest.assertFails(() -> MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_WRITE, 0, bufferSize, autoArena),
+                                NonWritableChannelException.class);
+                AbstractPolyglotTest.assertFails(() -> MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.PRIVATE, 0, bufferSize, autoArena), NonWritableChannelException.class);
+            }
+            Object segment;
+            try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ))) {
+                segment = MemorySegmentUtil.map(c, java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, bufferSize * 3, autoArena);
+            }
+            assertEquals(bufferSize * 3, MemorySegmentUtil.getByteSize(segment));
+            for (int i = 0; i < MemorySegmentUtil.getByteSize(segment); i++) {
+                assertEquals(0x01, MemorySegmentUtil.getByte(segment, i));
+            }
+            return null;
+        }
+    }
+
+    @Test
+    public void testFileLock() throws Exception {
+        Path testFile = createTestFile();
+        try (Context ctx = Context.newBuilder().allowIO(IOAccess.ALL).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(ctx, TestFileLock.class, "", testFile.toAbsolutePath().toString());
+        } finally {
+            Files.delete(testFile);
+        }
+    }
+
+    @Registration
+    static final class TestFileLock extends AbstractExecutableTestLanguage {
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile testFile = env.getPublicTruffleFile((String) contextArguments[0]);
+            try (FileChannel c = testFile.newByteChannel(Set.of(StandardOpenOption.READ, StandardOpenOption.WRITE))) {
+                FileLock l1 = c.lock();
+                try {
+                    assertTrue(l1.isValid());
+                    assertFalse(l1.isShared());
+                    assertSame(c, l1.acquiredBy());
+                    AbstractPolyglotTest.assertFails(() -> c.tryLock(), OverlappingFileLockException.class);
+                } finally {
+                    l1.close();
+                }
+                assertFalse(l1.isValid());
+
+                FileLock l2 = c.tryLock();
+                assertNotNull(l2);
+                try {
+                    assertTrue(l2.isValid());
+                    assertFalse(l2.isShared());
+                    assertSame(c, l2.acquiredBy());
+                } finally {
+                    l2.close();
+                }
+                assertFalse(l2.isValid());
+                FileLock l3 = c.tryLock(0, Long.MAX_VALUE, true);
+                assertNotNull(l3);
+                try {
+                    assertTrue(l3.isValid());
+                    assertSame(c, l3.acquiredBy());
+                } finally {
+                    l3.close();
+                }
+                assertFalse(l3.isValid());
+            }
+            return null;
+        }
+    }
+
+    @Test
+    public void testCorrectExceptions() {
+        IOAccess ioAccess = IOAccess.newBuilder().fileSystem(FileSystem.newDefaultFileSystem()).build();
+        try (Context context = Context.newBuilder().allowIO(ioAccess).build()) {
+            AbstractExecutableTestLanguage.evalTestLanguage(context, TestCorrectExceptions.class, "");
+        }
+    }
+
+    @Registration
+    static final class TestCorrectExceptions extends AbstractExecutableTestLanguage {
+
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile tmp = env.createTempDirectory(null, "exceptions-test");
+            try {
+                TruffleFile folder = tmp.resolve("folder");
+                folder.createDirectories();
+                TruffleFile file = tmp.resolve("file");
+                file.createFile();
+                TruffleFile nonExistent = tmp.resolve("non-existent");
+                boolean linkSupported;
+                try {
+                    tmp.resolve("link").createSymbolicLink(file);
+                    linkSupported = true;
+                } catch (UnsupportedOperationException unsupported) {
+                    linkSupported = false;
+                }
+                assertFails(() -> {
+                    file.createFile();
+                    return true;
+                }, FileAlreadyExistsException.class);
+                assertFails(() -> {
+                    nonExistent.delete();
+                    return true;
+                }, NoSuchFileException.class);
+                assertFails(() -> {
+                    file.list();
+                    return true;
+                }, NotDirectoryException.class);
+                if (linkSupported) {
+                    assertFails(() -> {
+                        file.readSymbolicLink();
+                        return true;
+                    }, NotLinkException.class);
+                }
+            } finally {
+                delete(tmp);
+            }
+            return null;
+        }
+    }
+
+    @Test
+    public void testCompositeFileSystemCreateSymbolicLinkRelativeTargetEscape() throws Exception {
+        Path tmp = Files.createTempDirectory("truffle-file-test");
+        try {
+            Path allowed = tmp.resolve("allowed").toAbsolutePath();
+            Files.createDirectories(allowed);
+            Path cwd = allowed.resolve("cwd").toAbsolutePath();
+            Files.createDirectories(cwd);
+            Path denied = tmp.resolve("denied").toAbsolutePath();
+            Files.writeString(denied, "denied");
+
+            FileSystem noIO = FileSystem.newDenyIOFileSystem();
+            FileSystem fullIO = FileSystem.newDefaultFileSystem();
+            FileSystem.Selector fullIOPredicate = new FileSystem.Selector(fullIO) {
+                @Override
+                public boolean test(Path path) {
+                    return path.startsWith(allowed);
+                }
+            };
+            FileSystem compositeFs = FileSystem.newCompositeFileSystem(noIO, fullIOPredicate);
+            compositeFs.setCurrentWorkingDirectory(cwd);
+
+            IOAccess ioAccess = IOAccess.newBuilder().fileSystem(compositeFs).build();
+            try (Context context = Context.newBuilder().allowIO(ioAccess).build()) {
+                assertFails(
+                                () -> AbstractExecutableTestLanguage.evalTestLanguage(
+                                                context, TestCompositeFileSystemCreateSymbolicLinkRelativeTargetEscape.class, "", allowed.toString()),
+                                PolyglotException.class,
+                                (e) -> Assert.assertTrue(e.getMessage().contains("Cross file system linking is not supported.")));
+                assertFalse(Files.exists(allowed.resolve("link")));
+            }
+        } finally {
+            delete(tmp);
+        }
+    }
+
+    @Registration
+    static final class TestCompositeFileSystemCreateSymbolicLinkRelativeTargetEscape extends AbstractExecutableTestLanguage {
+
+        @Override
+        @TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            TruffleFile allowed = env.getPublicTruffleFile((String) contextArguments[0]);
+            TruffleFile link = allowed.resolve("link");
+            TruffleFile target = env.getPublicTruffleFile("..").resolve("denied");
+            link.createSymbolicLink(target);
+            return null;
+        }
+    }
+
     private static void delete(Path path) throws IOException {
         if (Files.isDirectory(path)) {
             try (DirectoryStream<Path> dir = Files.newDirectoryStream(path)) {
@@ -1186,6 +1613,15 @@ public class TruffleFileTest {
             }
         }
         Files.delete(path);
+    }
+
+    private static void delete(TruffleFile file) throws IOException {
+        if (file.isDirectory()) {
+            for (TruffleFile child : file.list()) {
+                delete(child);
+            }
+        }
+        file.delete();
     }
 
     private static Type erase(Type type) {
@@ -1443,6 +1879,31 @@ public class TruffleFileTest {
             throw fail();
         }
 
+        @Override
+        public long getFileStoreTotalSpace(Path path) {
+            throw fail();
+        }
+
+        @Override
+        public long getFileStoreUnallocatedSpace(Path path) {
+            throw fail();
+        }
+
+        @Override
+        public long getFileStoreUsableSpace(Path path) {
+            throw fail();
+        }
+
+        @Override
+        public long getFileStoreBlockSize(Path path) {
+            throw fail();
+        }
+
+        @Override
+        public boolean isFileStoreReadOnly(Path path) {
+            throw fail();
+        }
+
         private static RuntimeException fail() {
             throw new RuntimeException("Should not reach here.");
         }
@@ -1586,5 +2047,57 @@ public class TruffleFileTest {
             Pattern pattern = Pattern.compile(regex);
             return records.stream().filter((r) -> r.getMessage() != null && pattern.matcher(r.getMessage()).matches()).findAny();
         }
+    }
+
+    @InternalResource.Id(value = TruffleFileTestInternalResource.ID, componentId = ProxyLanguage.ID, optional = true)
+    public static final class TruffleFileTestInternalResource implements InternalResource {
+
+        static final String ID = "truffle-file-test";
+
+        static Path resolveRoot(Path cacheRoot) {
+            return cacheRoot.resolve(ProxyLanguage.ID).resolve(ID);
+        }
+
+        @Override
+        public void unpackFiles(Env env, Path targetDirectory) throws IOException {
+        }
+
+        @Override
+        public String versionHash(Env env) throws IOException {
+            return "42";
+        }
+    }
+}
+
+final class MemorySegmentUtil {
+
+    @SuppressWarnings("unused")
+    static AutoCloseable createArena(boolean auto) {
+        throw new UnsupportedOperationException();
+    }
+
+    @SuppressWarnings("unused")
+    static Object map(FileChannel channel, java.nio.channels.FileChannel.MapMode mode, long offset, long length, Object arena) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
+    @SuppressWarnings("unused")
+    static long getByteSize(Object segment) {
+        throw new UnsupportedOperationException();
+    }
+
+    @SuppressWarnings("unused")
+    static byte getByte(Object segment, long offset) {
+        throw new UnsupportedOperationException();
+    }
+
+    @SuppressWarnings("unused")
+    static void setByte(Object segment, long offset, byte b) {
+        throw new UnsupportedOperationException();
+    }
+
+    @SuppressWarnings("unused")
+    static void force(Object segment) {
+        throw new UnsupportedOperationException();
     }
 }

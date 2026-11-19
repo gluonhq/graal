@@ -37,7 +37,7 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.impl.InternalPlatform;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.LibCHelper;
 import com.oracle.svm.core.OS;
@@ -45,15 +45,23 @@ import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.handles.PrimitiveArrayView;
-import com.oracle.svm.core.memory.UntrackedNullableNativeMemory;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.ApplicationLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
+
+class TimeZoneSubstitutions {
+}
 
 /**
  * The following classes aim to provide full support for time zones for native-image. This
@@ -88,7 +96,7 @@ final class Target_java_util_TimeZone {
 
     @Substitute
     private static String getSystemTimeZoneID(String javaHome) {
-        CCharPointer tzMappingsPtr = WordFactory.nullPointer();
+        CCharPointer tzMappingsPtr = Word.nullPointer();
         int contentLen = 0;
         PrimitiveArrayView refContent = null;
         try {
@@ -101,7 +109,7 @@ final class Target_java_util_TimeZone {
             CCharPointer tzId = LibCHelper.SVM_FindJavaTZmd(tzMappingsPtr, contentLen);
             String result = CTypeConversion.toJavaString(tzId);
             // SVM_FindJavaTZmd returns a newly allocated string
-            UntrackedNullableNativeMemory.free(tzId);
+            LibC.free(tzId);
             return result;
         } finally {
             if (refContent != null) {
@@ -114,6 +122,7 @@ final class Target_java_util_TimeZone {
 /**
  * Holds time zone mapping data.
  */
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = ApplicationLayerOnly.class)
 final class TimeZoneSupport {
     final byte[] tzMappingsContent;
 
@@ -151,9 +160,14 @@ final class TimeZoneFeature implements InternalFeature {
         };
 
         private static void printWarning() {
-            System.err.println("-H:IncludeAllTimeZones and -H:IncludeTimeZones are now deprecated. Native-image includes all timezones" +
+            System.out.println("-H:IncludeAllTimeZones and -H:IncludeTimeZones are now deprecated. Native-image includes all timezones" +
                             " by default.");
         }
+    }
+
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.lastImageBuild();
     }
 
     private static byte[] cleanCR(byte[] buffer) {
@@ -212,7 +226,4 @@ final class TimeZoneFeature implements InternalFeature {
          */
         ZoneId.systemDefault();
     }
-}
-
-class TimeZoneSubstitutions {
 }

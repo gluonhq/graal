@@ -60,16 +60,15 @@ import jdk.graal.compiler.nodes.java.NewInstanceWithExceptionNode;
 import jdk.graal.compiler.nodes.spi.Canonicalizable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.serviceprovider.GraalUnsafeAccess;
 import jdk.graal.compiler.test.SubprocessUtil;
+import jdk.internal.misc.Unsafe;
 import jdk.vm.ci.code.InvalidInstalledCodeException;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
-import sun.misc.Unsafe;
 
 public class TestNewInstanceWithException extends SubprocessTest {
 
-    static final Unsafe UNSAFE = GraalUnsafeAccess.getUnsafe();
+    static final Unsafe UNSAFE = Unsafe.getUnsafe();
 
     static final boolean TRACE_DEOPT = false;
 
@@ -570,6 +569,11 @@ public class TestNewInstanceWithException extends SubprocessTest {
         }
     }
 
+    /**
+     * The argument setting the maximum heap space of the subprocess.
+     */
+    public static final String MAX_HEAP_SPACE_ARG = "-Xmx64m";
+
     public static class TestNewInstanceWithException1 extends TestNewInstanceWithException {
 
         @Test
@@ -580,7 +584,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (InvalidInstalledCodeException e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -593,7 +597,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (InvalidInstalledCodeException e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -606,7 +610,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (Throwable e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -619,7 +623,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (Throwable e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -632,7 +636,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (Throwable e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -645,7 +649,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (Throwable e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 
@@ -658,7 +662,7 @@ public class TestNewInstanceWithException extends SubprocessTest {
                 } catch (Throwable e) {
                     throw GraalError.shouldNotReachHere(e);
                 }
-            }, "-Xmx32m");
+            }, MAX_HEAP_SPACE_ARG);
         }
     }
 }

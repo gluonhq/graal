@@ -24,11 +24,15 @@
  */
 package com.oracle.svm.core.code;
 
+import static com.oracle.svm.core.deopt.Deoptimizer.Options.LazyDeoptimization;
+
 import org.graalvm.nativeimage.c.function.CodePointer;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.deopt.Deoptimizer.Options;
 import com.oracle.svm.core.heap.CodeReferenceMapDecoder;
 import com.oracle.svm.core.heap.CodeReferenceMapEncoder;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * Information about an instruction pointer (IP), created and returned by methods in
@@ -52,10 +56,21 @@ public class CodeInfoQueryResult {
      */
     protected static final FrameInfoQueryResult NO_FRAME_INFO = null;
 
+    /**
+     * Marker value of {@link #getFramePointerSaveAreaOffset()} when the frame does not have a save
+     * area or no information is available for the {@linkplain #getIP() IP}.
+     */
+    public static final int NO_FRAME_POINTER_SAVE_AREA_OFFSET = -1;
+
     protected CodePointer ip;
     protected long encodedFrameSize;
     protected long exceptionOffset;
     protected long referenceMapIndex;
+    protected long framePointerSaveAreaOffset = NO_FRAME_POINTER_SAVE_AREA_OFFSET;
+    /**
+     * Only set for deopt entry points and only if {@link Options#LazyDeoptimization} is enabled.
+     */
+    protected boolean deoptReturnValueIsObject;
     protected FrameInfoQueryResult frameInfo;
 
     /**
@@ -120,6 +135,15 @@ public class CodeInfoQueryResult {
      */
     public long getReferenceMapIndex() {
         return referenceMapIndex;
+    }
+
+    public long getFramePointerSaveAreaOffset() {
+        return framePointerSaveAreaOffset;
+    }
+
+    public boolean getDeoptReturnValueIsObject() {
+        assert LazyDeoptimization.getValue();
+        return deoptReturnValueIsObject;
     }
 
     /**

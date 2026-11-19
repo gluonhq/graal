@@ -29,7 +29,7 @@ import org.graalvm.nativeimage.c.struct.RawField;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.c.struct.PinnedObjectField;
+import com.oracle.svm.guest.staging.core.c.struct.PinnedObjectField;
 
 /**
  * Holds the mutable state that is necessary for the execution of a {@linkplain NativeVMOperation}.
@@ -57,12 +57,6 @@ public interface NativeVMOperationData extends PointerBase {
 
     @RawField
     void setQueuingThread(IsolateThread value);
-
-    @RawField
-    long getQueuingThreadId();
-
-    @RawField
-    void setQueuingThreadId(long currentThreadId);
 
     @RawField
     boolean getFinished();

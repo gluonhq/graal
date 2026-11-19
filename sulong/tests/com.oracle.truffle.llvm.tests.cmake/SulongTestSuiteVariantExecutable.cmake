@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021, 2022, Oracle and/or its affiliates.
+# Copyright (c) 2021, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -38,29 +38,10 @@ macro(setupCompiler)
     setCompilerConfig(CMAKE_CXX_COMPILER ${CLANGXX})
     # reset in order to create a log message
     setCompilerConfig(LLVM_OBJCOPY ${LLVM_OBJCOPY})
-    if("Fortran" IN_LIST SULONG_ENABLED_LANGUAGES)
-        requireVariable(DRAGONEGG)
-        requireVariable(DRAGONEGG_FC)
-        setCompilerConfig(DRAGONEGG_FC ${DRAGONEGG_FC})
-        setCompilerConfig(DRAGONEGG ${DRAGONEGG})
-        setCompilerConfig(CMAKE_Fortran_COMPILER ${DRAGONEGG_FC})
-    endif()
 endmacro()
 
 macro(targetPostProcess SOURCE TARGET OUTPUT_DIR OUTPUT)
     get_source_file_property(TARGET_LANG ${SOURCE} LANGUAGE)
-    if(${TARGET_LANG} STREQUAL "Fortran")
-        set(TARGET_LL "${TARGET}.dragonegg.ll")
-        # create a bitcode target
-        add_library(${TARGET_LL} STATIC ${SOURCE})
-        target_compile_options(${TARGET_LL} PRIVATE "-S" "-fplugin=${DRAGONEGG}" "-fplugin-arg-dragonegg-emit-ir")
-        set_target_properties(${TARGET_LL} PROPERTIES Fortran_MODULE_DIRECTORY ${OUTPUT_DIR}/${OUTPUT}.dragonegg.ll.mod)
-        # postprocess to add the bitcode to the target file via objcopy
-        add_custom_command(
-          TARGET ${TARGET} POST_BUILD
-          COMMAND ${LLVM_OBJCOPY} "--add-section" ".llvmbc=$<TARGET_FILE:${TARGET_LL}>" "$<TARGET_FILE:${TARGET}>"
-        )
-    endif()
 endmacro()
 
 macro(setupOptions)
@@ -82,7 +63,7 @@ macro(setupOptions)
         string(APPEND CMAKE_CXX_FLAGS " -${SULONG_CURRENT_OPT_LEVEL}")
     elseif(SULONG_CURRENT_OPT_LEVEL)
         # non-empty but not in the known list
-        message(FATAL_ERROR "Unknonw opt-level: ${SULONG_CURRENT_OPT_LEVEL}")
+        message(FATAL_ERROR "Unknown opt-level: ${SULONG_CURRENT_OPT_LEVEL}")
     endif()
 
     if(SULONG_CURRENT_POST_OPT)

@@ -28,10 +28,15 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.ReservedRegisters;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.riscv64.RISCV64;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public final class RISCV64ReservedRegisters extends ReservedRegisters {
 
     public static final Register THREAD_REGISTER = RISCV64.x23;
@@ -39,6 +44,6 @@ public final class RISCV64ReservedRegisters extends ReservedRegisters {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     RISCV64ReservedRegisters() {
-        super(RISCV64.x2, THREAD_REGISTER, HEAP_BASE_REGISTER_CANDIDATE);
+        super(RISCV64.x2, THREAD_REGISTER, HEAP_BASE_REGISTER_CANDIDATE, null);
     }
 }

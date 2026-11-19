@@ -1,0 +1,1912 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.api.bytecode.test.sources;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.bytecode.BytecodeConfig;
+import com.oracle.truffle.api.bytecode.BytecodeLocation;
+import com.oracle.truffle.api.bytecode.BytecodeNode;
+import com.oracle.truffle.api.bytecode.BytecodeParser;
+import com.oracle.truffle.api.bytecode.BytecodeRootNode;
+import com.oracle.truffle.api.bytecode.BytecodeRootNodes;
+import com.oracle.truffle.api.bytecode.GenerateBytecode;
+import com.oracle.truffle.api.bytecode.GenerateBytecodeTestVariants;
+import com.oracle.truffle.api.bytecode.GenerateBytecodeTestVariants.Variant;
+import com.oracle.truffle.api.bytecode.Instruction;
+import com.oracle.truffle.api.bytecode.InstructionDescriptor;
+import com.oracle.truffle.api.bytecode.InstructionTracer;
+import com.oracle.truffle.api.bytecode.Operation;
+import com.oracle.truffle.api.bytecode.ShortCircuitOperation;
+import com.oracle.truffle.api.bytecode.SourceInformation;
+import com.oracle.truffle.api.bytecode.SourceInformationTree;
+import com.oracle.truffle.api.bytecode.Variadic;
+import com.oracle.truffle.api.bytecode.test.AbstractInstructionTest;
+import com.oracle.truffle.api.bytecode.test.BytecodeDSLTestLanguage;
+import com.oracle.truffle.api.bytecode.test.DebugBytecodeRootNode;
+import com.oracle.truffle.api.bytecode.test.sources.SourcesInterpreterBuilder.BytecodeVariant;
+import com.oracle.truffle.api.dsl.Bind;
+import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.exception.AbstractTruffleException;
+import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.FrameInstance;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.api.source.SourceSection;
+
+@RunWith(Parameterized.class)
+public class SourcesTest {
+
+    private final SourceTestRun sourceRun;
+
+    public SourcesTest(SourceTestRun run) {
+        this.sourceRun = run;
+    }
+
+    private SourcesInterpreter parseNode(String rootName, BytecodeParser<SourcesInterpreterBuilder> builder) {
+        SourcesInterpreter node = createNodes(BytecodeConfig.DEFAULT, builder).getNode(0);
+        node.setName(rootName);
+        return node;
+    }
+
+    private SourcesInterpreter parseNodeWithSource(String rootName, BytecodeParser<SourcesInterpreterBuilder> builder) {
+        SourcesInterpreter node = createNodes(BytecodeConfig.WITH_SOURCE, builder).getNode(0);
+        node.setName(rootName);
+        return node;
+    }
+
+    private BytecodeRootNodes<SourcesInterpreter> createNodes(BytecodeConfig config, BytecodeParser<SourcesInterpreterBuilder> builder) {
+        BytecodeRootNodes<SourcesInterpreter> result = sourceRun.variant().create((BytecodeDSLTestLanguage) null, config, builder);
+        if (sourceRun.testTracer()) {
+            InstructionDescriptor trace = sourceRun.variant().getInstructionDescriptors().stream().filter(descriptor -> descriptor.getName().equals("trace.instruction")).findFirst().orElseThrow();
+            result.addInstructionTracer(new InstructionTracer() {
+                @Override
+                public void onInstructionEnter(InstructionAccess access, BytecodeNode bytecode, int bytecodeIndex, Frame frame) {
+                    assertInstruction(access, bytecode, bytecodeIndex);
+                }
+
+                @TruffleBoundary
+                private void assertInstruction(InstructionAccess access, BytecodeNode bytecode, int bytecodeIndex) {
+                    Instruction current = bytecode.getInstruction(bytecodeIndex);
+                    assertSame(trace, current.getDescriptor());
+                    Instruction traced = access.getTracedInstruction(bytecode, bytecodeIndex);
+                    assertEquals(traced.getBytecodeIndex(), current.getNextBytecodeIndex());
+                    assertEquals(traced.getOperationCode(), access.getTracedOperationCode(bytecode, bytecodeIndex));
+                }
+            });
+        }
+        return result;
+    }
+
+    @Parameters(name = "{0}")
+    public static List<SourceTestRun> getRuns() {
+        List<SourceTestRun> runs = new ArrayList<>();
+        for (BytecodeVariant run : SourcesInterpreterBuilder.variants()) {
+            boolean testTracer = run.getInstructionDescriptors().stream().anyMatch(descriptor -> descriptor.getName().equals("trace.instruction"));
+            runs.add(new SourceTestRun(Mode.PREFIX, run, testTracer));
+            runs.add(new SourceTestRun(Mode.SUFFIX, run, testTracer));
+        }
+        return runs;
+    }
+
+    private static void emitReturnIf(SourcesInterpreterBuilder b, int argumentIndex, long value) {
+        b.beginIfThen();
+        b.emitLoadArgument(argumentIndex);
+        b.beginReturn();
+        b.emitLoadConstant(value);
+        b.endReturn();
+        b.endIfThen();
+    }
+
+    private static <T extends Throwable> T assertThrowsWithMessage(String message, Class<T> expectedThrowable, org.junit.function.ThrowingRunnable runnable) {
+        T error = org.junit.Assert.assertThrows(expectedThrowable, runnable);
+        assertTrue("Invalid message: " + error.getMessage(), error.getMessage().contains(message));
+        return error;
+    }
+
+    private void beginSourceSection(SourcesInterpreterBuilder b, int... args) {
+        if (args.length == 0) {
+            b.beginSourceSectionUnavailable();
+        } else if (sourceRun.mode() == Mode.PREFIX) {
+            switch (args.length) {
+                case 1 -> b.beginSourceSection(args[0]);
+                case 2 -> b.beginSourceSection(args[0], args[1]);
+                case 3 -> b.beginSourceSection(args[0], args[1], args[2]);
+                case 4 -> b.beginSourceSection(args[0], args[1], args[2], args[3]);
+                default -> throw new AssertionError("Unexpected argument count " + args.length);
+            }
+        } else {
+            b.beginSourceSection();
+        }
+    }
+
+    private void endSourceSection(SourcesInterpreterBuilder b, int... args) {
+        if (args.length == 0) {
+            b.endSourceSectionUnavailable();
+        } else if (sourceRun.mode() == Mode.PREFIX) {
+            b.endSourceSection();
+        } else {
+            switch (args.length) {
+                case 0 -> b.endSourceSectionUnavailable();
+                case 1 -> b.endSourceSection(args[0]);
+                case 2 -> b.endSourceSection(args[0], args[1]);
+                case 3 -> b.endSourceSection(args[0], args[1], args[2]);
+                case 4 -> b.endSourceSection(args[0], args[1], args[2], args[3]);
+                default -> throw new AssertionError("Unexpected argument count " + args.length);
+            }
+        }
+    }
+
+    @Test
+    public void testSource() {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 8);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 1);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 7, 1);
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 8);
+            b.endSource();
+            b.endRoot();
+        });
+
+        assertSourceSection(node.getSourceSection(), source, 0, 8);
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+        List<Instruction> instructions = bytecode.getInstructionsAsList();
+        if (sourceRun.testTracer()) {
+            assertInstructionSourceSection(instructions.get(0), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(1), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(2), source, 0, 8);
+            assertInstructionSourceSection(instructions.get(3), source, 0, 8);
+        } else {
+            assertInstructionSourceSection(instructions.get(0), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(1), source, 0, 8);
+        }
+
+        assertSourceInformationTree(bytecode, est("return 1", est("1")));
+
+    }
+
+    @Test
+    public void testIntrospectionDataSourceInformationTree() {
+        Source source = Source.newBuilder("test", "return (a + b) + 2", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("introspectionDataSourceInformationTree", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 18);
+
+            b.beginRoot();
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 11);
+            b.beginAdd();
+
+            beginSourceSection(b, 7, 7);
+            b.beginAdd();
+
+            beginSourceSection(b, 8, 1);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 8, 1);
+
+            beginSourceSection(b, 12, 1);
+            b.emitLoadArgument(1);
+            endSourceSection(b, 12, 1);
+
+            b.endAdd();
+            endSourceSection(b, 7, 7);
+
+            beginSourceSection(b, 17, 1);
+            b.emitLoadConstant(2L);
+            endSourceSection(b, 17, 1);
+
+            b.endAdd();
+            endSourceSection(b, 7, 11);
+
+            b.endReturn();
+            b.endRoot();
+
+            endSourceSection(b, 0, 18);
+            b.endSource();
+        });
+
+        // @formatter:off
+        ExpectedSourceTree expected = est("return (a + b) + 2",
+            est("(a + b) + 2",
+                est("(a + b)",
+                    est("a"),
+                    est("b")
+                ),
+                est("2")
+            )
+        );
+        // @formatter:on
+        SourceInformationTree tree = node.getBytecodeNode().getSourceInformationTree();
+        expected.assertTreeEquals(tree);
+        assertTrue(tree.toString().contains("return (a + b) + 2"));
+    }
+
+    @Test
+    public void testSourceCoalescingAfterEarlyExits() {
+        // This is a regression test. We would not coalesce two consecutive sections
+        // when they used suffix sections because we could not determine that they
+        // had the same attributes. We can support this behaviour by storing a unique
+        // id on each suffix section before it is patched.
+        Source source = Source.newBuilder("test", "return", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("sourceCoalescingAfterEarlyExits", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 6);
+            b.beginBlock();
+            b.beginReturn();
+            b.emitLoadConstant(42L);
+            b.endReturn();
+            b.emitLabel(b.createLabel()); // force reachability
+            b.beginReturn();
+            b.emitLoadConstant(123L);
+            b.endReturn();
+            b.endBlock();
+            endSourceSection(b, 0, 6);
+            b.endSource();
+            b.endRoot();
+        });
+
+        assertEquals(42L, node.getCallTarget().call());
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+        List<SourceInformation> sourceInformation = bytecode.getSourceInformation();
+        assertEquals(1, sourceInformation.size());
+
+        SourceInformation info = sourceInformation.get(0);
+        assertEquals(0, info.getStartBytecodeIndex());
+        assertEquals(bytecode.getInstructionsAsList().getLast().getNextBytecodeIndex(), info.getEndBytecodeIndex());
+        assertSourceSection(info.getSourceSection(), source, 0, 6);
+        assertSourceInformationTree(bytecode, est("return"));
+    }
+
+    @Test
+    public void testNestedSourceSectionsWithSameSourceDoNotCoalesce() {
+        // This is a regression test for source section coalescing.
+        // We should not coalesce entries with the same source attributes
+        // if they come from separate SourceSection operations, otherwise
+        // we break the nesting relationship between source sections.
+        Source source = Source.newBuilder("test", "same result", "test.test").build();
+        SourcesInterpreter node = parseNode("nestedSourceSectionsWithSameSourceDoNotCoalesce", b -> {
+            b.beginSource(source);
+            b.beginRoot();
+
+            beginSourceSection(b, 0, 4);
+            b.emitVoidOperation();
+            // afterChild should emit an entry covering void 1 with the outer section
+            b.beginBlock();
+            beginSourceSection(b, 0, 4);
+            b.emitVoidOperation();
+            // afterChild should emit an entry covering void 2 with the inner section
+            endSourceSection(b, 0, 4);
+            b.emitVoidOperation();
+            b.endBlock();
+            // afterChild should emit an entry covering void 2 and 3 with the outer section
+            endSourceSection(b, 0, 4);
+
+            b.emitLoadConstant(42L);
+            b.endRoot();
+            b.endSource();
+        });
+
+        assertEquals(42L, node.getCallTarget().call());
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals(42L, node.getCallTarget().call());
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+
+        assertSourceInformationTree(bytecode,
+                        est(null,
+                                        est("same"),
+                                        est("same", est("same"))));
+
+        List<SourceInformation> sourceInformation = bytecode.getSourceInformation();
+        assertEquals(3, sourceInformation.size());
+
+        SourceInformation outerPrefix = sourceInformation.get(0);
+        SourceInformation nested = sourceInformation.get(1);
+        SourceInformation outerRest = sourceInformation.get(2);
+        assertEquals(outerPrefix.getEndBytecodeIndex(), nested.getStartBytecodeIndex());
+        assertEquals(nested.getStartBytecodeIndex(), outerRest.getStartBytecodeIndex());
+        assertTrue(nested.getEndBytecodeIndex() < outerRest.getEndBytecodeIndex());
+        assertSourceSection(outerPrefix.getSourceSection(), source, 0, 4);
+        assertSourceSection(nested.getSourceSection(), source, 0, 4);
+        assertSourceSection(outerRest.getSourceSection(), source, 0, 4);
+    }
+
+    @Test
+    public void testSourceSectionDoesNotSequenceChildren() {
+        Source source = Source.newBuilder("test", "1 + 2", "test.test").build();
+        BytecodeParser<SourcesInterpreterBuilder> parser = b -> {
+            b.beginSource(source);
+            b.beginRoot();
+            b.beginAdd();
+            beginSourceSection(b, 0, 5);
+            b.emitLoadConstant(1L);
+            b.emitLoadConstant(2L);
+            endSourceSection(b, 0, 5);
+            b.endAdd();
+            b.endRoot();
+            b.endSource();
+        };
+
+        SourcesInterpreter node = parseNode("sourceSectionDoesNotSequenceChildren", parser);
+        assertEquals(3L, node.getCallTarget().call());
+
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals(3L, node.getCallTarget().call());
+    }
+
+    @Test
+    public void testSourceSectionExcludesBeforeChildInstructions() {
+        Source source = Source.newBuilder("test", "1+3; 2", "test.test").build();
+        SourcesInterpreter node = parseNode("sourceSectionExcludesBeforeChildInstructions", b -> {
+            b.beginSource(source);
+            b.beginRoot();
+            b.beginBlock();
+            beginSourceSection(b, 0, source.getLength());
+            b.beginAdd();
+            b.emitLoadConstant(1L);
+            b.emitLoadConstant(3L);
+            b.endAdd();
+            b.emitLoadConstant(2L);
+            endSourceSection(b, 0, source.getLength());
+            b.endBlock();
+            b.endRoot();
+            b.endSource();
+        });
+
+        assertEquals(2L, node.getCallTarget().call());
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals(2L, node.getCallTarget().call());
+
+        List<Instruction> instructions = node.getBytecodeNode().getInstructionsAsList();
+        assertNull(findInstruction(instructions, "pop").getLocation().getSourceLocation());
+        for (Instruction instruction : findInstructions(instructions, "load.constant")) {
+            assertInstructionSourceSection(instruction, source, 0, source.getLength());
+        }
+    }
+
+    @Test
+    public void testSourceSectionExcludesShortCircuitConverters() {
+        Source source = Source.newBuilder("test", "first second third", "test.test").build();
+        SourcesInterpreter node = parseNode("sourceSectionExcludesShortCircuitConverters", b -> {
+            b.beginSource(source);
+            b.beginRoot();
+            b.beginReturn();
+            b.beginScAnd();
+            beginSourceSection(b, 0, 5);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 0, 5);
+            beginSourceSection(b, 6, 6);
+            b.emitLoadConstant(true);
+            endSourceSection(b, 6, 6);
+            beginSourceSection(b, 13, 5);
+            b.emitLoadConstant("test");
+            endSourceSection(b, 13, 5);
+            b.endScAnd();
+            b.endReturn();
+            b.endRoot();
+            b.endSource();
+        });
+
+        assertEquals("test", node.getCallTarget().call());
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals("test", node.getCallTarget().call());
+
+        List<Instruction> instructions = node.getBytecodeNode().getInstructionsAsList();
+        List<Instruction> constants = findInstructions(instructions, "load.constant");
+        assertEquals(3, constants.size());
+        assertInstructionSourceSection(constants.get(0), source, 0, 5);
+        assertInstructionSourceSection(constants.get(1), source, 6, 6);
+        assertInstructionSourceSection(constants.get(2), source, 13, 5);
+
+        List<Instruction> converters = findInstructions(instructions, "c.ToBoolean");
+        assertFalse("Expected a short-circuit boolean converter.", converters.isEmpty());
+        for (Instruction converter : converters) {
+            assertNull(converter.getLocation().getSourceLocation());
+        }
+    }
+
+    @Test
+    public void testSourceSectionExcludesAfterChildInstructions() {
+        Source source = Source.newBuilder("test", "cond then else", "test.test").build();
+        SourcesInterpreter node = parseNode("sourceSectionExcludesAfterChildInstructions", b -> {
+            b.beginSource(source);
+            b.beginRoot();
+            b.beginConditional();
+            beginSourceSection(b, 0, 4);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 0, 4);
+            beginSourceSection(b, 5, 4);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 5, 4);
+            beginSourceSection(b, 10, 4);
+            b.emitLoadConstant(2L);
+            endSourceSection(b, 10, 4);
+            b.endConditional();
+            b.endRoot();
+            b.endSource();
+        });
+
+        assertEquals(1L, node.getCallTarget().call(true));
+        assertEquals(2L, node.getCallTarget().call(false));
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals(1L, node.getCallTarget().call(true));
+        assertEquals(2L, node.getCallTarget().call(false));
+
+        List<Instruction> instructions = node.getBytecodeNode().getInstructionsAsList();
+        assertNull(findInstruction(instructions, "branch.false").getLocation().getSourceLocation());
+        assertNull(findInstruction(instructions, "branch").getLocation().getSourceLocation());
+    }
+
+    @Test
+    public void testNestedSourceSectionsPreserveParentAttribution() {
+        Source source = Source.newBuilder("test", "outer inner cond then else", "test.test").build();
+        SourcesInterpreter node = parseNode("nestedSourceSectionsPreserveParentAttribution", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, source.getLength());
+            beginSourceSection(b, 6, 20);
+            b.beginRoot();
+            b.beginConditional();
+            beginSourceSection(b, 12, 4);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 12, 4);
+            b.emitLoadConstant(1L);
+            b.emitLoadConstant(2L);
+            b.endConditional();
+            b.endRoot();
+            endSourceSection(b, 6, 20);
+            endSourceSection(b, 0, source.getLength());
+            b.endSource();
+        });
+
+        assertEquals(1L, node.getCallTarget().call(true));
+        assertEquals(2L, node.getCallTarget().call(false));
+        node.getRootNodes().ensureSourceInformation();
+        assertEquals(1L, node.getCallTarget().call(true));
+        assertEquals(2L, node.getCallTarget().call(false));
+
+        List<Instruction> instructions = node.getBytecodeNode().getInstructionsAsList();
+        assertInstructionSourceSection(findInstruction(instructions, "load.argument"), source, 12, 4);
+        assertInstructionSourceSection(findInstruction(instructions, "branch.false"), source, 6, 20);
+    }
+
+    private static Instruction findInstruction(List<Instruction> instructions, String name) {
+        List<Instruction> matches = findInstructions(instructions, name);
+        assertEquals("Expected exactly one " + name + " instruction.", 1, matches.size());
+        return matches.get(0);
+    }
+
+    private static List<Instruction> findInstructions(List<Instruction> instructions, String name) {
+        return instructions.stream().filter((instruction) -> instructionNameMatches(instruction, name)).toList();
+    }
+
+    private static boolean instructionNameMatches(Instruction instruction, String name) {
+        String actualName = instruction.getName();
+        return actualName.equals(name) || actualName.startsWith(name + "$");
+    }
+
+    @Test
+    public void testManySourceSections() {
+        final int numSourceSections = 1000;
+        StringBuilder sb = new StringBuilder(numSourceSections);
+        for (int i = 0; i < numSourceSections; i++) {
+            sb.append("x");
+        }
+        String sourceString = sb.toString();
+        Source source = Source.newBuilder("test", sourceString, "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            for (int i = 0; i < numSourceSections; i++) {
+                beginSourceSection(b, 0, numSourceSections - i);
+            }
+            b.beginRoot();
+            b.beginReturn();
+            b.emitGetSourcePositions();
+            b.endReturn();
+            b.endRoot();
+            for (int i = 0; i < numSourceSections; i++) {
+                endSourceSection(b, 0, i + 1);
+            }
+            b.endSource();
+        });
+
+        SourceSection[] result = (SourceSection[]) node.getCallTarget().call();
+        assertEquals(1, result.length);
+        // sections are emitted in order of closing
+        assertSourceSection(result[0], source, 0, 1);
+
+        ExpectedSourceTree expectedSourceTree = est(sourceString.substring(0, 1));
+        assertSourceInformationTree(node.getBytecodeNode(), expectedSourceTree);
+    }
+
+    @Test
+    public void testSourceSplitByUnwind() {
+        // When an operation emits unwind instructions, we have to close and reopen the bc range
+        // that a source section applies to.
+        Source source = Source.newBuilder("test", "try finally", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("sourceSplitByUnwind", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 11); // root
+            b.beginRoot();
+
+            b.beginTryFinally(() -> {
+                beginSourceSection(b, 4, 7);
+                b.emitVoidOperation();
+                endSourceSection(b, 4, 7);
+            });
+
+            beginSourceSection(b, 0, 3); // try
+            b.beginIfThen();
+            b.emitLoadArgument(0);
+            b.beginReturn(); // early return causes finally handler to be emitted.
+            b.emitLoadConstant(42L);
+            b.endReturn();
+            b.endIfThen();
+            endSourceSection(b, 0, 3);
+            b.endTryFinally();
+
+            b.beginReturn();
+            b.emitLoadConstant(123L);
+            b.endReturn();
+
+            b.endRoot();
+            endSourceSection(b, 0, 11); // root
+            b.endSource();
+        });
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+
+        assertSourceInformationTree(bytecode, est("try finally",
+                        est("try"), // before early return
+                        est("finally"), // inlined finally
+                        est("try"), // after early return
+                        est("finally"), // fallthrough finally
+                        est("finally") // exceptional finally
+        ));
+    }
+
+    @Test
+    public void testRootNodeSourceSection() {
+        Source source = Source.newBuilder("test", "0123456789", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 10);
+            beginSourceSection(b, 1, 9);
+            beginSourceSection(b, 2, 8);
+
+            b.beginRoot();
+            b.emitLoadArgument(0);
+            beginSourceSection(b, 3, 7);
+            b.beginReturn();
+            beginSourceSection(b, 4, 6);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 4, 6);
+            b.endReturn();
+            endSourceSection(b, 3, 7);
+            b.endRoot();
+
+            endSourceSection(b, 2, 8);
+            endSourceSection(b, 1, 9);
+            endSourceSection(b, 0, 10);
+            b.endSource();
+        });
+        // The most specific source section should be chosen.
+        assertSourceSection(node.getSourceSection(), source, 2, 8);
+
+        assertSourceInformationTree(node.getBytecodeNode(),
+                        est("23456789", est("3456789", est("456789"))));
+    }
+
+    /**
+     * Tests that nested roots get the expected source sections.
+     */
+    @Test
+    public void testNestedRootNodeSourceSectionSimple() {
+        Source source = Source.newBuilder("test", "0123456789", "test.test").build();
+        BytecodeRootNodes<SourcesInterpreter> nodes = createNodes(BytecodeConfig.WITH_SOURCE, b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 10);
+            beginSourceSection(b, 1, 9);
+            beginSourceSection(b, 2, 8);
+
+            b.beginRoot();
+            b.beginRoot();
+            b.endRoot();
+            b.endRoot();
+
+            endSourceSection(b, 2, 8);
+            endSourceSection(b, 1, 9);
+            endSourceSection(b, 0, 10);
+            b.endSource();
+        });
+        // All roots should observe the most specific source section.
+        for (SourcesInterpreter root : nodes.getNodes()) {
+            assertSourceSection(root.getSourceSection(), source, 2, 8);
+        }
+    }
+
+    /**
+     * Comprehensive test for source sections with nested root nodes. For suffix sections, this test
+     * constructs a long patch list that spans multiple source sections of the current root and
+     * multiple nested roots, validating that they are all patched correctly.
+     */
+    @Test
+    public void testNestedRootNodeSourceSectionComprehensive() {
+        Source source = Source.newBuilder("test", "0123456789", "test.test").build();
+        BytecodeRootNodes<SourcesInterpreter> nodes = createNodes(BytecodeConfig.WITH_SOURCE, b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 10);
+            beginSourceSection(b, 1, 9);
+
+            b.beginRoot();
+            beginSourceSection(b, 2, 8);
+            b.beginReturn();
+            b.emitLoadConstant(42L);
+            b.beginRoot();
+            b.beginRoot();
+            b.endRoot().setName("C");
+            b.endRoot().setName("B");
+            b.endReturn();
+
+            b.beginRoot();
+            b.endRoot().setName("D");
+
+            b.beginBlock();
+            b.emitLabel(b.createLabel()); // force reachable
+            b.endBlock();
+
+            b.beginReturn();
+            b.emitLoadNull();
+            b.beginRoot();
+            b.endRoot().setName("E");
+            b.endReturn();
+
+            endSourceSection(b, 2, 8);
+            b.endRoot().setName("A");
+
+            endSourceSection(b, 1, 9);
+            endSourceSection(b, 0, 10);
+            b.endSource();
+        });
+        assertSourceSection(nodes.getNode(0).getSourceSection(), source, 1, 9);
+        AbstractInstructionTest.assertInstructions(nodes.getNode(0),
+                        "load.constant",
+                        "return",
+                        "load.null",
+                        "return");
+        List<Instruction> aInstructions = nodes.getNode(0).getBytecodeNode().getInstructionsAsList();
+        assertInstructionSourceSection(aInstructions.get(0), source, 2, 8);
+        assertInstructionSourceSection(aInstructions.get(2), source, 2, 8);
+        for (int i = 1; i < 5; i++) {
+            assertSourceSection(nodes.getNode(i).getSourceSection(), source, 2, 8);
+        }
+    }
+
+    @Test
+    public void testWithoutSource() {
+        SourcesInterpreter node = parseNode("source", b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadConstant(1L);
+            b.endReturn();
+            b.endRoot();
+        });
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+        List<Instruction> instructions = bytecode.getInstructionsAsList();
+        BytecodeLocation location1 = instructions.get(0).getLocation();
+        BytecodeLocation location2 = instructions.get(1).getLocation();
+
+        assertNull(location1.getSourceLocation());
+        assertNull(location2.getSourceLocation());
+
+        node.getRootNodes().ensureSourceInformation();
+        assertNull(node.getSourceSection());
+        assertTrue(node.getBytecodeNode().getSourceInformation().isEmpty());
+        assertNull(node.getBytecodeNode().getSourceInformationTree());
+    }
+
+    @Test
+    public void testWithoutSourceSection() {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        SourcesInterpreter node = parseNode("source", b -> {
+            b.beginSource(source);
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadConstant(1L);
+            b.endReturn();
+            b.endRoot();
+            b.endSource();
+        });
+        assertNull(node.getSource());
+        assertNull(node.getSourceSection());
+        assertNull(node.getBytecodeNode().getSourceInformationTree());
+    }
+
+    @Test
+    public void testGetSource() {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 8);
+
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadConstant(1L);
+            b.endReturn();
+            b.endRoot();
+
+            endSourceSection(b, 0, 8);
+            b.endSource();
+        });
+        assertSame(source, node.getSource());
+        assertSourceSection(node.getSourceSection(), source, 0, 8);
+    }
+
+    public void doTestSourceSectionEncoding(int... args) {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, args);
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadConstant(1L);
+            b.endReturn();
+            b.endRoot();
+            endSourceSection(b, args);
+            b.endSource();
+        });
+        assertSourceSection(node.getSourceSection(), source, args);
+    }
+
+    @Test
+    public void testAllSourceSectionEncodings() {
+        doTestSourceSectionEncoding(1);
+        doTestSourceSectionEncoding(0, 8);
+        doTestSourceSectionEncoding(1, 1, 8);
+        doTestSourceSectionEncoding(1, 1, 1, 8);
+    }
+
+    private void doTestSourceSectionUnavailable(Consumer<SourcesInterpreterBuilder> beginUnavailableSourceSection, Consumer<SourcesInterpreterBuilder> endUnavailableSourceSection) {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginUnavailableSourceSection.accept(b);
+            b.beginRoot();
+
+            b.beginReturn();
+            beginSourceSection(b, 7, 1);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 7, 1);
+            b.endReturn();
+
+            b.endRoot();
+            endUnavailableSourceSection.accept(b);
+            b.endSource();
+        });
+
+        assertTrue(!node.getSourceSection().isAvailable());
+
+        BytecodeNode bytecode = node.getBytecodeNode();
+        List<Instruction> instructions = bytecode.getInstructionsAsList();
+        assertInstructionSourceSection(instructions.get(0), source, 7, 1);
+        assertTrue(!instructions.get(sourceRun.testTracer() ? 3 : 1).getSourceSection().isAvailable());
+
+        assertSourceInformationTree(bytecode, ExpectedSourceTree.unavailable(est("1")));
+    }
+
+    @Test
+    public void testSourceSectionUnavailable() {
+        doTestSourceSectionUnavailable(b -> beginSourceSection(b), b -> endSourceSection(b));
+        doTestSourceSectionUnavailable(b -> beginSourceSection(b, -1), b -> endSourceSection(b, -1));
+        doTestSourceSectionUnavailable(b -> beginSourceSection(b, -1, -1), b -> endSourceSection(b, -1, -1));
+        doTestSourceSectionUnavailable(b -> beginSourceSection(b, -1, -1, -1), b -> endSourceSection(b, -1, -1, -1));
+        doTestSourceSectionUnavailable(b -> beginSourceSection(b, -1, -1, -1, -1), b -> endSourceSection(b, -1, -1, -1, -1));
+    }
+
+    private void doTestBadSourceSection(String invalidAttribute, Consumer<SourcesInterpreterBuilder> beginBadSourceSection, Consumer<SourcesInterpreterBuilder> endBadSourceSection) {
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        assertThrowsWithMessage("Invalid %s provided".formatted(invalidAttribute), IllegalArgumentException.class, () -> {
+            parseNodeWithSource("badSourceSection", b -> {
+                b.beginSource(source);
+                beginBadSourceSection.accept(b);
+                b.beginRoot();
+
+                b.endRoot();
+                endBadSourceSection.accept(b);
+                b.endSource();
+            });
+        });
+    }
+
+    @Test
+    public void testBadSourceSection() {
+        doTestBadSourceSection("line", b -> b.beginSourceSection(-2), b -> b.endSourceSection(-2));
+        doTestBadSourceSection("charIndex", b -> b.beginSourceSection(-2, 1), b -> b.endSourceSection(-2, 1));
+        doTestBadSourceSection("length", b -> b.beginSourceSection(0, -1), b -> b.endSourceSection(0, -1));
+        doTestBadSourceSection("startLine", b -> b.beginSourceSection(0, 1, 1), b -> b.endSourceSection(0, 1, 1));
+        doTestBadSourceSection("startColumn", b -> b.beginSourceSection(1, 0, 1), b -> b.endSourceSection(1, 0, 1));
+        doTestBadSourceSection("length", b -> b.beginSourceSection(1, 1, -1), b -> b.endSourceSection(1, 1, -1));
+        doTestBadSourceSection("startLine", b -> b.beginSourceSection(0, 1, 1, 1), b -> b.endSourceSection(0, 1, 1, 1));
+        doTestBadSourceSection("startColumn", b -> b.beginSourceSection(1, 0, 1, 1), b -> b.endSourceSection(1, 0, 1, 1));
+        doTestBadSourceSection("startColumn", b -> b.beginSourceSection(1, -2, 1, 1), b -> b.endSourceSection(1, -2, 1, 1));
+        doTestBadSourceSection("endLine", b -> b.beginSourceSection(1, 1, 0, 1), b -> b.endSourceSection(1, 1, 0, 1));
+        doTestBadSourceSection("endColumn", b -> b.beginSourceSection(1, 1, 1, 0), b -> b.endSourceSection(1, 1, 1, 0));
+        doTestBadSourceSection("endColumn", b -> b.beginSourceSection(1, 1, 1, -2), b -> b.endSourceSection(1, 1, 1, -2));
+        // -1 is a valid argument for columns if the source is CONTENT_NONE
+        Source source = Source.newBuilder("test", "", "test.test").content(Source.CONTENT_NONE).build();
+        parseNodeWithSource("acceptableSourceSection", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 1, -1, 1, -1);
+            b.beginRoot();
+
+            b.endRoot();
+            endSourceSection(b, 1, -1, 1, -1);
+            b.endSource();
+        });
+    }
+
+    @Test
+    public void testSourceNoSourceSet() {
+        assertThrowsWithMessage("No enclosing Source operation found - each SourceSection must be enclosed in a Source operation.", IllegalStateException.class, () -> {
+            parseNodeWithSource("sourceNoSourceSet", b -> {
+                b.beginRoot();
+                beginSourceSection(b, 0, 8);
+
+                b.beginReturn();
+
+                beginSourceSection(b, 7, 1);
+                b.emitLoadConstant(1L);
+                endSourceSection(b, 7, 1);
+
+                b.endReturn();
+
+                endSourceSection(b, 0, 8);
+                b.endRoot();
+            });
+        });
+    }
+
+    @Test
+    public void testSourceMultipleSources() {
+        Source source1 = Source.newBuilder("test", "abc", "test1.test").build();
+        Source source2 = Source.newBuilder("test", "01234567", "test2.test").build();
+        SourcesInterpreter root = parseNodeWithSource("sourceMultipleSources", b -> {
+            b.beginSource(source1);
+            beginSourceSection(b, 0, source1.getLength());
+
+            b.beginRoot();
+
+            b.emitVoidOperation(); // source1, 0, length
+            b.beginBlock();
+            b.emitVoidOperation(); // source1, 0, length
+
+            beginSourceSection(b, 1, 2);
+
+            b.beginBlock();
+            b.emitVoidOperation(); // source1, 1, 2
+            b.beginSource(source2);
+            b.beginBlock();
+            b.emitVoidOperation(); // source1, 1, 2
+
+            beginSourceSection(b, 3, 4);
+            b.beginBlock();
+            b.emitVoidOperation(); // source2, 3, 4
+
+            beginSourceSection(b, 5, 1);
+            b.beginBlock();
+            b.emitVoidOperation(); // source2, 5, 1
+            b.endBlock();
+            endSourceSection(b, 5, 1);
+
+            b.emitVoidOperation(); // source2, 3, 4
+            b.endBlock();
+            endSourceSection(b, 3, 4);
+
+            b.emitVoidOperation(); // source1, 1, 2
+            b.endBlock();
+            b.endSource();
+
+            b.emitVoidOperation(); // source1, 1, 2
+
+            b.endBlock();
+            endSourceSection(b, 1, 2);
+
+            b.emitVoidOperation(); // source1, 0, length
+
+            b.endBlock();
+
+            b.emitVoidOperation(); // source1, 0, length
+
+            b.endRoot();
+
+            endSourceSection(b, 0, source1.getLength());
+            b.endSource();
+        });
+
+        assertSourceSection(root.getSourceSection(), source1, 0, source1.getLength());
+
+        List<Instruction> instructions = root.getBytecodeNode().getInstructionsAsList();
+        if (sourceRun.testTracer()) {
+            assertInstructionSourceSection(instructions.get(0), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(1), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(2), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(3), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(4), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(5), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(6), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(7), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(8), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(9), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(10), source2, 5, 1);
+            assertInstructionSourceSection(instructions.get(11), source2, 5, 1);
+            assertInstructionSourceSection(instructions.get(12), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(13), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(14), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(15), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(16), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(17), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(18), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(19), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(20), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(21), source1, 0, source1.getLength());
+        } else {
+            assertInstructionSourceSection(instructions.get(0), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(1), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(2), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(3), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(4), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(5), source2, 5, 1);
+            assertInstructionSourceSection(instructions.get(6), source2, 3, 4);
+            assertInstructionSourceSection(instructions.get(7), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(8), source1, 1, 2);
+            assertInstructionSourceSection(instructions.get(9), source1, 0, source1.getLength());
+            assertInstructionSourceSection(instructions.get(10), source1, 0, source1.getLength());
+        }
+
+        assertSourceInformationTree(root.getBytecodeNode(),
+                        est("abc", est("bc", est("3456", est("5")))));
+    }
+
+    @Test
+    public void testGetSourcePosition() {
+        Source source = Source.newBuilder("test", "return 1", "testGetSourcePosition").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 8);
+
+            b.beginReturn();
+
+            b.beginSourceSection(7, 1);
+            b.emitGetSourcePosition();
+            b.endSourceSection();
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 8);
+            b.endSource();
+            b.endRoot();
+        });
+
+        SourceSection result = (SourceSection) node.getCallTarget().call();
+
+        assertSourceSection(result, source, 7, 1);
+    }
+
+    @Test
+    public void testGetSourcePositions() {
+        Source source = Source.newBuilder("test", "return 1", "testGetSourcePositions").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 8);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 1);
+            b.emitGetSourcePositions();
+            endSourceSection(b, 7, 1);
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 8);
+            b.endSource();
+            b.endRoot();
+        });
+
+        SourceSection[] result = (SourceSection[]) node.getCallTarget().call();
+
+        assertSourceSections(result, source, 7, 1, 0, 8);
+    }
+
+    @Test
+    public void testGetSourcePositionsEnclosingRootSections() {
+        Source source = Source.newBuilder("test", "other; def test() { return 1 }", "testGetSourcePositions").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 30);
+            beginSourceSection(b, 7, 23);
+
+            b.beginRoot();
+            beginSourceSection(b, 20, 8);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 27, 1);
+            b.emitGetSourcePositions();
+            endSourceSection(b, 27, 1);
+
+            b.endReturn();
+
+            endSourceSection(b, 20, 8);
+            b.endRoot();
+
+            endSourceSection(b, 7, 23);
+            endSourceSection(b, 0, 30);
+            b.endSource();
+        });
+
+        SourceSection[] result = (SourceSection[]) node.getCallTarget().call();
+
+        // Only the directly enclosing source section should be included.
+        assertSourceSections(result, source, 27, 1, 20, 8, 7, 23);
+    }
+
+    @Test
+    public void testExplicitBytecodeIndexFrameInstance() {
+        Source source = Source.newBuilder("test", "return", "testExplicitBytecodeIndexFrameInstance").build();
+        SourcesInterpreter root = parseNodeWithSource("root", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, source.getLength());
+            b.beginReturn();
+            b.emitLoadNull();
+            b.endReturn();
+            endSourceSection(b, 0, source.getLength());
+            b.endSource();
+            b.endRoot();
+        });
+        root.getRootNodes().ensureSourceInformation();
+        BytecodeNode bytecode = root.getBytecodeNode();
+        int explicitBytecodeIndex = -1;
+        for (Instruction instruction : bytecode.getInstructions()) {
+            int bci = instruction.getBytecodeIndex();
+            if (bytecode.getSourceLocation(bci) != null) {
+                explicitBytecodeIndex = bci;
+                break;
+            }
+        }
+        if (explicitBytecodeIndex == -1) {
+            throw new AssertionError("No instruction with a source location found.");
+        }
+        FrameInstance matching = createFrameInstance(root, bytecode, explicitBytecodeIndex);
+
+        assertSourceSection(bytecode.getSourceLocation(matching), source, 0, source.getLength());
+        SourceSection[] locations = bytecode.getSourceLocations(matching);
+        assertNotNull(locations);
+        assertEquals(1, locations.length);
+        assertSourceSection(locations[0], source, 0, source.getLength());
+
+        SourcesInterpreter otherRoot = parseNodeWithSource("other", b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadNull();
+            b.endReturn();
+            b.endRoot();
+        });
+        assertNull(otherRoot.getBytecodeNode().getSourceLocation(matching));
+        assertNull(otherRoot.getBytecodeNode().getSourceLocations(matching));
+
+        FrameInstance missingLocation = createFrameInstance(root, null, explicitBytecodeIndex);
+        assertNull(bytecode.getSourceLocation(missingLocation));
+        assertNull(bytecode.getSourceLocations(missingLocation));
+
+        FrameInstance invalidBytecodeIndex = createFrameInstance(root, bytecode, -2);
+        assertNull(bytecode.getSourceLocation(invalidBytecodeIndex));
+        assertNull(bytecode.getSourceLocations(invalidBytecodeIndex));
+    }
+
+    private static FrameInstance createFrameInstance(SourcesInterpreter root, Node location, int bytecodeIndex) {
+        return new FrameInstance() {
+            @Override
+            public Frame getFrame(FrameAccess access) {
+                return null;
+            }
+
+            @Override
+            public boolean isVirtualFrame() {
+                return false;
+            }
+
+            @Override
+            public Node getCallNode() {
+                return location;
+            }
+
+            @Override
+            public CallTarget getCallTarget() {
+                return root.getCallTarget();
+            }
+
+            @Override
+            public int getBytecodeIndex() {
+                return bytecodeIndex;
+            }
+        };
+    }
+
+    @Test
+    public void testGetSourcePositionFrameInstance() {
+        Source fooSource = Source.newBuilder("test", "return arg0()", "testGetSourcePositionFrameInstance#foo").build();
+        SourcesInterpreter foo = parseNodeWithSource("foo", b -> {
+            b.beginRoot();
+            b.beginSource(fooSource);
+            beginSourceSection(b, 0, 13);
+
+            b.beginReturn();
+            beginSourceSection(b, 7, 6);
+            b.beginInvoke();
+            beginSourceSection(b, 7, 4);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 7, 4);
+            b.endInvoke();
+            endSourceSection(b, 7, 6);
+            b.endReturn();
+
+            endSourceSection(b, 0, 13);
+            b.endSource();
+            b.endRoot();
+        });
+
+        Source barSource = Source.newBuilder("test", "return <position>", "testGetSourcePositionFrameInstance#bar").build();
+        SourcesInterpreter bar = parseNodeWithSource("bar", b -> {
+            b.beginRoot();
+            b.beginSource(barSource);
+            beginSourceSection(b, 0, 17);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 10);
+            b.emitCollectSourceLocations();
+            endSourceSection(b, 7, 10);
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 17);
+            b.endSource();
+            b.endRoot();
+        });
+
+        @SuppressWarnings("unchecked")
+        List<SourceSection> result = (List<SourceSection>) foo.getCallTarget().call(new Object[]{bar});
+        assertEquals(2, result.size());
+        assertSourceSection(result.get(0), barSource, 7, 10);
+        assertSourceSection(result.get(1), fooSource, 7, 6);
+    }
+
+    @Test
+    public void testGetSourcePositionsFrameInstance() {
+        Source fooSource = Source.newBuilder("test", "return arg0()", "testGetSourcePositionFrameInstance#foo").build();
+        SourcesInterpreter foo = parseNodeWithSource("foo", b -> {
+            b.beginRoot();
+            b.beginSource(fooSource);
+            beginSourceSection(b, 0, 13);
+
+            b.beginReturn();
+            beginSourceSection(b, 7, 6);
+            b.beginInvoke();
+            beginSourceSection(b, 7, 4);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 7, 4);
+            b.endInvoke();
+            endSourceSection(b, 7, 6);
+            b.endReturn();
+
+            endSourceSection(b, 0, 13);
+            b.endSource();
+            b.endRoot();
+        });
+
+        Source barSource = Source.newBuilder("test", "return <position>", "testGetSourcePositionFrameInstance#bar").build();
+        SourcesInterpreter bar = parseNodeWithSource("bar", b -> {
+            b.beginRoot();
+            b.beginSource(barSource);
+            beginSourceSection(b, 0, 17);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 10);
+            b.emitCollectAllSourceLocations();
+            endSourceSection(b, 7, 10);
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 17);
+            b.endSource();
+            b.endRoot();
+        });
+
+        @SuppressWarnings("unchecked")
+        List<SourceSection[]> result = (List<SourceSection[]>) foo.getCallTarget().call(new Object[]{bar});
+        assertEquals(2, result.size());
+        assertSourceSections(result.get(0), barSource, 7, 10, 0, 17);
+        assertSourceSections(result.get(1), fooSource, 7, 6, 0, 13);
+    }
+
+    @Test
+    public void testSourceTryFinally() {
+        // Finally handlers get emitted multiple times. Each handler's source info should be emitted
+        // as expected.
+
+        /** @formatter:off
+         *  try:
+         *    if arg0 < 0: throw
+         *    if 0 < arg0: return
+         *  finally:
+         *    return sourcePosition
+         *  @formatter:on
+         */
+
+        Source source = Source.newBuilder("test", "try finally", "sourceTryFinally").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 11);
+
+            b.beginTryFinally(() -> {
+                // finally
+                beginSourceSection(b, 4, 7);
+                b.beginReturn();
+                b.emitGetSourcePositions();
+                b.endReturn();
+                endSourceSection(b, 4, 7);
+            });
+            // try
+            beginSourceSection(b, 0, 4);
+            b.beginBlock();
+            // if arg0 < 0, throw
+            b.beginIfThen();
+
+            b.beginLess();
+            b.emitLoadArgument(0);
+            b.emitLoadConstant(0L);
+            b.endLess();
+
+            b.beginThrowOperation();
+            b.emitLoadConstant(0L);
+            b.endThrowOperation();
+
+            b.endIfThen();
+
+            // if 0 < arg0, return
+            b.beginIfThen();
+
+            b.beginLess();
+            b.emitLoadConstant(0L);
+            b.emitLoadArgument(0);
+            b.endLess();
+
+            b.beginReturn();
+            b.emitLoadConstant(0L);
+            b.endReturn();
+
+            b.endIfThen();
+            b.endBlock();
+            endSourceSection(b, 0, 4);
+
+            b.endTryFinally();
+
+            endSourceSection(b, 0, 11);
+            b.endSource();
+            b.endRoot();
+        });
+        long[] inputs = new long[]{0, -1, 1};
+        for (int i = 0; i < inputs.length; i++) {
+            SourceSection[] result = (SourceSection[]) node.getCallTarget().call(inputs[i]);
+            assertSourceSections(result, source, 4, 7, 0, 11);
+        }
+    }
+
+    @Test
+    public void testSourceOfRootWithTryFinally() {
+        // The root node is nested in Source/SourceSection operations, so there is a source section
+        // for the root.
+
+        /** @formatter:off
+         *  try:
+         *    if arg0 < 0: return
+         *    nop
+         *  finally:
+         *    nop
+         *  @formatter:on
+         */
+
+        Source source = Source.newBuilder("test", "try finally", "sourceOfRootWithTryFinally").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginSource(source);
+            beginSourceSection(b, 0, 11);
+            b.beginRoot();
+
+            b.beginTryFinally(() -> {
+                // finally
+                beginSourceSection(b, 4, 7);
+                b.emitVoidOperation();
+                endSourceSection(b, 4, 7);
+            });
+            // try
+            beginSourceSection(b, 0, 3);
+            b.beginBlock();
+            emitReturnIf(b, 0, 42L);
+            b.emitVoidOperation();
+            b.endBlock();
+            endSourceSection(b, 0, 3);
+
+            b.endTryFinally();
+
+            b.endRoot();
+            endSourceSection(b, 0, 11);
+            b.endSource();
+        });
+        assertEquals(42L, node.getCallTarget().call(true));
+        assertEquals(null, node.getCallTarget().call(false));
+
+        assertSourceSection(node.getSourceSection(), source, 0, 11);
+
+        // @formatter:off
+        assertSourceInformationTree(node.getBytecodeNode(),
+            est("try finally",
+                // try body before early return
+                est("try"),
+                // inlined finally
+                est("finally"),
+                // return and remainder of try
+                est("try"),
+                // fallthrough finally
+                est("finally"),
+                // exceptional finally
+                est("finally")
+            )
+        );
+        // @formatter:on
+    }
+
+    @Test
+    public void testSourceOfRootWithTryFinallyNotNestedInSource() {
+        // Unlike the previous test, a root node may not have a valid source section when it is not
+        // enclosed in Source/SourceSection operations because the full bytecode range is not always
+        // enclosed by a single source table entry (due to early exits).
+
+        /** @formatter:off
+         *  try:
+         *    if arg0 < 0: return
+         *    nop
+         *  finally:
+         *    nop
+         *  @formatter:on
+         */
+
+        Source source = Source.newBuilder("test", "try finally", "sourceOfRootWithTryFinallyNotNestedInSource").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 11);
+
+            b.beginTryFinally(() -> {
+                // finally
+                beginSourceSection(b, 4, 7);
+                b.emitVoidOperation();
+                endSourceSection(b, 4, 7);
+            });
+            // try
+            beginSourceSection(b, 0, 3);
+            b.beginBlock();
+            emitReturnIf(b, 0, 42L);
+            b.emitVoidOperation();
+            b.endBlock();
+            endSourceSection(b, 0, 3);
+
+            b.endTryFinally();
+
+            endSourceSection(b, 0, 11);
+            b.endSource();
+            b.endRoot();
+        });
+        assertEquals(42L, node.getCallTarget().call(true));
+        assertEquals(null, node.getCallTarget().call(false));
+
+        assertNull(node.getSourceSection());
+
+        // @formatter:off
+        assertSourceInformationTree(node.getBytecodeNode(),
+            est(null,
+                est("try finally",
+                    // try body before early return
+                    est("try"),
+                    // inlined finally
+                    est("finally")
+                ),
+                est("try finally",
+                    // return and remainder of try
+                    est("try"),
+                    // fallthrough finally
+                    est("finally"),
+                    // exceptional finally
+                    est("finally")
+                )
+                // fallthrough return
+            )
+        );
+        // @formatter:on
+    }
+
+    @Test
+    public void testSourceRootNodeDeclaredInTryFinally() {
+        // Ensures root nodes declared in a finally handler inherit sources declared outside the
+        // root node.
+
+        /** @formatter:off
+         *  try:
+         *    if arg0 < 0: throw
+         *    if 0 < arg0: return
+         *  finally:
+         *    def f() { return sourcePosition }
+         *    return f()
+         *  @formatter:on
+         */
+
+        Source source = Source.newBuilder("test", "try finally { def f(){body}; return f }", "sourceRootNodeDeclaredInTryFinally").build();
+        SourcesInterpreter node = parseNodeWithSource("source", b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 39);
+
+            b.beginTryFinally(() -> {
+                // finally
+                beginSourceSection(b, 14, 23);
+
+                beginSourceSection(b, 14, 13);
+                b.beginRoot();
+                beginSourceSection(b, 22, 4);
+                b.emitGetSourcePositions();
+                endSourceSection(b, 22, 4);
+                SourcesInterpreter f = b.endRoot();
+                endSourceSection(b, 14, 13);
+
+                beginSourceSection(b, 29, 8);
+                b.beginReturn();
+                b.beginInvoke();
+                b.emitLoadConstant(f);
+                b.endInvoke();
+                b.endReturn();
+                endSourceSection(b, 29, 8);
+
+                endSourceSection(b, 14, 23);
+            });
+            // try
+            beginSourceSection(b, 0, 3);
+            b.beginBlock();
+            // if arg0 < 0, throw
+            b.beginIfThen();
+
+            b.beginLess();
+            b.emitLoadArgument(0);
+            b.emitLoadConstant(0L);
+            b.endLess();
+
+            b.beginThrowOperation();
+            b.emitLoadConstant(0L);
+            b.endThrowOperation();
+
+            b.endIfThen();
+
+            // if 0 < arg0, return
+            b.beginIfThen();
+
+            b.beginLess();
+            b.emitLoadConstant(0L);
+            b.emitLoadArgument(0);
+            b.endLess();
+
+            b.beginReturn();
+            b.emitLoadConstant(0L);
+            b.endReturn();
+
+            b.endIfThen();
+            b.endBlock();
+            endSourceSection(b, 0, 3);
+
+            b.endTryFinally();
+
+            endSourceSection(b, 0, 39);
+            b.endSource();
+            b.endRoot();
+        });
+
+        long[] inputs = new long[]{0, -1, 1};
+        for (int i = 0; i < inputs.length; i++) {
+            SourceSection[] result = (SourceSection[]) node.getCallTarget().call(inputs[i]);
+            assertSourceSections(result, source, 22, 4, 14, 13);
+        }
+    }
+
+    @Test
+    public void testSourceReparse() {
+        // Test input taken from testSource above.
+        Source source = Source.newBuilder("test", "return 1", "test.test").build();
+        BytecodeRootNodes<SourcesInterpreter> nodes = createNodes(BytecodeConfig.DEFAULT, b -> {
+            b.beginRoot();
+            b.beginSource(source);
+            beginSourceSection(b, 0, 8);
+
+            b.beginReturn();
+
+            beginSourceSection(b, 7, 1);
+            b.emitLoadConstant(1L);
+            endSourceSection(b, 7, 1);
+
+            b.endReturn();
+
+            endSourceSection(b, 0, 8);
+            b.endSource();
+            b.endRoot();
+        });
+
+        assertTrue(nodes.ensureSourceInformation());
+
+        SourcesInterpreter node = nodes.getNode(0);
+        assertSourceSection(node.getSourceSection(), source, 0, 8);
+        List<Instruction> instructions = node.getBytecodeNode().getInstructionsAsList();
+
+        if (sourceRun.testTracer()) {
+            assertInstructionSourceSection(instructions.get(0), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(1), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(2), source, 0, 8);
+            assertInstructionSourceSection(instructions.get(3), source, 0, 8);
+        } else {
+            assertInstructionSourceSection(instructions.get(0), source, 7, 1);
+            assertInstructionSourceSection(instructions.get(1), source, 0, 8);
+        }
+
+    }
+
+    @Test
+    public void testReparseAfterTransitionToCached() {
+        /**
+         * This is a regression test for a bug caused by cached nodes being reused (because of a
+         * source reparse) but not getting adopted by the new BytecodeNode.
+         */
+        Source source = Source.newBuilder("test", "return arg0 ? 42 : position", "file").build();
+
+        BytecodeRootNodes<SourcesInterpreter> nodes = createNodes(BytecodeConfig.DEFAULT, b -> {
+            b.beginSource(source);
+            b.beginRoot();
+
+            beginSourceSection(b, 0, 27);
+            b.beginReturn();
+            b.beginConditional();
+
+            beginSourceSection(b, 7, 4);
+            b.emitLoadArgument(0);
+            endSourceSection(b, 7, 4);
+
+            beginSourceSection(b, 14, 2);
+            b.emitLoadConstant(42L);
+            endSourceSection(b, 14, 2);
+
+            beginSourceSection(b, 19, 8);
+            b.emitGetSourcePositions();
+            endSourceSection(b, 19, 8);
+
+            b.endConditional();
+            b.endReturn();
+            endSourceSection(b, 0, 27);
+
+            b.endRoot();
+            b.endSource();
+        });
+
+        SourcesInterpreter node = nodes.getNode(0);
+
+        // call it once to transition to cached
+        assertEquals(42L, node.getCallTarget().call(true));
+
+        BytecodeLocation aLocation = node.getBytecodeNode().getBytecodeLocation(node.getBytecodeNode().getInstructionsAsList().get(3).getBytecodeIndex());
+
+        assertNull(aLocation.getSourceInformation());
+
+        nodes.ensureSourceInformation();
+        SourceSection[] result = (SourceSection[]) node.getCallTarget().call(false);
+        assertSourceSections(result, source, 19, 8, 0, 27);
+
+        aLocation = aLocation.update();
+        assertNotNull(aLocation.getSourceInformation());
+
+    }
+
+    private static void assertInstructionSourceSection(Instruction i, Source source, int startIndex, int length) {
+        assertSourceSection(i.getLocation().getSourceLocation(), source, startIndex, length);
+    }
+
+    private static void assertSourceSection(SourceSection section, Source source, int... args) {
+        assertSame(source, section.getSource());
+        switch (args.length) {
+            case 1 -> {
+                assertEquals(args[0], section.getStartLine());
+            }
+            case 2 -> {
+                assertEquals(args[0], section.getCharIndex());
+                assertEquals(args[1], section.getCharLength());
+            }
+            case 3 -> {
+                assertEquals(args[0], section.getStartLine());
+                assertEquals(args[1], section.getStartColumn());
+                assertEquals(args[2], section.getCharLength());
+            }
+            case 4 -> {
+                assertEquals(args[0], section.getStartLine());
+                assertEquals(args[1], section.getStartColumn());
+                assertEquals(args[2], section.getEndLine());
+                assertEquals(args[3], section.getEndColumn());
+            }
+            default -> throw new AssertionError("Unexpected argument length " + args.length);
+        }
+    }
+
+    private static void assertSourceSections(SourceSection[] sections, Source source, int... pairs) {
+        assert pairs.length % 2 == 0;
+        assertEquals(pairs.length / 2, sections.length);
+
+        for (int i = 0; i < sections.length; i++) {
+            assertSourceSection(sections[i], source, pairs[2 * i], pairs[2 * i + 1]);
+        }
+    }
+
+    private static ExpectedSourceTree est(String contents, ExpectedSourceTree... children) {
+        return new ExpectedSourceTree(true, contents, children);
+    }
+
+    private static void assertSourceInformationTree(BytecodeNode bytecode, ExpectedSourceTree expected) {
+        expected.assertTreeEquals(bytecode.getSourceInformationTree());
+    }
+
+    record ExpectedSourceTree(boolean available, String contents, ExpectedSourceTree... children) {
+        void assertTreeEquals(SourceInformationTree actual) {
+            if (!available) {
+                assertTrue(!actual.getSourceSection().isAvailable());
+            } else if (contents == null) {
+                assertNull(actual.getSourceSection());
+            } else {
+                assertEquals(contents, actual.getSourceSection().getCharacters().toString());
+            }
+            assertEquals(children.length, actual.getChildren().size());
+            for (int i = 0; i < children.length; i++) {
+                children[i].assertTreeEquals(actual.getChildren().get(i));
+            }
+        }
+
+        static ExpectedSourceTree unavailable(ExpectedSourceTree... children) {
+            return new ExpectedSourceTree(false, null, children);
+        }
+    }
+
+    enum Mode {
+        PREFIX,
+        SUFFIX
+    }
+
+    record SourceTestRun(Mode mode, BytecodeVariant variant, boolean testTracer) {
+
+        @Override
+        public String toString() {
+            return mode.toString() + ":" + variant.toString();
+        }
+    }
+
+}
+
+@GenerateBytecodeTestVariants({
+                @Variant(suffix = "CompressedSources", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, additionalAssertions = true)),
+                @Variant(suffix = "UncompressedSources", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, additionalAssertions = true, //
+                                enableCompressedSources = false)),
+                @Variant(suffix = "CompressedSourcesWithTracing", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, additionalAssertions = true, enableInstructionTracing = true))})
+@ShortCircuitOperation(booleanConverter = SourcesInterpreter.ToBoolean.class, name = "ScAnd", operator = ShortCircuitOperation.Operator.AND_RETURN_VALUE)
+// The shared operations also serve variants without a bytecode index frame slot.
+@SuppressWarnings("truffle-interpreted-performance")
+abstract class SourcesInterpreter extends DebugBytecodeRootNode implements BytecodeRootNode {
+
+    protected SourcesInterpreter(BytecodeDSLTestLanguage language, FrameDescriptor frameDescriptor) {
+        super(language, frameDescriptor);
+    }
+
+    protected String name;
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    @Operation
+    static final class Add {
+        @Specialization
+        static long doLong(long left, long right) {
+            return left + right;
+        }
+    }
+
+    @Operation
+    static final class Less {
+        @Specialization
+        static boolean doLong(long left, long right) {
+            return left < right;
+        }
+    }
+
+    @Operation
+    static final class VoidOperation {
+        @Specialization
+        static void doNothing() {
+        }
+    }
+
+    @Operation
+    static final class ThrowOperation {
+        @Specialization
+        static Object doThrow(long value, @Bind Node node) {
+            throw new SourceTestException(value, node);
+        }
+    }
+
+    static final class SourceTestException extends AbstractTruffleException {
+        private static final long serialVersionUID = 1L;
+
+        SourceTestException(long value, Node node) {
+            super(Long.toString(value), node);
+        }
+    }
+
+    @Operation
+    static final class Invoke {
+        @Specialization
+        static Object doInvoke(SourcesInterpreter interpreter, @Variadic Object[] arguments, @Bind Node location) {
+            return interpreter.getCallTarget().call(location, arguments);
+        }
+    }
+
+    @Operation(storeBytecodeIndex = true)
+    static final class GetSourcePosition {
+        @Specialization
+        static SourceSection doOperation(VirtualFrame frame, @Bind Node node, @Bind BytecodeNode bytecode) {
+            return bytecode.getSourceLocation(frame, node);
+        }
+    }
+
+    @Operation(storeBytecodeIndex = true)
+    static final class GetSourcePositions {
+        @Specialization
+        static SourceSection[] doOperation(VirtualFrame frame, @Bind Node node, @Bind BytecodeNode bytecode) {
+            return bytecode.getSourceLocations(frame, node);
+        }
+    }
+
+    @Operation(storeBytecodeIndex = true)
+    static final class CollectSourceLocations {
+        @Specialization
+        static List<SourceSection> doOperation(@Bind BytecodeLocation location, @Bind SourcesInterpreter currentRootNode) {
+            List<SourceSection> sourceLocations = new ArrayList<>();
+            Truffle.getRuntime().iterateFrames(frame -> {
+                if (frame.getCallTarget() instanceof RootCallTarget target && target.getRootNode() instanceof SourcesInterpreter rootNode) {
+                    sourceLocations.add(currentRootNode == rootNode ? location.getSourceLocation() : rootNode.getBytecodeNode().getSourceLocation(frame));
+                } else {
+                    sourceLocations.add(null);
+                }
+                return null;
+            });
+            return sourceLocations;
+        }
+    }
+
+    @Operation(storeBytecodeIndex = true)
+    static final class CollectAllSourceLocations {
+        @Specialization
+        static List<SourceSection[]> doOperation(@Bind BytecodeLocation location, @Bind SourcesInterpreter currentRootNode) {
+            List<SourceSection[]> sourceLocations = new ArrayList<>();
+            Truffle.getRuntime().iterateFrames(frame -> {
+                if (frame.getCallTarget() instanceof RootCallTarget target && target.getRootNode() instanceof SourcesInterpreter rootNode) {
+                    sourceLocations.add(currentRootNode == rootNode ? location.getSourceLocations() : rootNode.getBytecodeNode().getSourceLocations(frame));
+                } else {
+                    sourceLocations.add(null);
+                }
+                return null;
+            });
+            return sourceLocations;
+        }
+    }
+
+    static final class ToBoolean {
+        @Specialization
+        static boolean doLong(long value) {
+            return value != 0;
+        }
+
+        @Specialization
+        static boolean doBoolean(boolean value) {
+            return value;
+        }
+    }
+}

@@ -26,6 +26,7 @@ package com.oracle.svm.core.jdk;
 
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.svm.shared.BuildPhaseProvider;
 import com.oracle.svm.core.StaticFieldsSupport;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
@@ -33,9 +34,10 @@ import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
-import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability;
+import com.oracle.svm.core.fieldvaluetransformer.JVMCIFieldValueTransformerWithAvailability;
 import com.oracle.svm.core.graal.nodes.FieldOffsetNode;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
@@ -51,10 +53,10 @@ public abstract class VarHandleSupport {
         return ImageSingletons.lookup(VarHandleSupport.class);
     }
 
-    protected abstract ResolvedJavaField findVarHandleField(Object varHandle);
+    protected abstract ResolvedJavaField findVarHandleField(CoreProviders providers, JavaConstant varHandle, boolean guaranteeUnsafeAccessed);
 }
 
-abstract class VarHandleFieldOffsetComputer implements FieldValueTransformerWithAvailability {
+abstract class VarHandleFieldOffsetComputer implements JVMCIFieldValueTransformerWithAvailability {
 
     private final JavaKind kind;
 
@@ -63,13 +65,13 @@ abstract class VarHandleFieldOffsetComputer implements FieldValueTransformerWith
     }
 
     @Override
-    public ValueAvailability valueAvailability() {
-        return ValueAvailability.AfterAnalysis;
+    public boolean isAvailable() {
+        return BuildPhaseProvider.isHostedUniverseBuilt();
     }
 
     @Override
-    public Object transform(Object receiver, Object originalValue) {
-        ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(receiver);
+    public JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
+        ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(GuestAccess.get().getProviders(), receiver, true);
         int offset = field.getOffset();
         if (offset <= 0) {
             throw VMError.shouldNotReachHere("Field is not marked as unsafe accessed: " + field);
@@ -77,9 +79,9 @@ abstract class VarHandleFieldOffsetComputer implements FieldValueTransformerWith
 
         switch (kind) {
             case Int:
-                return Integer.valueOf(offset);
+                return JavaConstant.forInt(offset);
             case Long:
-                return Long.valueOf(offset);
+                return JavaConstant.forLong(offset);
             default:
                 throw VMError.shouldNotReachHere("Invalid kind: " + kind);
         }
@@ -87,9 +89,8 @@ abstract class VarHandleFieldOffsetComputer implements FieldValueTransformerWith
 
     @Override
     public ValueNode intrinsify(CoreProviders providers, JavaConstant receiver) {
-        Object varHandle = providers.getSnippetReflection().asObject(Object.class, receiver);
-        if (varHandle != null) {
-            ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(varHandle);
+        if (receiver != null) {
+            ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(providers, receiver, false);
             return FieldOffsetNode.create(kind, field);
         }
         return null;
@@ -108,24 +109,26 @@ class VarHandleFieldOffsetAsLongComputer extends VarHandleFieldOffsetComputer {
     }
 }
 
-class VarHandleStaticBaseComputer implements FieldValueTransformerWithAvailability {
+class VarHandleStaticBaseComputer implements JVMCIFieldValueTransformerWithAvailability {
+
     @Override
-    public ValueAvailability valueAvailability() {
-        return ValueAvailability.AfterAnalysis;
+    public boolean isAvailable() {
+        return BuildPhaseProvider.isHostedUniverseBuilt();
     }
 
     @Override
-    public Object transform(Object receiver, Object originalValue) {
-        ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(receiver);
-        return field.getType().getJavaKind().isPrimitive() ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields();
+    public JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
+        ResolvedJavaField varHandleField = VarHandleSupport.singleton().findVarHandleField(GuestAccess.get().getProviders(), receiver, false);
+        StaticFieldsSupport.StaticFieldValidator.checkFieldOffsetAllowed(varHandleField);
+        return StaticFieldsSupport.getStaticFieldBaseTransformation(varHandleField);
     }
 
     @Override
     public ValueNode intrinsify(CoreProviders providers, JavaConstant receiver) {
-        Object varHandle = providers.getSnippetReflection().asObject(Object.class, receiver);
-        if (varHandle != null) {
-            ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(varHandle);
-            return StaticFieldsSupport.createStaticFieldBaseNode(field.getType().getJavaKind().isPrimitive());
+        if (receiver.isNonNull()) {
+            ResolvedJavaField field = VarHandleSupport.singleton().findVarHandleField(providers, receiver, false);
+            StaticFieldsSupport.StaticFieldValidator.checkFieldOffsetAllowed(field);
+            return StaticFieldsSupport.createStaticFieldBaseNode(field);
         }
         return null;
     }
@@ -372,7 +375,7 @@ final class Target_java_lang_invoke_DirectMethodHandle_StaticAccessor {
     long staticOffset;
 }
 
-@TargetClass(className = "java.lang.invoke.LazyInitializingVarHandle", onlyWith = JDKLatest.class)
+@TargetClass(className = "java.lang.invoke.LazyInitializingVarHandle")
 final class Target_java_lang_invoke_LazyInitializingVarHandle {
     @Alias @RecomputeFieldValue(isFinal = true, kind = RecomputeFieldValue.Kind.None) //
     Class<?> refc;

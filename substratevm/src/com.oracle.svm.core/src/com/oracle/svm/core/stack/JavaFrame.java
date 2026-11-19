@@ -30,7 +30,7 @@ import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.code.SimpleCodeInfoQueryResult;
-import com.oracle.svm.core.code.UntetheredCodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
 
 /**
  * Represents a physical Java stack frame.
@@ -51,6 +51,12 @@ public interface JavaFrame extends SimpleCodeInfoQueryResult {
 
     @RawField
     void setIP(CodePointer ip);
+
+    @RawField
+    boolean getIsPendingLazyDeopt();
+
+    @RawField
+    void setIsPendingLazyDeopt(boolean isPendingLazyDeopt);
 
     @RawField
     UntetheredCodeInfo getIPCodeInfo();

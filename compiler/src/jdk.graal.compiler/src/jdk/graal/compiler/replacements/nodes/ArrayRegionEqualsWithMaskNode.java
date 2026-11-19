@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -48,6 +48,8 @@ import jdk.graal.compiler.replacements.NodeStrideUtil;
 import org.graalvm.word.LocationIdentity;
 import org.graalvm.word.Pointer;
 
+import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -212,6 +214,15 @@ public final class ArrayRegionEqualsWithMaskNode extends PureFunctionStubIntrins
     }
 
     @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        /*
+         * A negative stub index selects dynamic strides. The AMD64 jump table uses the full stride
+         * register for addressing. AArch64 zero-extends the stride inside the operation.
+         */
+        return arch instanceof AMD64 && getDirectStubCallIndex() < 0;
+    }
+
+    @Override
     public void emitIntrinsic(NodeLIRBuilderTool gen) {
         if (getDirectStubCallIndex() < 0) {
             gen.setResult(this, gen.getLIRGeneratorTool().emitArrayEqualsWithMaskDynamicStrides(
@@ -243,6 +254,7 @@ public final class ArrayRegionEqualsWithMaskNode extends PureFunctionStubIntrins
     }
 
     @NodeIntrinsic
+    @GenerateStub.Default(runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
     @GenerateStub(name = "arrayRegionEqualsWithMaskS1S2S1", parameters = {"S1", "S2", "S1"})
     @GenerateStub(name = "arrayRegionEqualsWithMaskS2S2S1", parameters = {"S2", "S2", "S1"})
     @GenerateStub(name = "arrayRegionEqualsWithMaskS1S1", parameters = {"S1", "S1", "S1"})
@@ -267,6 +279,7 @@ public final class ArrayRegionEqualsWithMaskNode extends PureFunctionStubIntrins
                     @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
 
     @NodeIntrinsic
+    @GenerateStub.Default(runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
     @GenerateStub(name = "arrayRegionEqualsWithMaskDynamicStrides")
     public static native boolean regionEquals(Object arrayA, long offsetA, Object arrayB, long offsetB, Pointer mask, int length, int stride);
 

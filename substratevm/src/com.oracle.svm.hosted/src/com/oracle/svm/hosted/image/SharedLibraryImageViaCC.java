@@ -25,14 +25,14 @@
 
 package com.oracle.svm.hosted.image;
 
-import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.List;
 
+import com.oracle.svm.core.image.ImageHeapLayoutInfo;
 import jdk.graal.compiler.debug.DebugContext;
 
 import com.oracle.svm.core.LinkerInvocation;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.BeforeImageWriteAccessImpl;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
@@ -41,13 +41,13 @@ import com.oracle.svm.hosted.meta.HostedUniverse;
 
 public class SharedLibraryImageViaCC extends NativeImageViaCC {
 
-    public SharedLibraryImageViaCC(HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap, NativeImageCodeCache codeCache,
-                    List<HostedMethod> entryPoints, ClassLoader imageLoader) {
-        super(NativeImageKind.SHARED_LIBRARY, universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, imageLoader);
+    public SharedLibraryImageViaCC(HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap,
+                    ImageHeapLayoutInfo heapLayout, NativeImageCodeCache codeCache, List<HostedMethod> entryPoints, ClassLoader imageLoader) {
+        super(NativeImageKind.SHARED_LIBRARY, universe, metaAccess, nativeLibs, heap, heapLayout, codeCache, entryPoints, imageLoader);
     }
 
     @Override
-    public String[] makeLaunchCommand(NativeImageKind k, String imageName, Path binPath, Path workPath, Method method) {
+    public String[] makeLaunchCommand(NativeImageKind k, String imageName, Path binPath, Path workPath) {
         throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 

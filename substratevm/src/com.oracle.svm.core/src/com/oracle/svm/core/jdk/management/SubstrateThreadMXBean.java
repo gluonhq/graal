@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,11 +35,15 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicInteger;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicLong;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicInteger;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicLong;
 import com.oracle.svm.core.thread.PlatformThreads;
-import com.oracle.svm.core.thread.ThreadCpuTimeSupport;
+import com.oracle.svm.guest.staging.core.thread.ThreadCpuTimeSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import sun.management.Util;
 
@@ -50,7 +54,8 @@ import sun.management.Util;
  * empty arrays (instead of throwing errors) only to improve compatibility with tools that interact
  * with JMX. These still need to be implemented (GR-44559).
  */
-public final class SubstrateThreadMXBean implements com.sun.management.ThreadMXBean {
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public final class SubstrateThreadMXBean implements com.sun.management.ThreadMXBean, VMManagementBean {
     private final AtomicLong totalStartedThreadCount = new AtomicLong(0);
     private final AtomicInteger peakThreadCount = new AtomicInteger(0);
     private final AtomicInteger threadCount = new AtomicInteger(0);
@@ -60,7 +65,7 @@ public final class SubstrateThreadMXBean implements com.sun.management.ThreadMXB
     private boolean cpuTimeEnabled;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    SubstrateThreadMXBean() {
+    public SubstrateThreadMXBean() {
         /*
          * We always track the amount of memory that is allocated by each thread, so this MX bean
          * feature can be on by default.
@@ -282,6 +287,14 @@ public final class SubstrateThreadMXBean implements com.sun.management.ThreadMXB
     @Override
     public ThreadInfo[] dumpAllThreads(boolean lockedMonitors, boolean lockedSynchronizers) {
         return new ThreadInfo[0];
+    }
+
+    @Override
+    public long getTotalThreadAllocatedBytes() {
+        if (!isThreadAllocatedMemoryEnabled()) {
+            return -1;
+        }
+        return PlatformThreads.getTotalThreadAllocatedBytes();
     }
 
     @Override

@@ -24,8 +24,11 @@
  */
 package jdk.graal.compiler.core.common.spi;
 
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -50,6 +53,24 @@ public interface MetaAccessExtensionProvider {
     boolean canConstantFoldDynamicAllocation(ResolvedJavaType type);
 
     /**
+     * Returns whether this compilation may embed identity hash codes obtained from
+     * {@link ConstantReflectionProvider#identityHashCode(JavaConstant)}. Return {@code false} if
+     * compilation-time hashes may differ from those of the runtime objects; canonicalization must
+     * then retain the operation without querying constant reflection.
+     *
+     * This compilation-wide policy must apply from source graph construction through analysis and
+     * compilation: disabling it later cannot undo earlier folds. Compiler folding must go through
+     * {@code IdentityHashCodeNode} canonicalization; raw constant-reflection queries for metadata or
+     * heap construction are unaffected.
+     *
+     * @return {@code true} if compilation-time identity hash codes may be used at run time
+     * @implSpec The default implementation returns {@code true}.
+     */
+    default boolean canConstantFoldIdentityHashCode() {
+        return true;
+    }
+
+    /**
      * Checks if the invocation of the provided method is guaranteed to include a safepoint.
      *
      * @param isDirect Whether the method is being directly invoked. For indirect calls, a method is
@@ -59,8 +80,25 @@ public interface MetaAccessExtensionProvider {
     boolean isGuaranteedSafepoint(ResolvedJavaMethod method, boolean isDirect);
 
     /**
+     * Returns true if the provided method has the {@code java.lang.invoke.LambdaForm.Compiled}
+     * property.
+     */
+    boolean isLambdaFormCompiled(ResolvedJavaMethod method);
+
+    /**
      * Returns true if the partial escape analysis is allowed to virtualize object allocations of a
      * given type.
      */
     boolean canVirtualize(ResolvedJavaType instanceType);
+
+    /**
+     * Given an unsafe access, try to find the static field that is being accessed.
+     *
+     * @param base the base object used in the access.
+     * @param offset the offset used in the access.
+     * @param accessKind the kind of data being accessed.
+     * @return the static field being accessed or null if this is not a static field access or if it
+     *         can't be determined.
+     */
+    ResolvedJavaField getStaticFieldForAccess(JavaConstant base, long offset, JavaKind accessKind);
 }

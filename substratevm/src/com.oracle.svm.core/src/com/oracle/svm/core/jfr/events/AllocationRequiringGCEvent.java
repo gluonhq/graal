@@ -29,7 +29,7 @@ package com.oracle.svm.core.jfr.events;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.jfr.HasJfrSupport;
 import com.oracle.svm.core.jfr.JfrEvent;
 import com.oracle.svm.core.jfr.JfrNativeEventWriter;
@@ -54,7 +54,7 @@ public class AllocationRequiringGCEvent {
             JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.AllocationRequiringGC);
             JfrNativeEventWriter.putLong(data, JfrTicks.elapsedTicks());
             JfrNativeEventWriter.putEventThread(data);
-            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.AllocationRequiringGC, 0));
+            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.AllocationRequiringGC));
             JfrNativeEventWriter.putLong(data, gcId.rawValue());
             JfrNativeEventWriter.putLong(data, size.rawValue());
             JfrNativeEventWriter.endSmallEvent(data);

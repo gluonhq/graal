@@ -31,20 +31,31 @@ import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.UnsignedWord;
 
 import com.oracle.svm.core.SubstrateDiagnostics;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.headers.LibC;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.log.CoreLogSupport;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 @AutomaticallyRegisteredFeature
 class PosixLogHandlerFeature implements InternalFeature {
     @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
+    @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
-        Log.finalizeDefaultLogHandler(new PosixLogHandler());
+        CoreLogSupport.finalizeDefaultLogHandler(new PosixLogHandler());
     }
 }
 
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class PosixLogHandler implements LogHandler {
 
     @Override
@@ -52,7 +63,7 @@ public class PosixLogHandler implements LogHandler {
         /* Save and restore errno around calls that would otherwise change errno. */
         final int savedErrno = LibC.errno();
         try {
-            if (!PosixUtils.writeBytes(getOutputFile(), bytes, length)) {
+            if (!PosixUtils.write(getOutputFile(), bytes, length)) {
                 /*
                  * We are in a low-level log routine and output failed, so there is little we can
                  * do.

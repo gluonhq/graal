@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -42,8 +42,6 @@ import org.graalvm.collections.EconomicSet;
 import org.graalvm.collections.Equivalence;
 import org.graalvm.collections.UnmodifiableEconomicMap;
 
-import com.oracle.truffle.compiler.HostMethodInfo;
-
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.phases.HighTier;
 import jdk.graal.compiler.debug.Assertions;
@@ -75,6 +73,7 @@ import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
+import jdk.graal.compiler.phases.PhaseSuite;
 import jdk.graal.compiler.phases.OptimisticOptimizations;
 import jdk.graal.compiler.phases.common.AbstractInliningPhase;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
@@ -82,6 +81,7 @@ import jdk.graal.compiler.phases.common.DeadCodeEliminationPhase;
 import jdk.graal.compiler.phases.common.inlining.InliningUtil;
 import jdk.graal.compiler.phases.contract.NodeCostUtil;
 import jdk.graal.compiler.phases.tiers.HighTierContext;
+import jdk.graal.compiler.truffle.HostMethodInfo;
 import jdk.graal.compiler.truffle.KnownTruffleTypes;
 import jdk.graal.compiler.truffle.PartialEvaluator;
 import jdk.vm.ci.meta.JavaTypeProfile;
@@ -106,8 +106,17 @@ public class HostInliningPhase extends AbstractInliningPhase {
         @Option(help = "Maximum budget for Truffle host inlining for runtime compiled methods.")//
         public static final OptionKey<Integer> TruffleHostInliningBaseBudget = new OptionKey<>(5_000);
 
+        @Option(help = "Maximum exploration budget for Truffle host inlining when exploring inlining candidates.")//
+        public static final OptionKey<Integer> TruffleHostInliningExploreBudget = new OptionKey<>(10_000);
+
         @Option(help = "Maximum budget for Truffle host inlining for runtime compiled methods with a BytecodeInterpreterSwitch annotation.")//
         public static final OptionKey<Integer> TruffleHostInliningByteCodeInterpreterBudget = new OptionKey<>(100_000);
+
+        @Option(help = "Maximum budget for Truffle host inlining for runtime compiled methods with a BytecodeInterpreterHandler annotation.")//
+        public static final OptionKey<Integer> TruffleHostInliningByteCodeHandlerBudget = new OptionKey<>(100_000);
+
+        @Option(help = "Maximum number of subtree invokes for a subtree to get inlined until it is considered too complex. Only applies to runtime compiled methods with a BytecodeInterpreterHandler annotation.")//
+        public static final OptionKey<Integer> TruffleHostInliningByteCodeHandlerMaxSubtreeInvokes = new OptionKey<>(256);
 
         @Option(help = "When logging is activated for this phase enables printing of only explored, but ultimately not inlined call trees.")//
         public static final OptionKey<Boolean> TruffleHostInliningPrintExplored = new OptionKey<>(false);
@@ -116,7 +125,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
         public static final OptionKey<Integer> TruffleHostInliningMaxExplorationDepth = new OptionKey<>(1000);
 
         @Option(help = "Maximum number of subtree invokes for a subtree to get inlined until it is considered too complex.")//
-        public static final OptionKey<Integer> TruffleHostInliningMaxSubtreeInvokes = new OptionKey<>(20);
+        public static final OptionKey<Integer> TruffleHostInliningMaxSubtreeInvokes = new OptionKey<>(32);
 
         @Option(help = "Minimum relative frequency for calls to get inlined. Default 0.001 on HotSpot and no minimum frequency on SVM.")//
         public static final OptionKey<Double> TruffleHostInliningMinFrequency = new OptionKey<>(DEFAULT_MIN_FREQUENCY);
@@ -144,7 +153,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
     }
 
     protected boolean isEnabledFor(TruffleHostEnvironment env, ResolvedJavaMethod method) {
-        return isBytecodeInterpreterSwitch(env, method);
+        return isBytecodeInterpreterSwitch(env, method) || isInliningRoot(env, method) || isBytecodeInterpreterHandlerStub(env, method);
     }
 
     protected String isTruffleBoundary(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
@@ -154,12 +163,29 @@ public class HostInliningPhase extends AbstractInliningPhase {
         return null;
     }
 
-    private boolean isBytecodeInterpreterSwitch(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+    protected final boolean isBytecodeInterpreterSwitch(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
         return env.getHostMethodInfo(translateMethod(targetMethod)).isBytecodeInterpreterSwitch();
     }
 
     private boolean isInliningCutoff(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
         return env.getHostMethodInfo(translateMethod(targetMethod)).isInliningCutoff();
+    }
+
+    private boolean isInliningRoot(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+        return env.getHostMethodInfo(translateMethod(targetMethod)).isInliningRoot();
+    }
+
+    @SuppressWarnings("unused")
+    protected boolean isBytecodeInterpreterHandlerStub(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+        return false;
+    }
+
+    protected boolean isBytecodeInterpreterHandler(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+        return env.getHostMethodInfo(translateMethod(targetMethod)).isBytecodeInterpreterHandler();
+    }
+
+    protected boolean hasBytecodeInterpreterConfig(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+        return env.getHostMethodInfo(translateMethod(targetMethod)).hasBytecodeInterpreterHandlerConfig();
     }
 
     protected ResolvedJavaMethod translateMethod(ResolvedJavaMethod method) {
@@ -178,8 +204,28 @@ public class HostInliningPhase extends AbstractInliningPhase {
         return context.types().isTransferToInterpreterMethod(translateMethod(method));
     }
 
+    @SuppressWarnings("unused")
+    protected boolean forceShallowInline(CallTree caller, ResolvedJavaMethod callee, InliningPhaseContext context) {
+        /*
+         * The idea is to support composed bytecode switches from multiple methods. For that we
+         * always need to inline all bytecode switches first.
+         */
+        return context.isBytecodeSwitch && (caller.forceShallowInline || caller.parent == null) &&
+                        isBytecodeInterpreterSwitch(context.env, callee);
+    }
+
     @Override
-    protected final void run(StructuredGraph graph, HighTierContext highTierContext) {
+    protected boolean shouldVerifyForceInlinedInvokes(StructuredGraph graph) {
+        /*
+         * Host inlining is a domain-specific exploration phase and may leave force-inlined invokes
+         * to later general inlining phases.
+         */
+        return false;
+    }
+
+    @Override
+    @SuppressWarnings("try")
+    protected final void runInlining(StructuredGraph graph, HighTierContext highTierContext) {
         ResolvedJavaMethod method = graph.method();
         TruffleHostEnvironment env = TruffleHostEnvironment.get(method);
         if (env == null) {
@@ -197,7 +243,11 @@ public class HostInliningPhase extends AbstractInliningPhase {
             return;
         }
 
-        runImpl(new InliningPhaseContext(highTierContext, graph, env, isBytecodeInterpreterSwitch(env, method), this.defaultMinProfiledFrequency));
+        boolean isHandlerStub = isBytecodeInterpreterHandlerStub(env, method);
+        boolean isSwitch = isBytecodeInterpreterSwitch(env, method);
+        boolean hasBytecodeInterpreterConfig = hasBytecodeInterpreterConfig(env, method);
+
+        runImpl(new InliningPhaseContext(highTierContext, graph, env, isHandlerStub, hasBytecodeInterpreterConfig, isSwitch, this.defaultMinProfiledFrequency));
     }
 
     private void runImpl(InliningPhaseContext context) {
@@ -205,17 +255,20 @@ public class HostInliningPhase extends AbstractInliningPhase {
 
         int sizeLimit;
         int exploreLimit;
-        if (context.isBytecodeSwitch) {
+        if (context.isBytecodeHandlerStub) {
+            sizeLimit = Options.TruffleHostInliningByteCodeHandlerBudget.getValue(context.graph.getOptions());
+            exploreLimit = Math.max(sizeLimit, Options.TruffleHostInliningExploreBudget.getValue(context.graph.getOptions()));
+        } else if (context.isBytecodeSwitch) {
             /*
              * We use a significantly higher limit for method with @BytecodeInterpreterSwitch
              * annotation. In the future, we may even consider disabling the limit for such methods
              * all together and fail if the graph becomes too big.
              */
             sizeLimit = Options.TruffleHostInliningByteCodeInterpreterBudget.getValue(context.graph.getOptions());
-            exploreLimit = Options.TruffleHostInliningBaseBudget.getValue(context.graph.getOptions());
+            exploreLimit = Math.max(sizeLimit, Options.TruffleHostInliningExploreBudget.getValue(context.graph.getOptions()));
         } else {
             sizeLimit = Options.TruffleHostInliningBaseBudget.getValue(context.graph.getOptions());
-            exploreLimit = sizeLimit;
+            exploreLimit = Options.TruffleHostInliningExploreBudget.getValue(context.graph.getOptions());
         }
 
         if (sizeLimit < 0) {
@@ -448,7 +501,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
                      * Some if conditions may have already been converted to guards at this point.
                      * For guards that are protected inInterpreter blocks we need to mark all
                      * following blocks as inInterpreter blocks. We also mark all following fixed
-                     * nodes as inInterpeter by setting a local variable guardedByInInterpreter to
+                     * nodes as inInterpreter by setting a local variable guardedByInInterpreter to
                      * true.
                      */
                     FixedGuardNode guard = (FixedGuardNode) node;
@@ -505,13 +558,9 @@ public class HostInliningPhase extends AbstractInliningPhase {
 
                 boolean inInterpreter = guardedByInInterpreter || caller.inInterpreter || isBlockOrDominatorContainedIn(block, inInterpreterBlocks);
 
-                /*
-                 * The idea is to support composed bytecodes witches from multiple methods. For that
-                 * we always need to inline all bytecode switches first.
-                 */
-                boolean forceShallowInline = context.isBytecodeSwitch && (caller.forceShallowInline || caller.parent == null) && isBytecodeInterpreterSwitch(context.env, invoke.getTargetMethod());
+                boolean forceShallowInline = forceShallowInline(caller, newTargetMethod, context);
 
-                double frequency = context.isFrequencyCutoffEnabled() ? block.getRelativeFrequency() : 1.0d;
+                double frequency = (!forceShallowInline && context.isFrequencyCutoffEnabled()) ? block.getRelativeFrequency() : 1.0d;
                 CallTree callee = new CallTree(caller, invoke, deoptimized, unwind, inInterpreter, forceShallowInline, frequency);
                 children.add(callee);
 
@@ -600,6 +649,10 @@ public class HostInliningPhase extends AbstractInliningPhase {
      */
     private BackPropagation peekPropagatesDeoptOrUnwind(InliningPhaseContext context, Invoke callerInvoke, ResolvedJavaMethod method, int depth) {
         if (depth > MAX_PEEK_PROPAGATE_DEOPT) {
+            return BackPropagation.NOTHING;
+        }
+
+        if (!method.hasBytecodes() || method.isNative()) {
             return BackPropagation.NOTHING;
         }
 
@@ -896,7 +949,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
 
     /**
      * Returns <code>true</code> if a call tree should get inlined, otherwise <code>false</code>.
-     * This method does not yet make determine wheter the call site is in budget. See
+     * This method does not yet determine whether the call site is in budget. See
      * {@link #isInBudget(CallTree, int, int)} for that.
      */
     private boolean shouldInline(InliningPhaseContext context, CallTree call) {
@@ -948,11 +1001,12 @@ public class HostInliningPhase extends AbstractInliningPhase {
             /*
              * Always force inline bytecode switches into bytecode switches.
              */
-            if (call.frequency <= context.minimumFrequency) {
-                call.reason = "frequency < minimumFrequency";
-                return false;
-            }
             return true;
+        }
+
+        if (isBytecodeInterpreterHandler(context.env, targetMethod) && context.hasBytecodeInterpreterHandlerConfig) {
+            call.reason = "No inlining of @BytecodeInterpreterHandler method into @BytecodeInterpreterSwitch methods.";
+            return false;
         }
 
         if (call.deoptimized) {
@@ -1006,7 +1060,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
          * or non-direct virtual calls.
          */
         if (call.subTreeFastPathInvokes >= context.maxSubtreeInvokes) {
-            call.reason = "call has too many fast-path invokes - too complex, please optimize, see truffle/docs/HostOptimization.md";
+            call.reason = "call has too many fast-path invokes - too complex, please optimize, see truffle/docs/HostCompilation.md";
             return false;
         }
 
@@ -1055,8 +1109,9 @@ public class HostInliningPhase extends AbstractInliningPhase {
         }
 
         // seems to be quite expensive so do this last
-        ProfilingInfo info = context.graph.getProfilingInfo(targetMethod);
-        if (info != null && new OptimisticOptimizations(context.graph.getProfilingInfo(targetMethod), context.options).lessOptimisticThan(context.highTierContext.getOptimisticOptimizations())) {
+        ProfilingInfo info = context.graph.getProfilingInfo(context.graph.getCallerContext(), targetMethod);
+        if (info != null && new OptimisticOptimizations(context.graph.getProfilingInfo(context.graph.getCallerContext(), targetMethod), context.options).lessOptimisticThan(
+                        context.highTierContext.getOptimisticOptimizations())) {
             call.reason = "the callee uses less optimistic optimizations than caller";
             return false;
         }
@@ -1079,9 +1134,8 @@ public class HostInliningPhase extends AbstractInliningPhase {
         }
 
         if (targetMethod.isNative() && !(Intrinsify.getValue(context.options) &&
-                        context.highTierContext.getReplacements().getInlineSubstitution(targetMethod, call.invoke.bci(), call.invoke.getInlineControl(), context.graph.trackNodeSourcePosition(), null,
-                                        context.graph.allowAssumptions(),
-                                        context.options) != null)) {
+                        context.highTierContext.getReplacements().getInlineSubstitution(targetMethod, call.invoke.bci(), false, call.invoke.getInlineControl(), context.graph.trackNodeSourcePosition(),
+                                        null, context.graph.allowAssumptions(), context.options) != null)) {
             call.reason = "target method is a non-intrinsic native method";
             return false;
         }
@@ -1245,21 +1299,22 @@ public class HostInliningPhase extends AbstractInliningPhase {
          * copy the intrinsic graph if it is frozen.
          */
         StructuredGraph graph = context.highTierContext.getReplacements().getInlineSubstitution(method,
-                        invoke.bci(), invoke.getInlineControl(), context.graph.trackNodeSourcePosition(), null,
+                        invoke.bci(), invoke.isInOOMETry(), invoke.getInlineControl(), context.graph.trackNodeSourcePosition(), null,
                         invoke.asNode().graph().allowAssumptions(), invoke.asNode().getOptions());
         if (graph == null) {
-            graph = context.graphCache.get(method);
+            EconomicMap<ResolvedJavaMethod, StructuredGraph> graphCache = invoke.isInOOMETry() ? context.oomeGraphCache : context.graphCache;
+            graph = graphCache.get(method);
             if (graph == null) {
-                graph = parseGraph(context.highTierContext, context.graph, method);
+                graph = parseGraph(context.highTierContext, context.graph, method, invoke);
 
-                context.graphCache.put(method, graph);
+                graphCache.put(method, graph);
             }
         }
         return graph;
     }
 
     @SuppressWarnings("try")
-    protected StructuredGraph parseGraph(HighTierContext context, StructuredGraph graph, ResolvedJavaMethod method) {
+    protected StructuredGraph parseGraph(HighTierContext context, StructuredGraph graph, ResolvedJavaMethod method, Invoke invoke) {
         DebugContext debug = graph.getDebug();
         StructuredGraph newGraph = new StructuredGraph.Builder(graph.getOptions(), debug, graph.allowAssumptions())//
                         .method(method).trackNodeSourcePosition(graph.trackNodeSourcePosition()) //
@@ -1270,8 +1325,9 @@ public class HostInliningPhase extends AbstractInliningPhase {
             if (!graph.isUnsafeAccessTrackingEnabled()) {
                 newGraph.disableUnsafeAccessTracking();
             }
-            if (context.getGraphBuilderSuite() != null) {
-                context.getGraphBuilderSuite().apply(newGraph, context);
+            PhaseSuite<HighTierContext> graphBuilderSuite = context.getGraphBuilderSuiteForCallee(invoke);
+            if (graphBuilderSuite != null) {
+                graphBuilderSuite.apply(newGraph, context);
             }
             assert newGraph.start().next() != null : "graph needs to be populated by the GraphBuilderSuite " + method + ", " + method.canBeInlined();
 
@@ -1324,6 +1380,13 @@ public class HostInliningPhase extends AbstractInliningPhase {
             return;
         }
         HostInliningPhase phase = new HostInliningPhase(CanonicalizerPhase.create());
+        insertBeforeInlining(highTier, phase);
+    }
+
+    /**
+     * Insert {@code phase} before any {@code AbstractInliningPhase} in {@code highTier}.
+     */
+    public static void insertBeforeInlining(HighTier highTier, BasePhase<HighTierContext> phase) {
         ListIterator<BasePhase<? super HighTierContext>> insertionPoint = highTier.findPhase(AbstractInliningPhase.class);
         if (insertionPoint == null) {
             highTier.prependPhase(phase);
@@ -1347,10 +1410,12 @@ public class HostInliningPhase extends AbstractInliningPhase {
         TruffleKnownHostTypes types = env.types();
         HostMethodInfo info = env.getHostMethodInfo(callee);
         return (info.isBytecodeInterpreterSwitch() ||
+                        info.isBytecodeInterpreterHandler() ||
                         info.isInliningCutoff() ||
                         info.isTruffleBoundary() ||
                         types.isInInterpreter(callee) ||
                         types.isInInterpreterFastPath(callee) ||
+                        types.isHasNextTier(callee) ||
                         types.isTransferToInterpreterMethod(callee));
     }
 
@@ -1372,16 +1437,18 @@ public class HostInliningPhase extends AbstractInliningPhase {
 
     }
 
-    static final class InliningPhaseContext {
+    protected static final class InliningPhaseContext {
 
-        final HighTierContext highTierContext;
-        final StructuredGraph graph;
-        final OptionValues options;
-        final TruffleHostEnvironment env;
-        final boolean isBytecodeSwitch;
-        final int maxSubtreeInvokes;
-        final boolean printExplored;
-        final double minimumFrequency;
+        public final HighTierContext highTierContext;
+        public final StructuredGraph graph;
+        public final OptionValues options;
+        public final TruffleHostEnvironment env;
+        public final boolean isBytecodeHandlerStub;
+        public final boolean hasBytecodeInterpreterHandlerConfig;
+        public final boolean isBytecodeSwitch;
+        public final int maxSubtreeInvokes;
+        public final boolean printExplored;
+        public final double minimumFrequency;
 
         /**
          * Caches graphs for a single run of this phase. This is not just a performance optimization
@@ -1389,14 +1456,22 @@ public class HostInliningPhase extends AbstractInliningPhase {
          * CallTree.
          */
         final EconomicMap<ResolvedJavaMethod, StructuredGraph> graphCache = EconomicMap.create(Equivalence.DEFAULT);
+        final EconomicMap<ResolvedJavaMethod, StructuredGraph> oomeGraphCache = EconomicMap.create(Equivalence.DEFAULT);
 
-        InliningPhaseContext(HighTierContext context, StructuredGraph graph, TruffleHostEnvironment env, boolean isBytecodeSwitch, double defaultMinimumFrequency) {
+        InliningPhaseContext(HighTierContext context, StructuredGraph graph, TruffleHostEnvironment env, boolean isBytecodeHandlerStub, boolean hasBytecodeInterpreterHandlerConfig,
+                        boolean isBytecodeSwitch, double defaultMinimumFrequency) {
             this.highTierContext = context;
             this.graph = graph;
             this.options = graph.getOptions();
             this.env = env;
+            this.isBytecodeHandlerStub = isBytecodeHandlerStub;
             this.isBytecodeSwitch = isBytecodeSwitch;
-            this.maxSubtreeInvokes = Options.TruffleHostInliningMaxSubtreeInvokes.getValue(options);
+            if (isBytecodeHandlerStub) {
+                this.maxSubtreeInvokes = Options.TruffleHostInliningByteCodeHandlerMaxSubtreeInvokes.getValue(options);
+            } else {
+                this.maxSubtreeInvokes = Options.TruffleHostInliningMaxSubtreeInvokes.getValue(options);
+            }
+            this.hasBytecodeInterpreterHandlerConfig = hasBytecodeInterpreterHandlerConfig;
             this.printExplored = Options.TruffleHostInliningPrintExplored.getValue(options);
             if (Options.TruffleHostInliningMinFrequency.hasBeenSet(options)) {
                 this.minimumFrequency = Options.TruffleHostInliningMinFrequency.getValue(options);
@@ -1426,7 +1501,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
      * invokes are inlined so represent the original call stack. This allows to detect recursions
      * and capture information determined during exploration.
      */
-    static final class CallTree implements Comparable<CallTree> {
+    protected static final class CallTree implements Comparable<CallTree> {
 
         public StructuredGraph subtreeGraph;
 
@@ -1508,7 +1583,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
         int subTreeCost = -1;
 
         /**
-         * Cost of of all graal nodes in this method. The size is computed during exploration.
+         * Cost of all graal nodes in this method. The size is computed during exploration.
          */
         int cost = -1;
 
@@ -1569,7 +1644,7 @@ public class HostInliningPhase extends AbstractInliningPhase {
             return targetMethod;
         }
 
-        boolean isRoot() {
+        public boolean isRoot() {
             return parent == null;
         }
 

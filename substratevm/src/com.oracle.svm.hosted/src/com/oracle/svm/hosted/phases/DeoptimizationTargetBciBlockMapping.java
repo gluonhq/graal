@@ -24,15 +24,16 @@
  */
 package com.oracle.svm.hosted.phases;
 
-import java.util.HashSet;
 import java.util.Set;
 
-import com.oracle.svm.common.meta.MultiMethod;
+import org.graalvm.collections.EconomicSet;
+
 import com.oracle.svm.core.code.FrameInfoEncoder;
 import com.oracle.svm.core.graal.nodes.DeoptEntryNode;
 import com.oracle.svm.core.graal.nodes.DeoptProxyAnchorNode;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.bytecode.Bytecode;
 import jdk.graal.compiler.bytecode.BytecodeStream;
@@ -78,12 +79,12 @@ final class DeoptimizationTargetBciBlockMapping extends BciBlockMapping {
      * Keep track of blocks inserted for DeoptEntryPoints so that characteristics of these blocks
      * can be validated later within {@link #verify()}.
      */
-    private final Set<DeoptEntryInsertionPoint> insertedBlocks;
+    private final EconomicSet<DeoptEntryInsertionPoint> insertedBlocks;
 
     private DeoptimizationTargetBciBlockMapping(Bytecode code, DebugContext debug) {
         super(code, debug);
         VMError.guarantee(SubstrateCompilationDirectives.isDeoptTarget(code.getMethod()), "Deoptimization Target expected.");
-        insertedBlocks = new HashSet<>();
+        insertedBlocks = EconomicSet.create();
     }
 
     /**
@@ -281,14 +282,14 @@ final class DeoptimizationTargetBciBlockMapping extends BciBlockMapping {
      */
     private boolean isDeoptEntry(int bci, FrameState.StackState stackState) {
         ResolvedJavaMethod method = code.getMethod();
-        return SubstrateCompilationDirectives.singleton().isDeoptEntry((MultiMethod) method, bci, stackState);
+        return SubstrateCompilationDirectives.singleton().isDeoptEntry((MethodVariant) method, bci, stackState);
     }
 
     /**
      * Checking whether this bci corresponds to a deopt entry point.
      */
     private boolean isRegisteredDeoptEntry(int bci, FrameState.StackState stackState) {
-        return SubstrateCompilationDirectives.singleton().isRegisteredDeoptEntry((MultiMethod) code.getMethod(), bci, stackState);
+        return SubstrateCompilationDirectives.singleton().isRegisteredDeoptEntry((MethodVariant) code.getMethod(), bci, stackState);
     }
 
     /* A new block must be created for all places where a DeoptEntryNode will be inserted. */
@@ -468,7 +469,7 @@ final class DeoptimizationTargetBciBlockMapping extends BciBlockMapping {
      */
     @Override
     protected boolean verify() {
-        Set<Long> coveredEncodedBcis = new HashSet<>();
+        EconomicSet<Long> coveredEncodedBcis = EconomicSet.create();
         for (DeoptEntryInsertionPoint deopt : insertedBlocks) {
             BciBlock block = deopt.asBlock();
             int bci = deopt.frameStateBci();

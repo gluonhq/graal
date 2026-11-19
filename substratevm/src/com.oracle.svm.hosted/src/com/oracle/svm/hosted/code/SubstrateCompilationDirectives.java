@@ -31,11 +31,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.svm.common.meta.MethodVariant;
 import com.oracle.svm.core.code.FrameInfoEncoder;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.nodes.FrameState;
@@ -44,16 +48,17 @@ import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public class SubstrateCompilationDirectives {
 
     public static boolean isRuntimeCompiledMethod(ResolvedJavaMethod method) {
-        if (method instanceof MultiMethod multiMethod) {
-            return multiMethod.getMultiMethodKey() == RUNTIME_COMPILED_METHOD;
+        if (method instanceof MethodVariant methodVariant) {
+            return methodVariant.getMethodVariantKey() == RUNTIME_COMPILED_METHOD;
         }
         return false;
     }
 
-    public static final MultiMethod.MultiMethodKey RUNTIME_COMPILED_METHOD = new MultiMethod.MultiMethodKey() {
+    public static final MethodVariant.MethodVariantKey RUNTIME_COMPILED_METHOD = new MethodVariant.MethodVariantKey() {
         @Override
         public String toString() {
             return "R";
@@ -61,13 +66,13 @@ public class SubstrateCompilationDirectives {
     };
 
     public static boolean isDeoptTarget(ResolvedJavaMethod method) {
-        if (method instanceof MultiMethod multiMethod) {
-            return multiMethod.getMultiMethodKey() == DEOPT_TARGET_METHOD;
+        if (method instanceof MethodVariant methodVariant) {
+            return methodVariant.getMethodVariantKey() == DEOPT_TARGET_METHOD;
         }
         return false;
     }
 
-    public static final MultiMethod.MultiMethodKey DEOPT_TARGET_METHOD = new MultiMethod.MultiMethodKey() {
+    public static final MethodVariant.MethodVariantKey DEOPT_TARGET_METHOD = new MethodVariant.MethodVariantKey() {
         @Override
         public String toString() {
             /*
@@ -211,7 +216,11 @@ public class SubstrateCompilationDirectives {
          * deoptimization target. No bci needs to be registered, it is enough to have a non-null
          * value in the map.
          */
-        deoptEntries.computeIfAbsent(deoptMethod, m -> new ConcurrentHashMap<>());
+        deoptEntries.computeIfAbsent(deoptMethod, _ -> new ConcurrentHashMap<>());
+    }
+
+    public void registerFrameInformationRequired(AnalysisMethod method) {
+        frameInformationRequired.add(method);
     }
 
     public boolean isFrameInformationRequired(ResolvedJavaMethod method) {
@@ -226,11 +235,11 @@ public class SubstrateCompilationDirectives {
         assert state.bci >= 0;
         long encodedBci = FrameInfoEncoder.encodeBci(state.bci, state.getStackState());
 
-        Map<Long, DeoptSourceFrameInfo> sourceFrameInfoMap = deoptEntries.computeIfAbsent(toAnalysisMethod(method), m -> new ConcurrentHashMap<>());
+        Map<Long, DeoptSourceFrameInfo> sourceFrameInfoMap = deoptEntries.computeIfAbsent(toAnalysisMethod(method), _ -> new ConcurrentHashMap<>());
 
         boolean newEntry = !sourceFrameInfoMap.containsKey(encodedBci);
 
-        sourceFrameInfoMap.compute(encodedBci, (k, v) -> v == null ? DeoptSourceFrameInfo.create(state) : v.mergeStateInfo(state));
+        sourceFrameInfoMap.compute(encodedBci, (_, v) -> v == null ? DeoptSourceFrameInfo.create(state) : v.mergeStateInfo(state));
 
         return newEntry;
     }
@@ -251,15 +260,15 @@ public class SubstrateCompilationDirectives {
         return deoptEntries.containsKey(toAnalysisMethod(method));
     }
 
-    public boolean isDeoptEntry(MultiMethod method, int bci, FrameState.StackState stackState) {
-        if (method instanceof HostedMethod && ((HostedMethod) method).getMultiMethod(MultiMethod.ORIGINAL_METHOD).compilationInfo.canDeoptForTesting()) {
+    public boolean isDeoptEntry(MethodVariant method, int bci, FrameState.StackState stackState) {
+        if (method instanceof HostedMethod && ((HostedMethod) method).getMethodVariant(MethodVariant.ORIGINAL_METHOD).compilationInfo.canDeoptForTesting()) {
             return true;
         }
 
         return isRegisteredDeoptEntry(method, bci, stackState);
     }
 
-    public boolean isRegisteredDeoptEntry(MultiMethod method, int bci, FrameState.StackState stackState) {
+    public boolean isRegisteredDeoptEntry(MethodVariant method, int bci, FrameState.StackState stackState) {
         Map<Long, DeoptSourceFrameInfo> bciMap = deoptEntries.get(toAnalysisMethod((ResolvedJavaMethod) method));
         if (bciMap == null) {
             /*
@@ -309,7 +318,7 @@ public class SubstrateCompilationDirectives {
         // all methods which are registered for deopt testing cannot be cleared
         Map<AnalysisMethod, Map<Long, DeoptSourceFrameInfo>> newDeoptEntries = new ConcurrentHashMap<>();
         for (var deoptForTestingMethod : deoptForTestingMethods) {
-            var key = deoptForTestingMethod.getMultiMethod(DEOPT_TARGET_METHOD);
+            var key = deoptForTestingMethod.getMethodVariant(DEOPT_TARGET_METHOD);
             var value = deoptEntries.get(key);
             assert key != null && value != null : "Unexpected null value " + key + ", " + value;
             newDeoptEntries.put(key, value);
@@ -318,9 +327,9 @@ public class SubstrateCompilationDirectives {
         // all methods which require frame information must have a deoptimization entry
         frameInformationRequired.forEach(m -> {
             assert m.isOriginalMethod();
-            var deoptMethod = m.getMultiMethod(DEOPT_TARGET_METHOD);
+            var deoptMethod = m.getMethodVariant(DEOPT_TARGET_METHOD);
             assert deoptMethod != null;
-            deoptEntries.computeIfAbsent(deoptMethod, n -> new ConcurrentHashMap<>());
+            deoptEntries.computeIfAbsent(deoptMethod, _ -> new ConcurrentHashMap<>());
         });
     }
 }

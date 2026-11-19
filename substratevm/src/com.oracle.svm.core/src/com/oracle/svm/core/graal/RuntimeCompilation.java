@@ -24,20 +24,27 @@
  */
 package com.oracle.svm.core.graal;
 
-import jdk.graal.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 
+import com.oracle.svm.core.code.RuntimeCodeInstallation;
 import com.oracle.svm.core.deopt.DeoptimizationSupport;
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.replacements.Fold;
 
 public final class RuntimeCompilation {
     /**
-     * Returns whether the image supports runtime compilation using Graal. This method can be called
-     * as early as during {@link Feature#afterRegistration}. {@code true} means that deoptimization
-     * is also enabled, so that {@link DeoptimizationSupport#enabled} would return {@code true}.
+     * Returns whether the image supports runtime compilation using Graal. Use
+     * {@link RuntimeCodeInstallation#isEnabled()} when the question is whether runtime-installed
+     * code can appear, regardless of producer. This method can be called as early as during
+     * {@link Feature#afterRegistration}. {@code true} means that deoptimization is also enabled, so
+     * that {@link DeoptimizationSupport#enabled} would return {@code true}.
      */
     @Fold
     public static boolean isEnabled() {
+        VMError.guarantee(BuildPhaseProvider.isFeatureRegistrationFinished(), "RuntimeCompilation.isEnabled() must not be called before the feature registration is finished.");
         boolean enabled = ImageSingletons.contains(RuntimeCompilationCanaryFeature.class);
         assert !enabled || DeoptimizationSupport.enabled();
         return enabled;

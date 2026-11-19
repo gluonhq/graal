@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,9 +24,22 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
+import static jdk.graal.compiler.asm.amd64.AMD64Assembler.ConditionFlag.BelowEqual;
+import static jdk.graal.compiler.lir.amd64.AMD64LIRHelper.pointerConstant;
+import static jdk.graal.compiler.lir.amd64.AMD64LIRHelper.recordExternalAddress;
+import static jdk.vm.ci.amd64.AMD64.rax;
+import static jdk.vm.ci.amd64.AMD64.rcx;
+import static jdk.vm.ci.amd64.AMD64.rdi;
+import static jdk.vm.ci.amd64.AMD64.rdx;
+import static jdk.vm.ci.amd64.AMD64.rsi;
 import static jdk.vm.ci.amd64.AMD64.xmm0;
 import static jdk.vm.ci.amd64.AMD64.xmm1;
 import static jdk.vm.ci.amd64.AMD64.xmm10;
+import static jdk.vm.ci.amd64.AMD64.xmm11;
+import static jdk.vm.ci.amd64.AMD64.xmm12;
+import static jdk.vm.ci.amd64.AMD64.xmm13;
+import static jdk.vm.ci.amd64.AMD64.xmm14;
+import static jdk.vm.ci.amd64.AMD64.xmm15;
 import static jdk.vm.ci.amd64.AMD64.xmm2;
 import static jdk.vm.ci.amd64.AMD64.xmm3;
 import static jdk.vm.ci.amd64.AMD64.xmm4;
@@ -36,54 +49,53 @@ import static jdk.vm.ci.amd64.AMD64.xmm7;
 import static jdk.vm.ci.amd64.AMD64.xmm8;
 import static jdk.vm.ci.amd64.AMD64.xmm9;
 import static jdk.vm.ci.code.ValueUtil.asRegister;
-import static jdk.graal.compiler.asm.amd64.AMD64Assembler.ConditionFlag.BelowEqual;
-import static jdk.graal.compiler.lir.amd64.AMD64LIRHelper.pointerConstant;
-import static jdk.graal.compiler.lir.amd64.AMD64LIRHelper.recordExternalAddress;
+
+import java.util.EnumSet;
 
 import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.asm.amd64.AMD64Address;
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
+import jdk.graal.compiler.core.amd64.AMD64LIRGenerator;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.SyncPort;
 import jdk.graal.compiler.lir.asm.ArrayDataPointerConstant;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
-import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
+import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.Value;
 
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/be2b92bd8b43841cc2b9c22ed4fde29be30d47bb/src/hotspot/cpu/x86/stubGenerator_x86_64.cpp#L1517-L1559",
-          sha1 = "593a45db708f1b6a74086cf170612c1102fe56c2")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/8c9d091f19760deece8daf3e57add85482b9f2a7/src/hotspot/cpu/x86/macroAssembler_x86_sha.cpp#L235-L493",
-          sha1 = "722bdd7519a7d7b9d9cec900af38137f1849ac4e")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/c59e44a7aa2aeff0823830b698d524523b996650/src/hotspot/cpu/x86/stubGenerator_x86_64.cpp#L1579-L1632",
+          sha1 = "ab4fd62b52f1ad67abecf4cb2f919c5cd2c27610")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/9eeb86d972ac4cc38d923b2b868b426bbd27a4e8/src/hotspot/cpu/x86/macroAssembler_x86_sha.cpp#L234-L467",
+          sha1 = "fa2ae53c6b33b111e059e68ac3da4a9f17de3481")
 // @formatter:on
 public final class AMD64SHA256Op extends AMD64LIRInstruction {
 
     public static final LIRInstructionClass<AMD64SHA256Op> TYPE = LIRInstructionClass.create(AMD64SHA256Op.class);
 
-    @Alive({OperandFlag.REG}) private Value bufValue;
-    @Alive({OperandFlag.REG}) private Value stateValue;
-    @Alive({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value ofsValue;
-    @Alive({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value limitValue;
+    @Use({OperandFlag.REG}) private Value bufValue;
+    @Use({OperandFlag.REG}) private Value stateValue;
+    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value ofsValue;
+    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value limitValue;
 
     @Def({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value resultValue;
 
     @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value bufTempValue;
     @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value ofsTempValue;
-    @Temp({OperandFlag.REG}) private Value keyTempValue;
+    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value raxTempValue;
     @Temp({OperandFlag.REG}) private Value[] temps;
 
     private final boolean multiBlock;
 
-    public AMD64SHA256Op(LIRGeneratorTool tool, AllocatableValue bufValue, AllocatableValue stateValue) {
-        this(tool, bufValue, stateValue, Value.ILLEGAL, Value.ILLEGAL, Value.ILLEGAL, false);
+    public AMD64SHA256Op(AMD64LIRGenerator tool, EnumSet<CPUFeature> runtimeCheckedCPUFeatures, AllocatableValue bufValue, AllocatableValue stateValue) {
+        this(tool, runtimeCheckedCPUFeatures, bufValue, stateValue, Value.ILLEGAL, Value.ILLEGAL, Value.ILLEGAL, false);
     }
 
-    public AMD64SHA256Op(LIRGeneratorTool tool, AllocatableValue bufValue, AllocatableValue stateValue, AllocatableValue ofsValue,
+    public AMD64SHA256Op(AMD64LIRGenerator tool, EnumSet<CPUFeature> runtimeCheckedCPUFeatures, AllocatableValue bufValue, AllocatableValue stateValue, AllocatableValue ofsValue,
                     AllocatableValue limitValue, AllocatableValue resultValue, boolean multiBlock) {
         super(TYPE);
 
@@ -95,25 +107,52 @@ public final class AMD64SHA256Op extends AMD64LIRInstruction {
 
         this.multiBlock = multiBlock;
 
-        this.keyTempValue = tool.newVariable(bufValue.getValueKind());
+        GraalError.guarantee(asRegister(bufValue).equals(rdi), "expect bufValue at rdi, but was %s", bufValue);
+        GraalError.guarantee(asRegister(stateValue).equals(rsi), "expect stateValue at rsi, but was %s", stateValue);
+        GraalError.guarantee(!multiBlock || asRegister(ofsValue).equals(rdx), "expect ofsValue at rdx, but was %s", ofsValue);
+        GraalError.guarantee(!multiBlock || asRegister(limitValue).equals(rcx), "expect limitValue at rcx, but was %s", limitValue);
+        GraalError.guarantee(!multiBlock || asRegister(resultValue).equals(rax), "expect resultValue at rax, but was %s", resultValue);
 
-        this.temps = new Value[]{
-                        xmm0.asValue(),
-                        xmm1.asValue(),
-                        xmm2.asValue(),
-                        xmm3.asValue(),
-                        xmm4.asValue(),
-                        xmm5.asValue(),
-                        xmm6.asValue(),
-                        xmm7.asValue(),
-                        xmm8.asValue(),
-                        xmm9.asValue(),
-                        xmm10.asValue(),
-        };
+        this.raxTempValue = multiBlock ? Value.ILLEGAL : rax.asValue();
+
+        if (AMD64ComplexVectorOp.supports(tool.target(), runtimeCheckedCPUFeatures, CPUFeature.AVX)) {
+            // vzeroupper clears upper bits of xmm0-xmm15
+            this.temps = new Value[]{
+                            xmm0.asValue(),
+                            xmm1.asValue(),
+                            xmm2.asValue(),
+                            xmm3.asValue(),
+                            xmm4.asValue(),
+                            xmm5.asValue(),
+                            xmm6.asValue(),
+                            xmm7.asValue(),
+                            xmm8.asValue(),
+                            xmm9.asValue(),
+                            xmm10.asValue(),
+                            xmm11.asValue(),
+                            xmm12.asValue(),
+                            xmm13.asValue(),
+                            xmm14.asValue(),
+                            xmm15.asValue(),
+            };
+        } else {
+            this.temps = new Value[]{
+                            xmm0.asValue(),
+                            xmm1.asValue(),
+                            xmm2.asValue(),
+                            xmm3.asValue(),
+                            xmm4.asValue(),
+                            xmm5.asValue(),
+                            xmm6.asValue(),
+                            xmm7.asValue(),
+                            xmm8.asValue(),
+                            xmm9.asValue(),
+            };
+        }
 
         if (multiBlock) {
-            this.bufTempValue = tool.newVariable(bufValue.getValueKind());
-            this.ofsTempValue = tool.newVariable(ofsValue.getValueKind());
+            this.bufTempValue = bufValue;
+            this.ofsTempValue = ofsValue;
         } else {
             this.bufTempValue = Value.ILLEGAL;
             this.ofsTempValue = Value.ILLEGAL;
@@ -172,8 +211,6 @@ public final class AMD64SHA256Op extends AMD64LIRInstruction {
             ofs = asRegister(ofsTempValue);
             limit = asRegister(limitValue);
 
-            masm.movq(buf, asRegister(bufValue));
-            masm.movl(ofs, asRegister(ofsValue));
         } else {
             buf = asRegister(bufValue);
             ofs = Register.None;
@@ -196,8 +233,13 @@ public final class AMD64SHA256Op extends AMD64LIRInstruction {
 
         Label labelLoop0 = new Label();
 
-        // keyTemp replaces the hardcoded rax in the original stub.
-        Register keyTemp = asRegister(keyTempValue);
+        Register keyTemp = rax;
+
+        if (masm.supports(CPUFeature.AVX)) {
+            // Insert vzeroupper here to avoid performance penalty of SSE-AVX transition between
+            // previously executed AVX instructions and the following SHA-256 instructions.
+            masm.vzeroupper();
+        }
 
         masm.movdqu(state0, new AMD64Address(state, 0));
         masm.movdqu(state1, new AMD64Address(state, 16));
@@ -402,11 +444,11 @@ public final class AMD64SHA256Op extends AMD64LIRInstruction {
         if (multiBlock) {
             // increment data pointer and loop if more to process
             masm.addq(buf, 64);
-            masm.addl(ofs, 64);
-            masm.cmplAndJcc(ofs, limit, BelowEqual, labelLoop0, false);
+            masm.addq(ofs, 64);
+            masm.cmpqAndJcc(ofs, limit, BelowEqual, labelLoop0, false);
 
             GraalError.guarantee(resultValue.getPlatformKind().equals(AMD64Kind.DWORD), "Invalid resultValue kind: %s", resultValue);
-            masm.movl(asRegister(resultValue), ofs); // return ofs
+            masm.movq(asRegister(resultValue), ofs); // return ofs
         }
 
         masm.pshufd(state0, state0, 0x1B);

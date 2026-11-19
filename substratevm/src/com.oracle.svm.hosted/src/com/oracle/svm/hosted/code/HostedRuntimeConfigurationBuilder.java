@@ -25,10 +25,11 @@
 package com.oracle.svm.hosted.code;
 
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.code.SubstrateBackendFactory;
 import com.oracle.svm.core.graal.code.SubstratePlatformConfigurationProvider;
 import com.oracle.svm.core.graal.meta.SubstrateLoweringProvider;
+import com.oracle.svm.core.graal.meta.SubstrateReplacements;
 import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 import com.oracle.svm.hosted.meta.HostedConstantFieldProvider;
@@ -42,7 +43,6 @@ import jdk.graal.compiler.bytecode.ResolvedJavaMethodBytecodeProvider;
 import jdk.graal.compiler.core.common.spi.ConstantFieldProvider;
 import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
 import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
-import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
 import jdk.graal.compiler.nodes.spi.LoopsDataProvider;
 import jdk.graal.compiler.nodes.spi.LoweringProvider;
 import jdk.graal.compiler.nodes.spi.PlatformConfigurationProvider;
@@ -55,36 +55,46 @@ import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 
+/**
+ * Builds the AOT compilation configuration for the hosted universe.
+ */
 public class HostedRuntimeConfigurationBuilder extends SharedRuntimeConfigurationBuilder {
 
-    private final HostedUniverse universe;
-    private final HostedProviders analysisProviders;
+    /**
+     * Universe used by the compilation providers after analysis.
+     */
+    private final HostedUniverse hostedUniverse;
 
-    public HostedRuntimeConfigurationBuilder(OptionValues options, SVMHost hostVM, HostedUniverse universe, HostedMetaAccess metaAccess,
-                    HostedProviders analysisProviders, ClassInitializationSupport classInitializationSupport, LoopsDataProvider originalLoopsDataProvider,
-                    SubstratePlatformConfigurationProvider platformConfig, SnippetReflectionProvider snippetReflection) {
-        super(options, hostVM, metaAccess, SubstrateBackendFactory.get()::newBackend, classInitializationSupport, originalLoopsDataProvider, platformConfig, snippetReflection);
-        this.universe = universe;
-        this.analysisProviders = analysisProviders;
+    /**
+     * Source of snippets parsed before analysis, reused by {@link HostedReplacements} after metadata
+     * transplantation into the hosted universe.
+     */
+    private final SubstrateReplacements analysisReplacements;
+
+    public HostedRuntimeConfigurationBuilder(OptionValues options, SVMHost hostVM, HostedUniverse hostedUniverse, HostedMetaAccess metaAccess,
+                    SubstrateReplacements analysisReplacements, ClassInitializationSupport classInitializationSupport, SubstratePlatformConfigurationProvider platformConfig,
+                    SnippetReflectionProvider snippetReflection) {
+        super(options, hostVM, metaAccess, SubstrateBackendFactory.get()::newBackend, classInitializationSupport, platformConfig, snippetReflection);
+        this.hostedUniverse = hostedUniverse;
+        this.analysisReplacements = analysisReplacements;
     }
 
     @Override
     protected Providers createProviders(CodeCacheProvider codeCache, ConstantReflectionProvider constantReflection, ConstantFieldProvider constantFieldProvider, ForeignCallsProvider foreignCalls,
                     LoweringProvider lowerer, Replacements replacements, StampProvider stampProvider, SnippetReflectionProvider reflectionProvider,
-                    PlatformConfigurationProvider platformConfigurationProvider, MetaAccessExtensionProvider metaAccessExtensionProvider, WordTypes wordTypes, LoopsDataProvider loopsDataProvider,
-                    IdentityHashCodeProvider identityHashCodeProvider) {
+                    PlatformConfigurationProvider platformConfigurationProvider, MetaAccessExtensionProvider metaAccessExtensionProvider, WordTypes wordTypes, LoopsDataProvider loopsDataProvider) {
         return new HostedProviders(metaAccess, codeCache, constantReflection, constantFieldProvider, foreignCalls, lowerer, replacements, stampProvider, reflectionProvider,
-                        wordTypes, platformConfigurationProvider, metaAccessExtensionProvider, loopsDataProvider, identityHashCodeProvider);
+                        wordTypes, platformConfigurationProvider, metaAccessExtensionProvider, loopsDataProvider);
     }
 
     @Override
     protected ConstantReflectionProvider createConstantReflectionProvider() {
-        return new HostedConstantReflectionProvider(universe, (HostedMetaAccess) metaAccess, classInitializationSupport);
+        return new HostedConstantReflectionProvider(hostedUniverse, (HostedMetaAccess) metaAccess, classInitializationSupport);
     }
 
     @Override
     protected ConstantFieldProvider createConstantFieldProvider() {
-        return new HostedConstantFieldProvider(metaAccess, universe.hostVM());
+        return new HostedConstantFieldProvider(metaAccess, hostedUniverse.hostVM());
     }
 
     @Override
@@ -93,13 +103,13 @@ public class HostedRuntimeConfigurationBuilder extends SharedRuntimeConfiguratio
     }
 
     @Override
-    protected Replacements createReplacements(Providers p) {
+    protected Replacements createReplacements(Providers providers) {
         BytecodeProvider bytecodeProvider = new ResolvedJavaMethodBytecodeProvider();
-        return new HostedReplacements(universe, p, ConfigurationValues.getTarget(), analysisProviders, bytecodeProvider);
+        return new HostedReplacements(hostedUniverse, providers, SubstrateTarget.singleton(), analysisReplacements, bytecodeProvider);
     }
 
     @Override
     protected CodeCacheProvider createCodeCacheProvider(RegisterConfig registerConfig) {
-        return new HostedCodeCacheProvider(ConfigurationValues.getTarget(), registerConfig);
+        return new HostedCodeCacheProvider(SubstrateTarget.singleton(), registerConfig);
     }
 }

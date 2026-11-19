@@ -25,21 +25,39 @@
  */
 package com.oracle.svm.test;
 
-import com.oracle.svm.hosted.FeatureImpl;
-import com.oracle.svm.hosted.substitute.SubstitutionReflectivityFilter;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
+import java.lang.reflect.Executable;
+import java.lang.reflect.Field;
+import java.util.Set;
+
 import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.MissingReflectionRegistrationError;
 import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.hosted.RuntimeReflection;
 import org.graalvm.nativeimage.impl.RuntimeReflectionSupport;
 import org.junit.Test;
 
-import java.lang.reflect.Executable;
-import java.lang.reflect.Field;
+import com.oracle.svm.hosted.reflect.ReflectionHostedSupport;
+import com.oracle.svm.hosted.substitute.SubstitutionReflectivityFilter;
+
+import jdk.internal.misc.Unsafe;
 
 /**
  * Tests the {@link RuntimeReflection}.
  */
 public class ReflectionRegistrationTest {
+
+    private static final int FIELD_LOOKUP_TEST_VALUE = 42;
+
+    public static class FieldLookupTarget {
+        public int value = FIELD_LOOKUP_TEST_VALUE;
+    }
+
+    public static class UnsafeAllocationTarget {
+    }
 
     public static class TestFeature implements Feature {
 
@@ -77,44 +95,114 @@ public class ReflectionRegistrationTest {
             }
 
             try {
-                ImageSingletons.lookup(RuntimeReflectionSupport.class).register(null, true, this.getClass().getMethods());
+                ImageSingletons.lookup(RuntimeReflectionSupport.class).register(null, false, this.getClass().getMethods());
                 assert false;
             } catch (NullPointerException e) {
                 assert e.getMessage().startsWith("Cannot use null value");
             }
 
             try {
-                ImageSingletons.lookup(RuntimeReflectionSupport.class).register(null, true, this.getClass().getFields());
+                ImageSingletons.lookup(RuntimeReflectionSupport.class).register(null, true, false, this.getClass().getDeclaredFields());
                 assert false;
             } catch (NullPointerException e) {
                 assert e.getMessage().startsWith("Cannot use null value");
             }
 
-            FeatureImpl.BeforeAnalysisAccessImpl impl = (FeatureImpl.BeforeAnalysisAccessImpl) access;
+            var reflectivityFilter = SubstitutionReflectivityFilter.singleton();
             try {
-                SubstitutionReflectivityFilter.shouldExclude((Class<?>) null, impl.getMetaAccess(), impl.getUniverse());
+                reflectivityFilter.shouldExclude((Class<?>) null);
                 assert false;
             } catch (NullPointerException e) {
                 // expected
             }
             try {
-                SubstitutionReflectivityFilter.shouldExclude((Executable) null, impl.getMetaAccess(), impl.getUniverse());
+                reflectivityFilter.shouldExclude((Executable) null);
                 assert false;
             } catch (NullPointerException e) {
                 // expected
             }
             try {
-                SubstitutionReflectivityFilter.shouldExclude((Field) null, impl.getMetaAccess(), impl.getUniverse());
+                reflectivityFilter.shouldExclude((Field) null);
                 assert false;
             } catch (NullPointerException e) {
                 // expected
             }
+
+            RuntimeReflection.register(FieldLookupTarget.class);
+            RuntimeReflection.registerFieldLookup(FieldLookupTarget.class, "value");
         }
 
+        @Override
+        public void afterAnalysis(AfterAnalysisAccess access) {
+            Set<String> knownClassNames = ImageSingletons.lookup(ReflectionHostedSupport.class).getKnownClassNames();
+            if (!knownClassNames.contains(FieldLookupTarget.class.getName())) {
+                throw new AssertionError(FieldLookupTarget.class.getName() + " is missing from reflection metadata");
+            }
+        }
     }
 
     @Test
     public void test() {
         // nothing to do
+    }
+
+    @Test
+    public void testFieldLookupAllowsAccess() throws ReflectiveOperationException {
+        Field field = FieldLookupTarget.class.getDeclaredField("value");
+        assertEquals(FIELD_LOOKUP_TEST_VALUE, field.get(new FieldLookupTarget()));
+    }
+
+    private static Object unsafeAllocate(Class<?> clazz) throws ReflectiveOperationException {
+        Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        return ((Unsafe) unsafeField.get(null)).allocateInstance(clazz);
+    }
+
+    @NativeImageBuildArgs({
+                    "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
+                    "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
+    })
+    public static class UnsafeAllocationLegacyTest {
+        @Test
+        public void testUnregisteredUnsafeAllocationKeepsLegacyExceptionType() {
+            IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> unsafeAllocate(UnsafeAllocationTarget.class));
+            assertTrue(exception.getMessage().contains("unsafeAllocated"));
+        }
+    }
+
+    @NativeImageBuildArgs({
+                    "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
+                    "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+                    "--future-defaults=exact-reflection"
+    })
+    public static class ExactReflectionFutureDefaultTest {
+        @Test
+        public void testUnregisteredUnsafeAllocationThrowsMissingRegistrationError() {
+            assertThrows(MissingReflectionRegistrationError.class, () -> unsafeAllocate(UnsafeAllocationTarget.class));
+        }
+    }
+
+    @NativeImageBuildArgs({
+                    "--exact-reachability-metadata=com.oracle.svm.test",
+                    "--features=com.oracle.svm.test.ReflectionRegistrationTest$ExactReachabilityTest$TestFeature"
+    })
+    public static class ExactReachabilityTest {
+        public static class TestFeature implements Feature {
+            @Override
+            public void beforeAnalysis(BeforeAnalysisAccess access) {
+                RuntimeReflection.registerFieldLookup(FieldLookupTarget.class, "value");
+            }
+        }
+
+        @Test
+        public void testFieldLookupAllowsQueryOnly() throws NoSuchFieldException {
+            Field field = FieldLookupTarget.class.getDeclaredField(fieldName());
+            assertEquals(fieldName(), field.getName());
+            assertThrows(MissingReflectionRegistrationError.class, () -> field.get(new FieldLookupTarget()));
+        }
+
+        private static String fieldName() {
+            return System.nanoTime() == Long.MIN_VALUE ? "missing" : "value";
+        }
     }
 }

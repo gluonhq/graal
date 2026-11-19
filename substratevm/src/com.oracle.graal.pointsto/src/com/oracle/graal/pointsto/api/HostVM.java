@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2021, 2021, Alibaba Group Holding Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -27,7 +27,6 @@
 package com.oracle.graal.pointsto.api;
 
 import java.lang.reflect.AnnotatedElement;
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -35,13 +34,17 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiConsumer;
-import java.util.function.Function;
+import java.util.function.Predicate;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.hosted.Feature.DuringAnalysisAccess;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.flow.AnalysisParsedGraph.GraphMetadata;
+import com.oracle.graal.pointsto.flow.AnalysisParsedGraph.Stage;
 import com.oracle.graal.pointsto.flow.InvokeTypeFlow;
+import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
@@ -49,7 +52,11 @@ import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.graal.pointsto.phases.InlineBeforeAnalysisGraphDecoder;
 import com.oracle.graal.pointsto.phases.InlineBeforeAnalysisPolicy;
 import com.oracle.graal.pointsto.util.AnalysisError;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.util.OriginalClassProvider;
 
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
 import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
@@ -61,8 +68,10 @@ import jdk.graal.compiler.nodes.graphbuilderconf.IntrinsicContext;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.OptimisticOptimizations;
 import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.annotation.Annotated;
 
 /**
  * This abstract class defines the functionality that the hosting VM must support.
@@ -71,13 +80,15 @@ public abstract class HostVM {
 
     protected final OptionValues options;
     protected final ClassLoader classLoader;
+    protected final List<BiConsumer<AnalysisMethod, StructuredGraph>> methodAfterBytecodeParsedListeners;
     protected final List<BiConsumer<AnalysisMethod, StructuredGraph>> methodAfterParsingListeners;
     private final List<BiConsumer<DuringAnalysisAccess, Class<?>>> classReachabilityListeners;
-    private HostedProviders providers;
+    protected HostedProviders providers;
 
     protected HostVM(OptionValues options, ClassLoader classLoader) {
         this.options = options;
         this.classLoader = classLoader;
+        this.methodAfterBytecodeParsedListeners = new CopyOnWriteArrayList<>();
         this.methodAfterParsingListeners = new CopyOnWriteArrayList<>();
         this.classReachabilityListeners = new ArrayList<>();
     }
@@ -92,7 +103,7 @@ public abstract class HostVM {
 
     /**
      * Check if the provided object is a relocated pointer.
-     * 
+     *
      * @param constant the constant to check
      */
     public boolean isRelocatedPointer(JavaConstant constant) {
@@ -101,7 +112,7 @@ public abstract class HostVM {
 
     /**
      * Hook for handling foreign calls.
-     * 
+     *
      * @param foreignCallDescriptor the foreign call descriptor
      * @param foreignCallsProvider the foreign calls provider
      * @return the {@link AnalysisMethod} modeling the foreign call, if supported
@@ -120,15 +131,24 @@ public abstract class HostVM {
                 type.setReachabilityListenerNotified(true);
 
                 for (BiConsumer<DuringAnalysisAccess, Class<?>> listener : classReachabilityListeners) {
-                    listener.accept(access, type.getJavaClass());
+                    listener.accept(access, OriginalClassProvider.getJavaClass(type));
                 }
             }
         }
     }
 
     /**
+     * Run validation checks for reachable objects before registering them in the shadow heap.
+     *
+     * @param bb the active analysis
+     * @param constant the hosted object constant to validate
+     */
+    public void validateReachableObject(BigBang bb, JavaConstant constant) {
+    }
+
+    /**
      * Register newly created type.
-     * 
+     *
      * @param newValue the type to register
      */
     public void registerType(AnalysisType newValue) {
@@ -145,7 +165,7 @@ public abstract class HostVM {
 
     /**
      * Run additional checks on a type before the corresponding {@link AnalysisType} is created.
-     * 
+     *
      * @param type the hosted type
      * @param universe the analysis universe
      */
@@ -154,7 +174,7 @@ public abstract class HostVM {
 
     /**
      * Run initialization tasks for a newly created {@link AnalysisType}.
-     * 
+     *
      * @param newValue the type to initialize
      */
     public abstract void onTypeReachable(BigBang bb, AnalysisType newValue);
@@ -168,7 +188,11 @@ public abstract class HostVM {
     public void onTypeInstantiated(BigBang bb, AnalysisType type) {
     }
 
-    public boolean useBaseLayer() {
+    public boolean isCoreType(@SuppressWarnings("unused") ResolvedJavaType type) {
+        return false;
+    }
+
+    public boolean analyzedInPriorLayer(@SuppressWarnings("unused") AnalysisMethod method) {
         return false;
     }
 
@@ -180,7 +204,7 @@ public abstract class HostVM {
     /**
      * Hook to change the {@link GraphBuilderConfiguration} used for parsing a method during
      * analysis.
-     * 
+     *
      * @param config The default configuration used by the static analysis.
      * @param method The method that is going to be parsed with the returned configuration.
      * @return The updated configuration for the method.
@@ -207,31 +231,68 @@ public abstract class HostVM {
     public void recordActivity() {
     }
 
-    public void addMethodAfterParsingListener(BiConsumer<AnalysisMethod, StructuredGraph> methodAfterParsingHook) {
-        methodAfterParsingListeners.add(methodAfterParsingHook);
+    public void addMethodAfterBytecodeParsedListener(BiConsumer<AnalysisMethod, StructuredGraph> listener) {
+        methodAfterBytecodeParsedListeners.add(listener);
+    }
+
+    public void addMethodAfterParsingListener(BiConsumer<AnalysisMethod, StructuredGraph> listener) {
+        methodAfterParsingListeners.add(listener);
     }
 
     /**
-     * Can be overwritten to run code after a method is parsed.
+     * Can be overwritten to run code after the bytecode of a method is parsed. This hook is only
+     * invoked if
+     * {@link com.oracle.graal.pointsto.flow.AnalysisParsedGraph.Stage#isRequiredStage(Stage, AnalysisMethod)}
+     * is true for the given method and stage {@link Stage#BYTECODE_PARSED}. If the hook is invoked,
+     * it is guaranteed to be invoked before
+     * {@link #methodAfterParsingHook}.
      *
      * @param bb the analysis engine
      * @param method the newly parsed method
      * @param graph the method graph
      */
-    public void methodAfterParsingHook(BigBang bb, AnalysisMethod method, StructuredGraph graph) {
+    public void methodAfterBytecodeParsedHook(BigBang bb, AnalysisMethod method, StructuredGraph graph) {
+        AnalysisError.guarantee(Stage.isRequiredStage(Stage.firstStage(), method));
+        for (BiConsumer<AnalysisMethod, StructuredGraph> listener : methodAfterBytecodeParsedListeners) {
+            listener.accept(method, graph);
+        }
+    }
+
+    /**
+     * Processes a freshly parsed method graph before encoding and publication to the analysis.
+     * Implementations may apply pre-analysis optimizations and collect metadata for this parse.
+     *
+     * @param bb the analysis engine
+     * @param method the newly parsed method
+     * @param graph the method graph
+     * @param metadata collects metadata to retain with this graph's encoding
+     */
+    public void methodAfterParsingHook(BigBang bb, AnalysisMethod method, StructuredGraph graph, GraphMetadata.Builder metadata) {
         for (BiConsumer<AnalysisMethod, StructuredGraph> listener : methodAfterParsingListeners) {
             listener.accept(method, graph);
         }
     }
 
     /**
-     * Can be overwritten to run code before a method is created.
+     * Can be overwritten to run code before a method's type-flow graph is created.
      *
      * @param bb the analysis engine
      * @param method the newly created method
      * @param graph the method graph
      */
     public void methodBeforeTypeFlowCreationHook(BigBang bb, AnalysisMethod method, StructuredGraph graph) {
+    }
+
+    /**
+     * Controls whether the post-analysis graph should be preserved on the {@link AnalysisMethod}
+     * after type-flow creation completed.
+     *
+     * Hosted Native Image keeps this graph for later strengthening and compilation phases.
+     * Standalone analysis can override this when the analysis result is consumed directly and no
+     * later phase needs {@link AnalysisMethod#getAnalyzedGraph()}.
+     */
+    public boolean shouldStoreAnalyzedGraph(@SuppressWarnings("unused") BigBang bb, @SuppressWarnings("unused") AnalysisMethod method) {
+        return true;
     }
 
     /**
@@ -242,6 +303,23 @@ public abstract class HostVM {
     public boolean hasNeverInlineDirective(ResolvedJavaMethod method) {
         /* No inlining by the static analysis unless explicitly overwritten by the VM. */
         return true;
+    }
+
+    /**
+     * @return true if method must never apply constant folding based on the type flow analysis.
+     */
+    public boolean hasNeverStrengthenGraphWithConstantsDirective(@SuppressWarnings("unused") ResolvedJavaMethod method) {
+        return false;
+    }
+
+    /**
+     * Check if the method has to be inlined.
+     *
+     * @param method the target method
+     */
+    public boolean hasAlwaysInlineDirective(ResolvedJavaMethod method) {
+        /* No force inlining by the static analysis unless explicitly overwritten by the VM. */
+        return false;
     }
 
     public InlineBeforeAnalysisGraphDecoder createInlineBeforeAnalysisGraphDecoder(BigBang bb, AnalysisMethod method, StructuredGraph resultGraph) {
@@ -256,10 +334,19 @@ public abstract class HostVM {
 
     /**
      * Check if the element is supported on current platform.
-     * 
+     *
      * @param element the {@link AnnotatedElement} to check
      */
     public boolean platformSupported(AnnotatedElement element) {
+        return true;
+    }
+
+    /**
+     * Check if the element is supported on current platform.
+     *
+     * @param element the {@link Annotated} to check
+     */
+    public boolean platformSupported(Annotated element) {
         return true;
     }
 
@@ -318,100 +405,217 @@ public abstract class HostVM {
     }
 
     @SuppressWarnings("unused")
-    public HostedProviders getProviders(MultiMethod.MultiMethodKey key) {
+    public HostedProviders getProviders(MethodVariant.MethodVariantKey key) {
         return providers;
     }
 
+    /**
+     * Determine if the type is supported by the host VM and should be processed by the analysis.
+     */
     @SuppressWarnings("unused")
-    public boolean isFieldIncluded(BigBang bb, Field field) {
+    public boolean isSupportedOriginalType(BigBang bb, ResolvedJavaType type) {
         return true;
     }
 
     /**
-     * Helpers to determine what analysis actions should be taken for a given Multi-Method version.
+     * Determine if the method is supported by the host VM and should be processed by the analysis.
      */
-    public interface MultiMethodAnalysisPolicy {
+    @SuppressWarnings("unused")
+    public boolean isSupportedAnalysisMethod(BigBang bb, AnalysisMethod method) {
+        return true;
+    }
+
+    /**
+     * Determine if the method is supported by the host VM and should be processed by the analysis.
+     */
+    @SuppressWarnings("unused")
+    public boolean isSupportedOriginalMethod(BigBang bb, ResolvedJavaMethod method) {
+        return true;
+    }
+
+    /**
+     * Determine if the field is supported by the host VM and should be processed by the analysis.
+     */
+    @SuppressWarnings("unused")
+    public boolean isSupportedAnalysisField(BigBang bb, AnalysisField field) {
+        return true;
+    }
+
+    /**
+     * Determine if the field is supported by the host VM and should be processed by the analysis.
+     */
+    @SuppressWarnings("unused")
+    public boolean isSupportedOriginalField(BigBang bb, ResolvedJavaField field) {
+        return true;
+    }
+
+    /** Determine if type should be included in the shared layer. */
+    @SuppressWarnings("unused")
+    public boolean isTypeIncludedInSharedLayer(ResolvedJavaType type) {
+        return true;
+    }
+
+    /** Determine if method should be included in the shared layer. */
+    @SuppressWarnings("unused")
+    public boolean isMethodIncludedInSharedLayer(ResolvedJavaMethod method) {
+        return isTypeIncludedInSharedLayer(method.getDeclaringClass());
+    }
+
+    /** Determine if field should be included in the shared layer. */
+    @SuppressWarnings("unused")
+    public boolean isFieldIncludedInSharedLayer(ResolvedJavaField field) {
+        return isTypeIncludedInSharedLayer(field.getDeclaringClass());
+    }
+
+    /** Returns true for fields that should be always closed, even in an open-world analysis. */
+    public boolean isAlwaysClosedField(@SuppressWarnings("unused") ResolvedJavaField field) {
+        return true;
+    }
+
+    public boolean isClosedTypeWorld() {
+        return true;
+    }
+
+    public boolean enableTrackAcrossLayers() {
+        return false;
+    }
+
+    public boolean enableReachableInCurrentLayer() {
+        return false;
+    }
+
+    public boolean buildingImageLayer() {
+        return false;
+    }
+
+    public boolean buildingInitialLayer() {
+        return false;
+    }
+
+    public boolean buildingSharedLayer() {
+        return false;
+    }
+
+    public boolean buildingExtensionLayer() {
+        return false;
+    }
+
+    @SuppressWarnings("unused")
+    public boolean installableInLayer(AnalysisField aField) {
+        return true;
+    }
+
+    @SuppressWarnings("unused")
+    public boolean preventConstantFolding(AnalysisField aField) {
+        return false;
+    }
+
+    public EconomicSet<Module> getSharedLayerForbiddenModules() {
+        return EconomicSet.create();
+    }
+
+    public abstract String loaderName(AnalysisType type);
+
+    public static String loaderName(ClassLoader loader) {
+        if (loader == null) {
+            return "null";
+        }
+        var loaderName = loader.getName();
+        if (loaderName == null || loaderName.isBlank()) {
+            return loader.getClass().getName();
+        } else {
+            return loaderName;
+        }
+    }
+
+    /**
+     * Helpers to determine what analysis actions should be taken for a given method variant.
+     */
+    public interface MethodVariantsAnalysisPolicy {
 
         /**
          * Determines what versions of a method are reachable from the call.
          *
-         * @param implementation The resolved destination. {@link MultiMethod#ORIGINAL_METHOD}.
-         * @param target The original target. This should be a {@link MultiMethod#ORIGINAL_METHOD}.
-         * @param callerMultiMethodKey The context in which the call is being made.
+         * @param implementation The resolved destination. {@link MethodVariant#ORIGINAL_METHOD}.
+         * @param target The original target. This should be a
+         *            {@link MethodVariant#ORIGINAL_METHOD}.
+         * @param callerMethodVariantKey The context in which the call is being made.
          * @return Collection of possible targets for a given implementation, target, and caller
-         *         multi-method key. This method is expected to return a consistent value when
+         *         method variant key. This method is expected to return a consistent value when
          *         called multiple times with the same parameters; hence, values returned by this
          *         method are allowed to be cached
          */
-        <T extends AnalysisMethod> Collection<T> determineCallees(BigBang bb, T implementation, T target, MultiMethod.MultiMethodKey callerMultiMethodKey, InvokeTypeFlow invokeFlow);
+        <T extends AnalysisMethod> Collection<T> determineCallees(BigBang bb, T implementation, T target, MethodVariant.MethodVariantKey callerMethodVariantKey, InvokeTypeFlow invokeFlow);
 
         /**
          * Decides whether the caller's flows should be linked to callee's parameters flows.
          */
-        boolean performParameterLinking(MultiMethod.MultiMethodKey callerMultiMethodKey, MultiMethod.MultiMethodKey calleeMultiMethodKey);
+        boolean performParameterLinking(MethodVariant.MethodVariantKey callerMethodVariantKey, MethodVariant.MethodVariantKey calleeMethodVariantKey);
 
         /**
          * Decides whether the callee's return flow should be linked to caller's flows.
          */
-        boolean performReturnLinking(MultiMethod.MultiMethodKey callerMultiMethodKey, MultiMethod.MultiMethodKey calleeMultiMethodKey);
+        boolean performReturnLinking(MethodVariant.MethodVariantKey callerMethodVariantKey, MethodVariant.MethodVariantKey calleeMethodVariantKey);
 
         /**
          * Decides whether analysis should compute the returned parameter index.
          */
-        boolean canComputeReturnedParameterIndex(MultiMethod.MultiMethodKey multiMethodKey);
+        boolean canComputeReturnedParameterIndex(MethodVariant.MethodVariantKey methodVariantKey);
 
         /**
          * Decides whether placeholder flows should be inserted for missing object parameter and
          * return values.
          */
-        boolean insertPlaceholderParamAndReturnFlows(MultiMethod.MultiMethodKey multiMethodKey);
+        boolean insertPlaceholderParamAndReturnFlows(MethodVariant.MethodVariantKey methodVariantKey);
 
         /**
          * Some methods can be transformed after analysis; in these cases we do not know what the
          * returned value will be.
          */
-        boolean unknownReturnValue(BigBang bb, MultiMethod.MultiMethodKey callerMultiMethodKey, AnalysisMethod implementation);
+        boolean unknownReturnValue(BigBang bb, MethodVariant.MethodVariantKey callerMethodVariantKey, AnalysisMethod implementation);
 
     }
 
     /**
      * The default policy does not alter the typical analysis behavior.
      */
-    protected static final MultiMethodAnalysisPolicy DEFAULT_MULTIMETHOD_ANALYSIS_POLICY = new MultiMethodAnalysisPolicy() {
+    protected static final MethodVariantsAnalysisPolicy DEFAULT_METHOD_VARIANTS_ANALYSIS_POLICY = new DefaultMethodVariantsAnalysisPolicy();
 
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
+    private static final class DefaultMethodVariantsAnalysisPolicy implements MethodVariantsAnalysisPolicy {
         @Override
-        public <T extends AnalysisMethod> Collection<T> determineCallees(BigBang bb, T implementation, T target, MultiMethod.MultiMethodKey callerMultiMethodKey, InvokeTypeFlow invokeFlow) {
+        public <T extends AnalysisMethod> Collection<T> determineCallees(BigBang bb, T implementation, T target, MethodVariant.MethodVariantKey callerMethodVariantKey, InvokeTypeFlow invokeFlow) {
             return List.of(implementation);
         }
 
         @Override
-        public boolean performParameterLinking(MultiMethod.MultiMethodKey callerMultiMethodKey, MultiMethod.MultiMethodKey calleeMultiMethodKey) {
+        public boolean performParameterLinking(MethodVariant.MethodVariantKey callerMethodVariantKey, MethodVariant.MethodVariantKey calleeMethodVariantKey) {
             return true;
         }
 
         @Override
-        public boolean performReturnLinking(MultiMethod.MultiMethodKey callerMultiMethodKey, MultiMethod.MultiMethodKey calleeMultiMethodKey) {
+        public boolean performReturnLinking(MethodVariant.MethodVariantKey callerMethodVariantKey, MethodVariant.MethodVariantKey calleeMethodVariantKey) {
             return true;
         }
 
         @Override
-        public boolean canComputeReturnedParameterIndex(MultiMethod.MultiMethodKey multiMethodKey) {
+        public boolean canComputeReturnedParameterIndex(MethodVariant.MethodVariantKey methodVariantKey) {
             return true;
         }
 
         @Override
-        public boolean insertPlaceholderParamAndReturnFlows(MultiMethod.MultiMethodKey multiMethodKey) {
+        public boolean insertPlaceholderParamAndReturnFlows(MethodVariant.MethodVariantKey methodVariantKey) {
             return false;
         }
 
         @Override
-        public boolean unknownReturnValue(BigBang bb, MultiMethod.MultiMethodKey callerMultiMethodKey, AnalysisMethod implementation) {
+        public boolean unknownReturnValue(BigBang bb, MethodVariant.MethodVariantKey callerMethodVariantKey, AnalysisMethod implementation) {
             return false;
         }
-    };
+    }
 
-    public MultiMethodAnalysisPolicy getMultiMethodAnalysisPolicy() {
-        return DEFAULT_MULTIMETHOD_ANALYSIS_POLICY;
+    public MethodVariantsAnalysisPolicy getMethodVariantsAnalysisPolicy() {
+        return DEFAULT_METHOD_VARIANTS_ANALYSIS_POLICY;
     }
 
     public boolean ignoreInstanceOfTypeDisallowed() {
@@ -421,8 +625,8 @@ public abstract class HostVM {
     /**
      * Returns the function Strengthen Graphs should use to improve types based on analysis results.
      */
-    public Function<AnalysisType, ResolvedJavaType> getStrengthenGraphsToTargetFunction(@SuppressWarnings("unused") MultiMethod.MultiMethodKey key) {
-        return (t) -> t;
+    public Predicate<AnalysisType> getStrengthenGraphsTypePredicate(@SuppressWarnings("unused") MethodVariant.MethodVariantKey key) {
+        return (t) -> true;
     }
 
     public boolean allowConstantFolding(AnalysisMethod method) {

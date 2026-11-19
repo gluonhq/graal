@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,7 @@ package org.graalvm.polyglot.io;
 import java.util.Objects;
 
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.SandboxPolicy;
 
 /**
  * Represents an IO access configuration of a polyglot context. The IO access configuration
@@ -239,6 +240,12 @@ public final class IOAccess {
          * fully virtualize file system operations. An example of virtualization is a <a href=
          * "https://github.com/oracle/graal/blob/master/truffle/src/com.oracle.truffle.api.test/src/com/oracle/truffle/api/test/polyglot/MemoryFileSystem.java">memory-based
          * file system</a>.
+         * <p>
+         * GraalVM trusts a custom file system supplied by the embedder. Its methods may be invoked
+         * with guest-controlled input, so the embedder must ensure that the implementation is safe
+         * for use with the selected {@link SandboxPolicy sandbox policy}. Sandbox validation rejects
+         * file systems known to expose the default host file system, but it does not inspect the
+         * behavior of arbitrary custom implementations.
          *
          * @param fileSystem the file system to use in the guest language
          * @return the {@link Builder}
@@ -247,6 +254,35 @@ public final class IOAccess {
         public Builder fileSystem(FileSystem fileSystem) {
             this.customFileSystem = Objects.requireNonNull(fileSystem, "FileSystem must be non null.");
             return this;
+        }
+
+        /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("IOAccess.newBuilder()");
+            if (allowHostFileAccess) {
+                appendCall(b, "allowHostFileAccess", true);
+            }
+            if (allowHostSocketAccess) {
+                appendCall(b, "allowHostSocketAccess", true);
+            }
+            if (customFileSystem != null) {
+                appendCall(b, "fileSystem", customFileSystem);
+            }
+            return b.toString();
+        }
+
+        private static void appendCall(StringBuilder b, String methodName, Object value) {
+            b.append('\n');
+            b.append("  .");
+            b.append(methodName);
+            b.append('(');
+            b.append(String.valueOf(value));
+            b.append(')');
         }
 
         /**

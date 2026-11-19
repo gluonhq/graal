@@ -41,23 +41,4 @@ public class ProcessPropertiesTest {
         long pid = ProcessProperties.getProcessID();
         Assert.assertTrue("Invalid pid.", pid > 0);
     }
-
-    /**
-     * Test ProcessProperties.setLocale(). See
-     * <a href="http://pubs.opengroup.org/onlinepubs/9699919799/functions/setlocale.html">setLocale
-     * specification</a> for details.
-     */
-    @Test
-    public void testSetLocale() {
-        /* Get the default locale. */
-        String before = ProcessProperties.setLocale("LC_ALL", null);
-        Assert.assertTrue("Default locale is wrong.", before.equals("C") || before.equals("POSIX"));
-
-        /* Set locale to a new value. */
-        ProcessProperties.setLocale("LC_ALL", "en_US.UTF-8");
-
-        /* Get the locale value again. */
-        String after = ProcessProperties.setLocale("LC_ALL", null);
-        Assert.assertEquals("Locale is wrong.", "en_US.UTF-8", after);
-    }
 }

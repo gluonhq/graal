@@ -24,19 +24,19 @@
  */
 package com.oracle.svm.hosted.code;
 
-import org.graalvm.nativeimage.AnnotationAccess;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.word.impl.Word.Operation;
 
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaMethod;
-import com.oracle.svm.core.option.HostedOptionValues;
+import com.oracle.svm.shared.option.HostedOptionValues;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.graal.compiler.graph.Node.NodeIntrinsic;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
 import jdk.graal.compiler.nodes.spi.Replacements;
-import jdk.graal.compiler.word.Word.Operation;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -64,15 +64,23 @@ public class NativeMethodSubstitutionProcessor extends SubstitutionProcessor {
             assert !(method instanceof WrappedJavaMethod) : "Must not see AnalysisMethod or HostedMethod here";
             return method;
         }
-        assert !AnnotationAccess.isAnnotationPresent(method, CFunction.class) : "CFunction must have been handled by another SubstitutionProcessor";
-        if (AnnotationAccess.isAnnotationPresent(method, NodeIntrinsic.class) || AnnotationAccess.isAnnotationPresent(method, Operation.class) ||
-                        AnnotationAccess.isAnnotationPresent(method, CConstant.class)) {
+        assert !GuestAnnotationAccess.isAnnotationPresent(method, CFunction.class) : "CFunction must have been handled by another SubstitutionProcessor";
+        if (GuestAnnotationAccess.isAnnotationPresent(method, NodeIntrinsic.class) || GuestAnnotationAccess.isAnnotationPresent(method, Operation.class) ||
+                        GuestAnnotationAccess.isAnnotationPresent(method, CConstant.class)) {
             return method;
         }
-        boolean isHandledByPlugin = replacements.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method, HostedOptionValues.singleton()) != null;
+        boolean isHandledByPlugin = isHandledByPlugin(method);
         if (isHandledByPlugin) {
             return method;
         }
         return processor.lookup(method);
+    }
+
+    private boolean isHandledByPlugin(ResolvedJavaMethod method) {
+        InvocationPlugin plugin = replacements.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method, HostedOptionValues.singleton().get());
+        if (plugin instanceof InvocationPlugin.ConditionalInvocationPlugin conditionalInvocationPlugin) {
+            return conditionalInvocationPlugin.isApplicable(replacements.getProviders().getLowerer().getTarget().arch);
+        }
+        return plugin != null;
     }
 }

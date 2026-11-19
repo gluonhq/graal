@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,21 +25,23 @@
 
 package com.oracle.svm.core.jdk.resources.CompressedGlobTrie;
 
-import static com.oracle.svm.core.jdk.resources.CompressedGlobTrie.GlobTrieNode.LEVEL_IDENTIFIER;
-import static com.oracle.svm.core.jdk.resources.CompressedGlobTrie.GlobTrieNode.STAR;
-import static com.oracle.svm.core.jdk.resources.CompressedGlobTrie.GlobTrieNode.STAR_STAR;
+import static com.oracle.svm.util.GlobUtils.LEVEL_IDENTIFIER;
+import static com.oracle.svm.util.GlobUtils.STAR;
+import static com.oracle.svm.util.GlobUtils.STAR_STAR;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.regex.Pattern;
+import java.util.function.Predicate;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.util.StringUtil;
+import com.oracle.svm.core.ClassLoaderSupport;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.StringUtil;
+import com.oracle.svm.util.GlobUtils;
 
 /**
  * This data structure represents an immutable, Trie-like data structure that stores glob patterns
@@ -47,36 +49,36 @@ import com.oracle.svm.util.StringUtil;
  *
  * The structure can be created using {@link CompressedGlobTrieBuilder#build(List)} where list
  * parameter represents list of glob patterns given in any order. At the very beginning, all given
- * globs will be validated using {@link CompressedGlobTrieBuilder#validatePattern(String)}. If all
- * globs were correct, they will be classified (with
- * {@link CompressedGlobTrieBuilder#classifyPatterns(List, List, List, List)}) and sorted (using
- * {@link CompressedGlobTrieBuilder#comparePatterns(GlobWithInfo, GlobWithInfo)} as the comparator
- * function). This preprocessing phase allows incremental structure build, going from the most
- * general glob pattern to the more specific ones. Furthermore, when trying to add a new glob, the
- * structure will first check if the given glob can be matched with some glob that already exists in
- * the structure (NOTE: possibly more than one glob pattern from the structure can match the new
- * pattern). When that is not the case, a new pattern will be added using
- * {@link CompressedGlobTrieBuilder#addNewBranch(GlobTrieNode, List, int, String)}. This function
- * will attempt identical matching (where wildcards have no special semantics) to move as deep in
- * the structure as possible. Once it cannot proceed with the existing branches, the function will
- * append rest of the pattern as the new branch. At the end, each node (not necessarily leaf) that
- * represents end of the glob, can store additional content.
+ * globs will be validated using {@link GlobUtils#validatePattern(String)}. If all globs were
+ * correct, they will be classified (with
+ * {@link CompressedGlobTrieBuilder#classifyPatterns(List, List, List, List, boolean)}) and sorted
+ * (using {@link CompressedGlobTrieBuilder#comparePatterns(GlobWithInfo, GlobWithInfo)} as the
+ * comparator function). This preprocessing phase allows incremental structure build, going from the
+ * most general glob pattern to the more specific ones. Furthermore, when trying to add a new glob,
+ * the structure will first check if the given glob can be matched with some glob that already
+ * exists in the structure (NOTE: possibly more than one glob pattern from the structure can match
+ * the new pattern). When that is not the case, a new pattern will be added using
+ * {@link CompressedGlobTrieBuilder#addNewBranch}. This function will attempt identical matching
+ * (where wildcards have no special semantics) to move as deep in the structure as possible. Once it
+ * cannot proceed with the existing branches, the function will append rest of the pattern as the
+ * new branch. At the end, each node (not necessarily leaf) that represents end of the glob, can
+ * store additional content.
  *
  * When created, the structure can be used to either check if the given text can be matched with
  * globs from the structure (using {@link #match(GlobTrieNode, String)}) or to fetch all additional
  * content from globs that can match given text (using
- * {@link #getAdditionalContentIfMatched(GlobTrieNode, String)}).
+ * {@link #getHostedOnlyContentIfMatched(GlobTrieNode, String)}).
  */
 public class CompressedGlobTrie {
 
-    public record GlobWithInfo(String pattern, String additionalContent) {
+    public record GlobWithInfo<C>(String pattern, C additionalContent) {
     }
 
     /*
      * Data transfer object that points to the next matched child instance and its index in the
      * pattern parts list
      */
-    private record MatchedNode(GlobTrieNode child, int lastMatchedChildIndex) {
+    private record MatchedNode<C>(GlobTrieNode<C> child, int lastMatchedChildIndex) {
     }
 
     /*
@@ -92,23 +94,29 @@ public class CompressedGlobTrie {
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public static class CompressedGlobTrieBuilder {
+    public static class CompressedGlobTrieBuilder<C> {
         /**
          * Builds an immutable CompressedGlobTrie structure from glob patterns given in any order
          * with possibly additional context.
          */
-        public static GlobTrieNode build(List<GlobWithInfo> patterns) {
-            GlobTrieNode root = new GlobTrieNode();
-            /* classify patterns in groups */
-            List<GlobWithInfo> doubleStarPatterns = new ArrayList<>();
-            List<GlobWithInfo> starPatterns = new ArrayList<>();
-            List<GlobWithInfo> noStarPatterns = new ArrayList<>();
+        public static <C> GlobTrieNode<C> build(List<GlobWithInfo<C>> patterns) {
+            return build(patterns, true);
+        }
 
-            List<String> invalidPatterns = classifyPatterns(patterns, doubleStarPatterns, starPatterns, noStarPatterns);
-            if (!invalidPatterns.isEmpty()) {
-                StringBuilder sb = new StringBuilder("Error: invalid glob patterns found:" + System.lineSeparator());
-                invalidPatterns.forEach(msg -> sb.append(msg).append(System.lineSeparator()));
-                throw UserError.abort(sb.toString());
+        /**
+         * Builds an immutable CompressedGlobTrie structure from glob patterns given in any order
+         * with possibly additional context. Validation of patterns can be turned off.
+         */
+        public static <C> GlobTrieNode<C> build(List<GlobWithInfo<C>> patterns, boolean validatePatterns) {
+            GlobTrieNode<C> root = new GlobTrieNode<>();
+            /* classify patterns in groups */
+            List<GlobWithInfo<C>> doubleStarPatterns = new ArrayList<>();
+            List<GlobWithInfo<C>> starPatterns = new ArrayList<>();
+            List<GlobWithInfo<C>> noStarPatterns = new ArrayList<>();
+
+            List<String> invalidPatternsErrors = classifyPatterns(patterns, doubleStarPatterns, starPatterns, noStarPatterns, validatePatterns);
+            if (!invalidPatternsErrors.isEmpty()) {
+                invalidPatternsErrors.forEach(LogUtils::warning);
             }
 
             /* sort patterns in the groups based on generality */
@@ -123,27 +131,40 @@ public class CompressedGlobTrie {
             starPatterns.forEach(pattern -> addPattern(root, pattern));
             noStarPatterns.forEach(pattern -> addPattern(root, pattern));
 
-            root.trim();
             return root;
         }
 
-        private static void addPattern(GlobTrieNode root, GlobWithInfo pattern) {
-            List<GlobTrieNode> parts = getPatternParts(pattern.pattern());
+        /*
+         * this function should be called only when we are certain that all possible wildcards are
+         * actually escaped (i.e. only after validatePattern function)
+         */
+        private static String unescapePossibleWildcards(String pattern) {
+            String unescapedPattern = pattern;
+            for (char esc : GlobUtils.ALWAYS_ESCAPED_GLOB_WILDCARDS) {
+                unescapedPattern = unescapedPattern.replace("\\" + esc, String.valueOf(esc));
+            }
+
+            return unescapedPattern;
+        }
+
+        private static <C> void addPattern(GlobTrieNode<C> root, GlobWithInfo<C> pattern) {
+            String unescapedPattern = unescapePossibleWildcards(pattern.pattern());
+            List<GlobTrieNode<C>> parts = getPatternParts(unescapedPattern);
 
             /*
              * if this pattern can be matched with some other existing pattern, we should just
              * update content of leafs
              */
-            List<GlobTrieNode> reachableNodes = new ArrayList<>();
+            List<GlobTrieNode<C>> reachableNodes = new ArrayList<>();
             getAllPatterns(root, parts, 0, reachableNodes);
             if (!reachableNodes.isEmpty()) {
                 /* new pattern is a part of some existing patterns in the existing Trie */
-                for (GlobTrieNode node : reachableNodes) {
+                for (GlobTrieNode<C> node : reachableNodes) {
                     /*
                      * Both pattern and additionalContent are already present in the trie, so we can
                      * skip this pattern
                      */
-                    if (node.getAdditionalContent().stream().anyMatch(c -> c.equals(pattern.additionalContent()))) {
+                    if (node.getHostedOnlyContent().stream().anyMatch(c -> c.equals(pattern.additionalContent()))) {
                         return;
                     }
                 }
@@ -152,14 +173,14 @@ public class CompressedGlobTrie {
             addPattern(root, parts, 0, pattern.additionalContent());
         }
 
-        private static void addPattern(GlobTrieNode root, List<GlobTrieNode> parts, int i, String additionalInfo) {
+        private static <C> void addPattern(GlobTrieNode<C> root, List<GlobTrieNode<C>> parts, int i, C additionalInfo) {
             if (patternReachedEnd(i, parts)) {
                 root.setLeaf();
-                root.addAdditionalContent(additionalInfo);
+                root.addHostedOnlyContent(additionalInfo);
                 return;
             }
 
-            GlobTrieNode nextPart = parts.get(i);
+            GlobTrieNode<C> nextPart = parts.get(i);
             boolean canProceed = simplePatternMatch(root, nextPart);
             if (canProceed) {
                 /* we had progress, try to match rest of the pattern */
@@ -174,16 +195,16 @@ public class CompressedGlobTrie {
             addNewBranch(root, parts, i, additionalInfo);
         }
 
-        private static void addNewBranch(GlobTrieNode root, List<GlobTrieNode> parts, int i, String additionalInfo) {
+        private static <C> void addNewBranch(GlobTrieNode<C> root, List<GlobTrieNode<C>> parts, int i, C additionalInfo) {
             /* sanity check */
             if (parts.isEmpty() || i >= parts.size()) {
                 return;
             }
 
-            GlobTrieNode newNode = null;
+            GlobTrieNode<C> newNode = null;
             /* we matched pattern parts until i-th pattern part, so just add rest */
             for (int j = i; j < parts.size(); j++) {
-                GlobTrieNode part = parts.get(j);
+                GlobTrieNode<C> part = parts.get(j);
                 if (newNode == null) {
                     newNode = root.addChild(part.getContent(), part);
                     continue;
@@ -194,20 +215,28 @@ public class CompressedGlobTrie {
 
             /* mark end of pattern and populate additional info */
             newNode.setLeaf();
-            newNode.addAdditionalContent(additionalInfo);
+            newNode.addHostedOnlyContent(additionalInfo);
         }
 
-        private static List<String> classifyPatterns(List<GlobWithInfo> patterns,
-                        List<GlobWithInfo> doubleStar,
-                        List<GlobWithInfo> singleStar,
-                        List<GlobWithInfo> noStar) {
+        private static <C> List<String> classifyPatterns(List<GlobWithInfo<C>> patterns,
+                        List<GlobWithInfo<C>> doubleStar,
+                        List<GlobWithInfo<C>> singleStar,
+                        List<GlobWithInfo<C>> noStar,
+                        boolean validate) {
             List<String> invalidPatterns = new ArrayList<>();
-            for (GlobWithInfo patternWithInfo : patterns) {
-                /* validate patterns */
-                String error = validatePattern(patternWithInfo.pattern());
-                if (!error.isEmpty()) {
-                    invalidPatterns.add(error);
-                    continue;
+            for (GlobWithInfo<C> patternWithInfo : patterns) {
+                if (validate) {
+                    /* validate patterns */
+                    String error = GlobUtils.validatePattern(patternWithInfo.pattern());
+                    if (!error.isEmpty()) {
+                        if (patternWithInfo.additionalContent() instanceof ClassLoaderSupport.ConditionWithOrigin conditionWithOrigin) {
+                            invalidPatterns.add(error + "Pattern is from: " + conditionWithOrigin.origin());
+                        } else {
+                            invalidPatterns.add(error);
+                        }
+
+                        continue;
+                    }
                 }
 
                 String pattern = patternWithInfo.pattern();
@@ -223,7 +252,7 @@ public class CompressedGlobTrie {
             return invalidPatterns;
         }
 
-        private static int comparePatterns(GlobWithInfo n1, GlobWithInfo n2) {
+        private static int comparePatterns(GlobWithInfo<?> n1, GlobWithInfo<?> n2) {
             String s1 = n1.pattern();
             String s2 = n2.pattern();
 
@@ -327,153 +356,75 @@ public class CompressedGlobTrie {
     }
 
     /**
+     * Trims the Trie and makes it unmodifiable.
+     */
+    public static <C> void finalize(GlobTrieNode<C> root) {
+        root.trim();
+    }
+
+    /**
      * Returns list of information from all glob patterns that could match given text.
      */
     @Platforms(Platform.HOSTED_ONLY.class)
-    public static List<String> getAdditionalContentIfMatched(GlobTrieNode root, String text) {
-        List<GlobTrieNode> matchedNodes = new ArrayList<>();
-        getAllPatterns(root, getPatternParts(text), 0, matchedNodes);
+    public static <C> List<C> getHostedOnlyContentIfMatched(GlobTrieNode<C> root, String text) {
+        List<GlobTrieNode<C>> matchedNodes = getAllMatchedNodes(root, text);
         if (matchedNodes.isEmpty()) {
             /* text cannot be matched */
             return null;
         }
 
-        List<String> additionalContexts = new ArrayList<>();
-        matchedNodes.forEach(node -> additionalContexts.addAll(node.getAdditionalContent()));
+        List<C> additionalContexts = new ArrayList<>();
+        matchedNodes.forEach(node -> additionalContexts.addAll(node.getHostedOnlyContent()));
         return additionalContexts;
     }
 
     /**
      * Returns whether given text can be matched with any glob pattern in the Trie or not.
      */
-    public static boolean match(GlobTrieNode root, String text) {
+    public static <C> boolean match(GlobTrieNode<C> root, String text) {
+        return !getAllMatchedNodes(root, text).isEmpty();
+    }
+
+    private static <C> List<GlobTrieNode<C>> getAllMatchedNodes(GlobTrieNode<C> root, String text) {
         /* in this case text is a plain text without special meanings, so stars must be escaped */
         String escapedText = escapeAllStars(text);
-        List<GlobTrieNode> tmp = new ArrayList<>();
-        getAllPatterns(root, getPatternParts(escapedText), 0, tmp);
-        return !tmp.isEmpty();
+        List<GlobTrieNode<C>> matchedNodes = new ArrayList<>();
+        getAllPatterns(root, getPatternParts(escapedText), 0, matchedNodes);
+
+        return matchedNodes;
     }
 
     private static String escapeAllStars(String text) {
         return text.replace("*", "\\*");
     }
 
-    private static final Pattern threeConsecutiveStarsRegex = Pattern.compile(".*[*]{3,}.*");
-    private static final Pattern emptyLevelsRegex = Pattern.compile(".*/{2,}.*");
-
-    public static String validatePattern(String pattern) {
-        StringBuilder sb = new StringBuilder();
-
-        if (pattern.isEmpty()) {
-            sb.append("Pattern ").append(pattern).append(" : Pattern cannot be empty. ");
-            return sb.toString();
-        }
-
-        // check if pattern contains more than 2 consecutive characters. Example: a/***/b
-        if (threeConsecutiveStarsRegex.matcher(pattern).matches()) {
-            sb.append("Pattern contains more than two consecutive * characters. ");
-        }
-
-        /* check if pattern contains empty levels. Example: a//b */
-        if (emptyLevelsRegex.matcher(pattern).matches()) {
-            sb.append("Pattern contains empty levels. ");
-        }
-
-        /* check unnecessary ** repetition */
-        if (pattern.contains("**/**")) {
-            sb.append("Pattern contains invalid sequence **/**. Valid pattern should have ** followed by something other than **. ");
-        }
-
-        // check if pattern contains ** without previous Literal parent. Example: */**/... or **/...
-        List<GlobTrieNode> patternParts = getPatternParts(pattern);
-        for (GlobTrieNode part : patternParts) {
-            if (part instanceof LiteralNode) {
-                break;
-            }
-
-            if (part instanceof DoubleStarNode) {
-                sb.append("Pattern contains ** without previous literal. " +
-                                "This pattern is too generic and therefore can match many resources. " +
-                                "Please make the pattern more specific by adding non-generic level before ** level.");
-            }
-        }
-
-        if (!sb.isEmpty()) {
-            sb.insert(0, "Pattern " + pattern + " : ");
-        }
-
-        return sb.toString();
-    }
-
     /**
      * Returns list of glob pattern parts that will represent nodes in final Trie. This function is
      * used as a helper function in tests as well, and therefore must remain public.
      */
-    public static List<GlobTrieNode> getPatternParts(String glob) {
+    public static <C> List<GlobTrieNode<C>> getPatternParts(String glob) {
         String pattern = !glob.endsWith("/") ? glob : glob.substring(0, glob.length() - 1);
-        List<GlobTrieNode> parts = new ArrayList<>();
-        /* we are splitting patterns on levels */
-        List<String> levels = Arrays.stream(pattern.split(LEVEL_IDENTIFIER)).toList();
-        for (String level : levels) {
-            if (level.equals(STAR_STAR)) {
-                DoubleStarNode tmp = new DoubleStarNode();
-                tmp.setNewLevel();
-                parts.add(tmp);
-                continue;
+        List<List<GlobUtils.GlobToken>> tokens = GlobUtils.tokenize(pattern);
+        List<GlobTrieNode<C>> parts = new ArrayList<>(tokens.size());
+
+        for (List<GlobUtils.GlobToken> levelTokens : tokens) {
+            List<GlobTrieNode<C>> thisLevelParts = new ArrayList<>(levelTokens.size());
+            for (GlobUtils.GlobToken token : levelTokens) {
+                thisLevelParts.add(switch (token.kind()) {
+                    case STAR_STAR -> new DoubleStarNode<>();
+                    case STAR -> new StarTrieNode<>(true);
+                    case LITERAL_STAR -> new StarTrieNode<>(token.value());
+                    case LITERAL -> new LiteralNode<>(token.value());
+                });
             }
-
-            if (level.equals(STAR)) {
-                /* special case when * is alone on one level */
-                StarTrieNode tmp = new StarTrieNode(true);
-                tmp.setNewLevel();
-                parts.add(tmp);
-                continue;
-            }
-
-            /* adding a*bc and a*dc patterns will produce: a* -> bc a* -> dc */
-            int s = level.indexOf(STAR.charAt(0));
-            if (s != -1) {
-                /*
-                 * this level contains at least one star, but maybe it has more. E.g.:
-                 * something/a*b*c*d/else
-                 */
-
-                List<GlobTrieNode> thisLevelParts = new ArrayList<>();
-                StringBuilder currentPart = new StringBuilder();
-                StarCollectorMode currentMode = StarCollectorMode.NORMAL;
-                for (char c : level.toCharArray()) {
-                    currentPart.append(c);
-                    if (c == STAR.charAt(0) && currentMode == StarCollectorMode.NORMAL) {
-                        thisLevelParts.add(new StarTrieNode(currentPart.toString()));
-                        currentPart.setLength(0);
-                    }
-
-                    currentMode = c == '\\' ? StarCollectorMode.ESCAPE : StarCollectorMode.NORMAL;
-                }
-
-                if (!currentPart.isEmpty()) {
-                    /* this level ends with some literal node */
-                    thisLevelParts.add(new LiteralNode(currentPart.toString()));
-                }
-                thisLevelParts.get(0).setNewLevel();
-                parts.addAll(thisLevelParts);
-                continue;
-            }
-
-            LiteralNode tmp = new LiteralNode(level);
-            tmp.setNewLevel();
-            parts.add(tmp);
+            thisLevelParts.getFirst().setNewLevel();
+            parts.addAll(thisLevelParts);
         }
 
         return parts;
     }
 
-    private enum StarCollectorMode {
-        NORMAL,
-        ESCAPE
-    }
-
-    private static void getAllPatterns(GlobTrieNode node, List<GlobTrieNode> parts, int i, List<GlobTrieNode> matches) {
+    private static <C> void getAllPatterns(GlobTrieNode<C> node, List<GlobTrieNode<C>> parts, int i, List<GlobTrieNode<C>> matches) {
         if (patternReachedEnd(i, parts)) {
             if (node.isLeaf()) {
                 matches.add(node);
@@ -483,9 +434,9 @@ public class CompressedGlobTrie {
         }
 
         /* get ** successors that could extend check */
-        DoubleStarNode doubleStar = node.getDoubleStarNode();
+        DoubleStarNode<C> doubleStar = node.getDoubleStarNode();
         if (doubleStar != null) {
-            for (MatchedNode child : getAllAvailablePaths(doubleStar, parts, i)) {
+            for (MatchedNode<C> child : getAllAvailablePaths(doubleStar, parts, i)) {
                 getAllPatterns(child.child(), parts, child.lastMatchedChildIndex() + 1, matches);
             }
         }
@@ -493,12 +444,12 @@ public class CompressedGlobTrie {
         /* get * nodes that could match next level */
         SquashedParts sp = getThisLevel(parts, i);
         for (var child : node.getChildrenWithStar()) {
-            for (GlobTrieNode c : matchOneLevel(child, sp.squashedPart())) {
+            for (GlobTrieNode<C> c : matchOneLevel(child, sp.squashedPart())) {
                 getAllPatterns(c, parts, i + sp.numberOfSquashedParts() + 1, matches);
             }
         }
 
-        GlobTrieNode part = parts.get(i);
+        GlobTrieNode<C> part = parts.get(i);
         if (part instanceof StarTrieNode || part instanceof DoubleStarNode) {
             /*
              * next part is not simple text, and we didn't match it before, so we can't proceed
@@ -510,7 +461,7 @@ public class CompressedGlobTrie {
         }
 
         /* we don't have wildcards anymore, so try simple match */
-        GlobTrieNode child = node.getChild(part.getContent());
+        GlobTrieNode<C> child = node.getChild(part.getContent());
         if (child == null) {
             return;
         }
@@ -519,11 +470,11 @@ public class CompressedGlobTrie {
         getAllPatterns(child, parts, i + 1, matches);
     }
 
-    private static List<MatchedNode> getAllAvailablePaths(DoubleStarNode node, List<GlobTrieNode> parts, int i) {
-        List<MatchedNode> successors = new ArrayList<>();
+    private static <C> List<MatchedNode<C>> getAllAvailablePaths(DoubleStarNode<C> node, List<GlobTrieNode<C>> parts, int i) {
+        List<MatchedNode<C>> successors = new ArrayList<>();
         /* maybe ** is leaf, so we should cover this pattern */
         if (node.isLeaf()) {
-            return List.of(new MatchedNode(node, parts.size()));
+            return List.of(new MatchedNode<>(node, parts.size()));
         }
 
         /* checks if we skip some part (on index j) can we match with some child of node */
@@ -531,16 +482,16 @@ public class CompressedGlobTrie {
             /* in case next part contains many stars, squash them into one node */
             SquashedParts sp = getThisLevel(parts, j);
             /* checks if any child of current node can match next part */
-            for (StarTrieNode child : node.getChildrenWithStar()) {
+            for (StarTrieNode<C> child : node.getChildrenWithStar()) {
                 int finalJ = j;
                 /* we can match next level with more than one pattern */
                 successors.addAll(matchOneLevel(child, sp.squashedPart())
                                 .stream()
-                                .map(c -> new MatchedNode(c, finalJ + sp.numberOfSquashedParts()))
+                                .map(c -> new MatchedNode<>(c, finalJ + sp.numberOfSquashedParts()))
                                 .toList());
             }
 
-            GlobTrieNode part = parts.get(j);
+            GlobTrieNode<C> part = parts.get(j);
             if (part instanceof StarTrieNode) {
                 /*
                  * we are only checking trivial parts because we processed star nodes, and we don't
@@ -549,13 +500,13 @@ public class CompressedGlobTrie {
                 continue;
             }
 
-            GlobTrieNode child = node.getChild(part.getContent());
+            GlobTrieNode<C> child = node.getChild(part.getContent());
             /*
              * we are checking only parts that begins new level because in pattern a*b*c, last c is
              * LiteralNode, but it is a part of complex StarTrieNode
              */
             if (part.isNewLevel() && child != null) {
-                successors.add(new MatchedNode(child, j));
+                successors.add(new MatchedNode<>(child, j));
             }
         }
 
@@ -563,20 +514,20 @@ public class CompressedGlobTrie {
     }
 
     private static int getIndexOfFirstUnescapedStar(String level) {
-        StarCollectorMode currentMode = StarCollectorMode.NORMAL;
+        boolean escaped = false;
         for (int i = 0; i < level.length(); i++) {
             char c = level.charAt(i);
-            if (c == STAR.charAt(0) && currentMode == StarCollectorMode.NORMAL) {
+            if (c == STAR.charAt(0) && !escaped) {
                 return i;
             }
 
-            currentMode = c == '\\' ? StarCollectorMode.ESCAPE : StarCollectorMode.NORMAL;
+            escaped = c == '\\';
         }
 
         return -1;
     }
 
-    private static List<GlobTrieNode> matchOneLevel(StarTrieNode node, String wholeLevel) {
+    private static <C> List<GlobTrieNode<C>> matchOneLevel(StarTrieNode<C> node, String wholeLevel) {
         if (node.isMatchingWholeLevel()) {
             return List.of(node);
         }
@@ -600,8 +551,8 @@ public class CompressedGlobTrie {
             return List.of(node);
         }
 
-        List<GlobTrieNode> potentialChildren = new ArrayList<>();
-        for (LiteralNode child : node.getChildrenWithLiteral()) {
+        List<GlobTrieNode<C>> potentialChildren = new ArrayList<>();
+        for (LiteralNode<C> child : node.getChildrenWithLiteral()) {
             if (child.isNewLevel()) {
                 // we won't try matching with this child since it is not on same level
                 // example: a*/c => c is a child of * but it is on the next level, so it can't be
@@ -622,7 +573,7 @@ public class CompressedGlobTrie {
         /*
          * we need to go in deeper recursion with children that also contains star (like: a* -> b*)
          */
-        for (StarTrieNode child : node.getChildrenWithStar()) {
+        for (StarTrieNode<C> child : node.getChildrenWithStar()) {
             if (child.isNewLevel()) {
                 // we won't try matching with this child since it is not on same level
                 // example: a*/c* => c* is a child of a* but it is on the next level, so it can't be
@@ -631,7 +582,7 @@ public class CompressedGlobTrie {
             }
 
             /* if there is a repetition of certain * node we must check paths through all of them */
-            StarTrieNode tmpChild = child;
+            StarTrieNode<C> tmpChild = child;
             while (true) {
                 String childContent = tmpChild.getContent();
                 String childPrefix = childContent.substring(0, childContent.indexOf(STAR.charAt(0)));
@@ -641,21 +592,21 @@ public class CompressedGlobTrie {
                 }
 
                 /* check if current node has child with same content on same level */
-                GlobTrieNode potentialChild = tmpChild.getChildFromSameLevel(tmpChild.getContent());
+                GlobTrieNode<C> potentialChild = tmpChild.getChildFromSameLevel(tmpChild.getContent());
                 if (potentialChild == null) {
                     /* we don't have more repeated star nodes so just quit the loop */
                     break;
                 }
 
                 /* move to next node that is repeated */
-                tmpChild = (StarTrieNode) potentialChild;
+                tmpChild = (StarTrieNode<C>) potentialChild;
             }
         }
 
         return potentialChildren;
     }
 
-    private static boolean simplePatternMatch(GlobTrieNode root, GlobTrieNode part) {
+    private static <C> boolean simplePatternMatch(GlobTrieNode<C> root, GlobTrieNode<C> part) {
         if (root instanceof StarTrieNode || root instanceof DoubleStarNode || part instanceof StarTrieNode || part instanceof DoubleStarNode) {
             return false;
         }
@@ -663,12 +614,12 @@ public class CompressedGlobTrie {
         return root.getChild(part.getContent()) != null;
     }
 
-    private static SquashedParts getThisLevel(List<GlobTrieNode> parts, int begin) {
+    private static <C> SquashedParts getThisLevel(List<GlobTrieNode<C>> parts, int begin) {
         StringBuilder sb = new StringBuilder(parts.get(begin).getContent());
         int numberOfSquashedParts = 0;
         /* collect all parts until we hit beginning of the new level */
         for (int i = begin + 1; i < parts.size(); i++) {
-            GlobTrieNode nextPart = parts.get(i);
+            GlobTrieNode<C> nextPart = parts.get(i);
             if (nextPart.isNewLevel()) {
                 break;
             }
@@ -680,7 +631,39 @@ public class CompressedGlobTrie {
         return new SquashedParts(sb.toString(), numberOfSquashedParts);
     }
 
-    private static boolean patternReachedEnd(int index, List<GlobTrieNode> parts) {
+    private static <C> boolean patternReachedEnd(int index, List<GlobTrieNode<C>> parts) {
         return index >= parts.size();
+    }
+
+    public static <C> void removeNodes(GlobTrieNode<C> head, Predicate<C> shouldRemove) {
+        List<C> contentToRemove = head.getHostedOnlyContent().stream().filter(shouldRemove).toList();
+        head.removeHostedOnlyContent(contentToRemove);
+
+        List<GlobTrieNode<C>> childrenToRemove = new ArrayList<>();
+        for (GlobTrieNode<C> child : head.getChildren()) {
+            removeNodes(child, shouldRemove);
+
+            /* leaf without additional content should be removed */
+            if (child.isLeaf() && child.getHostedOnlyContent().isEmpty()) {
+                if (child.getChildren().isEmpty()) {
+                    /* if it is the last node remove it physically */
+                    childrenToRemove.add(child);
+                } else {
+                    /*
+                     * the child still has children, but it terminated some pattern => don't remove
+                     * it, just say that it doesn't terminate any pattern anymore
+                     */
+                    child.makeNodeInternal();
+                }
+                continue;
+            }
+
+            /* internal node without children should be removed */
+            if (!child.isLeaf() && child.getChildren().isEmpty()) {
+                childrenToRemove.add(child);
+            }
+        }
+
+        head.removeChildren(childrenToRemove);
     }
 }

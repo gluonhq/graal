@@ -2,13 +2,65 @@
 
 This changelog summarizes major changes to the WebAssembly engine implemented in GraalVM (GraalWasm).
 
+## Version 25.6
+* GraalWasm contexts now enforce single-threaded access. Concurrent WebAssembly execution must use separate polyglot contexts.
+
+## Version 25.4.4
+
+* Implemented the [Tail Call](https://github.com/WebAssembly/tail-call) proposal. This feature is enabled by default and can be disabled with the experimental option `--wasm.TailCalls=false`. The feature comes with an optimization that transforms direct recursive calls (functions calling themselves) into loops. This optimization is enabled by default and can be disabled with the experimental option `--wasm.TailCallLoops=false`.
+
+## Version 25.3.4
+
+* Implemented support for the [branch hinting](https://github.com/WebAssembly/branch-hinting) custom section, allowing GraalWasm to use `if` and `br_if` likelihood hints for optimized code generation.
+* Implemented the `table64` part of the [Memory64](https://github.com/WebAssembly/memory64/blob/main/proposals/memory64/Overview.md) proposal. This feature can be enabled with the option `--wasm.Memory64`.
+* Implemented the [Wide Arithmetic](https://github.com/WebAssembly/wide-arithmetic) proposal, adding `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, and `i64.mul_wide_u`. This feature is disabled by default and can be enabled with the experimental option `--wasm.WideArithmetic=true`.
+
+## Version 25.1.3
+
+* Adopted a bytecode-handler-based design for the WebAssembly interpreter, improving interpreted performance on Native Image.
+* Implemented the [exception handling](https://github.com/WebAssembly/exception-handling) proposal. This feature is enabled by default and can be disabled with the experimental option `wasm.Exceptions=false`.
+* Implemented the [legacy exception handling](https://github.com/WebAssembly/exception-handling/tree/main/proposals/exception-handling/legacy) proposal. This feature is disabled by default and can be enabled independently with the experimental option `wasm.LegacyExceptions=true`.
+* Implemented the [typed function references](https://github.com/WebAssembly/function-references) proposal. This feature is enabled by default and can be disabled with the experimental option `wasm.TypedFunctionReferences=false`.
+* Enabled the standardized features [Extended Constant Expressions](https://github.com/WebAssembly/extended-const/blob/master/proposals/extended-const/Overview.md), [Multiple Memories](https://github.com/WebAssembly/multi-memory/blob/master/proposals/multi-memory/Overview.md), and [Relaxed SIMD](https://github.com/WebAssembly/relaxed-simd/tree/main/proposals/relaxed-simd) by default.
+* Implemented the [GC proposal](https://github.com/WebAssembly/gc) proposal. This feature is enabled by default and can be disabled with the experimental option `wasm.GC=false`.
+
+## Version 25.0.0
+
+* BREAKING: Changed Context.eval of _wasm_ sources to return a compiled, but not yet instantiated, module object instead of the module instance.
+  To instantiate the module, you have to call `newInstance()` on the module object now, e.g.:
+  ```java
+  Context c = Context.create();
+  Source wasmSource = Source.newBuilder...;
+  Value module = c.eval(wasmSource);
+  Value instance = module.newInstance(); // < 25.0: c.eval(wasmSource)
+  ```
+  This change enables modules to be instantiated multiple times—and run independently—within the same context. Previously, each module could only be instantiated once per context.
+  `newInstance()` optionally also accepts an import object, similar to the JS WebAssembly API, as well as other modules to be linked together with the module.
+  The previous behavior can still be restored with the experimental option `--wasm.EvalReturnsInstance=true`.
+  Note: Modules instantiated using `module.newInstance()` are not accessible via `context.getBindings("wasm")`, unlike modules instantiated using `context.eval` when using `--wasm.EvalReturnsInstance=true`.
+* BREAKING: Exports are no longer exposed as direct members of the module instance.
+  Use the `exports` member of the module instance to access its exports, e.g:.
+  ```java
+  Value mainFunction = instance.getMember("exports").getMember("main"); // < 25.0: instance.getMember("main")
+  ```
+  This aligns with the JS WebAssembly API and allows other members to be introduced on the module instance without potential name clashes.
+  More information about these API changes and examples can be found in the [GraalWasm Polyglot API Migration Guide](docs/user/GraalWasmAPIMigration.md) and the [Readme](docs/user/README.md).
+* Implemented support for editing primitive values during debugging. Fixed several debugger-related issues.
+* Added an implementation of the [SIMD](https://github.com/WebAssembly/simd) proposal using the JDK's Vector API. This improves peak performance when running WebAssembly code which makes heavy use of the new instructions in the SIMD proposal. This new implementation is always used in native image. On the JVM, it is opt-in and requires setting `--add-modules=jdk.incubator.vector`. Use of the incubating Vector API will result in the following warning message being printed to stderr:
+  ```
+  WARNING: Using incubator modules: jdk.incubator.vector
+  ```
+
 ## Version 24.2.0
 
 * Updated developer metadata of Maven artifacts.
+* Deprecated the `--wasm.AsyncParsingBinarySize` and `--wasm.AsyncParsingStackSize` options. These options no longer have any effect and will be removed in a future release.
+* Implemented the [Relaxed SIMD](https://github.com/WebAssembly/relaxed-simd) proposal. This feature can be enabled with the option `--wasm.RelaxedSIMD`.
 
 ## Version 24.1.0
 
 * Implemented the [SIMD](https://github.com/WebAssembly/simd) proposal. This feature is enabled by default and can be disabled with the option `--wasm.SIMD=false`.
+* Implemented `clock_res_get`, `fd_advise`, `fd_datasync`, `fd_fdstat_set_rights`, `fd_filestat_set_size`, `fd_pread`, `fd_pwrite`, `fd_readdir`, `fd_renumber`, `fd_sync` and `fd_tell` in `wasi_snapshot_preview1`.
 
 ## Version 23.1.0
 

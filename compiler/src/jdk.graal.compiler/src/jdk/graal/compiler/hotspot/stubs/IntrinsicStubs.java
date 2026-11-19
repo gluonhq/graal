@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,57 +28,131 @@ import jdk.graal.compiler.lir.GeneratedStubsHolder;
 import jdk.graal.compiler.replacements.StringLatin1InflateNode;
 import jdk.graal.compiler.replacements.StringUTF16CompressNode;
 import jdk.graal.compiler.replacements.nodes.AESNode;
+import jdk.graal.compiler.replacements.nodes.Adler32UpdateBytesNode;
 import jdk.graal.compiler.replacements.nodes.ArrayCompareToNode;
 import jdk.graal.compiler.replacements.nodes.ArrayCopyWithConversionsNode;
 import jdk.graal.compiler.replacements.nodes.ArrayEqualsNode;
+import jdk.graal.compiler.replacements.nodes.ArrayFillNode;
 import jdk.graal.compiler.replacements.nodes.ArrayIndexOfNode;
 import jdk.graal.compiler.replacements.nodes.ArrayRegionCompareToNode;
 import jdk.graal.compiler.replacements.nodes.ArrayRegionEqualsNode;
 import jdk.graal.compiler.replacements.nodes.ArrayRegionEqualsWithMaskNode;
+import jdk.graal.compiler.replacements.nodes.Base64DecodeBlockNode;
+import jdk.graal.compiler.replacements.nodes.Base64EncodeBlockNode;
 import jdk.graal.compiler.replacements.nodes.BigIntegerMulAddNode;
+import jdk.graal.compiler.replacements.nodes.BigIntegerLeftShiftWorkerNode;
+import jdk.graal.compiler.replacements.nodes.BigIntegerMontgomeryMultiplyNode;
+import jdk.graal.compiler.replacements.nodes.BigIntegerMontgomerySquareNode;
 import jdk.graal.compiler.replacements.nodes.BigIntegerMultiplyToLenNode;
+import jdk.graal.compiler.replacements.nodes.BigIntegerRightShiftWorkerNode;
 import jdk.graal.compiler.replacements.nodes.BigIntegerSquareToLenNode;
 import jdk.graal.compiler.replacements.nodes.CalcStringAttributesNode;
+import jdk.graal.compiler.replacements.nodes.ChaCha20Node;
 import jdk.graal.compiler.replacements.nodes.CipherBlockChainingAESNode;
 import jdk.graal.compiler.replacements.nodes.CountPositivesNode;
+import jdk.graal.compiler.replacements.nodes.CRC32CUpdateBytesNode;
+import jdk.graal.compiler.replacements.nodes.CRC32UpdateBytesNode;
 import jdk.graal.compiler.replacements.nodes.CounterModeAESNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumAlmostInverseNttNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumAlmostNttNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumDecomposePolyNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumMontMulByConstantNode;
+import jdk.graal.compiler.replacements.nodes.DilithiumNode.DilithiumNttMultNode;
+import jdk.graal.compiler.replacements.nodes.DoubleKeccakNode;
+import jdk.graal.compiler.replacements.nodes.DoubleModStubNode;
+import jdk.graal.compiler.replacements.nodes.ElectronicCodeBookAESNode;
 import jdk.graal.compiler.replacements.nodes.EncodeArrayNode;
+import jdk.graal.compiler.replacements.nodes.GaloisCounterModeAESNode;
 import jdk.graal.compiler.replacements.nodes.GHASHProcessBlocksNode;
+import jdk.graal.compiler.replacements.nodes.IndexOfZeroNode;
+import jdk.graal.compiler.replacements.nodes.IntegerPolynomialAssignNode;
+import jdk.graal.compiler.replacements.nodes.IntegerPolynomialP256MontgomeryMultNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.Kyber12To16Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberAddPoly2Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberAddPoly3Node;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberBarrettReduceNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberInverseNttNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberNttMultNode;
+import jdk.graal.compiler.replacements.nodes.KyberNode.KyberNttNode;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.MD5MultiBlockNode;
 import jdk.graal.compiler.replacements.nodes.MessageDigestNode.MD5Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA1MultiBlockNode;
 import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA1Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA256MultiBlockNode;
 import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA256Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA3MultiBlockNode;
 import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA3Node;
+import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA512MultiBlockNode;
 import jdk.graal.compiler.replacements.nodes.MessageDigestNode.SHA512Node;
+import jdk.graal.compiler.replacements.nodes.Poly1305ProcessBlocksNode;
+import jdk.graal.compiler.replacements.nodes.StringCodepointIndexToByteIndexNode;
 import jdk.graal.compiler.replacements.nodes.VectorizedHashCodeNode;
 import jdk.graal.compiler.replacements.nodes.VectorizedMismatchNode;
 
 @GeneratedStubsHolder(targetVM = "hotspot", sources = {
-                ArrayIndexOfNode.class,
+                Adler32UpdateBytesNode.class,
+                AESNode.class,
+                ArrayCompareToNode.class,
+                ArrayCopyWithConversionsNode.class,
                 ArrayEqualsNode.class,
+                ArrayFillNode.class,
+                ArrayIndexOfNode.class,
+                ArrayRegionCompareToNode.class,
                 ArrayRegionEqualsNode.class,
                 ArrayRegionEqualsWithMaskNode.class,
-                ArrayCompareToNode.class,
-                ArrayRegionCompareToNode.class,
-                ArrayCopyWithConversionsNode.class,
-                CalcStringAttributesNode.class,
-                StringUTF16CompressNode.class,
-                StringLatin1InflateNode.class,
-                CountPositivesNode.class,
-                EncodeArrayNode.class,
-                VectorizedMismatchNode.class,
-                VectorizedHashCodeNode.class,
-                AESNode.class,
-                CounterModeAESNode.class,
-                CipherBlockChainingAESNode.class,
-                GHASHProcessBlocksNode.class,
-                BigIntegerMultiplyToLenNode.class,
+                Base64DecodeBlockNode.class,
+                Base64EncodeBlockNode.class,
+                BigIntegerLeftShiftWorkerNode.class,
+                BigIntegerMontgomeryMultiplyNode.class,
+                BigIntegerMontgomerySquareNode.class,
                 BigIntegerMulAddNode.class,
+                BigIntegerMultiplyToLenNode.class,
+                BigIntegerRightShiftWorkerNode.class,
                 BigIntegerSquareToLenNode.class,
-                SHA1Node.class,
-                SHA256Node.class,
-                SHA3Node.class,
-                SHA512Node.class,
+                CalcStringAttributesNode.class,
+                ChaCha20Node.class,
+                CipherBlockChainingAESNode.class,
+                CounterModeAESNode.class,
+                CountPositivesNode.class,
+                CRC32CUpdateBytesNode.class,
+                CRC32UpdateBytesNode.class,
+                DilithiumAlmostInverseNttNode.class,
+                DilithiumAlmostNttNode.class,
+                DilithiumDecomposePolyNode.class,
+                DilithiumMontMulByConstantNode.class,
+                DilithiumNttMultNode.class,
+                DoubleKeccakNode.class,
+                DoubleModStubNode.class,
+                ElectronicCodeBookAESNode.class,
+                EncodeArrayNode.class,
+                GaloisCounterModeAESNode.class,
+                GHASHProcessBlocksNode.class,
+                IndexOfZeroNode.class,
+                IntegerPolynomialAssignNode.class,
+                IntegerPolynomialP256MontgomeryMultNode.class,
+                KyberNttNode.class,
+                KyberInverseNttNode.class,
+                KyberNttMultNode.class,
+                KyberAddPoly2Node.class,
+                KyberAddPoly3Node.class,
+                Kyber12To16Node.class,
+                KyberBarrettReduceNode.class,
+                MD5MultiBlockNode.class,
                 MD5Node.class,
+                Poly1305ProcessBlocksNode.class,
+                SHA1MultiBlockNode.class,
+                SHA1Node.class,
+                SHA256MultiBlockNode.class,
+                SHA256Node.class,
+                SHA3MultiBlockNode.class,
+                SHA3Node.class,
+                SHA512MultiBlockNode.class,
+                SHA512Node.class,
+                StringCodepointIndexToByteIndexNode.class,
+                StringLatin1InflateNode.class,
+                StringUTF16CompressNode.class,
+                VectorizedHashCodeNode.class,
+                VectorizedMismatchNode.class,
 })
 public final class IntrinsicStubs {
 }

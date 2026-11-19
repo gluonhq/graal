@@ -1,0 +1,866 @@
+/*
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.util;
+
+import java.io.File;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.AnnotatedElement;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Executable;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.RecordComponent;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.ServiceLoader;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+
+import jdk.graal.compiler.vmaccess.InvocationException;
+import org.graalvm.nativeimage.ImageInfo;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.shared.util.ReflectionUtil;
+
+import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.serviceprovider.GraalServices;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModuleLayer;
+import jdk.graal.compiler.vmaccess.ResolvedJavaPackage;
+import jdk.graal.compiler.vmaccess.VMAccess;
+import jdk.vm.ci.code.TargetDescription;
+import jdk.vm.ci.meta.Constant;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
+import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.annotation.Annotated;
+
+/// This class supports Native Image's use of a [guest context][VMAccess]. It manages a
+/// lazily [planted][#plantConfiguration(VMAccess)] [singleton][#get()] and offers
+/// helper methods for extending the core functionality in [VMAccess].
+///
+/// To prepare for a world in which multiple images are built in a single process, with
+/// each image build using a fresh guest context, references to guest context values
+/// obtained from this object must not be stored in static fields. Such values will be
+/// stale/invalid when the guest context is discarded.
+@Platforms(Platform.HOSTED_ONLY.class)
+public final class GuestAccess implements VMAccess {
+
+    private final VMAccess delegate;
+    public final GuestElements elements;
+
+    // Caches
+    private final Map<Class<?>, ResolvedJavaType> typeCache = new ConcurrentHashMap<>();
+    private final Map<Executable, ResolvedJavaMethod> methodCache = new ConcurrentHashMap<>();
+    private final Map<Field, ResolvedJavaField> fieldCache = new ConcurrentHashMap<>();
+    private final Map<RecordComponent, ResolvedJavaRecordComponent> recordCache = new ConcurrentHashMap<>();
+    private final MetaAccessProvider metaAccess;
+    private final ConstantReflectionProvider constantReflection;
+    private final SnippetReflectionProvider snippetReflection;
+
+    /// The singleton initialized by [#plantConfiguration(VMAccess)].
+    private static GuestAccess singleton;
+
+    /**
+     * Guards against multiple calls to {@link #plantConfiguration(VMAccess)}. The value is a stack
+     * trace of the first call.
+     */
+    private static volatile String providersInit;
+
+    private GuestAccess(VMAccess delegate) {
+        this.delegate = delegate;
+        Providers providers = delegate.getProviders();
+        this.metaAccess = providers.getMetaAccess();
+        this.constantReflection = providers.getConstantReflection();
+        this.snippetReflection = providers.getSnippetReflection();
+        /* This must be last because it needs a fully initialized GuestAccess instance. */
+        this.elements = new GuestElementsImpl();
+    }
+
+    @Override
+    public boolean isFullyIsolated() {
+        return delegate.isFullyIsolated();
+    }
+
+    /// Prefix of system properties used to configure guest access.
+    private static final String PROPERTY_PREFIX = ImageInfo.PROPERTY_NATIVE_IMAGE_PREFIX + "vmaccess.";
+
+    /// Name of the property for selecting the guest context implementation.
+    public static final String NAME_PROPERTY = PROPERTY_PREFIX + "name";
+
+    //@formatter:off
+    /// Name of the property for setting guest context options. If the value of the option
+    /// starts with a non-alphanumeric character other than [File#separatorChar], then that
+    /// character is used as the delimiter between multiple options. Empty options are silently
+    /// ignored. For example:
+    ///
+    /// | option value                | options sent to [Builder#vmOption] |
+    /// |-----------------------------|------------------------------------|
+    /// | `log.level=ALL`             | "log.level=ALL"                    |
+    /// | `,log.level=ALL,foo=bar,,,` | "log.level=ALL", "foo=bar"         |
+    //@formatter:on
+    public static final String OPTIONS_PROPERTY = PROPERTY_PREFIX + "options";
+
+    /// Gets a [VMAccess] builder whose [name][Builder#getVMAccessName] is
+    /// specified by the {@value #NAME_PROPERTY} system property. If no name is specified,
+    /// `"host"` is used.
+    ///
+    /// @throws GraalError if the requested builder cannot be found
+    public static VMAccess.Builder getVmAccessBuilder() {
+        String oldProp = NAME_PROPERTY.replace(".name", "name");
+        if (System.getProperty(oldProp) != null) {
+            throw new GraalError("Use %s instead of %s to select VMAccess implementation", NAME_PROPERTY, oldProp);
+        }
+        String requestedAccessName = GraalServices.getSavedProperty(NAME_PROPERTY);
+        String accessName = requestedAccessName == null ? "host" : requestedAccessName;
+        Module vmAccessModule = Builder.class.getModule();
+        ModuleLayer vmAccessLayer = vmAccessModule.getLayer();
+        ServiceLoader<VMAccess.Builder> loader;
+        if (vmAccessLayer == null) {
+            // VMAccess was loaded on the class path (as an unnamed module).
+            // In this context, it's expected that all VMAccess providers
+            // are also on the class path.
+            loader = ServiceLoader.load(VMAccess.Builder.class);
+        } else {
+            loader = ServiceLoader.load(vmAccessLayer, VMAccess.Builder.class);
+        }
+        VMAccess.Builder selected = null;
+        List<VMAccess.Builder> builders = new ArrayList<>();
+        for (VMAccess.Builder builder : loader) {
+            builders.add(builder);
+            if (accessName.equals(builder.getVMAccessName())) {
+                selected = builder;
+                break;
+            }
+        }
+        if (selected == null) {
+            if (builders.isEmpty()) {
+                throw new GraalError("No %s service providers found", VMAccess.Builder.class.getName());
+            }
+            String available = builders.stream().map(b -> "'" + b.getVMAccessName() + "'").collect(Collectors.joining(", "));
+            String origin = requestedAccessName == null ? "" : "specified by system property %s ".formatted(NAME_PROPERTY);
+            throw new GraalError("%s service provider '%s' %snot found. Available providers: %s",
+                            VMAccess.Builder.class.getName(),
+                            accessName,
+                            origin,
+                            available);
+        }
+        if ("espresso".equals(selected.getVMAccessName())) {
+            // Make sure we use the modules prepared for GraalVM
+            selected.vmOption("JavaHome=" + System.getProperty("java.home"));
+            // This is needed for Word types:
+            selected.addModule("org.graalvm.word");
+        }
+        String options = GraalServices.getSavedProperty(OPTIONS_PROPERTY);
+        if (options != null && !options.isEmpty()) {
+            char char0 = options.charAt(0);
+            if (!Character.isLetterOrDigit(char0) && char0 != File.separatorChar) {
+                for (var option : options.substring(1).split(Pattern.quote(String.valueOf(char0)))) {
+                    if (!option.isEmpty()) {
+                        selected.vmOption(option);
+                    }
+                }
+            } else {
+                selected.vmOption(options);
+            }
+        }
+        return selected;
+    }
+
+    /**
+     * Initializes the {@link GuestAccess} singleton based on {@code vmAccess}.
+     * <p>
+     * If {@code vmAccess != null}, this method must be called before calling {@link #get()} and it
+     * can only be called once to ensure the whole system uses a stable configuration.
+     * <p>
+     * Naming this method with a "plant" prefix (as opposed to "set" or "init") is intentional. It
+     * conveys the fact that this initialization is done "from the side" where as ideally it should
+     * be done in the static initializer of this class.
+     *
+     * @param access the {@link VMAccess} value to use for configuring {@link GuestAccess}. If
+     *            {@code null}, then {@link #getVmAccessBuilder()} is used to create an instance
+     *            that reflects the host configuration.
+     */
+    public static synchronized void plantConfiguration(VMAccess access) {
+        GraalError.guarantee(providersInit == null, "Providers have already been planted: %s", providersInit);
+        if (access == null) {
+            VMAccess.Builder builder = getVmAccessBuilder();
+            String cp = System.getProperty("java.class.path");
+            if (cp != null) {
+                builder.classPath(Arrays.asList(cp.split(File.pathSeparator)));
+            }
+            singleton = new GuestAccess(builder.build());
+        } else {
+            singleton = new GuestAccess(access);
+        }
+        StringWriter sw = new StringWriter();
+        new Exception("providers previously planted here:").printStackTrace(new PrintWriter(sw));
+        providersInit = sw.toString();
+    }
+
+    /**
+     * Shortcut for {@code getProviders().getCodeCache().getTarget()}.
+     */
+    public TargetDescription getTarget() {
+        return getProviders().getCodeCache().getTarget();
+    }
+
+    /**
+     * Shortcut for {@code getProviders().getSnippetReflection()}.
+     */
+    public SnippetReflectionProvider getSnippetReflection() {
+        return snippetReflection;
+    }
+
+    /**
+     * Gets the singleton {@link GuestAccess} value. If an externally configured {@link VMAccess} is
+     * being used, then it must be {@linkplain #plantConfiguration(VMAccess) set} prior to the first
+     * call to this method.
+     */
+    public static GuestAccess get() {
+        if (providersInit == null) {
+            synchronized (GuestAccess.class) {
+                if (providersInit == null) {
+                    plantConfiguration(null);
+                }
+            }
+        }
+        return singleton;
+    }
+
+    /**
+     * Implementation of {@link GuestElements}. This needs to be an inner class of
+     * {@link GuestAccess} to make sure that initialization does not run into initialization order
+     * problems.
+     */
+    final class GuestElementsImpl extends GuestElements {
+        @Override
+        protected ResolvedJavaType lookupType(Class<?> clazz) {
+            ResolvedJavaType type = GuestAccess.this.lookupType(clazz);
+            if (type == null) {
+                throw new GraalError("Unable to find type for class " + clazz.getName());
+            }
+            return type;
+        }
+
+        @Override
+        protected ResolvedJavaType lookupType(String className) {
+            Objects.requireNonNull(className, "className must not be null");
+            ResolvedJavaType type = GuestAccess.this.lookupType(className);
+            if (type == null) {
+                throw new GraalError("Unable to find type for class name " + className);
+            }
+            return type;
+        }
+
+        @Override
+        protected ResolvedJavaMethod lookupMethod(ResolvedJavaType type, String name, Class<?>... parameterTypes) {
+            var method = JVMCIReflectionUtil.getUniqueDeclaredMethod(getProviders().getMetaAccess(), type, name, parameterTypes);
+            if (method == null) {
+                throw new GraalError("Unable to find type for class " + type.toClassName());
+            }
+            return method;
+        }
+    }
+
+    public static GuestElements elements() {
+        return get().elements;
+    }
+
+    public boolean isBoxingType(ResolvedJavaType type) {
+        return elements.primitiveBoxTypes.contains(type);
+    }
+
+    /**
+     * Gets the {@link Annotated} equivalent value for element.
+     *
+     * @return {@code null} if element is a {@link Package} that has no annotations
+     */
+    public Annotated toAnnotated(AnnotatedElement element) {
+        return switch (element) {
+            case Class<?> clazz -> get().lookupType(clazz);
+            case Method method -> lookupMethod(method);
+            case Constructor<?> cons -> lookupMethod(cons);
+            case Package pkg -> lookupPackage(pkg);
+            case Field field -> lookupField(field);
+            case RecordComponent rc -> lookupRecordComponent(rc);
+            default -> throw new IllegalArgumentException(String.valueOf(element));
+        };
+    }
+
+    public ResolvedJavaType lookupType(Class<?> cls) {
+        return typeCache.computeIfAbsent(cls, metaAccess::lookupJavaType);
+    }
+
+    public ResolvedJavaMethod lookupMethod(Executable exe) {
+        return methodCache.computeIfAbsent(exe, metaAccess::lookupJavaMethod);
+    }
+
+    public ResolvedJavaField lookupField(Field field) {
+        return fieldCache.computeIfAbsent(field, metaAccess::lookupJavaField);
+    }
+
+    public ResolvedJavaRecordComponent lookupRecordComponent(RecordComponent rc) {
+        return recordCache.computeIfAbsent(rc, metaAccess::lookupJavaRecordComponent);
+    }
+
+    private ResolvedJavaPackage lookupPackage(Package pkg) {
+        /*
+         * All Packages should have at least the package-info.class. We convert that Class object to
+         * a ResolvedJavaType and use that to query the ResolvedJavaPackage.
+         */
+        Method getPackageInfo = ReflectionUtil.lookupMethod(Package.class, "getPackageInfo");
+        Class<?> packageInfo = ReflectionUtil.invokeMethod(getPackageInfo, pkg);
+        if (packageInfo == null) {
+            throw new NullPointerException("Package info of " + pkg.getName() + " is null");
+        }
+        return getPackage(lookupType(packageInfo));
+    }
+
+    /**
+     * Creates a builder-side supplier backed by one instance of {@code supplierType} in this guest
+     * context. The returned supplier must not outlive this guest context.
+     *
+     * @param supplierType a concrete {@link java.util.function.BooleanSupplier} type
+     */
+    public BooleanSupplier createBooleanSupplier(ResolvedJavaType supplierType) {
+        JavaConstant supplier = instantiateBooleanSupplier(supplierType);
+        return () -> invokeBooleanSupplier(supplier);
+    }
+
+    /** Instantiates {@code supplierType} in the guest. */
+    private @GuestType(BooleanSupplier.class) JavaConstant instantiateBooleanSupplier(ResolvedJavaType supplierType) {
+        ResolvedJavaMethod cons = JVMCIReflectionUtil.getDeclaredConstructor(false, supplierType);
+        return invoke(cons, null);
+    }
+
+    /** Invokes a guest {@link BooleanSupplier}. */
+    private boolean invokeBooleanSupplier(@GuestType(BooleanSupplier.class) JavaConstant supplier) {
+        return invoke(elements.java_util_function_BooleanSupplier_getAsBoolean, supplier).asBoolean();
+    }
+
+    /**
+     * Instantiates an instance of {@code supplierType} in the guest and invokes
+     * {@link BooleanSupplier#getAsBoolean()} on it.
+     *
+     * @param supplierType a concrete {@link java.util.function.BooleanSupplier} type
+     */
+    public boolean callBooleanSupplier(ResolvedJavaType supplierType) {
+        return invokeBooleanSupplier(instantiateBooleanSupplier(supplierType));
+    }
+
+    /**
+     * Instantiates an instance of {@code functionType} in the guest and invokes
+     * {@link Function#apply(Object)} on it.
+     *
+     * @param functionType a concrete {@link java.util.function.BooleanSupplier} type
+     * @param arg the single function argument for {@code apply}
+     */
+    public JavaConstant callFunction(ResolvedJavaType functionType, JavaConstant arg) {
+        ResolvedJavaMethod cons = JVMCIReflectionUtil.getDeclaredConstructor(false, functionType);
+        JavaConstant function = invoke(cons, null);
+        return invoke(elements.java_util_function_Function_apply, function, arg);
+    }
+
+    /**
+     * Instantiates an instance of {@code predicateType} in the guest and invokes
+     * {@link java.util.function.Predicate#test(Object)} on it.
+     */
+    public boolean callPredicate(ResolvedJavaType predicateType, JavaConstant arg) {
+        ResolvedJavaMethod cons = JVMCIReflectionUtil.getDeclaredConstructor(false, predicateType);
+        JavaConstant predicate = invoke(cons, null);
+        return invoke(elements.java_util_function_Predicate_test, predicate, arg).asBoolean();
+    }
+
+    /**
+     * Gets an annotation instance from a guest type.
+     */
+    public @GuestType(Annotation.class) JavaConstant getAnnotation(ResolvedJavaType annotatedType, ResolvedJavaType annotationType) {
+        JavaConstant annotatedClass = constantReflection.asJavaClass(annotatedType);
+        JavaConstant annotationClass = constantReflection.asJavaClass(annotationType);
+        return invoke(elements.java_lang_Class_getAnnotation, annotatedClass, annotationClass);
+    }
+
+    /**
+     * Gets the nest members of a type by invoking {@link Class#getNestMembers()} in the guest.
+     */
+    public ResolvedJavaType[] getNestMembers(ResolvedJavaType type) {
+        JavaConstant classConstant = constantReflection.asJavaClass(OriginalClassProvider.getOriginalType(type));
+        return asResolvedJavaTypes(invoke(elements.java_lang_Class_getNestMembers, classConstant));
+    }
+
+    /**
+     * Shortcut for {@code lookupAppClassLoaderType(name)}.
+     */
+    public ResolvedJavaType lookupType(String name) {
+        return lookupAppClassLoaderType(name);
+    }
+
+    /**
+     * Looks up a method in the guest.
+     *
+     * @param declaringType the class declaring the method
+     * @param name name of the method
+     * @param parameterTypes types of the method's parameters
+     */
+    public ResolvedJavaMethod lookupMethod(ResolvedJavaType declaringType, String name, Class<?>... parameterTypes) {
+        return JVMCIReflectionUtil.getUniqueDeclaredMethod(false, metaAccess, declaringType, name, parameterTypes);
+    }
+
+    /**
+     * Converts the host string {@code value} to a guest instance and returns a reference to it as a
+     * {@link JavaConstant}.
+     */
+    public @GuestType(String.class) JavaConstant asGuestString(String value) {
+        return constantReflection.forString(value);
+    }
+
+    /**
+     * Converts the host strings in {@code values} to a guest string array and returns a reference to
+     * it as a {@link JavaConstant}.
+     */
+    public @GuestType(String[].class) JavaConstant asGuestStringArray(String[] values) {
+        JavaConstant[] constants = new JavaConstant[values.length];
+        for (int i = 0; i < values.length; i++) {
+            constants[i] = asGuestString(values[i]);
+        }
+        return asArrayConstant(elements.java_lang_String, constants);
+    }
+
+    /**
+     * Decodes the elements of a guest array whose component type is assignable to
+     * {@code expectedComponentClass}.
+     */
+    public Stream<JavaConstant> asGuestArrayElements(JavaConstant array, ResolvedJavaType expectedComponentClass) {
+        return readGuestArrayElements(array, expectedComponentClass, false);
+    }
+
+    /**
+     * Decodes the elements of a guest array while preserving null entries as guest null constants.
+     */
+    Stream<JavaConstant> asGuestArrayElementsAllowingNull(JavaConstant array, ResolvedJavaType expectedComponentClass) {
+        return readGuestArrayElements(array, expectedComponentClass, true);
+    }
+
+    /** Shared guest-array decoder with an explicit null-element policy. */
+    private Stream<JavaConstant> readGuestArrayElements(JavaConstant array, ResolvedJavaType expectedComponentClass, boolean allowNullElements) {
+        if (array == null || array.isNull()) {
+            throw new IllegalArgumentException("Guest array must not be null.");
+        }
+        ResolvedJavaType arrayType = metaAccess.lookupJavaType(array);
+        if (arrayType == null || !arrayType.isArray() || arrayType.getComponentType() == null) {
+            throw new IllegalArgumentException("Expected a guest array, got " + array + ".");
+        }
+        ResolvedJavaType componentType = arrayType.getComponentType();
+        if (!expectedComponentClass.equals(componentType) && !expectedComponentClass.isAssignableFrom(componentType)) {
+            throw new IllegalArgumentException("Expected a guest array with component type " + expectedComponentClass.toJavaName() + ", got " + componentType.toJavaName() + ".");
+        }
+        Integer length = constantReflection.readArrayLength(array);
+        if (length == null) {
+            throw new IllegalArgumentException("Expected a guest array, got " + array + ".");
+        }
+        return IntStream.range(0, length).mapToObj(i -> {
+            JavaConstant element = constantReflection.readArrayElement(array, i);
+            if (element == null) {
+                throw new IllegalArgumentException("Could not read guest array element at index " + i + ".");
+            }
+            if (!allowNullElements && element.isNull()) {
+                throw new IllegalArgumentException("Guest array element at index " + i + " must not be null.");
+            }
+            return element;
+        });
+    }
+
+    public ResolvedJavaType[] asResolvedJavaTypes(@GuestType(Class[].class) JavaConstant array) {
+        return asGuestArrayElements(array, elements.java_lang_Class).map(element -> {
+            ResolvedJavaType type = constantReflection.asJavaType(element);
+            if (type == null) {
+                throw new IllegalArgumentException("Guest array element is not a Class: %s.".formatted(describeGuestConstant(element)));
+            }
+            return type;
+        }).toArray(ResolvedJavaType[]::new);
+    }
+
+    public ResolvedJavaMethod[] asResolvedJavaMethods(@GuestType(Executable[].class) JavaConstant array) {
+        return asGuestArrayElements(array, lookupType(Executable.class)).map(element -> {
+            ResolvedJavaMethod method = asResolvedJavaMethod(element);
+            if (method == null) {
+                throw new IllegalArgumentException("Guest array element is not an Executable: %s.".formatted(describeGuestConstant(element)));
+            }
+            return method;
+        }).toArray(ResolvedJavaMethod[]::new);
+    }
+
+    public ResolvedJavaField[] asResolvedJavaFields(@GuestType(Field[].class) JavaConstant array) {
+        return asGuestArrayElements(array, elements.java_lang_reflect_Field).map(element -> {
+            ResolvedJavaField field = asResolvedJavaField(element);
+            if (field == null) {
+                throw new IllegalArgumentException("Guest array element is not a Field: %s.".formatted(describeGuestConstant(element)));
+            }
+            return field;
+        }).toArray(ResolvedJavaField[]::new);
+    }
+
+    private String describeGuestConstant(JavaConstant constant) {
+        ResolvedJavaType guestType;
+        try {
+            guestType = metaAccess.lookupJavaType(constant);
+        } catch (RuntimeException ignored) {
+            guestType = null;
+        }
+        return guestType == null ? constant.toString() : "%s (resolved guest type: %s)".formatted(constant, guestType.toJavaName());
+    }
+
+    /**
+     * Converts the guest {@code val} to a host {@code type} object instance.
+     *
+     * @return {@code null} if {@code val.isNull()} otherwise a non-null {@code type} instance
+     * @throws IllegalArgumentException if conversion is not supported for {@code type}
+     */
+    public <T> T asHostObject(Class<T> type, JavaConstant val) {
+        if (val.isNull()) {
+            return null;
+        }
+        T res = snippetReflection.asObject(type, val);
+        if (res == null) {
+            throw new IllegalArgumentException("Cannot convert guest constant to a %s: %s".formatted(type.getName(), val));
+        }
+        return res;
+    }
+
+    /**
+     * Safely converts the guest {@code value} to a host object of {@code type}. Unlike
+     * {@link SnippetReflectionProvider#asObject}, this method does not expose an arbitrary guest
+     * object to the host. It only materializes primitive values, boxed primitive values, strings,
+     * enums, and {@code null}.
+     *
+     * @throws IllegalArgumentException if {@code type} is not supported
+     */
+    public <T> T asSafeHostObject(Class<T> type, JavaConstant value) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(value, "value");
+        if (value.getJavaKind().isObject() && value.isNull()) {
+            GraalError.guarantee(!type.isPrimitive(), "Cannot convert null guest value to primitive host type %s", type.getName());
+            return null;
+        }
+
+        Class<T> boxedType = box(type);
+        if (value.getJavaKind().isPrimitive()) {
+            return boxedType.cast(value.asBoxedPrimitive());
+        } else if (boxedType == String.class) {
+            return boxedType.cast(asHostString(value));
+        } else if (lookupType(boxedType).isEnum()) {
+            return asHostEnum(boxedType, value);
+        } else if (isBoxedPrimitive(boxedType)) {
+            return boxedType.cast(asHostBoxedPrimitive(boxedType, value));
+        } else {
+            throw new IllegalArgumentException("Cannot safely convert guest constant to " + type.getName());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> Class<T> box(Class<T> type) {
+        if (type == boolean.class) {
+            return (Class<T>) Boolean.class;
+        } else if (type == byte.class) {
+            return (Class<T>) Byte.class;
+        } else if (type == short.class) {
+            return (Class<T>) Short.class;
+        } else if (type == char.class) {
+            return (Class<T>) Character.class;
+        } else if (type == int.class) {
+            return (Class<T>) Integer.class;
+        } else if (type == long.class) {
+            return (Class<T>) Long.class;
+        } else if (type == float.class) {
+            return (Class<T>) Float.class;
+        } else if (type == double.class) {
+            return (Class<T>) Double.class;
+        } else {
+            return type;
+        }
+    }
+
+    private static boolean isBoxedPrimitive(Class<?> type) {
+        return type == Boolean.class || type == Byte.class || type == Short.class || type == Character.class || type == Integer.class || type == Long.class || type == Float.class ||
+                        type == Double.class;
+    }
+
+    private Object asHostBoxedPrimitive(Class<?> type, JavaConstant value) {
+        ResolvedJavaMethod method;
+        if (type == Boolean.class) {
+            method = elements.java_lang_Boolean_booleanValue;
+        } else if (type == Byte.class) {
+            method = elements.java_lang_Byte_byteValue;
+        } else if (type == Short.class) {
+            method = elements.java_lang_Short_shortValue;
+        } else if (type == Character.class) {
+            method = elements.java_lang_Character_charValue;
+        } else if (type == Integer.class) {
+            method = elements.java_lang_Integer_intValue;
+        } else if (type == Long.class) {
+            method = elements.java_lang_Long_longValue;
+        } else if (type == Float.class) {
+            method = elements.java_lang_Float_floatValue;
+        } else if (type == Double.class) {
+            method = elements.java_lang_Double_doubleValue;
+        } else {
+            throw new IllegalArgumentException("Not a boxed primitive type: " + type.getName());
+        }
+        return invoke(method, value).asBoxedPrimitive();
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private <T> T asHostEnum(Class<T> type, JavaConstant value) {
+        JavaConstant name = invoke(elements.java_lang_Enum_name, value);
+        return (T) Enum.valueOf((Class<? extends Enum>) type, asHostString(name));
+    }
+
+    /**
+     * Boxes a primitive {@link JavaConstant} into its corresponding object wrapper.
+     * <p>
+     * This method takes a primitive {@link JavaConstant} and invokes the corresponding
+     * {@code valueOf} method on the wrapper class to box the primitive value in the guest.
+     * <p>
+     * For example, if the input {@code primitive} is of kind {@link JavaKind#Int}, this method will
+     * invoke {@code Integer.valueOf(primitive.asInt())} to box the integer value.
+     *
+     * @param primitive the primitive {@link JavaConstant} to be boxed
+     * @return a {@link JavaConstant} representing the boxed object
+     * @throws IllegalArgumentException if the kind of {@code primitive} is not a primitive type
+     */
+    public JavaConstant boxPrimitive(JavaConstant primitive) {
+        if (!primitive.getJavaKind().isPrimitive()) {
+            throw new IllegalArgumentException("Not a primitive: " + primitive);
+        }
+        return switch (primitive.getJavaKind()) {
+            case Boolean -> invokeStatic(elements.java_lang_Boolean_valueOf, primitive);
+            case Byte -> invokeStatic(elements.java_lang_Byte_valueOf, primitive);
+            case Short -> invokeStatic(elements.java_lang_Short_valueOf, primitive);
+            case Char -> invokeStatic(elements.java_lang_Character_valueOf, primitive);
+            case Int -> invokeStatic(elements.java_lang_Integer_valueOf, primitive);
+            case Long -> invokeStatic(elements.java_lang_Long_valueOf, primitive);
+            case Float -> invokeStatic(elements.java_lang_Float_valueOf, primitive);
+            case Double -> invokeStatic(elements.java_lang_Double_valueOf, primitive);
+            default -> throw new IllegalArgumentException("Unsupported primitive kind: " + primitive.getJavaKind());
+        };
+    }
+
+    /**
+     * Shortcut for {@code asHostObject(String.class, val)}.
+     */
+    public String asHostString(JavaConstant val) {
+        return asHostObject(String.class, val);
+    }
+
+    public JavaConstant invokeStatic(ResolvedJavaMethod method, JavaConstant... args) {
+        assert method.isStatic() : method;
+        return invoke(method, null, args);
+    }
+
+    // delegating methods
+
+    @Override
+    public Providers getProviders() {
+        return delegate.getProviders();
+    }
+
+    @Override
+    public boolean owns(ResolvedJavaType value) {
+        return delegate.owns(value);
+    }
+
+    @Override
+    public boolean owns(ResolvedJavaMethod value) {
+        return delegate.owns(value);
+    }
+
+    @Override
+    public boolean owns(ResolvedJavaField value) {
+        return delegate.owns(value);
+    }
+
+    /**
+     * Invokes the provided method. Unlike {@link VMAccess#invoke}, this method rethrows builder
+     * exceptions returned through host proxies directly instead of wrapping them in an
+     * {@link InvocationException}.
+     */
+    @Override
+    public JavaConstant invoke(ResolvedJavaMethod method, JavaConstant receiver, JavaConstant... args) {
+        try {
+            return delegate.invoke(method, receiver, args);
+        } catch (InvocationException ie) {
+            if (ie.getCause() != null && ie.getExceptionObject() == null) {
+                // host exception
+                throw sneakyThrow(ie.getCause());
+            }
+            throw ie;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> RuntimeException sneakyThrow(Throwable ex) throws T {
+        throw (T) ex;
+    }
+
+    @Override
+    public void writeField(ResolvedJavaField field, JavaConstant receiver, JavaConstant value) {
+        delegate.writeField(OriginalFieldProvider.getOriginalField(field), receiver, value);
+    }
+
+    @Override
+    public JavaConstant asArrayConstant(ResolvedJavaType componentType, JavaConstant... arrayElements) {
+        return delegate.asArrayConstant(componentType, arrayElements);
+    }
+
+    @Override
+    public JavaConstant createPrimitiveArray(JavaKind kind, int length) {
+        return delegate.createPrimitiveArray(kind, length);
+    }
+
+    @Override
+    public JavaConstant clonePrimitiveArray(JavaConstant primitiveArray) {
+        return delegate.clonePrimitiveArray(primitiveArray);
+    }
+
+    @Override
+    public void copyArray(JavaConstant src, int srcPos, JavaConstant dest, int destPos, int length) {
+        delegate.copyArray(src, srcPos, dest, destPos, length);
+    }
+
+    @Override
+    public void writeArrayElement(JavaConstant array, int index, JavaConstant element) {
+        delegate.writeArrayElement(array, index, element);
+    }
+
+    @Override
+    public ResolvedJavaMethod asResolvedJavaMethod(Constant constant) {
+        return delegate.asResolvedJavaMethod(constant);
+    }
+
+    @Override
+    public ResolvedJavaField asResolvedJavaField(Constant constant) {
+        return delegate.asResolvedJavaField(constant);
+    }
+
+    @Override
+    public ResolvedJavaPackage asResolvedJavaPackage(Constant constant) {
+        return delegate.asResolvedJavaPackage(constant);
+    }
+
+    @Override
+    public ResolvedJavaRecordComponent asResolvedJavaRecordComponent(Constant constant) {
+        return delegate.asResolvedJavaRecordComponent(constant);
+    }
+
+    @Override
+    public JavaConstant asExecutableConstant(ResolvedJavaMethod method) {
+        return delegate.asExecutableConstant(method);
+    }
+
+    @Override
+    public JavaConstant asFieldConstant(ResolvedJavaField field) {
+        return delegate.asFieldConstant(field);
+    }
+
+    @Override
+    public ResolvedJavaType lookupAppClassLoaderType(String name) {
+        return delegate.lookupAppClassLoaderType(name);
+    }
+
+    @Override
+    public ResolvedJavaType lookupPlatformClassLoaderType(String name) {
+        return delegate.lookupPlatformClassLoaderType(name);
+    }
+
+    @Override
+    public ResolvedJavaType lookupBootClassLoaderType(String name) {
+        return delegate.lookupBootClassLoaderType(name);
+    }
+
+    @Override
+    public ResolvedJavaModule getModule(ResolvedJavaType type) {
+        return delegate.getModule(type);
+    }
+
+    @Override
+    public ResolvedJavaPackage getPackage(ResolvedJavaType type) {
+        return delegate.getPackage(type);
+    }
+
+    @Override
+    public ResolvedJavaModuleLayer bootModuleLayer() {
+        return delegate.bootModuleLayer();
+    }
+
+    @Override
+    public URL getCodeSourceLocation(ResolvedJavaType type) {
+        return delegate.getCodeSourceLocation(type);
+    }
+
+    @Override
+    public void copyMemory(JavaConstant src, int srcFrom, int srcTo, byte[] dst, int dstFrom) {
+        delegate.copyMemory(src, srcFrom, srcTo, dst, dstFrom);
+    }
+
+    @Override
+    public JavaConstant readPrimitiveArrayUnaligned(JavaConstant array, JavaKind kind, int offset) {
+        return delegate.readPrimitiveArrayUnaligned(array, kind, offset);
+    }
+
+    @Override
+    public JavaConstant createHostProxy(Object hostTarget, ResolvedJavaType guestType) {
+        return delegate.createHostProxy(hostTarget, guestType);
+    }
+
+    @Override
+    public JavaConstant createHostProxy(Object hostTarget, ResolvedJavaType guestType, Map<ResolvedJavaMethod, String> methodNameMappings) {
+        return delegate.createHostProxy(hostTarget, guestType, methodNameMappings);
+    }
+
+    @Override
+    public Throwable unwrapHostProxyException(JavaConstant guestWrapper) {
+        return delegate.unwrapHostProxyException(guestWrapper);
+    }
+}

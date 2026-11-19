@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -122,6 +122,9 @@ public final class TypeInfo {
                 case MAP_ENTRY:
                     subtype = SUBTYPE.INTERNAL_ENTRY;
                     break;
+                case ARRAY_PROPERTIES:
+                case ARRAY_SLOTS:
+                    break;
                 default:
                     throw new UnsupportedOperationException(typeMark.name());
             }
@@ -184,6 +187,8 @@ public final class TypeInfo {
             switch (typeMark) {
                 case MAP_ENTRIES:
                 case MAP_ENTRY:
+                case ARRAY_PROPERTIES:
+                case ARRAY_SLOTS:
                     return TYPE.OBJECT;
                 default:
                     throw new UnsupportedOperationException(typeMark.name());

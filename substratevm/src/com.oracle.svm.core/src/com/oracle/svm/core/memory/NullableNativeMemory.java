@@ -25,19 +25,23 @@
  */
 package com.oracle.svm.core.memory;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.UnmanagedMemory;
 import org.graalvm.nativeimage.impl.UnmanagedMemorySupport;
+import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.VMInspectionOptions;
 import com.oracle.svm.core.nmt.NativeMemoryTracking;
 import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.nmt.NmtMallocHeader;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.memory.UntrackedNullableNativeMemory;
+import com.oracle.svm.shared.Uninterruptible;
+import org.graalvm.word.impl.Word;
 
 /**
  * Internal API for managing native memory. This class supports native memory tracking (NMT) and is
@@ -47,6 +51,9 @@ import com.oracle.svm.core.nmt.NmtMallocHeader;
  * All methods that allocate native memory return {@code null} if the memory allocation fails.
  */
 public class NullableNativeMemory {
+    public static final byte UNINITIALIZED_NATIVE_MEMORY = (byte) 0xBA;
+    private static final byte FREED_NATIVE_MEMORY = (byte) 0xBE;
+
     /**
      * Allocates {@code size} bytes of native memory. The content of the memory is undefined.
      * <p>
@@ -55,7 +62,12 @@ public class NullableNativeMemory {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static <T extends PointerBase> T malloc(UnsignedWord size, NmtCategory category) {
         T outerPointer = UntrackedNullableNativeMemory.malloc(getAllocationSize(size));
-        return track(outerPointer, size, category);
+        T innerPtr = track(outerPointer, size, category);
+
+        if (SubstrateOptions.ZapNativeMemory.getValue() && VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            UnmanagedMemoryUtil.fill((Pointer) innerPtr, size, UNINITIALIZED_NATIVE_MEMORY);
+        }
+        return innerPtr;
     }
 
     /**
@@ -66,7 +78,7 @@ public class NullableNativeMemory {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static <T extends PointerBase> T malloc(int size, NmtCategory category) {
         assert size >= 0;
-        return malloc(WordFactory.unsigned(size), category);
+        return malloc(Word.unsigned(size), category);
     }
 
     /**
@@ -88,7 +100,7 @@ public class NullableNativeMemory {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static <T extends PointerBase> T calloc(int size, NmtCategory category) {
         assert size >= 0;
-        return calloc(WordFactory.unsigned(size), category);
+        return calloc(Word.unsigned(size), category);
     }
 
     /**
@@ -116,14 +128,21 @@ public class NullableNativeMemory {
         /* Try to realloc. */
         T newOuterPointer = UntrackedNullableNativeMemory.realloc(oldOuterPointer, getAllocationSize(size));
         if (newOuterPointer.isNull()) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
-        oldOuterPointer = WordFactory.nullPointer();
+        oldOuterPointer = Word.nullPointer();
 
         /* Only untrack the old block if the allocation was successful. */
         NativeMemoryTracking.singleton().untrack(oldSize, oldCategory);
-        return track(newOuterPointer, size, category);
+        T newInnerPtr = track(newOuterPointer, size, category);
+
+        if (SubstrateOptions.ZapNativeMemory.getValue() && VMInspectionOptions.hasNativeMemoryTrackingSupport() && size.aboveThan(oldSize)) {
+            UnsignedWord numUninitializedBytes = size.subtract(oldSize);
+            Pointer uninitializedStart = ((Pointer) newInnerPtr).add(oldSize);
+            UnmanagedMemoryUtil.fill(uninitializedStart, numUninitializedBytes, UNINITIALIZED_NATIVE_MEMORY);
+        }
+        return newInnerPtr;
     }
 
     /**
@@ -136,7 +155,7 @@ public class NullableNativeMemory {
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static <T extends PointerBase> T realloc(T ptr, int size, NmtCategory category) {
         assert size >= 0;
-        return realloc(ptr, WordFactory.unsigned(size), category);
+        return realloc(ptr, Word.unsigned(size), category);
     }
 
     /**
@@ -151,6 +170,11 @@ public class NullableNativeMemory {
     public static void free(PointerBase ptr) {
         if (ptr.isNull()) {
             return;
+        }
+
+        if (SubstrateOptions.ZapNativeMemory.getValue() && VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NmtMallocHeader header = NativeMemoryTracking.getHeader(ptr);
+            UnmanagedMemoryUtil.fill((Pointer) ptr, header.getAllocationSize(), FREED_NATIVE_MEMORY);
         }
 
         PointerBase outerPtr = untrack(ptr);

@@ -27,34 +27,34 @@ package com.oracle.svm.core.locks;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.c.CIsolateData;
+import com.oracle.svm.guest.staging.core.c.CIsolateDataFactory;
+import com.oracle.svm.core.locks.PlatformLockingSupport.PlatformSemaphore;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
+
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 /**
  * <p>
  * A semaphore that has minimal requirements on Java code. The implementation does not perform
  * memory allocation, exception unwinding, or other complicated operations. This allows it to be
  * used in early startup and shutdown phases of the VM, as well as to coordinate garbage collection.
- * </p>
- * 
  * <p>
  * Higher-level code that does not have these restrictions should use regular semaphores from the
  * JDK instead, i.e., implementations of {@link java.util.concurrent.Semaphore}.
- * </p>
- * 
  * <p>
  * It is not possible to allocate new VM semaphores at run time. All VM semaphores must be allocated
  * during image generation.
- * </p>
- * 
  * <p>
- * This class is almost an abstract base class for VMSemaphore. Subclasses replace instances of
- * VMSemaphore with platform-specific implementations.
- * </p>
+ * This class is a hosted-only placeholder. Image building replaces reachable instances with
+ * {@link RuntimeVMSemaphore} objects.
  */
 public class VMSemaphore extends VMLockingPrimitive {
-
     @Platforms(Platform.HOSTED_ONLY.class) //
     private final String name;
 
@@ -80,21 +80,58 @@ public class VMSemaphore extends VMLockingPrimitive {
 
     /**
      * The function that increments the semaphore.
-     * 
+     *
      * <p>
      * If the semaphore value resulting from this operation is positive, then no threads were
      * blocked waiting for the semaphore to become available; the semaphore value is simply
      * incremented.
-     * </p>
-     * 
      * <p>
      * If the value of the semaphore resulting from this operation is zero, then one of the threads
      * blocked waiting for the semaphore shall be allowed to return successfully from its call to
      * {@link #await()}.
-     * </p>
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void signal() {
         throw VMError.shouldNotReachHere("Semaphore cannot be used during native image generation.");
+    }
+}
+
+final class RuntimeVMSemaphore extends VMSemaphore {
+    private final CIsolateData<PlatformSemaphore> platformSemaphore;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    RuntimeVMSemaphore(String name) {
+        super(name);
+        UnsignedWord size = Word.unsigned(PlatformLockingSupport.singleton().semaphoreSize());
+        platformSemaphore = CIsolateDataFactory.create("semaphore_" + name, size);
+    }
+
+    @Override
+    @Uninterruptible(reason = "Too early for safepoints.")
+    public int initialize() {
+        return PlatformLockingSupport.singleton().initializeSemaphore(getPlatformSemaphore());
+    }
+
+    @Override
+    @Uninterruptible(reason = "The isolate teardown is in progress.")
+    public int destroy() {
+        return PlatformLockingSupport.singleton().destroySemaphore(getPlatformSemaphore());
+    }
+
+    @Override
+    public void await() {
+        PlatformLockingSupport.singleton().awaitSemaphore(getPlatformSemaphore());
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void signal() {
+        PlatformLockingSupport.singleton().signalSemaphore(getPlatformSemaphore());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private PlatformSemaphore getPlatformSemaphore() {
+        SubstrateUtil.guaranteeRuntimeOnly();
+        return platformSemaphore.get();
     }
 }

@@ -40,12 +40,14 @@ import org.graalvm.nativeimage.c.type.CConst;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.core.posix.headers.Errno;
 import com.oracle.svm.core.posix.headers.PosixDirectives;
 import com.oracle.svm.core.posix.headers.darwin.DarwinStat;
 import com.oracle.svm.core.posix.headers.linux.LinuxStat;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -55,8 +57,15 @@ public final class PosixStat {
     @CConstant
     public static native int S_IFLNK();
 
+    /// Masks all file-type bits; the `S_IF*` values overlap and are not independent flags.
+    @CConstant
+    public static native int S_IFMT();
+
     @CConstant
     public static native int S_IFDIR();
+
+    @CConstant
+    public static native int S_IFREG();
 
     @CConstant
     public static native int S_IRUSR();
@@ -122,12 +131,17 @@ public final class PosixStat {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static boolean S_ISLNK(stat buf) {
-        return st_mode(buf).and(S_IFLNK()).equal(S_IFLNK());
+        return st_mode(buf).and(S_IFMT()).equal(S_IFLNK());
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static boolean S_ISDIR(stat buf) {
-        return st_mode(buf).and(S_IFDIR()).equal(S_IFDIR());
+        return st_mode(buf).and(S_IFMT()).equal(S_IFDIR());
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static boolean S_ISREG(stat buf) {
+        return st_mode(buf).and(S_IFMT()).equal(S_IFREG());
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -139,6 +153,7 @@ public final class PosixStat {
         }
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static UnsignedWord st_nlink(stat buf) {
         if (Platform.includedIn(Platform.LINUX.class) || Platform.includedIn(Platform.DARWIN.class)) {
             return buf.st_nlink();
@@ -162,9 +177,32 @@ public final class PosixStat {
         @CField
         long st_size();
 
+        @CField("st_ctime")
+        long st_ctime();
+
         @CField
         @AllowWideningCast
         UnsignedWord st_nlink();
+    }
+
+    @Uninterruptible(reason = "LibC.errno() must not be overwritten accidentally.")
+    public static int restartableFstat(int fd, PosixStat.stat buf) {
+        int result;
+        do {
+            result = PosixStat.NoTransitions.fstat(fd, buf);
+        } while (result == -1 && LibC.errno() == Errno.EINTR());
+
+        return result;
+    }
+
+    @Uninterruptible(reason = "LibC.errno() must not be overwritten accidentally.")
+    public static int restartableLstat(CCharPointer path, PosixStat.stat buf) {
+        int result;
+        do {
+            result = PosixStat.NoTransitions.lstat(path, buf);
+        } while (result == -1 && LibC.errno() == Errno.EINTR());
+
+        return result;
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)

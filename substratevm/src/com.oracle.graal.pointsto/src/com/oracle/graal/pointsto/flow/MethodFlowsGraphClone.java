@@ -78,7 +78,7 @@ public class MethodFlowsGraphClone extends MethodFlowsGraph {
 
         if (!isReclone) {
             // during a reclone the original parameters and returnflow are retained
-            parameters = new FormalParamTypeFlow[originalFlowsGraph.parameters.length];
+            parameters = createParameters(originalFlowsGraph.parameters.length);
             for (int i = 0; i < originalFlowsGraph.parameters.length; i++) {
                 // copy the flow
                 if (originalFlowsGraph.getParameter(i) != null) {
@@ -127,7 +127,8 @@ public class MethodFlowsGraphClone extends MethodFlowsGraph {
         assert !(original instanceof FieldTypeFlow) : "Trying to clone a field type flow";
         assert !(original instanceof ArrayElementsTypeFlow) : "Trying to clone an mixed elements type flow";
 
-        if (original instanceof AllInstantiatedTypeFlow || original instanceof AllSynchronizedTypeFlow || original instanceof AnyPrimitiveSourceTypeFlow) {
+        if (original instanceof AllInstantiatedTypeFlow || original instanceof AllSynchronizedTypeFlow || (original instanceof AnyPrimitiveSourceTypeFlow && original.getSource() == null) ||
+                        original instanceof ConstantPrimitiveSourceTypeFlow) {
             /* These flows are not cloneable. */
             return original;
         }

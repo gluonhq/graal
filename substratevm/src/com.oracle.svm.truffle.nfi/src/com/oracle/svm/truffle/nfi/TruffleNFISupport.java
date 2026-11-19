@@ -35,13 +35,13 @@ import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalObject;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalObject;
 import com.oracle.svm.truffle.nfi.NativeAPI.TruffleContextHandle;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import org.graalvm.word.impl.Word;
 
 public abstract class TruffleNFISupport {
 
@@ -126,7 +126,7 @@ public abstract class TruffleNFISupport {
 
     @TruffleBoundary
     public static String utf8ToJavaString(CCharPointer str) {
-        if (str.equal(WordFactory.zero())) {
+        if (str.equal(Word.zero())) {
             return null;
         } else {
             UnsignedWord len = SubstrateUtil.strlen(str);
@@ -207,7 +207,7 @@ public abstract class TruffleNFISupport {
 
     protected static Target_com_oracle_truffle_nfi_backend_libffi_LibFFIContext getContext(long nativeContext) {
         TruffleNFISupport truffleNFISupport = ImageSingletons.lookup(TruffleNFISupport.class);
-        NativeAPI.NativeTruffleContext ctx = WordFactory.pointer(nativeContext);
+        NativeAPI.NativeTruffleContext ctx = Word.pointer(nativeContext);
         return truffleNFISupport.resolveContextHandle(ctx.contextHandle());
     }
 }

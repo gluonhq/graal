@@ -30,7 +30,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.graalvm.nativeimage.AnnotationAccess;
 import org.graalvm.nativeimage.c.constant.CEnum;
 import org.graalvm.nativeimage.c.constant.CEnumConstant;
 import org.graalvm.nativeimage.c.struct.AllowNarrowingCast;
@@ -42,7 +41,7 @@ import com.oracle.svm.core.c.enums.CEnumMapLookup;
 import com.oracle.svm.core.c.enums.CEnumNoLookup;
 import com.oracle.svm.core.c.enums.CEnumRuntimeData;
 import com.oracle.svm.core.c.struct.CInterfaceLocationIdentity;
-import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.shared.option.HostedOptionKey;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.c.info.AccessorInfo;
 import com.oracle.svm.hosted.c.info.ConstantInfo;
@@ -54,7 +53,8 @@ import com.oracle.svm.hosted.c.info.SizableInfo;
 import com.oracle.svm.hosted.c.info.SizableInfo.ElementKind;
 import com.oracle.svm.hosted.c.info.StructBitfieldInfo;
 import com.oracle.svm.hosted.c.info.StructFieldInfo;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.options.Option;
@@ -190,7 +190,7 @@ public final class SizeAndSignednessVerifier extends NativeInfoTreeVisitor {
         long[] javaToCArray = new long[javaToC.size()];
         for (Map.Entry<Enum<?>, Long> entry : javaToC.entrySet()) {
             int idx = entry.getKey().ordinal();
-            assert idx >= 0 && idx < javaToCArray.length && javaToCArray[idx] == 0 : "ordinal values are defined as unique and consecutive";
+            assert idx < javaToCArray.length && javaToCArray[idx] == 0 : "ordinal values are defined as unique and consecutive";
             javaToCArray[idx] = entry.getValue();
         }
 
@@ -241,7 +241,7 @@ public final class SizeAndSignednessVerifier extends NativeInfoTreeVisitor {
     private void verifySize(SizableInfo sizableInfo, ResolvedJavaType type, ResolvedJavaMethod method, boolean isReturn) {
         int declaredSize = getSizeInBytes(type);
 
-        boolean allowNarrowingCast = AnnotationAccess.isAnnotationPresent(method, AllowNarrowingCast.class);
+        boolean allowNarrowingCast = GuestAnnotationAccess.isAnnotationPresent(method, AllowNarrowingCast.class);
         if (allowNarrowingCast) {
             if (sizableInfo.isObject()) {
                 addError(ClassUtil.getUnqualifiedName(AllowNarrowingCast.class) + " cannot be used on fields that have an object type.", method);
@@ -250,7 +250,7 @@ public final class SizeAndSignednessVerifier extends NativeInfoTreeVisitor {
             }
         }
 
-        boolean allowWideningCast = AnnotationAccess.isAnnotationPresent(method, AllowWideningCast.class);
+        boolean allowWideningCast = GuestAnnotationAccess.isAnnotationPresent(method, AllowWideningCast.class);
         if (allowWideningCast) {
             if (sizableInfo.isObject()) {
                 addError(ClassUtil.getUnqualifiedName(AllowWideningCast.class) + " cannot be used on fields that have an object type.", method);
@@ -267,7 +267,7 @@ public final class SizeAndSignednessVerifier extends NativeInfoTreeVisitor {
             }
 
             Class<? extends Annotation> suppressionAnnotation = narrow ? AllowNarrowingCast.class : AllowWideningCast.class;
-            if (method.getAnnotation(suppressionAnnotation) == null) {
+            if (!GuestAnnotationAccess.isAnnotationPresent(method, suppressionAnnotation)) {
                 addError("Type " + type.toJavaName(false) + " has a size of " + declaredSize + " bytes, but accessed C value has a size of " + actualSize +
                                 " bytes; to suppress this error, use the annotation @" + ClassUtil.getUnqualifiedName(suppressionAnnotation), method);
             }

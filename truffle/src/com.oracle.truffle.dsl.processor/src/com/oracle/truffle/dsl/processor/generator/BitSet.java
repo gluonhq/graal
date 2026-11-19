@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -49,15 +49,19 @@ import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory.FrameState;
 import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory.LocalVariable;
 import com.oracle.truffle.dsl.processor.java.model.CodeTree;
 import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
+import com.oracle.truffle.dsl.processor.java.model.CodeVariableElement;
 
-final class BitSet {
+public final class BitSet {
 
+    // factory may be null
+    private final FlatNodeGenFactory factory;
     private final BitStateList states;
     private final String name;
     private final long allMask;
     private final TypeMirror type;
 
-    BitSet(String name, BitStateList states) {
+    BitSet(FlatNodeGenFactory factory, String name, BitStateList states) {
+        this.factory = factory;
         this.name = name;
         this.states = states;
         int bitCount = states.getBitCount();
@@ -96,6 +100,10 @@ final class BitSet {
         return false;
     }
 
+    public boolean isLoaded(FrameState state) {
+        return state.get(getName()) != null;
+    }
+
     private CodeTree createLocalReference(FrameState frameState) {
         LocalVariable var = frameState != null ? frameState.get(getName()) : null;
         if (var != null) {
@@ -114,7 +122,7 @@ final class BitSet {
         if (ref == null) {
             CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
             builder.string(getName(), "_");
-            ref = FlatNodeGenFactory.createInlinedAccess(frameState, null, builder.build(), null);
+            ref = factory.createInlinedAccess(frameState, null, builder.build(), null);
         }
         return ref;
     }
@@ -136,25 +144,7 @@ final class BitSet {
             // already loaded
             return CodeTreeBuilder.singleString("");
         }
-
-        String fieldName = name + "_";
-        CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
-        CodeTreeBuilder init = builder.create();
-        init.string("this.").tree(CodeTreeBuilder.singleString(fieldName));
-
-        CodeTree inlinedAccess = FlatNodeGenFactory.createInlinedAccess(frameState, null, init.build(), null);
-
-        if (var == null) {
-            var = new LocalVariable(type, name, null);
-            frameState.set(name, var);
-            builder.tree(var.createDeclaration(inlinedAccess));
-        } else {
-            builder.startStatement();
-            builder.string(name).string(" = ").tree(inlinedAccess);
-            builder.end();
-        }
-
-        return builder.build();
+        return factory.createStateLoad(frameState, this);
     }
 
     public void clearLoaded(FrameState frameState) {
@@ -213,6 +203,10 @@ final class BitSet {
     }
 
     public String formatMask(long mask) {
+        return formatMask(mask, getBitCount());
+    }
+
+    public static String formatMask(long mask, int bitCount) {
         if (mask == 0) {
             return "0";
         }
@@ -220,7 +214,7 @@ final class BitSet {
         if (bitsUsed <= 16) {
             return "0b" + Integer.toBinaryString((int) mask);
         } else {
-            if (getBitCount() <= 32) {
+            if (bitCount <= 32) {
                 return "0x" + Integer.toHexString((int) mask);
             } else {
                 return "0x" + Long.toHexString(mask) + "L";
@@ -234,7 +228,7 @@ final class BitSet {
 
         // use the calculation of power of two
         // (state & (state - 1L)) == 0L
-        builder.startParantheses().tree(masked).string(" & ").startParantheses().tree(masked).string(" - 1").end().end().string(" == 0");
+        builder.startParentheses().tree(masked).string(" & ").startParentheses().tree(masked).string(" - 1").end().end().string(" == 0");
 
         builder.string(" /* ", "is-single ", " */");
         return builder.build();
@@ -254,7 +248,7 @@ final class BitSet {
 
     public CodeTree createNotContains(CodeTree receiver, StateQuery elements) {
         CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
-        builder.startParantheses();
+        builder.startParentheses();
         builder.tree(createMaskedReference(receiver, elements));
         builder.end();
         builder.string(" == 0");
@@ -321,34 +315,21 @@ final class BitSet {
 
     private CodeTree createPersist(FrameState frameState, boolean persist, CodeTree valueTree, boolean update) {
         CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
-        builder.startStatement();
         if (persist) {
-            builder.string("this.", name, "_");
-            if (frameState != null && frameState.isInlinedNode()) {
-                builder.startCall(".set");
-                builder.tree(frameState.getValue(0).createReference());
+            CodeTree updateReference;
+            if (update) {
+                updateReference = createLocalReference(frameState);
             } else {
-                builder.string(" = ");
+                updateReference = null;
             }
-
-            builder.startGroup();
-            // if there is a local variable we need to update it as well
-            CodeTree localReference = createLocalReference(frameState);
-            if (localReference != null && update) {
-                builder.tree(localReference).string(" = ");
-            }
+            builder.tree(factory.createStatePersist(frameState, this, updateReference, valueTree));
         } else {
-            builder.startGroup();
-            builder.tree(createReference(frameState)).string(" = ");
+            builder.startStatement();
+            builder.tree(createReference(frameState));
+            builder.string(" = ");
+            builder.tree(valueTree);
+            builder.end(); // statement
         }
-        builder.tree(valueTree);
-        builder.end();
-
-        if (persist && frameState != null && frameState.isInlinedNode()) {
-            builder.end();
-        }
-
-        builder.end(); // statement
         return builder.build();
     }
 
@@ -356,7 +337,7 @@ final class BitSet {
         int offset = getStateOffset(element);
         CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
         builder.tree(receiver).string(" = ");
-        builder.startParantheses();
+        builder.startParentheses();
         builder.tree(receiver);
         builder.string(" | (");
         if (getBitCount() > 32) {
@@ -407,6 +388,10 @@ final class BitSet {
             this.length = length;
         }
 
+    }
+
+    public CodeVariableElement createField() {
+        return factory.createStateField(this);
     }
 
 }

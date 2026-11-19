@@ -31,10 +31,12 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Set;
 
 import org.graalvm.collections.EconomicMap;
 
+import com.oracle.graal.pointsto.ExtensionPolicy;
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
@@ -42,8 +44,11 @@ import com.oracle.graal.pointsto.util.AnalysisError;
 
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.EncodedGraph.EncodedNodeReference;
+import jdk.vm.ci.code.BytecodePosition;
 
 public class MethodFlowsGraph implements MethodFlowsGraphInfo {
+    private static final FormalParamTypeFlow[] EMPTY_PARAMETERS = new FormalParamTypeFlow[0];
+
     /**
      * The type of method flows graph.
      */
@@ -58,7 +63,7 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
          * A full MethodFlowsGraph has the full internal flow. Whether the graph flows for all
          * object parameters and return values, regardless of whether they are linked to the
          * internal flows, is dependent on
-         * {@code HostVM.MultiMethodAnalysisPolicy#insertPlaceholderParamAndReturnFlows}.
+         * {@code HostVM.MethodVariantsAnalysisPolicy#insertPlaceholderParamAndReturnFlows}.
          */
         FULL,
     }
@@ -93,7 +98,11 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
         // parameters
         boolean isStatic = Modifier.isStatic(method.getModifiers());
         int parameterCount = method.getSignature().getParameterCount(!isStatic);
-        parameters = new FormalParamTypeFlow[parameterCount];
+        parameters = createParameters(parameterCount);
+    }
+
+    static FormalParamTypeFlow[] createParameters(int length) {
+        return length == 0 ? EMPTY_PARAMETERS : new FormalParamTypeFlow[length];
     }
 
     public <T extends TypeFlow<?>> T lookupCloneOf(@SuppressWarnings("unused") PointsToAnalysis bb, T original) {
@@ -120,8 +129,10 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
     public static boolean nonMethodFlow(TypeFlow<?> flow) {
         /*
          * These flows do not belong to any method, but can be reachable from a use.
+         * 
+         * AnyPrimitiveFlow can be either global (source == null) or local (source != null)
          */
-        return flow instanceof AllInstantiatedTypeFlow || flow instanceof AllSynchronizedTypeFlow || flow instanceof AnyPrimitiveSourceTypeFlow;
+        return flow instanceof GlobalFlow || flow.isContextInsensitive() || (flow instanceof AnyPrimitiveSourceTypeFlow && flow.getSource() == null);
     }
 
     /**
@@ -174,7 +185,7 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
     private Iterator<TypeFlow<?>> flowsIterator() {
         return new Iterator<>() {
             final Deque<TypeFlow<?>> worklist = new ArrayDeque<>();
-            final Set<TypeFlow<?>> seen = new HashSet<>();
+            final Set<TypeFlow<?>> seen = new HashSet<>(); // noEconomicSet(null key is used)
             TypeFlow<?> next;
 
             {
@@ -220,9 +231,29 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
 
             @Override
             public TypeFlow<?> next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
                 TypeFlow<?> current = next;
+                assert withinMethod(current) : "Flow " + current + " has source " + current.source + " that is not a part of " + method;
                 next = findNext();
                 return current;
+            }
+
+            /**
+             * Check that the flow is local to the typeflow graph of this method. The iterator
+             * should not leave the scope of this method, but it may include flows originated from
+             * inlined methods.
+             */
+            private boolean withinMethod(TypeFlow<?> flow) {
+                var source = flow.getSource();
+                while (source instanceof BytecodePosition position) {
+                    if (method.equals(position.getMethod())) {
+                        return true;
+                    }
+                    source = position.getCaller();
+                }
+                return false;
             }
 
             /** Get the next flow and expand the work list. */
@@ -348,7 +379,7 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
                     InvokeTypeFlow invoke = callerInvoke;
                     if (InvokeTypeFlow.isContextInsensitiveVirtualInvoke(callerInvoke)) {
                         /* The invoke has been replaced by the context insensitive one. */
-                        invoke = callerInvoke.getTargetMethod().getContextInsensitiveVirtualInvoke(method.getMultiMethodKey());
+                        invoke = callerInvoke.getTargetMethod().getContextInsensitiveVirtualInvoke(method.getMethodVariantKey());
                     }
                     for (MethodFlowsGraph calleeFlowGraph : invoke.getAllNonStubCalleesFlows(bb)) {
                         // 'this' method graph was found among the callees of an invoke flow in one
@@ -441,31 +472,28 @@ public class MethodFlowsGraph implements MethodFlowsGraphInfo {
     }
 
     /**
-     * Saturates all the formal parameters of the graph. This is expected to be used by layered base
-     * image analysis.
+     * Seed external method entries and results of calls that may target extension code. A method
+     * whose entry is covered by analyzed callers can still invoke an extension callback.
      */
-    public void saturateAllParameters(PointsToAnalysis bb) {
-        AnalysisError.guarantee(bb.isBaseLayerAnalysisEnabled());
-        for (TypeFlow<?> parameter : getParameters()) {
-            if (parameter != null && parameter.canSaturate()) {
-                parameter.onSaturated(bb);
+    void saturateForOpenTypeWorld(PointsToAnalysis bb) {
+        ExtensionPolicy extensionPolicy = bb.getExtensionPolicy();
+        if (!extensionPolicy.isMethodEntryClosed(method)) {
+            for (TypeFlow<?> parameter : getParameters()) {
+                if (parameter != null && parameter.canSaturate(bb)) {
+                    parameter.enableFlow(bb);
+                    parameter.onSaturated(bb);
+                }
             }
         }
 
         /*
-         * Even if saturating only parameters already ensures that all code from the base layer is
-         * reached, it is still necessary to saturate flows from miscEntryFlows, as the extension
-         * image can introduce new types and methods. For example, an ActualReturnTypeFlow returning
-         * from an AbstractVirtualInvokeTypeFlow would not be saturated only by saturating
-         * parameters, as there is no direct use/observer link between the two flows. While all the
-         * types returned by the implementations from the base image will be in the TypeState, a
-         * different type might be returned by an implementation introduced by the extension image.
+         * An analyzed caller can pass an extension callback into a method with a closed entry.
+         * Account for the callback's results and normal continuation independently of entry seeding,
+         * even when no callback implementation is analyzed. This includes void-call return predicates.
          */
-        if (miscEntryFlows != null) {
-            for (TypeFlow<?> miscEntryFlow : miscEntryFlows) {
-                if (miscEntryFlow != null && miscEntryFlow.canSaturate()) {
-                    miscEntryFlow.onSaturated(bb);
-                }
+        for (InvokeTypeFlow invokeTypeFlow : getInvokes()) {
+            if (extensionPolicy.requiresOpenInvokeResult(invokeTypeFlow.getReceiverType(), invokeTypeFlow.isDirectInvoke())) {
+                invokeTypeFlow.saturateForOpenTypeWorld(bb);
             }
         }
     }

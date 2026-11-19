@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -40,7 +40,6 @@ import com.oracle.truffle.runtime.OptimizedIndirectCallNode;
 import com.oracle.truffle.runtime.OptimizedRuntimeOptions;
 import com.oracle.truffle.runtime.OptimizedTruffleRuntime;
 
-@SuppressWarnings("try")
 public class IndirectCallSiteTest extends TestWithSynchronousCompiling {
 
     private static final OptimizedTruffleRuntime runtime = (OptimizedTruffleRuntime) Truffle.getRuntime();
@@ -221,7 +220,7 @@ public class IndirectCallSiteTest extends TestWithSynchronousCompiling {
         }
         // make sure the direct call target is compiled too not just inlined
         for (int i = 0; i < compilationThreshold; i++) {
-            toInterpreterOnString.callDirect(null, directArguments);
+            toInterpreterOnString.callDirect(null, -1, directArguments);
         }
         assertCompiled(directCall);
         assertNotDeoptimized(directCall);

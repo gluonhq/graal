@@ -1,0 +1,780 @@
+/*
+ * Copyright (c) 2025, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.util;
+
+import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import com.oracle.svm.shared.util.ReflectionUtil;
+
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModuleLayer;
+import jdk.graal.compiler.vmaccess.ResolvedJavaPackage;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ModifiersProvider;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
+import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.Signature;
+import jdk.vm.ci.meta.annotation.Annotated;
+
+/**
+ * This class contains utility methods for commonly used reflection functionality based on JVMCI
+ * reflection (i.e. {@code jdk.vm.ci.meta}) as opposed to core reflection (i.e.
+ * {@code java.lang.reflect}).
+ */
+public final class JVMCIReflectionUtil {
+
+    /**
+     * Gets the method declared by {@code declaringClass} uniquely identified by {@code name} and
+     * {@code parameterTypes}. Like {@link Class#getDeclaredMethod(String, Class...)}, this does not
+     * consider super classes or interfaces.
+     *
+     * @param optional when {@code false}, an exception is thrown if the method does not exist
+     * @param declaringClass the class in which to look up the method
+     * @param name the name of the method to look up
+     * @param parameterTypes the parameter types of the method to look up
+     * @return the {@link ResolvedJavaMethod} object representing the requested method or
+     *         {@code null} if no such method exists and {@code optional} is {@code true}
+     * @throws GraalError if there is a method named {@code name} with a parameter whose type name
+     *             matches the name of the corresponding entry {@code p} in {@code parameterTypes}
+     *             but whose value is not {@link Object#equals(Object)} to {@code p} (because it is
+     *             unresolved or is resolved by a different class loader)
+     * @throws NoSuchMethodError if {@code optional} is {@code false} and there is no method
+     *             declared by {@code declaringClass} that is uniquely identified by {@code name}
+     *             and {@code parameterTypes}
+     */
+    public static ResolvedJavaMethod getUniqueDeclaredMethod(boolean optional, ResolvedJavaType declaringClass, String name, ResolvedJavaType... parameterTypes) {
+        var result = findUniqueMethod(optional, declaringClass, declaringClass.getDeclaredMethods(false), name, parameterTypes);
+        if (!optional && result == null) {
+            throw new NoSuchMethodError("%s.%s(%s)".formatted(
+                            declaringClass.toClassName(),
+                            name,
+                            Arrays.stream(parameterTypes).map(ResolvedJavaType::toClassName).collect(Collectors.joining(", "))));
+        }
+        return result;
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getUniqueDeclaredMethod(boolean, ResolvedJavaType, String, ResolvedJavaType...)} that
+     * passes {@code false} for {@code optional}.
+     */
+    public static ResolvedJavaMethod getUniqueDeclaredMethod(ResolvedJavaType declaringClass, String name, ResolvedJavaType... parameterTypes) {
+        return getUniqueDeclaredMethod(false, declaringClass, name, parameterTypes);
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getUniqueDeclaredMethod(boolean, ResolvedJavaType, String, ResolvedJavaType...)} that
+     * converts the {@link Class} parameters to {@link ResolvedJavaType} using the provided
+     * {@link MetaAccessProvider}.
+     */
+    public static ResolvedJavaMethod getUniqueDeclaredMethod(boolean optional, MetaAccessProvider metaAccess, ResolvedJavaType declaringClass, String name, Class<?>... parameterTypes) {
+        var parameterJavaTypes = Arrays.stream(parameterTypes).map(metaAccess::lookupJavaType).toArray(ResolvedJavaType[]::new);
+        return getUniqueDeclaredMethod(optional, declaringClass, name, parameterJavaTypes);
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getUniqueDeclaredMethod(boolean, MetaAccessProvider, ResolvedJavaType, String, Class...)}
+     * with {@code optional} set to {@code false}.
+     */
+    public static ResolvedJavaMethod getUniqueDeclaredMethod(MetaAccessProvider metaAccess, ResolvedJavaType declaringClass, String name, Class<?>... parameterTypes) {
+        return getUniqueDeclaredMethod(false, metaAccess, declaringClass, name, parameterTypes);
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getUniqueDeclaredMethod(MetaAccessProvider, ResolvedJavaType, String, Class...)} that
+     * converts the {@link Class} parameters to {@link ResolvedJavaType} using the provided
+     * {@link MetaAccessProvider}.
+     */
+    public static ResolvedJavaMethod getUniqueDeclaredMethod(MetaAccessProvider metaAccess, Class<?> declaringClass, String name, Class<?>... parameterTypes) {
+        return getUniqueDeclaredMethod(metaAccess, metaAccess.lookupJavaType(declaringClass), name, parameterTypes);
+    }
+
+    /**
+     * Gets the method declared by {@code declaringClass} identified by its full JVM signature. Like
+     * {@link Class#getDeclaredMethod(String, Class...)}, this does not consider super classes or
+     * interfaces. The explicit {@code returnType} distinguishes covariant-return bridge methods
+     * that have the same name and parameter types.
+     *
+     * @param optional when {@code false}, an exception is thrown if the method does not exist
+     * @param declaringClass the class in which to look up the method
+     * @param name the name of the method to look up
+     * @param returnType the return type of the method to look up
+     * @param parameterTypes the parameter types of the method to look up
+     * @return the {@link ResolvedJavaMethod} object representing the requested method or
+     *         {@code null} if no such method exists and {@code optional} is {@code true}
+     * @throws GraalError if a signature type has the expected name but resolves to a different type
+     * @throws NoSuchMethodError if {@code optional} is {@code false} and no matching method exists
+     */
+    public static ResolvedJavaMethod getDeclaredMethod(boolean optional, ResolvedJavaType declaringClass, String name, ResolvedJavaType returnType,
+                    ResolvedJavaType... parameterTypes) {
+        for (ResolvedJavaMethod method : declaringClass.getDeclaredMethods(false)) {
+            if (method.getName().equals(name) && parameterTypesEqual(parameterTypes, method.getSignature(), declaringClass) &&
+                            returnTypesEqual(returnType, method.getSignature(), declaringClass)) {
+                return method;
+            }
+        }
+        if (!optional) {
+            throw new NoSuchMethodError("%s %s.%s(%s)".formatted(
+                            returnType.toClassName(),
+                            declaringClass.toClassName(),
+                            name,
+                            Arrays.stream(parameterTypes).map(ResolvedJavaType::toClassName).collect(Collectors.joining(", "))));
+        }
+        return null;
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getDeclaredMethod(boolean, ResolvedJavaType, String, ResolvedJavaType, ResolvedJavaType...)}
+     * that passes {@code false} for {@code optional}.
+     */
+    public static ResolvedJavaMethod getDeclaredMethod(ResolvedJavaType declaringClass, String name, ResolvedJavaType returnType, ResolvedJavaType... parameterTypes) {
+        return getDeclaredMethod(false, declaringClass, name, returnType, parameterTypes);
+    }
+
+    /**
+     * Shortcut for {@link #getDeclaredConstructor(boolean, ResolvedJavaType, ResolvedJavaType...)}
+     * with {@code optional} set to {@code false}.
+     */
+    public static ResolvedJavaMethod getDeclaredConstructor(ResolvedJavaType declaringClass, ResolvedJavaType... parameterTypes) {
+        return getDeclaredConstructor(false, declaringClass, parameterTypes);
+    }
+
+    /**
+     * Gets the constructor declared by {@code declaringClass} uniquely identified by
+     * {@code parameterTypes}. Like {@link Class#getDeclaredConstructor(Class...)}, this does not
+     * consider super classes.
+     *
+     * @param optional when {@code false}, an exception is thrown if the constructor does not exist
+     * @param declaringClass the class in which to look up the constructor
+     * @param parameterTypes the parameter types of the constructor to look up
+     * @return the {@link ResolvedJavaMethod} object representing the requested constructor or
+     *         {@code null} if no such constructor exists and {@code optional} is {@code true}
+     * @throws GraalError if there is a constructor with a parameter whose type name matches the
+     *             name of the corresponding entry {@code p} in {@code parameterTypes} but whose
+     *             value is not {@link Object#equals(Object)} to {@code p} (because it is unresolved
+     *             or is resolved by a different class loader)
+     * @throws NoSuchMethodError if {@code optional} is {@code false} and there is no constructor
+     *             declared by {@code declaringClass} that is uniquely identified by
+     *             {@code parameterTypes}
+     */
+    public static ResolvedJavaMethod getDeclaredConstructor(boolean optional, ResolvedJavaType declaringClass, ResolvedJavaType... parameterTypes) {
+        String name = "<init>";
+        var result = findUniqueMethod(optional, declaringClass, declaringClass.getDeclaredConstructors(false), name, parameterTypes);
+        if (!optional && result == null) {
+            throw new NoSuchMethodError("No constructor found for %s.%s(%s)".formatted(
+                            declaringClass.toClassName(),
+                            name,
+                            Arrays.stream(parameterTypes).map(ResolvedJavaType::toClassName).collect(Collectors.joining(", "))));
+        }
+        return result;
+    }
+
+    /**
+     * Shortcut for {@link #getDeclaredConstructor(boolean, ResolvedJavaType, ResolvedJavaType...)}
+     * that converts the {@link Class} parameters to {@link ResolvedJavaType} using the provided
+     * {@link MetaAccessProvider}.
+     */
+    public static ResolvedJavaMethod getDeclaredConstructor(boolean optional, MetaAccessProvider metaAccess, ResolvedJavaType declaringClass, Class<?>... parameterTypes) {
+        var parameterJavaTypes = Arrays.stream(parameterTypes).map(metaAccess::lookupJavaType).toArray(ResolvedJavaType[]::new);
+        return getDeclaredConstructor(optional, declaringClass, parameterJavaTypes);
+    }
+
+    /**
+     * Shortcut for
+     * {@link #getDeclaredConstructor(boolean, MetaAccessProvider, ResolvedJavaType, Class...)} with
+     * {@code optional} set to {@code false}.
+     */
+    public static ResolvedJavaMethod getDeclaredConstructor(MetaAccessProvider metaAccess, ResolvedJavaType declaringClass, Class<?>... parameterTypes) {
+        return getDeclaredConstructor(false, metaAccess, declaringClass, parameterTypes);
+    }
+
+    /**
+     * Shortcut for {@link #getDeclaredConstructor(MetaAccessProvider, ResolvedJavaType, Class...)}
+     * that converts the {@link Class} parameters to {@link ResolvedJavaType} using the provided
+     * {@link MetaAccessProvider}.
+     */
+    public static ResolvedJavaMethod getDeclaredConstructor(MetaAccessProvider metaAccess, Class<?> declaringClass, Class<?>... parameterTypes) {
+        return getDeclaredConstructor(metaAccess, metaAccess.lookupJavaType(declaringClass), parameterTypes);
+    }
+
+    /**
+     * Gets the constructors declared by {@code declaringClass}. Like
+     * {@link Class#getConstructors()}, this only returns public constructors and does not consider
+     * super classes.
+     */
+    public static ResolvedJavaMethod[] getConstructors(ResolvedJavaType declaringClass) {
+        return Arrays.stream(declaringClass.getDeclaredConstructors(false)).filter(ModifiersProvider::isPublic).toArray(ResolvedJavaMethod[]::new);
+    }
+
+    private static boolean parameterTypesEqual(ResolvedJavaType[] parameterTypes, Signature sig, ResolvedJavaType declaringClass) {
+        if (sig.getParameterCount(false) != parameterTypes.length) {
+            return false;
+        }
+        for (int i = 0; i < parameterTypes.length; i++) {
+            ResolvedJavaType p1 = parameterTypes[i];
+            JavaType p2 = sig.getParameterType(i, declaringClass);
+            if (!p1.getName().equals(p2.getName())) {
+                return false;
+            }
+            p2 = p2.resolve(declaringClass);
+            if (!p1.equals(p2)) {
+                // Handles case of p2 being unresolved or being resolved
+                // but with a different class loader.
+                throw new GraalError("Parameter %d has matching type name (%s) but type objects are not equal: p1=%s, p2=%s", i, p2.toClassName(), p1, p2);
+            }
+        }
+        return true;
+    }
+
+    private static boolean returnTypesEqual(ResolvedJavaType returnType, Signature signature, ResolvedJavaType declaringClass) {
+        JavaType candidate = signature.getReturnType(declaringClass);
+        if (!returnType.getName().equals(candidate.getName())) {
+            return false;
+        }
+        candidate = candidate.resolve(declaringClass);
+        if (!returnType.equals(candidate)) {
+            throw new GraalError("Return type has matching type name (%s) but type objects are not equal: expected=%s, actual=%s", candidate.toClassName(), returnType, candidate);
+        }
+        return true;
+    }
+
+    private static ResolvedJavaMethod findUniqueMethod(boolean optional, ResolvedJavaType declaringClass, ResolvedJavaMethod[] methods, String name, ResolvedJavaType... parameterTypes) {
+        ResolvedJavaMethod res = null;
+        for (ResolvedJavaMethod m : methods) {
+            if (!m.getName().equals(name)) {
+                continue;
+            }
+            // ignore receiver type for comparison
+            Signature sig = m.getSignature();
+            if (!parameterTypesEqual(parameterTypes, sig, declaringClass)) {
+                continue;
+            }
+            if (res == null) {
+                res = m;
+            } else {
+                if (!optional) {
+                    if (m.isConstructor()) {
+                        throw new NoSuchMethodError("More than one constructor with parameters %s is declared by %s".formatted(res.format("(%P)"), declaringClass.toClassName()));
+                    } else {
+                        throw new NoSuchMethodError("More than one method named %s with signature %s is declared by %s".formatted(name, res.format("(%P)"), declaringClass.toClassName()));
+                    }
+                }
+                return null;
+            }
+        }
+        return res;
+    }
+
+    /**
+     * Gets the field declared by {@code declaringClass} uniquely identified by {@code fieldName}.
+     * Like {@link Class#getDeclaredField(String)}, this does not consider super classes or
+     * interfaces. Unlike {@link Class#getDeclaredField(String)}, it includes
+     * {@linkplain ResolvedJavaField#isInternal() internal} fields.
+     *
+     * @param optional when {@code true}, an exception is thrown if a field is not uniquely
+     *            identified by {@code fieldName}
+     * @param declaringClass the class in which to look up the field
+     * @param fieldName the name of the field to look up
+     * @return the {@link ResolvedJavaField} object or {@code null} if no such unique field exists
+     *         and {@code optional} is {@code true}
+     * @throws NoSuchFieldError if no field is uniquely identified by {@code fieldName} in
+     *             {@code declaringClass} and {@code optional} is {@code false}
+     */
+    public static ResolvedJavaField getUniqueDeclaredField(boolean optional, ResolvedJavaType declaringClass, String fieldName) {
+        ResolvedJavaField[][] allFields = {declaringClass.getStaticFields(), declaringClass.getInstanceFields(false)};
+        ResolvedJavaField found = null;
+        for (ResolvedJavaField[] fields : allFields) {
+            for (ResolvedJavaField field : fields) {
+                if (field.getName().equals(fieldName)) {
+                    if (found != null) {
+                        throw new NoSuchFieldError("More than one field named %s in %s".formatted(fieldName, declaringClass.toClassName()));
+                    }
+                    found = field;
+                }
+            }
+        }
+        if (!optional && found == null) {
+            throw new NoSuchFieldError(declaringClass.toClassName() + "." + fieldName);
+        }
+        return found;
+    }
+
+    /**
+     * Shortcut for {@link #getUniqueDeclaredField(boolean, ResolvedJavaType, String)} with
+     * {@code optional} set to {@code false}.
+     */
+    public static ResolvedJavaField getUniqueDeclaredField(ResolvedJavaType declaringClass, String fieldName) {
+        return getUniqueDeclaredField(false, declaringClass, fieldName);
+    }
+
+    /**
+     * Shortcut for {@link #getUniqueDeclaredField(ResolvedJavaType, String)} that converts the
+     * {@link Class} parameters to {@link ResolvedJavaType} using the provided
+     * {@link MetaAccessProvider}.
+     */
+    public static ResolvedJavaField getUniqueDeclaredField(MetaAccessProvider metaAccessProvider, Class<?> declaringClass, String fieldName) {
+        return getUniqueDeclaredField(metaAccessProvider.lookupJavaType(declaringClass), fieldName);
+    }
+
+    /**
+     * Returns a list containing all fields present within this type, including
+     * {@linkplain ResolvedJavaField#isInternal() internal} fields. The returned List is
+     * unmodifiable; calls to any mutator method will always cause
+     * {@code UnsupportedOperationException} to be thrown.
+     */
+    public static List<ResolvedJavaField> getAllFields(ResolvedJavaType declaringClass) {
+        ResolvedJavaField[] staticFields = declaringClass.getStaticFields();
+        ResolvedJavaField[] instanceFields = declaringClass.getInstanceFields(false);
+        ResolvedJavaField[] allFields = new ResolvedJavaField[staticFields.length + instanceFields.length];
+        System.arraycopy(staticFields, 0, allFields, 0, staticFields.length);
+        System.arraycopy(instanceFields, 0, allFields, staticFields.length, instanceFields.length);
+        return Collections.unmodifiableList(Arrays.asList(allFields));
+    }
+
+    /**
+     * Gets the package name for a {@link ResolvedJavaType}. This is the same as calling
+     * {@link Class#getPackageName()} on the underlying class.
+     * <p>
+     * Implementation derived from {@link Class#getPackageName()}.
+     */
+    public static String getPackageName(ResolvedJavaType type) {
+        ResolvedJavaType c = type.isArray() ? type.getElementalType() : type;
+        if (c.isPrimitive()) {
+            return "java.lang";
+        }
+        String cn = c.toClassName();
+        int dot = cn.lastIndexOf('.');
+        return (dot != -1) ? cn.substring(0, dot).intern() : "";
+    }
+
+    /**
+     * Gets the package enclosing {@code type} or null if {@code type} represents an array type, a
+     * primitive type or void.
+     */
+    public static ResolvedJavaPackage getPackage(ResolvedJavaType type) {
+        return GuestAccess.get().getPackage(OriginalClassProvider.getOriginalType(type));
+    }
+
+    /**
+     * Tests whether {@code type} represents a proxy class, equivalent to
+     * {@link java.lang.reflect.Proxy#isProxyClass(Class)}.
+     */
+    public static boolean isProxyClass(ResolvedJavaType type) {
+        GuestAccess access = GuestAccess.get();
+        ConstantReflectionProvider constantReflection = access.getProviders().getConstantReflection();
+        JavaConstant classConstant = constantReflection.asJavaClass(OriginalClassProvider.getOriginalType(type));
+        return access.invokeStatic(access.elements.java_lang_reflect_Proxy_isProxyClass, classConstant).asBoolean();
+    }
+
+    /**
+     * Gets the return type for a {@link ResolvedJavaMethod}. This is the same as calling
+     * {@link Method#getReturnType()} on the underlying method.
+     *
+     * @throws GraalError if the return type is not a {@link ResolvedJavaType}
+     */
+    public static ResolvedJavaType getResolvedReturnType(ResolvedJavaMethod m) {
+        JavaType returnType = m.getSignature().getReturnType(m.getDeclaringClass());
+        if (returnType instanceof ResolvedJavaType resolvedJavaType) {
+            return resolvedJavaType;
+        }
+        throw new GraalError("Method does not have a resolved return type: %s", m.format("%H.%n(%p)"));
+    }
+
+    /**
+     * Gets the declared exception types of {@code method} in declaration order.
+     * <p>
+     * Resolution is all-or-fail. If resolving any declared exception type raises a
+     * {@link LinkageError}, the error is propagated and no partial result is returned.
+     *
+     * @return an empty array if no reflection mirror is available
+     * @throws LinkageError if a declared exception type cannot be resolved
+     */
+    public static ResolvedJavaType[] getExceptionTypes(ResolvedJavaMethod method) {
+        ResolvedJavaMethod original = OriginalMethodProvider.getOriginalMethod(method);
+        if (original == null) {
+            return new ResolvedJavaType[0];
+        }
+        GuestAccess access = GuestAccess.get();
+        JavaConstant executable = access.asExecutableConstant(original);
+        if (executable == null || executable.isNull()) {
+            return new ResolvedJavaType[0];
+        }
+        return access.asResolvedJavaTypes(access.invoke(access.elements.java_lang_reflect_Executable_getExceptionTypes, executable));
+    }
+
+    /**
+     * Gets the defining class loader of {@code type} as an opaque guest constant. The null constant
+     * denotes the bootstrap class loader.
+     */
+    public static JavaConstant getClassLoader(ResolvedJavaType type) {
+        GuestAccess access = GuestAccess.get();
+        JavaConstant clazz = access.getProviders().getConstantReflection().asJavaClass(OriginalClassProvider.getOriginalType(type));
+        return access.invoke(access.elements.java_lang_Class_getClassLoader, clazz);
+    }
+
+    /**
+     * Gets the signers of {@code type} as opaque guest constants. Null signer entries are preserved
+     * as guest null constants.
+     *
+     * @return {@code null} if the guest class has no signers
+     */
+    public static JavaConstant[] getSigners(ResolvedJavaType type) {
+        GuestAccess access = GuestAccess.get();
+        JavaConstant clazz = access.getProviders().getConstantReflection().asJavaClass(OriginalClassProvider.getOriginalType(type));
+        JavaConstant signers = access.invoke(access.elements.java_lang_Class_getSigners, clazz);
+        if (signers.isNull()) {
+            return null;
+        }
+        return access.asGuestArrayElementsAllowingNull(signers, access.elements.java_lang_Object).toArray(JavaConstant[]::new);
+    }
+
+    /**
+     * Gets the raw class-file generic signature of a {@link ResolvedJavaType},
+     * {@link ResolvedJavaField}, {@link ResolvedJavaMethod}, or
+     * {@link ResolvedJavaRecordComponent}. A {@link ResolvedJavaMethod} may represent either a method
+     * or a constructor.
+     *
+     * @return the copied signature string, or {@code null} if the declaration has no signature or
+     *         no reflection mirror
+     * @throws IllegalArgumentException if {@code element} is not one of the supported JVMCI elements
+     */
+    public static String getGenericSignature(Annotated element) {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaMethod accessor;
+        if (element instanceof ResolvedJavaType) {
+            accessor = access.elements.java_lang_Class_getGenericSignature0;
+        } else if (element instanceof ResolvedJavaField) {
+            accessor = access.elements.java_lang_reflect_Field_getGenericSignature;
+        } else if (element instanceof ResolvedJavaMethod method) {
+            accessor = method.isConstructor() ? access.elements.java_lang_reflect_Constructor_getSignature : access.elements.java_lang_reflect_Method_getGenericSignature;
+        } else if (element instanceof ResolvedJavaRecordComponent) {
+            accessor = access.elements.java_lang_reflect_RecordComponent_getGenericSignature;
+        } else {
+            throw new IllegalArgumentException("Unsupported annotated element: " + element);
+        }
+        JavaConstant receiver = asReflectionConstant(access, element);
+        if (receiver == null || receiver.isNull()) {
+            return null;
+        }
+        JavaConstant signature = access.invoke(accessor, receiver);
+        if (signature.isNull()) {
+            return null;
+        }
+        return access.asHostString(signature);
+    }
+
+    /**
+     * Recovers the guest reflection mirror for {@code element}. Field and method wrappers are first
+     * unwrapped to their original JVMCI elements. The returned constant remains guest-owned.
+     *
+     * @return the reflection mirror, or {@code null} if no original element or mirror is available
+     */
+    private static JavaConstant asReflectionConstant(GuestAccess access, Annotated element) {
+        if (element instanceof ResolvedJavaType type) {
+            return access.getProviders().getConstantReflection().asJavaClass(OriginalClassProvider.getOriginalType(type));
+        } else if (element instanceof ResolvedJavaField field) {
+            ResolvedJavaField original = OriginalFieldProvider.getOriginalField(field);
+            return original == null ? null : access.asFieldConstant(original);
+        } else if (element instanceof ResolvedJavaMethod method) {
+            ResolvedJavaMethod original = OriginalMethodProvider.getOriginalMethod(method);
+            return original == null ? null : access.asExecutableConstant(original);
+        } else if (element instanceof ResolvedJavaRecordComponent component) {
+            return asRecordComponentConstant(access, component);
+        } else {
+            throw new IllegalArgumentException("Unsupported annotated element: " + element);
+        }
+    }
+
+    /**
+     * Finds the guest reflection mirror corresponding to {@code component} by converting and
+     * comparing the declaring record's components in the active guest context.
+     */
+    private static JavaConstant asRecordComponentConstant(GuestAccess access, ResolvedJavaRecordComponent component) {
+        ResolvedJavaType declaringType = OriginalClassProvider.getOriginalType(component.getDeclaringRecord());
+        JavaConstant declaringClass = access.getProviders().getConstantReflection().asJavaClass(declaringType);
+        JavaConstant components = access.invoke(access.elements.java_lang_Class_getRecordComponents, declaringClass);
+        if (components.isNull()) {
+            return null;
+        }
+        return access.asGuestArrayElements(components, access.elements.java_lang_reflect_RecordComponent).filter(candidate -> component.equals(access.asResolvedJavaRecordComponent(candidate)))
+                        .findFirst()
+                        .orElse(null);
+    }
+
+    /**
+     * Gets the type name for a {@link ResolvedJavaType}. This is the same as calling
+     * {@link Class#getTypeName()} on the underlying class.
+     * <p>
+     * Implementation derived from {@link Class#getTypeName()}.
+     */
+    public static String getTypeName(ResolvedJavaType type) {
+        if (type.isArray()) {
+            try {
+                ResolvedJavaType cl = type;
+                int dimensions = 0;
+                do {
+                    dimensions++;
+                    cl = cl.getComponentType();
+                } while (cl.isArray());
+                return cl.toClassName().concat("[]".repeat(dimensions));
+            } catch (Throwable e) {
+                /* FALLTHRU */
+            }
+        }
+        return type.toClassName();
+    }
+
+    /**
+     * Gets the simple name for a {@link ResolvedJavaType}. This is the same as calling
+     * {@link Class#getSimpleName()} on the underlying class.
+     * <p>
+     * Implementation derived from {@link Class#getSimpleName()}.
+     */
+    public static String getSimpleName(ResolvedJavaType type) {
+        if (type.isArray()) {
+            return getSimpleName(type.getComponentType()).concat("[]");
+        }
+
+        String className = type.toClassName();
+        ResolvedJavaType enclosingType = type.getEnclosingType();
+        if (enclosingType == null) {
+            return className.substring(className.lastIndexOf('.') + 1);
+        } else if (!type.isMember() && !type.isLocal()) {
+            return "";
+        }
+
+        String enclosingName = enclosingType.toClassName();
+        assert className.startsWith(enclosingName + "$") : type;
+        String result = className.substring(enclosingName.length() + 1);
+        if (type.isLocal()) {
+            int index = 0;
+            while (index < result.length() && Character.isDigit(result.charAt(index))) {
+                index++;
+            }
+            result = result.substring(index);
+        }
+        return result;
+    }
+
+    /**
+     * Returns the Java language modifiers for {@code type}, equivalent to
+     * {@link Class#getModifiers()} on the underlying class.
+     * <p>
+     * Unlike {@link ResolvedJavaType#getModifiers()}, this method includes member-class modifiers
+     * such as {@link java.lang.reflect.Modifier#STATIC} that are stored in the {@code InnerClasses}
+     * attribute instead of the class access flags. Use this method when migrating code that
+     * depends on the Java language modifiers returned by core reflection. Otherwise, prefer
+     * {@link ResolvedJavaType#getModifiers()} to avoid invoking guest code.
+     */
+    public static int getJavaLanguageModifiers(ResolvedJavaType type) {
+        if (!type.isMember() && !type.isArray()) {
+            return type.getModifiers();
+        }
+        GuestAccess access = GuestAccess.get();
+        ConstantReflectionProvider constantReflection = access.getProviders().getConstantReflection();
+        JavaConstant classConstant = constantReflection.asJavaClass(OriginalClassProvider.getOriginalType(type));
+        return access.invoke(access.elements.java_lang_Class_getModifiers, classConstant).asInt();
+    }
+
+    /**
+     * Returns the type that declares {@code type}, equivalent to {@link Class#getDeclaringClass()}
+     * on the underlying class, or {@code null} if {@code type} is not a member type.
+     * <p>
+     * Unlike {@link ResolvedJavaType#getEnclosingType()}, this method returns {@code null} for local
+     * and anonymous types. Use this method when migrating code that relies on the distinction
+     * between a declaring class and the broader enclosing class. Use
+     * {@link ResolvedJavaType#getEnclosingType()} when local and anonymous types should also return
+     * their enclosing type.
+     */
+    public static ResolvedJavaType getDeclaringType(ResolvedJavaType type) {
+        return type.isMember() ? type.getEnclosingType() : null;
+    }
+
+    public static ResolvedJavaModule getModule(ResolvedJavaType declaringClass) {
+        return GuestAccess.get().getModule(OriginalClassProvider.getOriginalType(declaringClass));
+    }
+
+    /**
+     * Returns the <em>origin</em> associated with this {@link ResolvedJavaType}.
+     *
+     * @return the location (URL), or {@code null} if no URL was supplied during construction.
+     */
+    public static URL getOrigin(ResolvedJavaType type) {
+        return GuestAccess.get().getCodeSourceLocation(OriginalClassProvider.getOriginalType(type));
+    }
+
+    /**
+     * Counts the number of superclasses as returned by {@link Class#getSuperclass()}.
+     * {@link java.lang.Object} and all primitive types are at depth 0 and all interfaces are at
+     * depth 1.
+     */
+    public static int countSuperclasses(ResolvedJavaType type) {
+        Objects.requireNonNull(type, "Must accept a non-null class argument");
+        int depth = 0;
+        for (var cur = type.getSuperclass(); cur != null; cur = cur.getSuperclass()) {
+            depth += 1;
+        }
+        return depth;
+    }
+
+    /**
+     * Returns the boot layer. See {@link java.lang.ModuleLayer#boot()}.
+     */
+    public static ResolvedJavaModuleLayer bootModuleLayer() {
+        return GuestAccess.get().bootModuleLayer();
+    }
+
+    /**
+     * Reads the value of the non-static field named {@code fieldName} declared by
+     * {@code declaringClass} from the object represented by {@code receiver}.
+     *
+     * @param receiver the instance object from which the field value will be read
+     * @param declaringClass the class in which the field is declared
+     * @param fieldName name of the field to read
+     * @throws NoSuchFieldError if no field is uniquely identified by {@code fieldName} in
+     *             {@code declaringClass}
+     * @throws IllegalArgumentException if {@code !receiver.getJavaKind().isObject()} or the named
+     *             field is static or the type of receiver is not assignable to
+     *             {@code declaringClass}
+     * @throws NullPointerException if {@code receiver == null} or {@code receiver} represents
+     *             {@link JavaConstant#isNull() null}
+     */
+    public static JavaConstant readInstanceField(JavaConstant receiver, ResolvedJavaType declaringClass, String fieldName) {
+        if (!receiver.getJavaKind().isObject()) {
+            throw new IllegalArgumentException("Not an object: " + receiver);
+        }
+        if (receiver.isNull()) {
+            throw new NullPointerException();
+        }
+        GuestAccess access = GuestAccess.get();
+        MetaAccessProvider metaAccess = access.getProviders().getMetaAccess();
+        ResolvedJavaType receiverClass = metaAccess.lookupJavaType(receiver);
+        if (!declaringClass.isAssignableFrom(receiverClass)) {
+            throw new IllegalArgumentException(receiverClass.toClassName() + " is not assignable to " + declaringClass.toClassName());
+        }
+        ResolvedJavaField field = JVMCIReflectionUtil.getUniqueDeclaredField(false, declaringClass, fieldName);
+        if (field.isStatic()) {
+            throw new IllegalArgumentException(fieldName + " is static");
+        }
+        return access.getProviders().getConstantReflection().readFieldValue(field, receiver);
+    }
+
+    /**
+     * Reads the value of the static field {@code fieldName} declared by {@code declaringClass}.
+     *
+     * @throws NoSuchFieldError if no field is uniquely identified by {@code fieldName} in
+     *             {@code declaringClass}
+     * @throws IllegalArgumentException if the named field is not static
+     */
+    public static JavaConstant readStaticField(ResolvedJavaType declaringClass, String fieldName) {
+        ResolvedJavaField field = JVMCIReflectionUtil.getUniqueDeclaredField(false, declaringClass, fieldName);
+        if (!field.isStatic()) {
+            throw new IllegalArgumentException(fieldName + " is not static");
+        }
+        return GuestAccess.get().getProviders().getConstantReflection().readFieldValue(field, null);
+    }
+
+    /**
+     * @see ReflectionUtil#newInstance
+     */
+    public static JavaConstant newInstance(ResolvedJavaType type) {
+        ResolvedJavaMethod ctor = getDeclaredConstructor(false, type);
+        return GuestAccess.get().invoke(ctor, null);
+    }
+
+    /**
+     * Creates a new array with the specified component type and length.
+     *
+     * @see java.lang.reflect.Array#newInstance(Class, int)
+     */
+    public static JavaConstant newArrayInstance(ResolvedJavaType componentType, int length) {
+        if (componentType.isPrimitive()) {
+            return GuestAccess.get().createPrimitiveArray(componentType.getJavaKind(), length);
+        }
+        JavaConstant[] elements = new JavaConstant[length];
+        Arrays.fill(elements, JavaConstant.defaultForKind(componentType.getJavaKind()));
+        return GuestAccess.get().asArrayConstant(componentType, elements);
+    }
+
+    /**
+     * Implements {@link Class#getResourceAsStream(String)} followed by
+     * {@link InputStream#readAllBytes()} using JVMCI reflection.
+     *
+     * @return The resource contents as a byte array; {@code null} if
+     *         {@link Class#getResourceAsStream(String)} returned {@code null}.
+     */
+    public static byte[] getResource(ResolvedJavaType type, String name) {
+        GuestAccess access = GuestAccess.get();
+        Providers providers = access.getProviders();
+        ConstantReflectionProvider constantReflection = providers.getConstantReflection();
+
+        JavaConstant classConstant = constantReflection.asJavaClass(OriginalClassProvider.getOriginalType(type));
+        JavaConstant nameConstant = constantReflection.forString(name);
+
+        JavaConstant streamConstant = access.invoke(access.elements.java_lang_Class_getResourceAsStream, classConstant, nameConstant);
+
+        if (streamConstant.isNull()) {
+            return null;
+        }
+
+        JavaConstant bytesConstant = access.invoke(access.elements.java_io_Input_Stream_readAllBytesMethod, streamConstant);
+
+        return access.getSnippetReflection().asObject(byte[].class, bytesConstant);
+    }
+
+    /**
+     * @see ReflectionUtil#writeField
+     */
+    public static void writeField(ResolvedJavaType declaringType, String fieldName, JavaConstant receiver, JavaConstant value) {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaField field = JVMCIReflectionUtil.getUniqueDeclaredField(declaringType, fieldName);
+        access.writeField(field, receiver, value);
+    }
+
+    /**
+     * @see ReflectionUtil#writeStaticField
+     */
+    public static void writeStaticField(ResolvedJavaType declaringType, String fieldName, JavaConstant value) {
+        writeField(declaringType, fieldName, null, value);
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,21 +20,16 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.impl;
 
 import java.lang.reflect.Modifier;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.classfile.ConstantPool;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Signature;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.constantpool.RuntimeConstantPool;
 import com.oracle.truffle.espresso.impl.ModuleTable.ModuleEntry;
 import com.oracle.truffle.espresso.impl.ObjectKlass.KlassVersion;
 import com.oracle.truffle.espresso.impl.PackageTable.PackageEntry;
-import com.oracle.truffle.espresso.jdwp.api.MethodRef;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
 import com.oracle.truffle.espresso.runtime.GuestAllocator;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
@@ -58,7 +53,7 @@ public final class PrimitiveKlass extends Klass {
         assert primitiveKind.isPrimitive() : primitiveKind + " not a primitive kind";
         this.primitiveKind = primitiveKind;
         assert getMeta().java_lang_Class != null;
-        initializeEspressoClass();
+        initializeGuestClassMirror();
     }
 
     public JavaKind getPrimitiveJavaKind() {
@@ -76,18 +71,8 @@ public final class PrimitiveKlass extends Klass {
     }
 
     @Override
-    public ConstantPool getConstantPool() {
+    public RuntimeConstantPool getConstantPool() {
         return null;
-    }
-
-    @Override
-    public boolean isLocal() {
-        return false;
-    }
-
-    @Override
-    public boolean isMember() {
-        return false;
     }
 
     @Override
@@ -106,18 +91,8 @@ public final class PrimitiveKlass extends Klass {
     }
 
     @Override
-    public MethodRef[] getDeclaredMethodRefs() {
-        return Method.EMPTY_VERSION_ARRAY;
-    }
-
-    @Override
     public Method.MethodVersion[] getDeclaredMethodVersions() {
         return Method.EMPTY_VERSION_ARRAY;
-    }
-
-    @Override
-    public Method lookupMethod(Symbol<Name> methodName, Symbol<Signature> signature, LookupMode lookupMode) {
-        return null;
     }
 
     @Override

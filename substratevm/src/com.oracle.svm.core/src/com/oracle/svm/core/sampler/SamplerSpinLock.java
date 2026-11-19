@@ -30,15 +30,15 @@ import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.shared.util.VMError;
+import org.graalvm.word.impl.Word;
 
 /**
  * The custom implementation of spin lock that is async signal safe.
- * 
+ *
  * In some specific situations, the signal handler can interrupt execution while the same thread
  * already has the lock. This implementation will check and fatally fail while other spin locks
  * implementations can deadlock in this case. So it is essential to check if the current thread is
@@ -61,7 +61,7 @@ class SamplerSpinLock {
     public void lock() {
         VMError.guarantee(!isOwner(), "The current thread already has the lock!");
         IsolateThread currentThread = CurrentIsolate.getCurrentThread();
-        while (!owner.compareAndSet(WordFactory.nullPointer(), currentThread)) {
+        while (!owner.compareAndSet(Word.nullPointer(), currentThread)) {
             PauseNode.pause();
         }
     }
@@ -69,6 +69,6 @@ class SamplerSpinLock {
     @Uninterruptible(reason = "The whole critical section must be uninterruptible.", callerMustBe = true)
     public void unlock() {
         VMError.guarantee(isOwner(), "The current thread doesn't have the lock!");
-        owner.compareAndSet(CurrentIsolate.getCurrentThread(), WordFactory.nullPointer());
+        owner.compareAndSet(CurrentIsolate.getCurrentThread(), Word.nullPointer());
     }
 }

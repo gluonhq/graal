@@ -30,19 +30,19 @@ import java.util.Map;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.c.libc.TemporaryBuildDirectoryProvider;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.code.SubstrateBackend;
 import com.oracle.svm.core.graal.code.SubstrateBackendFactory;
 import com.oracle.svm.core.graal.code.SubstrateLoweringProviderFactory;
 import com.oracle.svm.core.graal.code.SubstrateSuitesCreatorProvider;
+import com.oracle.svm.core.graal.code.SubstrateVectorArchitectureFactory;
 import com.oracle.svm.core.graal.llvm.image.LLVMCCompilerInvoker;
 import com.oracle.svm.core.graal.llvm.lowering.LLVMLoadExceptionObjectLowering;
 import com.oracle.svm.core.graal.llvm.lowering.SubstrateLLVMLoweringProvider;
@@ -52,8 +52,7 @@ import com.oracle.svm.core.graal.llvm.runtime.LLVMExceptionUnwind;
 import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
-import com.oracle.svm.core.layeredimagesingleton.UnsupportedLayeredSingleton;
-import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.shared.option.HostedOptionKey;
 import com.oracle.svm.core.snippets.ExceptionUnwind;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.FeatureImpl;
@@ -65,14 +64,25 @@ import com.oracle.svm.hosted.image.NativeImageCodeCache;
 import com.oracle.svm.hosted.image.NativeImageCodeCacheFactory;
 import com.oracle.svm.hosted.image.NativeImageHeap;
 import com.oracle.svm.hosted.image.ObjectFileFactory;
-import com.oracle.svm.util.ModuleSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ModuleSupport;
 
+import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
+import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodes.java.LoadExceptionObjectNode;
+import jdk.graal.compiler.nodes.spi.PlatformConfigurationProvider;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.replacements.DefaultJavaLoweringProvider;
 import jdk.graal.compiler.replacements.TargetGraphBuilderPlugins;
+import jdk.graal.compiler.vector.architecture.VectorArchitecture;
+import jdk.vm.ci.code.TargetDescription;
+import jdk.vm.ci.meta.MetaAccessProvider;
 
 /*
  * This feature enables the LLVM backend of Native Image. It does so by registering the backend,
@@ -81,7 +91,7 @@ import jdk.graal.compiler.replacements.TargetGraphBuilderPlugins;
  */
 @AutomaticallyRegisteredFeature
 @Platforms({Platform.LINUX.class, Platform.DARWIN.class})
-public class LLVMFeature implements Feature, InternalFeature, UnsupportedLayeredSingleton {
+public class LLVMFeature implements InternalFeature {
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
@@ -97,39 +107,20 @@ public class LLVMFeature implements Feature, InternalFeature, UnsupportedLayered
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        if (ModuleSupport.modulePathBuild) {
-            ModuleSupport.accessModuleByClass(ModuleSupport.Access.EXPORT, NodeClass.class, LLVMGraphBuilderPlugins.class);
-            ModuleSupport.accessModuleByClass(ModuleSupport.Access.EXPORT, NodeClass.class, SubstrateLLVMLoweringProvider.class);
+        LLVMVersionChecker.checkLLVMVersion();
 
-            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.EXPORT, LLVMFeature.class, false, "jdk.internal.vm.ci", "jdk.vm.ci.code.site", "jdk.vm.ci.code", "jdk.vm.ci.meta");
-        }
+        ModuleSupport.accessModuleByClass(ModuleSupport.Access.EXPORT, NodeClass.class, LLVMGraphBuilderPlugins.class);
+        ModuleSupport.accessModuleByClass(ModuleSupport.Access.EXPORT, NodeClass.class, SubstrateLLVMLoweringProvider.class);
 
-        ImageSingletons.add(SubstrateBackendFactory.class, new SubstrateBackendFactory() {
-            @Override
-            public SubstrateBackend newBackend(Providers newProviders) {
-                return new SubstrateLLVMBackend(newProviders);
-            }
-        });
+        ModuleSupport.accessPackagesToClass(ModuleSupport.Access.EXPORT, LLVMFeature.class, false, "jdk.internal.vm.ci", "jdk.vm.ci.code.site", "jdk.vm.ci.code", "jdk.vm.ci.meta");
 
-        ImageSingletons.add(SubstrateLoweringProviderFactory.class, SubstrateLLVMLoweringProvider::new);
+        ImageSingletons.add(SubstrateBackendFactory.class, new LLVMSubstrateBackendFactory());
 
-        ImageSingletons.add(NativeImageCodeCacheFactory.class, new NativeImageCodeCacheFactory() {
-            @Override
-            public NativeImageCodeCache newCodeCache(CompileQueue compileQueue, NativeImageHeap heap, Platform platform, Path tempDir) {
-                return new LLVMNativeImageCodeCache(compileQueue.getCompilationResults(), heap, platform, tempDir);
-            }
-        });
+        ImageSingletons.add(SubstrateLoweringProviderFactory.class, new LLVMSubstrateLoweringProviderFactory());
 
-        ImageSingletons.add(ObjectFileFactory.class, new ObjectFileFactory() {
-            @Override
-            public ObjectFile newObjectFile(int pageSize, Path tempDir, BigBang bb) {
-                if (LLVMOptions.UseLLVMDataSection.getValue()) {
-                    return new LLVMObjectFile(pageSize, tempDir, bb);
-                } else {
-                    return ObjectFile.getNativeObjectFile(pageSize);
-                }
-            }
-        });
+        ImageSingletons.add(NativeImageCodeCacheFactory.class, new LLVMCodeCacheFactory());
+
+        ImageSingletons.add(ObjectFileFactory.class, new LLVMObjectFileFactory());
 
         if (LLVMOptions.UseLLVMDataSection.getValue()) {
             ImageSingletons.add(CCompilerInvoker.class, new LLVMCCompilerInvoker(ImageSingletons.lookup(TemporaryBuildDirectoryProvider.class).getTemporaryBuildDirectory()));
@@ -139,7 +130,7 @@ public class LLVMFeature implements Feature, InternalFeature, UnsupportedLayered
 
         ImageSingletons.add(TargetGraphBuilderPlugins.class, new LLVMGraphBuilderPlugins());
 
-        ImageSingletons.add(SubstrateSuitesCreatorProvider.class, new SubstrateSuitesCreatorProvider());
+        ImageSingletons.add(SubstrateSuitesCreatorProvider.class, new LLVMSubstrateSuitesCreatorProvider());
     }
 
     @Override
@@ -155,18 +146,9 @@ public class LLVMFeature implements Feature, InternalFeature, UnsupportedLayered
     }
 
     static class LLVMVersionChecker {
-        private static final int MIN_LLVM_VERSION = 8;
-        private static final int MIN_LLVM_OPTIMIZATIONS_VERSION = 9;
-        private static final int llvmVersion = getLLVMVersion();
+        private static final int MIN_LLVM_VERSION = 20;
 
-        static boolean useExplicitSelects() {
-            if (!Platform.includedIn(Platform.AMD64.class)) {
-                return false;
-            }
-            return llvmVersion < MIN_LLVM_OPTIMIZATIONS_VERSION;
-        }
-
-        private static int getLLVMVersion() {
+        static void checkLLVMVersion() {
             String versionString;
             try {
                 versionString = LLVMToolchain.runLLVMCommand("llvm-config", null, "--version");
@@ -179,11 +161,49 @@ public class LLVMFeature implements Feature, InternalFeature, UnsupportedLayered
 
             if (version < MIN_LLVM_VERSION) {
                 throw UserError.abort("Unsupported LLVM version: %d. Supported versions are LLVM %d and above", version, MIN_LLVM_VERSION);
-            } else if (LLVMOptions.BitcodeOptimizations.getValue() && version < MIN_LLVM_OPTIMIZATIONS_VERSION) {
-                throw UserError.abort("Unsupported LLVM version to enable bitcode optimizations: %d. Supported versions are LLVM %d.0.0 and above", version, MIN_LLVM_OPTIMIZATIONS_VERSION);
             }
+        }
+    }
 
-            return version;
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMSubstrateBackendFactory extends SubstrateBackendFactory {
+        @Override
+        public SubstrateBackend newBackend(Providers newProviders) {
+            return new SubstrateLLVMBackend(newProviders);
+        }
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMSubstrateLoweringProviderFactory extends SubstrateVectorArchitectureFactory implements SubstrateLoweringProviderFactory {
+        @Override
+        public DefaultJavaLoweringProvider newLoweringProvider(MetaAccessProvider metaAccess, ForeignCallsProvider foreignCalls, PlatformConfigurationProvider platformConfig,
+                        MetaAccessExtensionProvider metaAccessExtensionProvider, TargetDescription target) {
+            VectorArchitecture vectorArchitecture = getSingletonVectorArchitecture(target.arch, platformConfig.getBarrierSet());
+            return new SubstrateLLVMLoweringProvider(metaAccess, foreignCalls, platformConfig, metaAccessExtensionProvider, target, vectorArchitecture);
+        }
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMSubstrateSuitesCreatorProvider extends SubstrateSuitesCreatorProvider {
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMCodeCacheFactory extends NativeImageCodeCacheFactory {
+        @Override
+        public NativeImageCodeCache newCodeCache(CompileQueue compileQueue, NativeImageHeap heap, Platform platform, Path tempDir) {
+            return new LLVMNativeImageCodeCache(compileQueue.getCompilationResults(), heap, platform, tempDir);
+        }
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMObjectFileFactory implements ObjectFileFactory {
+        @Override
+        public ObjectFile newObjectFile(int pageSize, Path tempDir, BigBang bb) {
+            if (LLVMOptions.UseLLVMDataSection.getValue()) {
+                return new LLVMObjectFile(pageSize, tempDir, bb);
+            } else {
+                return ObjectFile.getNativeObjectFile(pageSize);
+            }
         }
     }
 }

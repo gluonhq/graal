@@ -1,0 +1,1104 @@
+/*
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.dsl.processor.bytecode.model;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+
+import javax.lang.model.type.TypeMirror;
+
+import com.oracle.truffle.dsl.processor.ProcessorContext;
+import com.oracle.truffle.dsl.processor.bytecode.model.OperationModel.OperationArgument;
+import com.oracle.truffle.dsl.processor.bytecode.model.OperationModel.OperationKind;
+import com.oracle.truffle.dsl.processor.bytecode.model.Signature.Operand;
+import com.oracle.truffle.dsl.processor.java.ElementUtils;
+import com.oracle.truffle.dsl.processor.java.model.CodeTree;
+import com.oracle.truffle.dsl.processor.java.model.CodeTypeElement;
+import com.oracle.truffle.dsl.processor.model.CacheExpression;
+import com.oracle.truffle.dsl.processor.model.InlineFieldData;
+import com.oracle.truffle.dsl.processor.model.InlinedNodeData;
+import com.oracle.truffle.dsl.processor.model.NodeData;
+import com.oracle.truffle.dsl.processor.model.SpecializationData;
+
+public final class InstructionModel implements PrettyPrintable {
+    public static final int OPCODE_WIDTH = 2; // short
+    public static final int INSTRUCTION_ALIGNMENT = 2;
+
+    /*
+     * Sort by how commonly they are used.
+     */
+    public enum InstructionKind {
+        LOAD_ARGUMENT,
+        LOAD_CONSTANT,
+        LOAD_STACKVALUE,
+        LOAD_LOCAL,
+        CLEAR_LOCAL,
+        STORE_LOCAL,
+        STORE_STACKVALUE,
+        BRANCH,
+        BRANCH_BACKWARD,
+        BRANCH_FALSE,
+        POP,
+        DUP,
+        LOAD_VARIADIC,
+        CREATE_VARIADIC,
+        EMPTY_VARIADIC,
+        SPLAT_VARIADIC,
+        LOAD_LOCAL_MATERIALIZED,
+        STORE_LOCAL_MATERIALIZED,
+
+        LOAD_NULL,
+        RETURN,
+        YIELD,
+        THROW,
+        MERGE_CONDITIONAL,
+
+        CUSTOM,
+        CUSTOM_SHORT_CIRCUIT,
+        SUPERINSTRUCTION,
+
+        LOAD_EXCEPTION,
+        TAG_ENTER,
+        TAG_LEAVE,
+        TAG_LEAVE_VOID,
+        TAG_YIELD,
+        TAG_YIELD_NULL,
+        TAG_RESUME,
+        TRACE_INSTRUCTION,
+        INVALIDATE;
+
+        public boolean isLocalVariableAccess() {
+            switch (this) {
+                case LOAD_LOCAL:
+                case STORE_LOCAL:
+                case CLEAR_LOCAL:
+                    return true;
+            }
+            return false;
+        }
+
+        public boolean isCustom() {
+            switch (this) {
+                case CUSTOM:
+                case CUSTOM_SHORT_CIRCUIT:
+                    return true;
+            }
+            return false;
+        }
+
+        public boolean isLocalVariableMaterializedAccess() {
+            switch (this) {
+                case LOAD_LOCAL_MATERIALIZED:
+                case STORE_LOCAL_MATERIALIZED:
+                    return true;
+            }
+            return false;
+        }
+
+    }
+
+    public enum ImmediateWidth {
+        NONE(0),
+        BYTE(1),
+        SHORT(2),
+        INT(4),
+        LONG(8);
+
+        public final int byteSize;
+
+        ImmediateWidth(int byteSize) {
+            this.byteSize = byteSize;
+        }
+
+        public TypeMirror toType(ProcessorContext context) {
+            return switch (this) {
+                case NONE -> throw new AssertionError("Non-encoded immediates do not have a Java storage type.");
+                case BYTE -> context.getType(byte.class);
+                case SHORT -> context.getType(short.class);
+                case INT -> context.getType(int.class);
+                case LONG -> context.getType(long.class);
+            };
+        }
+
+        /**
+         * Short name to use in fields/methods.
+         */
+        public String toEncodedName() {
+            return switch (this) {
+                case NONE -> "";
+                case BYTE -> "B";
+                case SHORT -> "S";
+                case INT -> "I";
+                case LONG -> "L";
+            };
+        }
+
+        @Override
+        public String toString() {
+            return name().toLowerCase();
+        }
+    }
+
+    public enum ImmediateKind {
+        /**
+         * Frame index of a local. Should not be directly exposed to users; instead we expose a
+         * local offset, which is the logical offset of the local (frame_index - n_reserved_slots).
+         */
+        FRAME_INDEX("frame_index", ImmediateWidth.SHORT),
+        /**
+         * Index into the locals table. We may encode the local index when it is needed for
+         * {@link BytecodeDSLModel#localAccessesNeedLocalIndex() local accesses} or
+         * {@link BytecodeDSLModel#materializedLocalAccessesNeedLocalIndex() materialized local
+         * accesses}.
+         */
+        LOCAL_INDEX("local_index", ImmediateWidth.SHORT),
+        /**
+         * Index into BytecodeRootNodes.nodes. Necessary for boxing elimination of materialized
+         * local accesses.
+         */
+        LOCAL_ROOT("local_root", ImmediateWidth.INT),
+        STATE_PROFILE("state", ImmediateWidth.SHORT),
+        SHORT("short", ImmediateWidth.SHORT),
+        INTEGER("int", ImmediateWidth.INT),
+        BYTECODE_INDEX("bci", ImmediateWidth.INT),
+        STACK_POINTER("sp", ImmediateWidth.SHORT),
+        CONSTANT("const", ImmediateWidth.INT),
+        CONSTANT_LONG("const_long", ImmediateWidth.LONG),
+        CONSTANT_DOUBLE("const_double", ImmediateWidth.LONG),
+        CONSTANT_INT("const_int", ImmediateWidth.INT),
+        CONSTANT_FLOAT("const_float", ImmediateWidth.INT),
+        CONSTANT_SHORT("const_short", ImmediateWidth.SHORT),
+        CONSTANT_CHAR("const_char", ImmediateWidth.SHORT),
+        CONSTANT_BYTE("const_byte", ImmediateWidth.SHORT),
+        CONSTANT_BOOL("const_bool", ImmediateWidth.SHORT),
+        NODE_PROFILE("node", ImmediateWidth.INT),
+        TAG_NODE("tag", ImmediateWidth.INT),
+        BRANCH_PROFILE("branch_profile", ImmediateWidth.INT),
+        RELATIVE_BYTECODE_INDEX("relative_bci", ImmediateWidth.BYTE);
+
+        public final String shortName;
+        public final ImmediateWidth width;
+
+        ImmediateKind(String shortName, ImmediateWidth width) {
+            this.shortName = shortName;
+            this.width = width;
+        }
+
+        public boolean isUnsigned() {
+            return this == FRAME_INDEX || this == LOCAL_INDEX;
+        }
+
+        public TypeMirror toDeclaredType(ProcessorContext context) {
+            if (isUnsigned()) {
+                return context.getType(int.class);
+            }
+            return width.toType(context);
+        }
+    }
+
+    /**
+     * Models the value and {@link CodeTree} of a fixed immediate.
+     */
+    public record FixedImmediateValue(Object value, CodeTree tree) {
+    }
+
+    /**
+     * Models an immediate of an instruction.
+     *
+     * @param kind the kind of the immediate
+     * @param name the unique name of the immediate
+     * @param encoding how the immediate is encoded
+     * @param dynamic whether the immediate's value is initialized during execution instead of at parse time (e.g., profiles)
+     * @param operandIndex the operand index this immediate corresponds to, if any
+     * @param fixedValue the fixed value this immediate takes on, if any; if an immediate has a fixed value, it must not be {@link #isEncoded()} encoded}
+     */
+    public record InstructionImmediate(ImmediateKind kind, String name, InstructionImmediateEncoding encoding, boolean dynamic, OptionalInt operandIndex, Optional<FixedImmediateValue> fixedValue) {
+
+        public InstructionImmediate {
+            if (fixedValue.isPresent() && encoding.width() != ImmediateWidth.NONE) {
+                throw new IllegalArgumentException("Fixed immediates must not be encoded.");
+            }
+        }
+
+        /**
+         * Returns a fresh copy of the immediate for quickened/variant instructions.
+         */
+        public InstructionImmediate copy() {
+            return new InstructionImmediate(kind, name, encoding.copy(), dynamic, operandIndex, fixedValue);
+        }
+
+        public int offset() {
+            return encoding.offset();
+        }
+
+        public boolean isEncoded() {
+            return encoding.width() != ImmediateWidth.NONE;
+        }
+    }
+
+    public record InstructionEncoding(List<InstructionImmediateEncoding> immediates, int length) implements Comparable<InstructionEncoding> {
+
+        InstructionEncoding(InstructionModel instruction) {
+            this(instruction.getEncodedImmediates().stream().map(InstructionImmediate::encoding).toList(),
+                            instruction.getInstructionLength());
+        }
+
+        @Override
+        public int compareTo(InstructionEncoding other) {
+            if (this.equals(other)) {
+                return 0;
+            }
+
+            // First, order by byte length.
+            int diff = length - other.length;
+            if (diff != 0) {
+                return diff;
+            }
+
+            // Then, order by number of immediates.
+            diff = immediates.size() - other.immediates.size();
+            if (diff != 0) {
+                return diff;
+            }
+
+            // If both match, order by each pairwise immediate's byte width.
+            for (int i = 0; i < immediates.size(); i++) {
+                diff = immediates.get(i).width().byteSize - other.immediates.get(i).width().byteSize;
+                if (diff != 0) {
+                    return diff;
+                }
+            }
+
+            throw new AssertionError("compareTo cannot determine that non-equal instruction encodings are not equal.");
+        }
+    }
+
+    public static final class InstructionImmediateEncoding {
+        private int offset;
+        private final ImmediateWidth width;
+
+        public InstructionImmediateEncoding(ImmediateWidth width) {
+            this.offset = -1;
+            this.width = width;
+        }
+
+        /**
+         * Returns a fresh copy of the current encoding with unassigned offset.
+         */
+        private InstructionImmediateEncoding copy() {
+            return new InstructionImmediateEncoding(this.width);
+        }
+
+        public int offset() {
+            if (this.offset == -1) {
+                throw new AssertionError("Attempting to read an immediate offset prior to it being set");
+            }
+            return offset;
+        }
+
+        public void setOffset(int offset) {
+            if (this.offset != -1) {
+                throw new AssertionError("Attempting to set an immediate offset twice");
+            }
+            this.offset = offset;
+        }
+
+        public ImmediateWidth width() {
+            return width;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof InstructionImmediateEncoding other)) {
+                return false;
+            }
+            return offset == other.offset && width == other.width;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(offset, width);
+        }
+
+        @Override
+        public String toString() {
+            return "InstructionImmediateEncoding[offset=" + offset + ", width=" + width + "]";
+        }
+    }
+
+    private int byteLength = OPCODE_WIDTH;
+    public final InstructionKind kind;
+    private final InstructionName instructionName;
+    public final Signature signature;
+    public CodeTypeElement nodeType;
+    public NodeData nodeData;
+
+    // Immediate values that get encoded in the bytecode.
+    public final List<InstructionImmediate> immediates = new ArrayList<>();
+
+    /*
+     * Defines a mapping from constant operand to immediate. Useful for loading constant operands
+     * from bytecode.
+     */
+    public Map<ConstantOperandModel, InstructionImmediate> constantOperandImmediates = new HashMap<>();
+
+    public List<InstructionModel> subInstructions;
+    public final List<InstructionModel> quickenedInstructions = new ArrayList<>();
+
+    private List<SpecializationData> filteredSpecializations;
+
+    public final InstructionModel quickeningBase;
+
+    public enum QuickeningKind {
+        /**
+         * Not a quickening.
+         */
+        BASE,
+        /**
+         * Implements a specialized version of the base instruction. Typically this is a type
+         * specialization but it need not be.
+         */
+        SPECIALIZED,
+        /**
+         * Like {@link #SPECIALIZED}, but produces an unboxed result (for {@code StoreLocal},
+         * consumes an unboxed operand).
+         */
+        SPECIALIZED_UNBOXED,
+        /**
+         * Implements a generic version of the base instruction. This instruction acts as a sink to
+         * prevent the base instruction from re-quickening to a specialized case.
+         */
+        GENERIC;
+
+        public boolean isSpecialized() {
+            switch (this) {
+                case SPECIALIZED:
+                case SPECIALIZED_UNBOXED:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    public final QuickeningKind quickeningKind;
+
+    /*
+     * Whether the instruction checks for invalid operands. Currently only used by local load
+     * instructions.
+     */
+    public final boolean checked;
+
+    /*
+     * Alternative argument specialization type for builtin quickenings. E.g. for loadLocal
+     * parameter types.
+     */
+    public final TypeMirror specializedType;
+
+    // operation this instruction stems from. null if none
+    public OperationModel operation;
+
+    public boolean nonNull;
+
+    public ShortCircuitInstructionModel shortCircuitModel;
+
+    /*
+     * Contains the short circuit instructions that use this instruction as a converter.
+     */
+    public final List<InstructionModel> shortCircuitInstructions = new ArrayList<>();
+
+    private Signature customSpecializationSignature;
+    private boolean finalized;
+
+    /*
+     * Main constructor for instructions.
+     */
+    public InstructionModel(InstructionKind kind, String name, Signature signature) {
+        this.kind = kind;
+        this.instructionName = InstructionName.create(kind, name);
+        this.signature = signature;
+        this.quickeningBase = null;
+        this.quickeningKind = QuickeningKind.BASE;
+        this.specializedType = null;
+        this.checked = false;
+    }
+
+    /*
+     * Quickening constructor.
+     */
+    public InstructionModel(InstructionModel base, String quickeningName, Signature signature, QuickeningKind quickeningKind, TypeMirror specializedType, boolean checked) {
+        this.kind = base.kind;
+        this.instructionName = base.instructionName.withQuickening(quickeningName);
+        this.signature = signature;
+        this.quickeningBase = base;
+        this.quickeningKind = quickeningKind;
+        this.specializedType = specializedType;
+        this.checked = checked;
+        this.filteredSpecializations = base.filteredSpecializations;
+        this.nodeData = base.nodeData;
+        this.nodeType = base.nodeType;
+        this.operation = base.operation;
+        this.shortCircuitModel = base.shortCircuitModel;
+        for (InstructionImmediate imm : base.immediates) {
+            addImmediate(imm.copy());
+        }
+        base.quickenedInstructions.add(this);
+    }
+
+    /*
+     * Instruction variant constructor. Copies instruction metadata and applies a variant name.
+     */
+    public InstructionModel(InstructionModel base, String variantName) {
+        this.kind = base.kind;
+        this.instructionName = base.instructionName.withVariant(variantName);
+        this.signature = base.signature;
+        this.quickeningBase = null;
+        this.quickeningKind = base.quickeningKind;
+        this.specializedType = base.specializedType;
+        this.checked = base.checked;
+        this.filteredSpecializations = base.filteredSpecializations;
+        this.nodeData = base.nodeData;
+        this.nodeType = base.nodeType;
+        this.operation = base.operation;
+        this.nonNull = base.nonNull;
+        this.shortCircuitModel = base.shortCircuitModel;
+        this.subInstructions = base.subInstructions;
+        for (InstructionImmediate imm : base.immediates) {
+            addImmediate(imm.copy());
+        }
+    }
+
+    public void finalizeModel() {
+        if (nodeData != null) {
+            this.customSpecializationSignature = operation.getSpecializationSignature(getSpecializations());
+        }
+        this.finalized = true;
+    }
+
+    public void setFilteredSpecializations(List<SpecializationData> specializations) {
+        if (finalized) {
+            throw new IllegalStateException("Specializations cannot be set after parsing.");
+        }
+        this.filteredSpecializations = specializations;
+    }
+
+    public List<SpecializationData> getFilteredSpecializations() {
+        return filteredSpecializations;
+    }
+
+    public boolean isYield() {
+        if (operation == null) {
+            return false;
+        }
+        switch (operation.kind) {
+            case YIELD:
+            case CUSTOM_YIELD:
+                return true;
+        }
+        return false;
+    }
+
+    public boolean isShortCircuitConverter() {
+        return !shortCircuitInstructions.isEmpty();
+    }
+
+    public boolean isEpilogReturn() {
+        if (this.operation == null) {
+            return false;
+        }
+        var epilogReturn = operation.parent.epilogReturn;
+        if (epilogReturn == null) {
+            return false;
+        }
+        return epilogReturn.operation == operation;
+    }
+
+    public boolean hasBoxingOverloadForType(TypeMirror type) {
+        for (SpecializationData s : getSpecializations()) {
+            for (SpecializationData overload : s.getBoxingOverloads()) {
+                if (ElementUtils.typeEquals(overload.getReturnType().getType(), type)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public List<SpecializationData> getSpecializations() {
+        return getFilteredSpecializations() == null ? nodeData.getReachableSpecializations() : getFilteredSpecializations();
+    }
+
+    public Signature getCustomSpecializationSignature() {
+        if (customSpecializationSignature == null) {
+            throw new UnsupportedOperationException("Specialization signature only exists for custom operations atm.");
+        }
+        return customSpecializationSignature;
+    }
+
+    public boolean isEpilogExceptional() {
+        if (this.operation == null) {
+            return false;
+        }
+        var epilogExceptional = operation.parent.epilogExceptional;
+        if (epilogExceptional == null) {
+            return false;
+        }
+        return epilogExceptional.operation.instruction() == this;
+    }
+
+    public List<InstructionModel> getFlattenedQuickenedInstructions() {
+        if (quickenedInstructions.isEmpty()) {
+            return quickenedInstructions;
+        }
+        List<InstructionModel> allInstructions = new ArrayList<>();
+        for (InstructionModel child : this.quickenedInstructions) {
+            allInstructions.add(child);
+            allInstructions.addAll(child.getFlattenedQuickenedInstructions());
+        }
+        return allInstructions;
+    }
+
+    public String getQuickeningName() {
+        return instructionName.quickeningName;
+    }
+
+    public InstructionModel getQuickeningRoot() {
+        if (quickeningBase != null) {
+            return quickeningBase.getQuickeningRoot();
+        }
+        return this;
+    }
+
+    public boolean hasQuickenings() {
+        return !quickenedInstructions.isEmpty();
+    }
+
+    public boolean hasSpecializedQuickenings() {
+        for (InstructionModel instr : quickenedInstructions) {
+            if (instr.quickeningKind == QuickeningKind.SPECIALIZED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isQuickening() {
+        return quickeningBase != null;
+    }
+
+    public boolean isReturnTypeQuickening() {
+        return quickeningKind == QuickeningKind.SPECIALIZED_UNBOXED && kind != InstructionKind.STORE_LOCAL && kind != InstructionKind.STORE_LOCAL_MATERIALIZED;
+    }
+
+    @Override
+    public void pp(PrettyPrinter printer) {
+        printer.print("Instruction %s", getName());
+        printer.field("kind", kind);
+        printer.field("byteLength", byteLength);
+        printer.field("encoding", prettyPrintEncoding());
+        if (nodeType != null) {
+            printer.field("nodeType", nodeType.getSimpleName());
+        }
+        if (signature != null) {
+            printer.field("signature", signature);
+        }
+
+        if (getQuickeningRoot().hasQuickenings()) {
+            String quickenKind;
+            quickenKind = switch (quickeningKind) {
+                case BASE -> "base";
+                case GENERIC -> "generic";
+                case SPECIALIZED -> "specialized";
+                case SPECIALIZED_UNBOXED -> "return-type";
+            };
+            printer.field("quicken-kind", quickenKind);
+        }
+    }
+
+    public boolean isTagInstrumentation() {
+        switch (kind) {
+            case TAG_ENTER:
+            case TAG_LEAVE:
+            case TAG_LEAVE_VOID:
+            case TAG_RESUME:
+            case TAG_YIELD:
+            case TAG_YIELD_NULL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public boolean isTraceInstrumentation() {
+        return kind == InstructionKind.TRACE_INSTRUCTION;
+    }
+
+    public boolean isInstrumentation() {
+        if (isTraceInstrumentation()) {
+            return true;
+        } else if (isTagInstrumentation()) {
+            return true;
+        } else if (kind == InstructionKind.CUSTOM) {
+            return operation.kind == OperationKind.CUSTOM_INSTRUMENTATION;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if this instruction has no stack effects. This is different to
+     * having {@link InstructionModel#getStackEffect()} being zero in that the return value is not
+     * popped and pushed from the stack. Void instructions with zero operands are automatically
+     * transparent.
+     */
+    public boolean isTransparent() {
+        if (signature.isVoid() && signature.dynamicOperandCount() == 0) {
+            return true;
+        }
+        switch (kind) {
+            case BRANCH:
+            case BRANCH_BACKWARD:
+            case TAG_ENTER:
+            case TAG_LEAVE:
+            case TAG_LEAVE_VOID:
+            case TAG_YIELD:
+            case TAG_YIELD_NULL:
+            case TAG_RESUME:
+            case TRACE_INSTRUCTION:
+            case INVALIDATE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public boolean hasNodeImmediate() {
+        switch (kind) {
+            case CUSTOM:
+                return !canUseNodeSingleton();
+            default:
+                return false;
+        }
+    }
+
+    public InstructionModel addImmediate(ImmediateKind immediateKind, String immediateName) {
+        return addImmediate(immediateKind, immediateName, false);
+    }
+
+    public InstructionModel addImmediate(ImmediateKind immediateKind, String immediateName, boolean dynamic) {
+        addImmediate(new InstructionImmediate(immediateKind, immediateName, new InstructionImmediateEncoding(immediateKind.width), dynamic, OptionalInt.empty(), Optional.empty()));
+        return this;
+    }
+
+    public InstructionModel addFixedImmediate(ImmediateKind immediateKind, String immediateName, Object fixedValue, CodeTree fixedTree) {
+        addImmediate(new InstructionImmediate(immediateKind, immediateName, new InstructionImmediateEncoding(ImmediateWidth.NONE), false, OptionalInt.empty(), Optional.of(new FixedImmediateValue(
+                        fixedValue,
+                        fixedTree))));
+        return this;
+    }
+
+    public InstructionModel addConstantOperandImmediate(Operand operand, String immediateName) {
+        if (!operand.isConstant()) {
+            throw new IllegalArgumentException("Operand must be constant: " + operand);
+        }
+        ConstantOperandModel constantOperand = operand.constant();
+        addImmediate(new InstructionImmediate(constantOperand.kind(), immediateName, new InstructionImmediateEncoding(constantOperand.kind().width), false,
+                        OptionalInt.of(operand.index()), Optional.empty()));
+        return this;
+    }
+
+    public InstructionModel addChildBciImmediate(Operand operand) {
+        if (!operand.isDynamic()) {
+            throw new IllegalArgumentException("Operand must be dynamic: " + operand);
+        }
+        addImmediate(new InstructionImmediate(ImmediateKind.RELATIVE_BYTECODE_INDEX, "child" + operand.dynamicIndex(), new InstructionImmediateEncoding(ImmediateKind.RELATIVE_BYTECODE_INDEX.width),
+                        false, OptionalInt.of(operand.index()), Optional.empty()));
+        return this;
+    }
+
+    public void addImmediate(InstructionImmediate immediate) {
+        byteLength += immediate.encoding.width.byteSize;
+        immediates.add(immediate);
+        resolveConstantOperand(immediate).ifPresent(constantOperand -> constantOperandImmediates.put(constantOperand, immediate));
+    }
+
+    public Optional<Operand> resolveOperand(InstructionImmediate immediate) {
+        if (immediate.operandIndex().isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(signature.operands().get(immediate.operandIndex().getAsInt()));
+    }
+
+    public OptionalInt resolveDynamicOperandIndex(InstructionImmediate immediate) {
+        Optional<Operand> operand = resolveOperand(immediate);
+        if (operand.isPresent() && operand.get().isDynamic()) {
+            return OptionalInt.of(operand.get().dynamicIndex());
+        }
+        return OptionalInt.empty();
+    }
+
+    public boolean isChildBciImmediate(InstructionImmediate immediate) {
+        return immediate.kind == ImmediateKind.RELATIVE_BYTECODE_INDEX && resolveDynamicOperandIndex(immediate).isPresent();
+    }
+
+    public boolean hasChildBciImmediates() {
+        return immediates.stream().anyMatch(this::isChildBciImmediate);
+    }
+
+    public Optional<ConstantOperandModel> resolveConstantOperand(InstructionImmediate immediate) {
+        return resolveOperand(immediate).filter(Operand::isConstant).map(Operand::constant);
+    }
+
+    public Optional<OperationArgument> resolveOperationArgument(InstructionImmediate immediate) {
+        if (operation == null) {
+            return Optional.empty();
+        }
+        return resolveConstantOperand(immediate).flatMap(operation::resolveOperationArgument);
+    }
+
+    public InstructionImmediate findImmediate(ImmediateKind immediateKind, String immediateName) {
+        for (InstructionImmediate immediate : immediates) {
+            if (immediate.kind == immediateKind && immediate.name.equals(immediateName)) {
+                return immediate;
+            }
+        }
+        return null;
+    }
+
+    public InstructionImmediate findChildBciImmediate(int dynamicOperandIndex) {
+        for (InstructionImmediate immediate : immediates) {
+            if (isChildBciImmediate(immediate) && resolveDynamicOperandIndex(immediate).orElseThrow() == dynamicOperandIndex) {
+                return immediate;
+            }
+        }
+        return null;
+    }
+
+    public List<InstructionImmediate> getImmediates() {
+        return immediates;
+    }
+
+    public List<InstructionImmediate> getEncodedImmediates() {
+        return immediates.stream().filter(InstructionImmediate::isEncoded).toList();
+    }
+
+    public List<InstructionImmediate> getImmediates(ImmediateKind immediateKind) {
+        return immediates.stream().filter(imm -> imm.kind == immediateKind).toList();
+    }
+
+    public InstructionImmediate getImmediate(ImmediateKind immediateKind) {
+        List<InstructionImmediate> filteredImmediates = getImmediates(immediateKind);
+        if (filteredImmediates.isEmpty()) {
+            return null;
+        } else if (filteredImmediates.size() > 1) {
+            throw new AssertionError("Too many immediates of kind " + immediateKind + ". Use getImmediates() instead. Found immediates: " + filteredImmediates);
+        }
+        return filteredImmediates.get(0);
+    }
+
+    public InstructionImmediate getImmediate(String immediateName) {
+        return immediates.stream().filter(imm -> imm.name.equals(immediateName)).findAny().get();
+    }
+
+    public int getInstructionLength() {
+        return byteLength;
+    }
+
+    public InstructionEncoding getInstructionEncoding() {
+        return new InstructionEncoding(this);
+    }
+
+    public String getName() {
+        return instructionName.instructionName;
+    }
+
+    public String getInternalName() {
+        return instructionName.internalName;
+    }
+
+    public String getConstantName() {
+        return instructionName.constantName;
+    }
+
+    public SpecializationData resolveSingleSpecialization() {
+        List<SpecializationData> specializations = null;
+        if (this.getFilteredSpecializations() != null) {
+            specializations = this.getFilteredSpecializations();
+        } else if (this.nodeData != null) {
+            specializations = this.nodeData.getReachableSpecializations();
+        }
+        if (specializations != null && specializations.size() == 1) {
+            return specializations.get(0);
+        }
+        return null;
+    }
+
+    @Override
+    public String toString() {
+        return String.format("Instruction(%s)", getName());
+    }
+
+    public String prettyPrintEncoding() {
+        StringBuilder b = new StringBuilder("[");
+        b.append("opcode : short");
+        for (InstructionImmediate imm : getEncodedImmediates()) {
+            b.append(", ");
+            b.append(imm.name);
+            if (!imm.name.equals(imm.kind.shortName)) {
+                b.append(" (");
+                b.append(imm.kind.shortName);
+                b.append(")");
+            }
+            b.append(" : ");
+            b.append(imm.kind.width);
+        }
+        if (immediates.stream().filter((imm) -> imm.encoding.width() == ImmediateWidth.BYTE).count() % INSTRUCTION_ALIGNMENT == 1) {
+            b.append(", padding : byte");
+        }
+        b.append("]");
+        return b.toString();
+    }
+
+    public boolean canUseNodeSingleton() {
+        if (nodeData == null) {
+            return false;
+        }
+        if (!canInlineState() && (nodeData.needsState() || nodeData.isForceSpecialize())) {
+            return false;
+        }
+        for (SpecializationData specialization : nodeData.getReachableSpecializations()) {
+            for (CacheExpression cache : specialization.getCaches()) {
+                if (cache.isAlwaysInitialized()) {
+                    continue;
+                }
+                if (cache.isEncodedEnum()) {
+                    continue;
+                }
+                return false;
+            }
+
+            /*
+             * Only CACHED_NODE mode needs $node to identify the current operation for implicit
+             * bytecode index lookup. Other modes use a frame-stored or explicitly passed index,
+             * so binding the bytecode node does not prevent using a singleton.
+             */
+            if (operation.parent.bytecodeIndexMode == BytecodeDSLModel.BytecodeIndexMode.CACHED_NODE && specialization.isNodeReceiverBoundInAnyExpression()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether the instruction or any of its quickenings needs a child bci immediate in order to
+     * perform boxing elimination of the given operand.
+     */
+    public boolean needsChildBciForBoxingElimination(BytecodeDSLModel model, Operand signatureOperand) {
+        if (!signatureOperand.isDynamic()) {
+            return false;
+        }
+        if (!model.usesBoxingElimination()) {
+            return false;
+        }
+        if (signature.isVariadicOperand(signatureOperand)) {
+            return false;
+        }
+        if (model.isBoxingEliminated(signatureOperand.type())) {
+            return true;
+        }
+        for (InstructionModel quickenedInstruction : quickenedInstructions) {
+            if (quickenedInstruction.needsChildBciForBoxingElimination(model, quickenedInstruction.signature.operands().get(signatureOperand.index()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @SuppressWarnings("hiding")
+    public InstructionModel findQuickening(QuickeningKind quickeningKind, TypeMirror specializedType, boolean checked) {
+        InstructionModel result = null;
+        for (InstructionModel quickening : quickenedInstructions) {
+            if (quickening.quickeningKind == quickeningKind && ElementUtils.typeEquals(quickening.specializedType, specializedType) && quickening.checked == checked) {
+                if (result != null) {
+                    String specializedTypeString = (specializedType == null) ? null : ElementUtils.getSimpleName(specializedType);
+                    throw new AssertionError("Multiple quickenings found with kind %s and specialized type %s: %s, %s".formatted(quickeningKind, specializedTypeString, result, quickening));
+                }
+                result = quickening;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Order immediates from biggest to smallest.
+     * This helps keep immediates short-aligned, by ensuring potential byte-sized immediates are at the end of the instruction.
+     * Otherwise, we would need to emit padding in the middle of the instruction to ensure short-alignment.
+     */
+    public void orderImmediates() {
+        immediates.sort(Comparator.comparingInt((InstructionImmediate imm) -> imm.encoding().width().byteSize).reversed());
+
+        byteLength = OPCODE_WIDTH;
+        for (InstructionImmediate immediate : immediates) {
+            immediate.encoding().setOffset(byteLength);
+            byteLength += immediate.encoding().width().byteSize;
+        }
+        byteLength += byteLength % INSTRUCTION_ALIGNMENT;
+    }
+
+    public void validateAlignment() {
+        /*
+         * Unaligned accesses are not atomic. For correctness, since we overwrite opcodes for
+         * quickening/invalidation, our instructions *must* be short-aligned.
+         *
+         * Additionally, byte array reads are only PE-constant when they are aligned. Thus, for
+         * performance, it is crucial that opcodes and immediates are aligned. We enforce short
+         * immediate alignment below.
+         *
+         * Uniquely, int immediates do *not* need to be int-aligned. Bytecode DSL interpreters use
+         * special PE-able methods for int reads that split unaligned reads into multiple aligned
+         * reads in compiled code. Since immediates are never modified, atomicity is not important.
+         */
+        if (getInstructionLength() % INSTRUCTION_ALIGNMENT != 0) {
+            throw new AssertionError(String.format("All instructions should be short-aligned, but instruction %s has length %s.",
+                            getName(), getInstructionLength()));
+        }
+
+        for (InstructionImmediate immediate : immediates) {
+            if (immediate.encoding.width() == ImmediateWidth.SHORT && immediate.offset() % INSTRUCTION_ALIGNMENT != 0) {
+                throw new AssertionError(String.format("Immediate %s of instruction %s should be short-aligned, but it appears at offset %s.",
+                                immediate.name, getName(), immediate.offset()));
+            }
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if all state of this operation should get inlined into the
+     * instruction, else <code>false</code>.
+     *
+     * Inlining the state is almost always beneficial as we already have the bytecode array in a
+     * register.
+     */
+    public boolean canInlineState() {
+        NodeData node = this.nodeData;
+        if (node == null) {
+            return false;
+        }
+
+        for (SpecializationData specialization : node.getReachableSpecializations()) {
+            for (CacheExpression cache : specialization.getCaches()) {
+                InlinedNodeData inlinedNode = cache.getInlinedNode();
+                if (inlinedNode != null) {
+                    for (InlineFieldData inlineField : inlinedNode.getFields()) {
+                        /*
+                         * Inlined node data cannot be supported if state is inlined.
+                         */
+                        if (inlineField.isState()) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    public boolean hasVariableStackEffect() {
+        return switch (kind) {
+            case LOAD_VARIADIC, CREATE_VARIADIC -> true;
+            default -> false;
+        };
+    }
+
+    public int getStackEffect() {
+        if (hasVariableStackEffect()) {
+            throw new IllegalArgumentException("Variadic instruction " + this + " does not have a fixed stack effect.");
+        }
+        if (operation != null && operation.kind == OperationKind.CUSTOM_RETURN) {
+            // The specializations are non-void, but the instruction itself is void (it doesn't push a result).
+            return -signature.dynamicOperandCount();
+        }
+        return (signature.isVoid() ? 0 : 1) - signature.dynamicOperandCount();
+    }
+
+    public boolean isQuickeningRoot() {
+        return hasQuickenings() && quickeningBase == null;
+    }
+
+    public boolean isInliningCutoff() {
+        switch (this.kind) {
+            case TAG_ENTER:
+            case TAG_LEAVE:
+            case TAG_LEAVE_VOID:
+            case TAG_YIELD:
+            case TAG_YIELD_NULL:
+            case TAG_RESUME:
+            case TRACE_INSTRUCTION:
+                return true;
+
+        }
+        return false;
+    }
+
+    public boolean hasStackEffects() {
+        if (!signature.isVoid()) {
+            return true;
+        }
+        if (signature.dynamicOperands().size() != 0) {
+            return true;
+        }
+        return false;
+    }
+
+    public boolean isDispatched() {
+        return !isEpilogExceptional();
+    }
+
+}

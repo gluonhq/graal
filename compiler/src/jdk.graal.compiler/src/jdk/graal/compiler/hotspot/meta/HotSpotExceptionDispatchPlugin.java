@@ -39,6 +39,7 @@ import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.hotspot.GraalHotSpotVMConfig;
 import jdk.graal.compiler.hotspot.HotSpotCompilationIdentifier;
 import jdk.graal.compiler.hotspot.nodes.CurrentJavaThreadNode;
+import jdk.graal.compiler.java.FrameStateBuilder;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.FixedGuardNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
@@ -80,7 +81,8 @@ public final class HotSpotExceptionDispatchPlugin implements NodePlugin {
     }
 
     @Override
-    public FixedWithNextNode instrumentExceptionDispatch(StructuredGraph graph, FixedWithNextNode afterExceptionLoaded, Supplier<FrameState> frameStateFunction) {
+    public FixedWithNextNode instrumentExceptionDispatch(StructuredGraph graph, int bci, FixedWithNextNode afterExceptionLoaded, FrameStateBuilder dispatchState,
+                    Supplier<FrameState> frameStateFunction) {
         CompilationIdentifier id = graph.compilationId();
         if (id instanceof HotSpotCompilationIdentifier &&
                         config.jvmciCompileStateCanPostOnExceptionsOffset != Integer.MIN_VALUE &&

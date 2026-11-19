@@ -41,7 +41,7 @@ import com.oracle.objectfile.ObjectFile.Section;
 import com.oracle.objectfile.ObjectFile.Symbol;
 import com.oracle.objectfile.SymbolTable;
 import com.oracle.svm.core.graal.llvm.objectfile.LLVMObjectFile.LLVMSection;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 public class LLVMSymtab extends LLVMSection implements SymbolTable {
 
@@ -145,7 +145,7 @@ public class LLVMSymtab extends LLVMSection implements SymbolTable {
     }
 
     @Override
-    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode) {
+    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode, boolean isExported) {
         assert referencedSection != null;
         return addEntry(new Entry(name, referencedOffset, size, (LLVMSection) referencedSection));
     }
@@ -156,7 +156,7 @@ public class LLVMSymtab extends LLVMSection implements SymbolTable {
     }
 
     private Entry addEntry(Entry entry) {
-        entriesByName.compute(entry.getName(), (k, v) -> SymbolTable.tryReplace(v, entry));
+        entriesByName.compute(entry.getName(), (_, v) -> SymbolTable.tryReplace(v, entry));
         if (entry.getDefinedSection() != null) {
             entriesBySection.compute(entry.getDefinedSection().getName(), (k, v) -> {
                 if (v == null) {

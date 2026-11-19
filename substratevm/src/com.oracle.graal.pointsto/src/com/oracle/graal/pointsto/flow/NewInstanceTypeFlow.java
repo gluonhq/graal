@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,6 +32,7 @@ import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.context.AnalysisContext;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 import jdk.vm.ci.code.BytecodePosition;
@@ -47,6 +48,13 @@ public class NewInstanceTypeFlow extends TypeFlow<BytecodePosition> {
                     AtomicReferenceFieldUpdater.newUpdater(NewInstanceTypeFlow.class, ConcurrentMap.class, "heapObjectsCache");
 
     /**
+     * True iff the flow should insert default values into the fields of the instantiated type. Both
+     * NewInstanceNode and CommitAllocationNode are represented as a NewInstanceTypeFlow, but we
+     * want to insert the default values only for NewInstanceNode.
+     */
+    private final boolean insertDefaultFieldValues;
+
+    /**
      * The original type flow keeps track of the heap objects created for the clones to avoid
      * duplication of heap object abstractions. The allocation context is derived from the allocator
      * context, i.e., the context of the method clone that holds this flow. There is only one
@@ -55,11 +63,23 @@ public class NewInstanceTypeFlow extends TypeFlow<BytecodePosition> {
      */
     volatile ConcurrentMap<AnalysisContext, AnalysisObject> heapObjectsCache;
 
-    public NewInstanceTypeFlow(BytecodePosition position, AnalysisType type) {
+    public NewInstanceTypeFlow(BytecodePosition position, AnalysisType type, boolean insertDefaultFieldValues) {
         /* The actual type state is set lazily in initFlow(). */
         super(position, type, TypeState.forEmpty());
+        this.insertDefaultFieldValues = insertDefaultFieldValues;
         assert source != null;
-        assert declaredType.isInstantiated() : "Type " + declaredType + " not instantiated " + position;
+    }
+
+    @Override
+    protected void onFlowEnabled(PointsToAnalysis bb) {
+        super.onFlowEnabled(bb);
+        declaredType.registerAsInstantiated(source);
+        if (insertDefaultFieldValues) {
+            for (var f : declaredType.getInstanceFields(true)) {
+                var field = (PointsToAnalysisField) f;
+                field.getInitialFlow().addState(bb, TypeState.defaultValueForKind(bb, field.getStorageKind()));
+            }
+        }
     }
 
     @Override
@@ -81,6 +101,7 @@ public class NewInstanceTypeFlow extends TypeFlow<BytecodePosition> {
 
     NewInstanceTypeFlow(PointsToAnalysis bb, NewInstanceTypeFlow original, MethodFlowsGraph methodFlows) {
         super(original, methodFlows, original.createCloneState(bb, methodFlows));
+        this.insertDefaultFieldValues = original.insertDefaultFieldValues;
     }
 
     @Override
@@ -128,6 +149,6 @@ public class NewInstanceTypeFlow extends TypeFlow<BytecodePosition> {
 
     @Override
     public String toString() {
-        return "NewInstanceFlow<" + getState() + ">";
+        return "NewInstanceFlow<" + getStateDescription() + ">";
     }
 }

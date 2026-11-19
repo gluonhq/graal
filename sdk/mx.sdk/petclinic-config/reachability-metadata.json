@@ -1,0 +1,28 @@
+{
+  "reflection": [
+    {
+      "type": "org.apache.coyote.AbstractProtocol",
+      "allPublicMethods": true
+    },
+    {
+      "type": "org.apache.coyote.http11.AbstractHttp11Protocol",
+      "methods": [
+        {
+          "name": "isSSLEnabled",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.zaxxer.hikari.HikariDataSource",
+      "fields": [
+        {
+          "name": "pool"
+        }
+      ]
+    },
+    {
+      "type": "java.lang.management.MemoryUsage"
+    }
+  ]
+}

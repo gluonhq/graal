@@ -36,15 +36,20 @@ import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.posix.headers.Pthread;
 import com.oracle.svm.core.posix.headers.darwin.DarwinPthread;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import org.graalvm.word.impl.Word;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 @AutomaticallyRegisteredImageSingleton(StackOverflowCheck.PlatformSupport.class)
 final class DarwinStackOverflowSupport implements StackOverflowCheck.PlatformSupport {
     @Override
@@ -66,12 +71,12 @@ final class DarwinStackOverflowSupport implements StackOverflowCheck.PlatformSup
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static UnsignedWord vmComputeStackGuardSize(UnsignedWord stackend) {
-        UnsignedWord guardsize = WordFactory.zero();
+        UnsignedWord guardsize = Word.zero();
 
         WordPointer address = StackValue.get(WordPointer.class);
         address.write(stackend);
         WordPointer size = StackValue.get(WordPointer.class);
-        size.write(WordFactory.zero());
+        size.write(Word.zero());
 
         vm_region_basic_info_data_64_t info = StackValue.get(vm_region_basic_info_data_64_t.class);
         WordPointer task = mach_task_self();

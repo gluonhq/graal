@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -49,6 +49,7 @@ import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.nodes.virtual.VirtualObjectNode;
 import org.graalvm.word.Pointer;
 
+import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -69,38 +70,32 @@ public class ArrayEqualsNode extends PureFunctionStubIntrinsicNode implements Ca
      * The arrays are guaranteed to always have the same kind because the signature of
      * {@link Arrays#equals} only allows arrays of the same kind.
      */
-    protected final JavaKind kind;
+    private final JavaKind kind;
 
     /** One array to be tested for equality. */
-    @Input protected ValueNode array1;
+    @Input private ValueNode array1;
 
     /** array base offset of array1. */
-    @Input protected ValueNode offset1;
+    @Input private ValueNode offset1;
 
     /** The other array to be tested for equality. */
-    @Input protected ValueNode array2;
+    @Input private ValueNode array2;
 
     /** array base offset of array2. */
-    @Input protected ValueNode offset2;
+    @Input private ValueNode offset2;
 
     /** Length of both arrays. */
-    @Input protected ValueNode length;
+    @Input private ValueNode length;
 
     public ArrayEqualsNode(ValueNode array1, ValueNode offset1, ValueNode array2, ValueNode offset2, ValueNode length,
                     @ConstantNodeParameter JavaKind kind) {
-        this(TYPE, array1, offset1, array2, offset2, length, kind, null);
+        this(array1, offset1, array2, offset2, length, kind, null);
     }
 
     public ArrayEqualsNode(ValueNode array1, ValueNode offset1, ValueNode array2, ValueNode offset2, ValueNode length,
                     @ConstantNodeParameter JavaKind kind,
                     @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures) {
-        this(TYPE, array1, offset1, array2, offset2, length, kind, runtimeCheckedCPUFeatures);
-    }
-
-    protected ArrayEqualsNode(NodeClass<? extends ArrayEqualsNode> c, ValueNode array1, ValueNode offset1, ValueNode array2, ValueNode offset2, ValueNode length,
-                    @ConstantNodeParameter JavaKind kind,
-                    @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures) {
-        super(c, StampFactory.forKind(JavaKind.Boolean), runtimeCheckedCPUFeatures, NamedLocationIdentity.getArrayLocation(kind));
+        super(TYPE, StampFactory.forKind(JavaKind.Boolean), runtimeCheckedCPUFeatures, NamedLocationIdentity.getArrayLocation(kind));
         this.kind = kind;
         this.array1 = array1;
         this.offset1 = offset1;
@@ -167,38 +162,46 @@ public class ArrayEqualsNode extends PureFunctionStubIntrinsicNode implements Ca
             if (virtual1.entryCount() == virtual2.entryCount()) {
                 int entryCount = virtual1.entryCount();
                 boolean allEqual = true;
-                for (int i = 0; i < entryCount; i++) {
-                    ValueNode entry1 = tool.getEntry(virtual1, i);
-                    ValueNode entry2 = tool.getEntry(virtual2, i);
-                    if (entry1 != entry2) {
-                        if (entry1 instanceof ConstantNode && entry2 instanceof ConstantNode) {
-                            // Float NaN constants are different constant nodes but treated as
-                            // equal in Arrays.equals([F[F) or Arrays.equals([D[D).
-                            if (entry1.getStackKind() == JavaKind.Float && entry2.getStackKind() == JavaKind.Float) {
-                                float value1 = ((JavaConstant) entry1.asConstant()).asFloat();
-                                float value2 = ((JavaConstant) entry2.asConstant()).asFloat();
-                                if (Float.floatToIntBits(value1) != Float.floatToIntBits(value2)) {
-                                    allEqual = false;
-                                }
-                            } else if (entry1.getStackKind() == JavaKind.Double && entry2.getStackKind() == JavaKind.Double) {
-                                double value1 = ((JavaConstant) entry1.asConstant()).asDouble();
-                                double value2 = ((JavaConstant) entry2.asConstant()).asDouble();
-                                if (Double.doubleToLongBits(value1) != Double.doubleToLongBits(value2)) {
-                                    allEqual = false;
-                                }
+                int index = 0;
+                while (index < entryCount) {
+                    ValueNode entry1 = tool.getEntry(virtual1, index);
+                    ValueNode entry2 = tool.getEntry(virtual2, index);
+                    int end1 = nextEntryBoundary(virtual1, index, tool);
+                    int end2 = nextEntryBoundary(virtual2, index, tool);
+
+                    if (end1 != end2 || entry1.getStackKind() != entry2.getStackKind()) {
+                        // Resume comparison at the next boundary shared by both layouts.
+                        allEqual = false;
+                        while (end1 != end2) {
+                            if (end1 < end2) {
+                                end1 = nextEntryBoundary(virtual1, end1, tool);
                             } else {
-                                allEqual = false;
+                                end2 = nextEntryBoundary(virtual2, end2, tool);
                             }
-                        } else {
-                            // the contents might be different
-                            allEqual = false;
                         }
+                        index = end1;
+                        continue;
                     }
-                    if (entry1.stamp(NodeView.DEFAULT).alwaysDistinct(entry2.stamp(NodeView.DEFAULT))) {
-                        // the contents are different
+
+                    index = end1;
+                    if (entry1 == entry2) {
+                        continue;
+                    }
+                    if (entry1.isJavaConstant() && entry2.isJavaConstant()) {
+                        JavaConstant c1 = entry1.asJavaConstant();
+                        JavaConstant c2 = entry2.asJavaConstant();
+                        // Normalize NaNs only for floating-point array comparisons.
+                        if (c1.equals(c2) || (kind == c1.getJavaKind() && isNaNFloat(c1) && isNaNFloat(c2))) {
+                            continue;
+                        }
                         tool.replaceWithValue(ConstantNode.forBoolean(false, graph()));
                         return;
                     }
+                    if (entry1.stamp(NodeView.DEFAULT).alwaysDistinct(entry2.stamp(NodeView.DEFAULT))) {
+                        tool.replaceWithValue(ConstantNode.forBoolean(false, graph()));
+                        return;
+                    }
+                    allEqual = false;
                 }
                 if (allEqual) {
                     tool.replaceWithValue(ConstantNode.forBoolean(true, graph()));
@@ -207,7 +210,16 @@ public class ArrayEqualsNode extends PureFunctionStubIntrinsicNode implements Ca
         }
     }
 
+    private static int nextEntryBoundary(VirtualObjectNode virtual, int index, VirtualizerTool tool) {
+        int next = index + 1;
+        while (next < virtual.entryCount() && tool.getEntry(virtual, next).isIllegalConstant()) {
+            next++;
+        }
+        return next;
+    }
+
     @NodeIntrinsic
+    @GenerateStub.Default(runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
     @GenerateStub(name = "longArraysEquals", parameters = {"Long"})
     @GenerateStub(name = "floatArraysEquals", parameters = {"Float"})
     @GenerateStub(name = "doubleArraysEquals", parameters = {"Double"})
@@ -243,6 +255,11 @@ public class ArrayEqualsNode extends PureFunctionStubIntrinsicNode implements Ca
     @Override
     public ValueNode[] getForeignCallArguments() {
         return new ValueNode[]{array1, offset1, array2, offset2, length};
+    }
+
+    @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return false;
     }
 
     @Override

@@ -24,27 +24,24 @@
  */
 package jdk.graal.compiler.java;
 
+import static jdk.graal.compiler.bytecode.Bytecodes.INVOKEDYNAMIC;
+import static jdk.graal.compiler.bytecode.Bytecodes.INVOKEINTERFACE;
+import static jdk.graal.compiler.bytecode.Bytecodes.INVOKESPECIAL;
+import static jdk.graal.compiler.bytecode.Bytecodes.INVOKESTATIC;
+import static jdk.graal.compiler.bytecode.Bytecodes.INVOKEVIRTUAL;
+
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.nodes.Invoke;
-import jdk.graal.compiler.nodes.StructuredGraph;
-import jdk.graal.compiler.nodes.graphbuilderconf.ClassInitializationPlugin;
-import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
-import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
-import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
-import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.phases.OptimisticOptimizations;
-import jdk.graal.compiler.phases.tiers.HighTierContext;
-import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.bytecode.BytecodeStream;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.util.Digest;
 import jdk.vm.ci.common.JVMCIError;
+import jdk.vm.ci.meta.ConstantPool;
+import jdk.vm.ci.meta.JavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -57,69 +54,63 @@ public final class LambdaUtils {
     public static final String SERIALIZATION_TEST_LAMBDA_CLASS_SPLIT_PATTERN = "\\$\\$Lambda";
     public static final String ADDRESS_PREFIX = ".0x";
 
-    private static GraphBuilderConfiguration buildLambdaParserConfig(ClassInitializationPlugin cip) {
-        GraphBuilderConfiguration.Plugins plugins = new GraphBuilderConfiguration.Plugins(new InvocationPlugins());
-        plugins.setClassInitializationPlugin(cip);
-        return GraphBuilderConfiguration.getDefault(plugins).withEagerResolving(true);
-    }
-
     private LambdaUtils() {
     }
 
     /**
-     * Creates a stable name for a lambda by hashing all the invokes in the lambda. Lambda class
-     * names are typically created based on an increasing atomic counter (e.g.
-     * {@code Test$$Lambda$23}). A stable name is created by replacing the substring after
-     * {@code "$$Lambda$"} with a hash of the method descriptor for each method invoked by the
-     * lambda.
+     * Creates a stable name for a lambda by replacing the unqualified name of the hidden class name
+     * with a stable {@link #getSignature signature}.
      *
-     * Starting from JDK17, the lambda classes can have additional interfaces that lambda should
-     * implement. This further means that lambda can have more than one public method (public and
-     * not bridge).
-     *
-     * The scala lambda classes have by default one additional interface with one method. This
-     * method has the same signature as the original one but with generalized parameters (all
-     * parameters are Object types) and serves as a wrapper that casts parameters to specialized
-     * types and calls an original method.
-     *
-     * @param cip plugin to
-     *            {@link ClassInitializationPlugin#loadReferencedType(GraphBuilderContext, jdk.vm.ci.meta.ConstantPool, int, int)
-     *            load} new types
-     * @param providers providers to use when processing the lambda code
      * @param lambdaType the lambda type to analyze
-     * @param options options to use when analyzing the lamda code
-     * @param debug debug context to nest the analysis into
-     * @param ctx context to use for the
-     *            {@link DebugContext#scope(java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object)}
      * @return stable name for the lambda class
      */
     @SuppressWarnings("try")
-    public static String findStableLambdaName(ClassInitializationPlugin cip, Providers providers, ResolvedJavaType lambdaType, OptionValues options, DebugContext debug, Object ctx,
-                    Function<GraphBuilderConfiguration, GraphBuilderPhase.Instance> graphBuilderSupplier)
-                    throws RuntimeException {
-        ResolvedJavaMethod[] lambdaProxyMethods = Arrays.stream(lambdaType.getDeclaredMethods(false)).filter(m -> !m.isBridge() && m.isPublic()).toArray(ResolvedJavaMethod[]::new);
-        /*
-         * Take only the first method to build a graph, because the graph for all other methods will
-         * be the same.
-         */
-        StructuredGraph graph = new StructuredGraph.Builder(options, debug).method(lambdaProxyMethods[0]).build();
-        try (DebugContext.Scope ignored = debug.scope("Lambda target method analysis", graph, lambdaType, ctx)) {
-            GraphBuilderPhase.Instance lambdaParserPhase = graphBuilderSupplier.apply(buildLambdaParserConfig(cip));
-            HighTierContext context = new HighTierContext(providers, null, OptimisticOptimizations.NONE);
-            lambdaParserPhase.apply(graph, context);
-        } catch (Throwable e) {
-            throw debug.handle(e);
-        }
-        List<ResolvedJavaMethod> invokedMethods = StreamSupport.stream(graph.getInvokes().spliterator(), false).map(Invoke::getTargetMethod).collect(Collectors.toList());
-        if (invokedMethods.isEmpty()) {
+    public static String findStableLambdaName(ResolvedJavaType lambdaType) {
+        final String lambdaName = lambdaType.getName();
+        assert lambdaMatcher(lambdaName).find() : "Stable name should be created for lambda types: " + lambdaName;
+
+        Matcher matcher = lambdaMatcher(lambdaName);
+        String signature = getSignature(lambdaType);
+        if (signature == null) {
             StringBuilder sb = new StringBuilder();
-            sb.append("Lambda without a target invoke: ").append(lambdaType.toClassName());
-            for (ResolvedJavaMethod m : lambdaType.getDeclaredMethods(false)) {
-                sb.append("\n  Method: ").append(m);
+            sb.append("Lambda without a signature: ").append(lambdaType.toClassName()).append(" (linked: ").append(lambdaType.isLinked()).append(")");
+            for (ResolvedJavaMethod method : lambdaType.getDeclaredMethods(false)) {
+                sb.append("\n  Method: ").append(method);
             }
             throw new JVMCIError(sb.toString());
         }
-        return createStableLambdaName(lambdaType, invokedMethods);
+        return matcher.replaceFirst(Matcher.quoteReplacement(LAMBDA_CLASS_NAME_SUBSTRING + ADDRESS_PREFIX + signature + ";"));
+    }
+
+    /**
+     * Finds the methods invoked in the bytecode of the provided method.
+     *
+     * @param method the method whose bytecode is parsed
+     * @return the list of invoked methods
+     */
+    private static List<JavaMethod> findInvokedMethods(ResolvedJavaMethod method) {
+        ConstantPool constantPool = method.getConstantPool();
+        List<JavaMethod> invokedMethods = new ArrayList<>();
+        for (BytecodeStream stream = new BytecodeStream(method.getCode()); stream.currentBCI() < stream.endBCI(); stream.next()) {
+            int opcode = stream.currentBC();
+            int cpi;
+            switch (opcode) {
+                case INVOKEVIRTUAL: // fall through
+                case INVOKESPECIAL: // fall through
+                case INVOKESTATIC: // fall through
+                case INVOKEINTERFACE:
+                    cpi = stream.readCPI();
+                    invokedMethods.add(constantPool.lookupMethod(cpi, opcode, method));
+                    break;
+                case INVOKEDYNAMIC:
+                    cpi = stream.readCPI4();
+                    invokedMethods.add(constantPool.lookupMethod(cpi, opcode, method));
+                    break;
+                default:
+                    break;
+            }
+        }
+        return invokedMethods;
     }
 
     /**
@@ -131,25 +122,64 @@ public final class LambdaUtils {
 
     public static boolean isLambdaType(ResolvedJavaType type) {
         String typeName = type.getName();
-        return type.isFinalFlagSet() && isLambdaName(typeName);
+        return !isArrayTypeName(typeName) && !type.isArray() &&
+                        type.isFinalFlagSet() && isLambdaName(typeName);
     }
 
     public static boolean isLambdaName(String name) {
         return isLambdaClassName(name) && lambdaMatcher(name).find();
     }
 
-    private static String createStableLambdaName(ResolvedJavaType lambdaType, List<ResolvedJavaMethod> targetMethods) {
-        final String lambdaName = lambdaType.getName();
-        assert lambdaMatcher(lambdaName).find() : "Stable name should be created for lambda types: " + lambdaName;
-
-        Matcher m = lambdaMatcher(lambdaName);
+    /**
+     * Generates a signature for a given type by hashing its composing parts. The signature is
+     * generated based on the methods invoked in the bytecode of a public non-bridge method, the
+     * constructor parameter types, and the interfaces implemented by the type. Returns {@code null}
+     * if the type is not linked or the selected declared method does not invoke any other method.
+     * The procedure should generate reasonable signatures for lambda proxy types, but it may fail
+     * to do so for general hidden classes.
+     * <p>
+     * Starting from JDK17, lambda classes can have additional interfaces that lambda should
+     * implement. This further means that lambda can have more than one public method (public and
+     * not bridge).
+     * <p>
+     * The scala lambda classes have by default one additional interface with one method. This
+     * method has the same signature as the original one but with generalized parameters (all
+     * parameters are Object types) and serves as a wrapper that casts parameters to specialized
+     * types and calls an original method.
+     *
+     * @param type the type to generate a signature for
+     * @return a 32-character hexadecimal string representing the type signature or {@code null} if
+     *         the type is not linked or the selected declared method does not have any invokes
+     */
+    public static String getSignature(ResolvedJavaType type) {
+        if (!type.isLinked()) {
+            return null;
+        }
+        /*
+         * Take only the first method to find invoked methods, because the result would be the same
+         * for all other methods (if it is a lambda type).
+         */
+        List<JavaMethod> invokedMethods = Arrays.stream(type.getDeclaredMethods(false)).filter(m -> !m.isBridge() && m.isPublic()).findFirst().map(LambdaUtils::findInvokedMethods).orElse(List.of());
+        if (invokedMethods.isEmpty()) {
+            return null;
+        }
+        /* Generate type signature by hashing its composing parts. */
         StringBuilder sb = new StringBuilder();
-        targetMethods.forEach((targetMethod) -> sb.append(targetMethod.format("%H.%n(%P)%R")));
-        // Take parameter types of constructor into consideration, see GR-52837
-        for (ResolvedJavaMethod ctor : lambdaType.getDeclaredConstructors()) {
+        /* Append invoked methods. */
+        for (JavaMethod method : invokedMethods) {
+            sb.append(method.format("%H.%n(%P)%R"));
+        }
+        /* Append constructor parameter types. */
+        for (JavaMethod ctor : type.getDeclaredConstructors(false)) {
             sb.append(ctor.format("%P"));
         }
-        return m.replaceFirst(Matcher.quoteReplacement(LAMBDA_CLASS_NAME_SUBSTRING + ADDRESS_PREFIX + Digest.digestAsHex(sb.toString()) + ";"));
+        /* Append implemented interfaces. */
+        for (ResolvedJavaType iface : type.getInterfaces()) {
+            sb.append(iface.toJavaName());
+        }
+        String signature = Digest.digestAsHex(sb.toString());
+        GraalError.guarantee(signature.length() == 32, "Expecting a 32 digits long hex value.");
+        return signature;
     }
 
     private static Matcher lambdaMatcher(String value) {
@@ -173,7 +203,7 @@ public final class LambdaUtils {
      * @return true if the clazz is lambda class, false instead
      */
     public static boolean isLambdaClass(Class<?> clazz) {
-        return isLambdaClassName(clazz.getName());
+        return !clazz.isArray() && isLambdaClassName(clazz.getName());
     }
 
     /**
@@ -184,5 +214,9 @@ public final class LambdaUtils {
      */
     public static boolean isLambdaClassName(String className) {
         return className.contains(LAMBDA_CLASS_NAME_SUBSTRING);
+    }
+
+    private static boolean isArrayTypeName(String name) {
+        return !name.isEmpty() && name.charAt(0) == '[';
     }
 }

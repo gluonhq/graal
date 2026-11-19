@@ -23,6 +23,10 @@
     <property name="id" value="endless-loop"/>
   </module>
   <module name="TreeWalker">
+    <module name="OuterTypeFilename">
+      <message key="type.file.mismatch"
+               value="The top-level type matching the filename must be declared first in the file."/>
+    </module>
     <module name="AvoidStarImport"/>
     <module name="JavadocStyle">
       <property name="checkHtml" value="false"/>
@@ -142,6 +146,24 @@
       <property name="message" value="Don't use old synchronized collection classes"/>
     </module>
     <module name="RegexpSinglelineJava">
+      <property name="format" value="(new|extends) (HashMap|HashSet|IdentityHashMap|Hashtable)[^\w]"/>
+      <property name="message" value="Collections with unstable iteration order are prohibited. Use EconomicHashMap (EconomicHashSet), EconomicMap (EconomicSet), or LinkedHashMap (LinkedHashSet) instead."/>
+      <property name="ignoreComments" value="true"/>
+      <property name="id" value="new-unstable-collection"/>
+    </module>
+    <module name="RegexpSinglelineJava">
+      <property name="format" value="[^\w]Hash(Map|Set)\.newHash(Map|Set)[^\w]"/>
+      <property name="message" value="Collections with unstable iteration order are prohibited. Use EconomicHashMap (EconomicHashSet), EconomicMap (EconomicSet), or LinkedHashMap (LinkedHashSet) instead."/>
+      <property name="ignoreComments" value="true"/>
+      <property name="id" value="unstable-collection-factory"/>
+    </module>
+    <module name="RegexpSinglelineJava">
+      <property name="format" value="[^\w](Map|Set)\.(of|copyOf|ofEntries)[^\w]"/>
+      <property name="message" value="Immutable collections with unstable iteration order are prohibited. Use a CollectionsUtil factory or LinkedHashMap (LinkedHashSet) instead."/>
+      <property name="ignoreComments" value="true"/>
+      <property name="id" value="immutable-unstable-collection"/>
+    </module>
+    <module name="RegexpSinglelineJava">
       <property name="format" value="instanceof MoveOp"/>
       <property name="message" value="Do not use `op instanceof MoveOp`. Use `MoveOp.isMoveOp(op)` instead!"/>
     </module>
@@ -176,6 +198,42 @@
       <property name="checkFormat" value=".*"/>
       <property name="influenceFormat" value="0"/>
       <property name="idFormat" value="endless-loop"/>
+    </module>
+    <module name="SuppressWithNearbyCommentFilter">
+      <property name="commentFormat" value="STABLE ITERATION ORDER: \w.*"/>
+      <property name="checkFormat" value=".*"/>
+      <property name="influenceFormat" value="1"/>
+      <property name="idFormat" value="new-unstable-collection"/>
+    </module>
+    <module name="SuppressWithNearbyCommentFilter">
+      <property name="commentFormat" value="STABLE ITERATION ORDER: \w.*"/>
+      <property name="checkFormat" value=".*"/>
+      <property name="influenceFormat" value="1"/>
+      <property name="idFormat" value="unstable-collection-factory"/>
+    </module>
+    <module name="SuppressWithNearbyCommentFilter">
+      <property name="commentFormat" value="STABLE ITERATION ORDER: \w.*"/>
+      <property name="checkFormat" value=".*"/>
+      <property name="influenceFormat" value="1"/>
+      <property name="idFormat" value="immutable-unstable-collection"/>
+    </module>
+    <module name="SuppressionCommentFilter">
+      <property name="offCommentFormat" value="Checkstyle: stop stable iteration order check"/>
+      <property name="onCommentFormat" value="Checkstyle: resume stable iteration order check"/>
+      <property name="idFormat" value="new-unstable-collection"/>
+      <metadata name="com.atlassw.tools.eclipse.checkstyle.comment" value="Allow collections with unstable iteration order."/>
+    </module>
+    <module name="SuppressionCommentFilter">
+      <property name="offCommentFormat" value="Checkstyle: stop stable iteration order check"/>
+      <property name="onCommentFormat" value="Checkstyle: resume stable iteration order check"/>
+      <property name="idFormat" value="unstable-collection-factory"/>
+      <metadata name="com.atlassw.tools.eclipse.checkstyle.comment" value="Allow collections with unstable iteration order."/>
+    </module>
+    <module name="SuppressionCommentFilter">
+      <property name="offCommentFormat" value="Checkstyle: stop stable iteration order check"/>
+      <property name="onCommentFormat" value="Checkstyle: resume stable iteration order check"/>
+      <property name="idFormat" value="immutable-unstable-collection"/>
+      <metadata name="com.atlassw.tools.eclipse.checkstyle.comment" value="Allow collections with unstable iteration order."/>
     </module>
     <module name="SuppressionCommentFilter">
       <property name="offCommentFormat" value="Checkstyle: stop constant name check"/>
@@ -246,7 +304,7 @@
       <property name="illegalPattern" value="true"/>
     </module>
     <module name="Regexp">
-      <property name="format" value="[^/](?i)master|(?i)slave|(?i)whitelist|(?i)blacklist|(?i)whitehat|(?i)blackhat|(?i)grandfather"/>
+      <property name="format" value="(?i)slave|(?i)whitelist|(?i)blacklist|(?i)whitehat|(?i)blackhat|(?i)grandfather"/>
       <message key="illegal.regexp" value="Avoid insensitive term matched by {0}." />
       <property name="illegalPattern" value="true"/>
     </module>
@@ -255,7 +313,7 @@
     <property name="max" value="250"/>
   </module>
   <module name="RegexpHeader">
-    <property name="header" value="/\*\n \* Copyright \(c\) (20[0-9][0-9], )?20[0-9][0-9], Oracle and/or its affiliates\. All rights reserved\.\n \* Copyright \(c\) (20[0-9][0-9], )?20[0-9][0-9], .*\. All rights reserved\.\n \* Intel Math Library \(LIBM\) Source Code\n \* DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER\.\n \*\n \* This code is free software; you can redistribute it and/or modify it\n \* under the terms of the GNU General Public License version 2 only, as\n \* published by the Free Software Foundation\.  Oracle designates this\n \* particular file as subject to the &quot;Classpath&quot; exception as provided\n \* by Oracle in the LICENSE file that accompanied this code.\n \*\n \* This code is distributed in the hope that it will be useful, but WITHOUT\n \* ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or\n \* FITNESS FOR A PARTICULAR PURPOSE\.  See the GNU General Public License\n \* version 2 for more details \(a copy is included in the LICENSE file that\n \* accompanied this code\)\.\n \*\n \* You should have received a copy of the GNU General Public License version\n \* 2 along with this work; if not, write to the Free Software Foundation,\n \* Inc\., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA\.\n \*\n \* Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA\n \* or visit www\.oracle\.com if you need additional information or have any\n \* questions\.\n \*/\n"/>
+    <property name="header" value="/\*\n \* Copyright \(c\) (20[0-9][0-9], )?20[0-9][0-9], Oracle and/or its affiliates\. All rights reserved\.\n \* Copyright (?:\(c\) (20[0-9][0-9], )?20[0-9][0-9], .*\. All rights reserved\.|Amazon\.com Inc\. or its affiliates\. All Rights Reserved\.)\n \* Intel Math Library \(LIBM\) Source Code\n \* DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER\.\n \*\n \* This code is free software; you can redistribute it and/or modify it\n \* under the terms of the GNU General Public License version 2 only, as\n \* published by the Free Software Foundation\.  Oracle designates this\n \* particular file as subject to the &quot;Classpath&quot; exception as provided\n \* by Oracle in the LICENSE file that accompanied this code.\n \*\n \* This code is distributed in the hope that it will be useful, but WITHOUT\n \* ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or\n \* FITNESS FOR A PARTICULAR PURPOSE\.  See the GNU General Public License\n \* version 2 for more details \(a copy is included in the LICENSE file that\n \* accompanied this code\)\.\n \*\n \* You should have received a copy of the GNU General Public License version\n \* 2 along with this work; if not, write to the Free Software Foundation,\n \* Inc\., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA\.\n \*\n \* Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA\n \* or visit www\.oracle\.com if you need additional information or have any\n \* questions\.\n \*/\n"/>
     <property name="multiLines" value="3,4"/>
     <property name="fileExtensions" value="java"/>
   </module>

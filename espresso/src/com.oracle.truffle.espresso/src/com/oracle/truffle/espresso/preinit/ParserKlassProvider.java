@@ -22,16 +22,81 @@
  */
 package com.oracle.truffle.espresso.preinit;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.ClassfileParser;
+import com.oracle.truffle.espresso.classfile.ClassfileStream;
+import com.oracle.truffle.espresso.classfile.ParserException;
+import com.oracle.truffle.espresso.classfile.ParserKlass;
+import com.oracle.truffle.espresso.classfile.ParsingContext;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.classfile.descriptors.ValidationException;
 import com.oracle.truffle.espresso.impl.ClassLoadingEnv;
 import com.oracle.truffle.espresso.impl.ClassRegistry;
-import com.oracle.truffle.espresso.impl.ParserKlass;
+import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.meta.Meta;
+import com.oracle.truffle.espresso.runtime.EspressoVerifier;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 public interface ParserKlassProvider {
-    ParserKlass getParserKlass(ClassLoadingEnv env, StaticObject loader, Symbol<Symbol.Type> typeOrNull, byte[] bytes, ClassRegistry.ClassDefinitionInfo info);
+    ParserKlass getParserKlass(ClassLoadingEnv env, StaticObject loader, Symbol<Type> typeOrNull, byte[] bytes, ClassRegistry.ClassDefinitionInfo info);
 
     default int getCachedParserKlassCount() {
         return 0;
+    }
+
+    /**
+     * Like {@link #parseKlass} but throws host exceptions that must be caught an handled by the
+     * called.
+     * 
+     * @throws ValidationException a descriptor validation caused a class format error.
+     * @throws ParserException various exceptions, see subclasses.
+     */
+    static ParserKlass parseKlassWithHostErrors(ClassRegistry.ClassDefinitionInfo info, ClassLoadingEnv env, StaticObject loader, Symbol<Type> typeOrNull, byte[] bytes) throws ValidationException {
+        boolean verifiable = EspressoVerifier.needsVerify(env.getLanguage(), loader);
+        boolean loaderIsBootOrPlatform = env.loaderIsBootOrPlatform(loader);
+        // Classes from trusted class loaders can create strongly referenced symbols directly
+        // during parsing.
+        boolean ensureStrongSymbols = env.loaderIsBootOrPlatform(loader) || env.loaderIsAppLoader(loader);
+        ParsingContext parsingContext = ClassLoadingEnv.createParsingContext(env, ensureStrongSymbols);
+
+        // Trusted classes do not need validation/verification.
+        boolean validate = verifiable;
+        ParserKlass parserKlass = ClassfileParser.parse(parsingContext, new ClassfileStream(bytes, null), verifiable, loaderIsBootOrPlatform, typeOrNull, info.isHidden,
+                        info.forceAllowVMAnnotations, validate);
+        if (info.isHidden) {
+            return ParserKlass.forHiddenClass(parserKlass, typeOrNull, env.getNewKlassId(), parsingContext);
+        }
+
+        return parserKlass;
+    }
+
+    static ParserKlass parseKlass(ClassRegistry.ClassDefinitionInfo info, ClassLoadingEnv env, StaticObject loader, Symbol<Type> typeOrNull, byte[] bytes) {
+        Meta meta = env.getMeta();
+        try {
+            return parseKlassWithHostErrors(info, env, loader, typeOrNull, bytes);
+        } catch (ValidationException | ParserException.ClassFormatError validationOrBadFormat) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, validationOrBadFormat.getMessage());
+        } catch (ParserException.UnsupportedClassVersionError unsupportedClassVersionError) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_UnsupportedClassVersionError, unsupportedClassVersionError.getMessage());
+        } catch (ParserException.NoClassDefFoundError noClassDefFoundError) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_NoClassDefFoundError, noClassDefFoundError.getMessage());
+        } catch (ParserException parserException) {
+            throw EspressoError.shouldNotReachHere("Not a validation nor parser exception", parserException);
+        }
+    }
+
+    static Symbol<Name> getClassName(Meta meta, ParsingContext parsingContext, byte[] bytes) {
+        try {
+            return ClassfileParser.getClassName(parsingContext, bytes);
+        } catch (ValidationException | ParserException.ClassFormatError validationOrBadFormat) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, validationOrBadFormat.getMessage());
+        } catch (ParserException.UnsupportedClassVersionError unsupportedClassVersionError) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_UnsupportedClassVersionError, unsupportedClassVersionError.getMessage());
+        } catch (ParserException.NoClassDefFoundError noClassDefFoundError) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_NoClassDefFoundError, noClassDefFoundError.getMessage());
+        } catch (ParserException parserException) {
+            throw EspressoError.shouldNotReachHere("Not a validation or known parser exception", parserException);
+        }
     }
 }

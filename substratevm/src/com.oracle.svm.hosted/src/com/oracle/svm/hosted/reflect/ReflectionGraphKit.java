@@ -35,10 +35,10 @@ import java.util.Map;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
 import com.oracle.svm.core.reflect.ReflectionAccessorHolder;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.code.FactoryMethodSupport;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.graal.compiler.core.common.calc.FloatConvert;
 import jdk.graal.compiler.core.common.type.StampFactory;
@@ -291,7 +291,7 @@ public class ReflectionGraphKit extends HostedGraphKit {
         if (fromStackKind == toStackKind) {
             return unboxedValue;
         }
-
+        // Checkstyle: stop FallThrough
         switch (fromStackKind) {
             case Int:
                 switch (toStackKind) {
@@ -323,5 +323,6 @@ public class ReflectionGraphKit extends HostedGraphKit {
             default:
                 throw VMError.shouldNotReachHereUnexpectedInput(fromStackKind); // ExcludeFromJacocoGeneratedReport
         }
+        // Checkstyle: resume FallThrough
     }
 }

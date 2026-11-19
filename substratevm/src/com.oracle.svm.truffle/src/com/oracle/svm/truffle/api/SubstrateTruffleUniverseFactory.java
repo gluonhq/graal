@@ -24,25 +24,37 @@
  */
 package com.oracle.svm.truffle.api;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
 import com.oracle.svm.core.code.ImageCodeInfo;
+import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.util.HostedStringDeduplication;
 import com.oracle.svm.graal.meta.SubstrateField;
 import com.oracle.svm.graal.meta.SubstrateMethod;
+import com.oracle.svm.graal.meta.SubstrateType;
 import com.oracle.svm.graal.meta.SubstrateUniverseFactory;
-import com.oracle.truffle.compiler.ConstantFieldInfo;
-import com.oracle.truffle.compiler.PartialEvaluationMethodInfo;
+import com.oracle.svm.core.UninterruptibleGuestValue;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.OriginalClassProvider;
 import com.oracle.truffle.compiler.TruffleCompilerRuntime;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
+import jdk.graal.compiler.truffle.ConstantFieldInfo;
+import jdk.graal.compiler.truffle.KnownTruffleTypes;
+import jdk.graal.compiler.truffle.PartialEvaluationMethodInfo;
+import jdk.graal.compiler.truffle.PartialEvaluator;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 public final class SubstrateTruffleUniverseFactory extends SubstrateUniverseFactory {
 
@@ -56,7 +68,7 @@ public final class SubstrateTruffleUniverseFactory extends SubstrateUniverseFact
 
     @Override
     public SubstrateMethod createMethod(AnalysisMethod aMethod, ImageCodeInfo imageCodeInfo, HostedStringDeduplication stringTable) {
-        PartialEvaluationMethodInfo peInfo = createPartialEvaluationMethodInfo(truffleRuntime, aMethod);
+        PartialEvaluationMethodInfo peInfo = createPartialEvaluationMethodInfo(truffleRuntime, aMethod, ImageSingletons.lookup(KnownTruffleTypes.class));
         PartialEvaluationMethodInfo canonicalPeInfo = canonicalMethodInfos.computeIfAbsent(peInfo, k -> k);
         /*
          * A collection of all the flags that Truffle needs for partial evaluation. Most of this
@@ -69,19 +81,29 @@ public final class SubstrateTruffleUniverseFactory extends SubstrateUniverseFact
 
     @Override
     public SubstrateField createField(AnalysisField aField, HostedStringDeduplication stringTable) {
-        ConstantFieldInfo fieldInfo = truffleRuntime.getConstantFieldInfo(aField);
+        Map<ResolvedJavaType, AnnotationValue> annotations = GuestAnnotationAccess.getDeclaredAnnotationValues(aField);
+        ConstantFieldInfo fieldInfo = PartialEvaluator.computeConstantFieldInfo(aField, annotations, ImageSingletons.lookup(KnownTruffleTypes.class), OriginalClassProvider::getOriginalType);
         ConstantFieldInfo canonicalFieldInfo = fieldInfo == null ? null : canonicalFieldInfos.computeIfAbsent(fieldInfo, k -> k);
         return new SubstrateTruffleField(aField, stringTable, canonicalFieldInfo);
     }
 
+    @Override
+    public SubstrateType createType(AnalysisType analysisType, DynamicHub hub) {
+        Map<ResolvedJavaType, AnnotationValue> annotations = GuestAnnotationAccess.getDeclaredAnnotationValues(analysisType);
+        boolean valueType = annotations.containsKey(OriginalClassProvider.getOriginalType(ImageSingletons.lookup(KnownTruffleTypes.class).CompilerDirectives_ValueType));
+        return new SubstrateTruffleType(analysisType.getJavaKind(), hub, valueType);
+    }
+
     @Platforms(Platform.HOSTED_ONLY.class)
-    static PartialEvaluationMethodInfo createPartialEvaluationMethodInfo(TruffleCompilerRuntime runtime, ResolvedJavaMethod method) {
-        var info = ((SubstrateTruffleRuntime) runtime).getPartialEvaluationMethodInfo(method);
-        if (Uninterruptible.Utils.isUninterruptible(method)) {
-            Uninterruptible uninterruptibleAnnotation = Uninterruptible.Utils.getAnnotation(method);
+    static PartialEvaluationMethodInfo createPartialEvaluationMethodInfo(TruffleCompilerRuntime runtime, ResolvedJavaMethod method,
+                    KnownTruffleTypes types) {
+        Map<ResolvedJavaType, AnnotationValue> annotations = GuestAnnotationAccess.getDeclaredAnnotationValues(method);
+        var info = PartialEvaluator.computePartialEvaluationMethodInfo(runtime, method, annotations, types, OriginalClassProvider::getOriginalType);
+        if (UninterruptibleAnnotationUtils.isUninterruptible(method)) {
+            UninterruptibleGuestValue uninterruptibleAnnotation = UninterruptibleAnnotationUtils.getAnnotation(method);
             if (uninterruptibleAnnotation == null || !uninterruptibleAnnotation.mayBeInlined()) {
                 /* The semantics of Uninterruptible would get lost during partial evaluation. */
-                return new PartialEvaluationMethodInfo(info.loopExplosion(),
+                info = new PartialEvaluationMethodInfo(info.loopExplosion(),
                                 info.inlineForPartialEvaluation(),
                                 info.inlineForTruffleBoundary(),
                                 // override inlinable for uninterruptible methods here

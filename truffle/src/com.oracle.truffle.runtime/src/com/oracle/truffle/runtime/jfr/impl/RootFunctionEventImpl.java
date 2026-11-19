@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,42 +41,50 @@
 package com.oracle.truffle.runtime.jfr.impl;
 
 import com.oracle.truffle.api.nodes.LanguageInfo;
+import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.runtime.OptimizedCallTarget;
+import com.oracle.truffle.runtime.jfr.RootFunctionEvent;
+
+import jdk.jfr.Description;
 import jdk.jfr.Event;
 import jdk.jfr.Label;
-import jdk.jfr.Description;
-import com.oracle.truffle.api.source.SourceSection;
-import com.oracle.truffle.runtime.jfr.RootFunctionEvent;
-import com.oracle.truffle.api.nodes.RootNode;
 
 abstract class RootFunctionEventImpl extends Event implements RootFunctionEvent {
 
+    @Label("Engine Id") @Description("Truffle Engine Unique Id") public long engineId;
     @Label("Id") @Description("Truffle Compilable Unique Id") public long id;
     @Label("Source") @Description("Compiled Source") public String source;
+    @Label("Source Hash") @Description("Compiled Source Hash Code") public String sourceHash;
     @Label("Language") @Description("Guest Language") public String language;
     @Label("Root Function") @Description("Root Function") public String rootFunction;
+    @Label("AST Size") @Description("AST Node Count") public int astSize;
 
     RootFunctionEventImpl() {
     }
 
-    RootFunctionEventImpl(long id, String source, String language, String rootFunction) {
+    RootFunctionEventImpl(long engineId, long id, String source, String sourceHash, String language, String rootFunction, int astSize) {
+        this.engineId = engineId;
         this.id = id;
         this.source = source;
+        this.sourceHash = sourceHash;
         this.language = language;
         this.rootFunction = rootFunction;
+        this.astSize = astSize;
     }
 
     @Override
     public void setRootFunction(OptimizedCallTarget target) {
+        this.engineId = target.engineId();
         this.id = target.id;
         RootNode rootNode = target.getRootNode();
-        this.source = targetName(rootNode);
+        SourceSection sourceSection = safeSourceSection(target);
+        this.source = formatSourceName(sourceSection);
+        this.sourceHash = formatSourceHash(sourceSection);
         LanguageInfo languageInfo = rootNode.getLanguageInfo();
-        this.language = languageInfo != null ? languageInfo.getId() : null;
-        this.rootFunction = rootNode.getName();
-        if (this.rootFunction == null) {
-            this.rootFunction = rootNode.toString();
-        }
+        this.language = languageInfo != null ? languageInfo.getId() : "n/a";
+        this.rootFunction = safeTargetName(target);
+        this.astSize = target.getNonTrivialNodeCount();
     }
 
     @Override
@@ -84,11 +92,34 @@ abstract class RootFunctionEventImpl extends Event implements RootFunctionEvent 
         commit();
     }
 
-    private static String targetName(RootNode rootNode) {
-        SourceSection sourceSection = rootNode.getSourceSection();
-        if (sourceSection != null && sourceSection.getSource() != null) {
-            return sourceSection.getSource().getName() + ":" + sourceSection.getStartLine();
+    private static SourceSection safeSourceSection(OptimizedCallTarget target) {
+        try {
+            return target.getRootNode().getSourceSection();
+        } catch (Throwable throwable) {
+            return null;
         }
-        return null;
     }
+
+    private static String safeTargetName(OptimizedCallTarget target) {
+        try {
+            return target.getName();
+        } catch (Throwable throwable) {
+            return "n/a";
+        }
+    }
+
+    private static String formatSourceName(SourceSection sourceSection) {
+        if (sourceSection == null || sourceSection.getSource() == null) {
+            return "n/a";
+        }
+        return String.format("%s:%d", sourceSection.getSource().getName(), sourceSection.getStartLine());
+    }
+
+    private static String formatSourceHash(SourceSection sourceSection) {
+        if (sourceSection == null || sourceSection.getSource() == null) {
+            return "n/a";
+        }
+        return String.format("0x%x", sourceSection.getSource().hashCode());
+    }
+
 }

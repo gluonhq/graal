@@ -14,27 +14,53 @@ Usage: native-image [options] class [imagename] [options]
 where options include:
 
     @argument files       one or more argument files containing options
+||@argument| files|one or more argument files containing options|String||false|
     -cp <class search path of directories and zip/jar files>
+||-cp| <class search path of directories and zip/jar files>|class search path of directories and zip/jar files|Path||false|
     -classpath <class search path of directories and zip/jar files>
+||-classpath| <class search path of directories and zip/jar files>|class search path of directories and zip/jar files|Path||false|
     --class-path <class search path of directories and zip/jar files>
                           A %pathsep% separated list of directories, JAR archives,
                           and ZIP archives to search for class files.
+||--class-path| <class search path of directories and zip/jar files>|A %pathsep% separated list of directories, JAR archives, and ZIP archives to search for class files.|Path||false|
     -p <module path>
+||-p| <module path>|module path|Path||false|
     --module-path <module path>...
                           A %pathsep% separated list of directories, each directory
                           is a directory of modules.
+||--module-path| <module path>...|A %pathsep% separated list of directories, each directory is a directory of modules.|Path||false|
     --add-modules <module name>[,<module name>...]
                           root modules to resolve in addition to the initial module.
                           <module name> can also be ALL-DEFAULT, ALL-SYSTEM,
                           ALL-MODULE-PATH.
-    -D<name>=<value>      set a system property
+||--add-modules| <module name>[,<module name>...]|root modules to resolve in addition to the initial module.|String||false|
+||> <module name> can also be ALL-DEFAULT, ALL-SYSTEM, ALL-MODULE-PATH.|
+    -D<name>=<value>      set a system property for image build time only
+||-D|<name>=<value>|set a system property for image build time only|String||false|
     -J<flag>              pass <flag> directly to the JVM running the image generator
+||-J|<flag>|pass <flag> directly to the JVM running the image generator|String||false|
     --diagnostics-mode    enable diagnostics output: class initialization, substitutions, etc.
+||--diagnostics-mode||enable diagnostics output: class initialization, substitutions, etc.|Flag||false|
     --enable-preview      allow classes to depend on preview features of this release
-    --enable-native-access <module name>[,<module name>...]
-                          modules that are permitted to perform restricted native operations.
-                          <module name> can also be ALL-UNNAMED.
+||--enable-preview||allow classes to depend on preview features of this release|Flag||false|
+    --sun-misc-unsafe-memory-access=<value>
+                          allow or deny usage of unsupported API sun.misc.Unsafe
+                          <value> is one of "allow", "warn", "debug", or "deny".
+                          The default value is "warn".
+||--sun-misc-unsafe-memory-access|=<value>|allow or deny usage of unsupported API sun.misc.Unsafe|String||false|
+||> <value> is one of "allow", "warn", "debug", or "deny".|
+||> The default value is "warn".|
     --verbose             enable verbose output
+||--verbose||enable verbose output|Flag||false|
     --version             print product version and exit
+||--version||print product version and exit|Flag||false|
     --help                print this help message
+||--help||print this help message|Flag||false|
     --help-extra          print help on non-standard options
+||--help-extra||print help on non-standard options|Flag||false|
+    --print-options[=<format>]
+                          print comprehensive options table. Available formats:
+                          * 'table' (default): human-readable table format
+                          * 'markdown' or 'md': markdown table for documentation
+                          * 'json': machine-readable JSON format
+||--print-options|[=<format>]|print comprehensive options table. Available formats: 'table' (default), 'markdown' or 'md', and 'json'. This eliminates duplication with manual documentation tables.|String||false|

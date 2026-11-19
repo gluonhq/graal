@@ -25,15 +25,33 @@
 
 package com.oracle.graal.pointsto.meta;
 
+import java.lang.annotation.Annotation;
+
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.TypedConstant;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
+
 import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
 import jdk.graal.compiler.debug.GraalError;
-
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class AnalysisMetaAccessExtensionProvider implements MetaAccessExtensionProvider {
+    @SuppressWarnings("unchecked") //
+    private static final Class<? extends Annotation> LAMBDA_FORM_COMPILED = (Class<? extends Annotation>) ReflectionUtil.lookupClass("java.lang.invoke.LambdaForm$Compiled");
+
+    private final AnalysisUniverse aUniverse;
+
+    public AnalysisMetaAccessExtensionProvider(AnalysisUniverse aUniverse) {
+        this.aUniverse = aUniverse;
+    }
 
     @Override
     public JavaKind getStorageKind(JavaType type) {
@@ -43,7 +61,7 @@ public class AnalysisMetaAccessExtensionProvider implements MetaAccessExtensionP
     @Override
     public boolean canConstantFoldDynamicAllocation(ResolvedJavaType t) {
         AnalysisType type = (AnalysisType) t;
-        if (type.universe.sealed()) {
+        if (aUniverse.sealed()) {
             /* Static analysis has finished, e.g., we are applying static analysis results. */
             return type.isInstantiated();
         } else {
@@ -58,7 +76,48 @@ public class AnalysisMetaAccessExtensionProvider implements MetaAccessExtensionP
     }
 
     @Override
+    public boolean isLambdaFormCompiled(ResolvedJavaMethod method) {
+        return isLambdaFormCompiledMethod(method);
+    }
+
+    public static boolean isLambdaFormCompiledMethod(ResolvedJavaMethod method) {
+        ResolvedJavaMethod original = OriginalMethodProvider.getOriginalMethod(method);
+        if (original instanceof BaseLayerMethod) {
+            /*
+             * Base layer methods are not from GuestAccess' host JVMCI provider, but their persisted
+             * annotations are available.
+             */
+            return GuestAnnotationAccess.isAnnotationPresent(original, LAMBDA_FORM_COMPILED);
+        }
+        return original != null && GuestAccess.get().getProviders().getMetaAccessExtensionProvider().isLambdaFormCompiled(original);
+    }
+
+    @Override
     public boolean canVirtualize(ResolvedJavaType instanceType) {
         return true;
+    }
+
+    @Override
+    public ResolvedJavaField getStaticFieldForAccess(JavaConstant base, long offset, JavaKind accessKind) {
+        JavaConstant hostedObject;
+        if (base instanceof ImageHeapConstant imageHeapConstant) {
+            hostedObject = imageHeapConstant.getHostedObject();
+            if (hostedObject == null) {
+                return null;
+            }
+            assert !(hostedObject instanceof ImageHeapConstant);
+        } else if (!(base instanceof TypedConstant)) {
+            /*
+             * Ideally, this path should be unreachable, i.e., we should only see TypedConstant. But
+             * the image heap scanning during static analysis is not implemented cleanly enough and
+             * invokes this method both with image heap constants and original HotSpot object
+             * constants. See AnalysisMetaAccess.lookupJavaType.
+             */
+            hostedObject = base;
+        } else {
+            return null;
+        }
+        MetaAccessExtensionProvider original = GuestAccess.get().getProviders().getMetaAccessExtensionProvider();
+        return aUniverse.lookup(original.getStaticFieldForAccess(hostedObject, offset, accessKind));
     }
 }

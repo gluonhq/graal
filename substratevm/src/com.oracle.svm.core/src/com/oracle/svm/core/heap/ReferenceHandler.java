@@ -24,19 +24,26 @@
  */
 package com.oracle.svm.core.heap;
 
+import static com.oracle.svm.shared.NeverInline.CALLER_CATCHES_IMPLICIT_EXCEPTIONS;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import java.lang.ref.Reference;
 
-import com.oracle.svm.core.IsolateArgumentParser;
-import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.internal.ref.CleanerFactory;
 
 public final class ReferenceHandler {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean useDedicatedThread() {
         int automaticReferenceHandling = IsolateArgumentParser.getOptionIndex(SubstrateOptions.ConcealedOptions.AutomaticReferenceHandling);
-        return ReferenceHandlerThread.isSupported() && IsolateArgumentParser.getBooleanOptionValue(automaticReferenceHandling);
+        return ReferenceHandlerThread.isSupported() && IsolateArgumentParser.singleton().getBooleanOptionValue(automaticReferenceHandling);
     }
 
     public static boolean isExecutedManually() {
@@ -63,12 +70,12 @@ public final class ReferenceHandler {
         }
     }
 
-    @NeverInline("Ensure that every exception can be caught, including implicit exceptions.")
+    @NeverInline(CALLER_CATCHES_IMPLICIT_EXCEPTIONS)
     static void processCleaners() {
         // Note: (sun.misc|jdk.internal).Cleaner objects are invoked in pending reference processing
 
         // Process the JDK's common cleaner, additional cleaners start their own threads
-        Target_java_lang_ref_Cleaner commonCleaner = Target_jdk_internal_ref_CleanerFactory.cleaner();
+        Target_java_lang_ref_Cleaner commonCleaner = SubstrateUtil.cast(CleanerFactory.cleaner(), Target_java_lang_ref_Cleaner.class);
         Reference<?> ref = commonCleaner.impl.queue.poll();
         while (ref != null) {
             try {

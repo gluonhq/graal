@@ -31,13 +31,20 @@ import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.thread.ThreadListener;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class ThreadListenerSupport {
     private ThreadListener[] listeners;
 
@@ -55,15 +62,15 @@ public class ThreadListenerSupport {
         listeners[oldLength] = listener;
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static ThreadListenerSupport get() {
         return ImageSingletons.lookup(ThreadListenerSupport.class);
     }
 
     @Uninterruptible(reason = "Force that all listeners are uninterruptible.")
-    public void beforeThreadStart(IsolateThread isolateThread, Thread javaThread) {
+    public void afterThreadStart(IsolateThread isolateThread, Thread javaThread) {
         for (ThreadListener listener : listeners) {
-            listener.beforeThreadStart(isolateThread, javaThread);
+            listener.afterThreadStart(isolateThread, javaThread);
         }
     }
 

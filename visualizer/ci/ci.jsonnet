@@ -4,15 +4,13 @@
 
   Gate:: {
     timelimit : "30:00",
-    targets: [ "gate" ],
+    targets: [ "tier2" ],
     run: [
       ["cd", "./visualizer"],
       ["mx", "pylint" ],
-      # temporarily disabled until GR-52034 is closed ["mx", "verify-graal-graphio" ],
+      ["mx", "verify-graal-graphio" ],
       ["mx", "build" ],
       ["mx", "clean" ],
-      ["mx", "build-release" ],
-      ["mx", "spotbugs" ],
       ["mx", "unittest" ],
       ["mx", "igv", "-J-Dnetbeans.close=true", "--nosplash"],
     ]
@@ -20,24 +18,31 @@
 
   Integration:: {
     timelimit : "30:00",
-    targets: [ "gate" ],
+    targets: [ "tier2" ],
+    # reset catch files to avoid capturing (non-existent) dump files, which can take very long
+    catch_files: [],
     downloads+: {
-      "VISUALIZER_JAVA_HOME": common.jdks_data["oraclejdk11"]
+      "TOOLS_JAVA_HOME": common.jdks_data["oraclejdk21"]
     },
     run: [
-      ["cd", "./visualizer"],
-      ["mx", "--java-home=$VISUALIZER_JAVA_HOME", "build" ],
-      ["cd", "../compiler"],
+      ["cd", "./compiler"],
       ["mx", "build" ],
-      ["mx", "benchmark", "dacapo:fop", "--", "-Djdk.graal.Dump=:1", "-Djdk.graal.PrintGraph=File", "-Djdk.graal.DumpPath=../IGV_Dumps"],
+      ["mx", "benchmark", "dacapo:fop", "--", "-Djdk.graal.Dump=:1", "-Djdk.graal.PrintGraph=File", "-Djdk.graal.DumpPath=../IGV_Dumps", "-Djdk.graal.ShowDumpFiles=false"],
       ["cd", "../visualizer"],
-      ["mx", "igv", "-J-Digv.openfile.onstartup.and.close=../compiler/IGV_Dumps", "--nosplash"],
+      ["mx", "--java-home=$TOOLS_JAVA_HOME", "build" ],
+      ["mx", "--java-home=$TOOLS_JAVA_HOME", "igv", "-J-Digv.openfile.onstartup.and.close=../compiler/IGV_Dumps", "--nosplash"],
     ]
   },
 
+  linux_maven: {
+    packages+: {
+      maven: '==3.9.10',
+    },
+  },
+
   local _builds = [
-    common.linux_amd64 + common.oraclejdk11 + self.Gate + { name: "gate-visualizer-linux-amd64-oraclejdk-11" },
-    common.linux_amd64 + common.labsjdkLatestCE + self.Integration + { name: "gate-visualizer-integration-linux-amd64-labsjdk-latest" },
+    common.linux_amd64 + self.linux_maven + common.oraclejdk21 + self.Gate + { name: "gate-visualizer-linux-amd64-oraclejdk-21" },
+    common.linux_amd64 + self.linux_maven + common.labsjdkLatestCE + self.Integration + { name: "gate-visualizer-integration-linux-amd64-labsjdk-latest" },
   ],
 
   builds: utils.add_defined_in(_builds, std.thisFile),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,6 +41,8 @@
 package com.oracle.truffle.runtime;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -48,6 +50,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import com.oracle.truffle.api.Truffle;
@@ -58,53 +61,127 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
         @Override
         public void accept(CompilationTask task) {
             OptimizedCallTarget callTarget = task.targetRef.get();
-            if (callTarget != null && task.start()) {
-                try {
-                    ((OptimizedTruffleRuntime) Truffle.getRuntime()).doCompile(callTarget, task);
-                } finally {
-                    callTarget.compiledTier(task.tier());
-                    task.finished();
+            if (callTarget != null) {
+                if (task.start()) {
+                    try {
+                        ((OptimizedTruffleRuntime) Truffle.getRuntime()).doCompile(callTarget, task);
+                    } finally {
+                        callTarget.compiledTier(task.tier());
+                        task.finish();
+                    }
+                } else {
+                    /*
+                     * The task did not start.
+                     *
+                     * For explicit cancellations, the dequeue event is sent by {@link
+                     * OptimizedCallTarget#cancelCompilation(CharSequence)}.
+                     *
+                     * For staleness we must notify listeners here.
+                     */
+                    if (!task.isCancelled()) {
+                        OptimizedTruffleRuntime runtime = (OptimizedTruffleRuntime) Truffle.getRuntime();
+                        runtime.getListener().onCompilationDequeued(callTarget, null, "Stale compilation task", task.tier());
+                    }
+                    task.finish();
                 }
             }
         }
     };
+
+    public enum SubmissionReason {
+        /*
+         * Queued from automatic call/loop hotness transitions. These tasks may be dropped when they
+         * become stale while waiting in the traversing queue.
+         */
+        HOTNESS,
+        /*
+         * Queued explicitly (e.g., compile(true), AOT/debug-cache preparation, OSR requests). These
+         * tasks must not be treated as stale.
+         */
+        EXPLICIT;
+
+        boolean canBecomeStale() {
+            return this == HOTNESS;
+        }
+    }
+
     final WeakReference<OptimizedCallTarget> targetRef;
     private final BackgroundCompileQueue.Priority priority;
     private final long id;
     private final Consumer<CompilationTask> action;
     private final EngineData engineData;
     private volatile Future<?> future;
+    /*
+     * Cancellation before CompilationTask.start() and the executor path both complete tasks that
+     * did not start compilation. Coordinate those paths so only one of them resets the target.
+     */
+    private boolean completionHandled;
     private volatile boolean cancelled;
+    volatile BooleanSupplier cancelledPredicate;
     private volatile boolean started;
     // Traversing queue related
     private int lastCount;
     private long lastTime;
     private double lastWeight;
     private boolean isOSR;
+    private final SubmissionReason submissionReason;
 
     private double lastRate;
+    private long lastActivityTime;
+    private int lastActivityCount;
     private long time;
     private int queueChange;
 
-    private CompilationTask(BackgroundCompileQueue.Priority priority, WeakReference<OptimizedCallTarget> targetRef, Consumer<CompilationTask> action, long id) {
+    private CompilationTask(BackgroundCompileQueue.Priority priority, WeakReference<OptimizedCallTarget> targetRef, Consumer<CompilationTask> action, long id, SubmissionReason submissionReason) {
         this.priority = priority;
         this.targetRef = targetRef;
         this.action = action;
         this.id = id;
+        this.submissionReason = submissionReason;
+        // Last weight < 0 indicates that this task's weight has not been initialized yet.
+        // Why not initialize/calculate it here? We do not have any information about the rate of
+        // change of its call and loop count yet since the task is newly created. Consequently, we
+        // cannot compute a reliable rate yet. The rate will be computed the first time updateWeight
+        // is called.
+        lastWeight = -1.0;
+        long timestamp = System.nanoTime();
         OptimizedCallTarget target = targetRef.get();
-        lastCount = target != null ? target.getCallAndLoopCount() : Integer.MIN_VALUE;
-        lastTime = System.nanoTime();
-        lastWeight = target != null ? target.getCallAndLoopCount() : -1;
-        engineData = target != null ? target.engine : null;
-        isOSR = target != null && target.isOSR();
+        if (target == null) {
+            lastTime = timestamp;
+            lastCount = Integer.MIN_VALUE;
+            lastActivityTime = timestamp;
+            lastActivityCount = Integer.MIN_VALUE;
+            engineData = null;
+            isOSR = false;
+            cancelledPredicate = null;
+        } else {
+            engineData = target.engine;
+            isOSR = target.isOSR();
+            cancelledPredicate = target.engine.cancelledPredicate;
+            lastCount = 0;
+            lastTime = target.getInitializedTimestamp();
+            lastActivityTime = timestamp;
+            lastActivityCount = target.getCallAndLoopCount();
+            if (target.isInitialized()) {
+                assert lastTime != 0;
+                updateWeight(timestamp);
+            } else {
+                /*
+                 * Call targets used for the initialization of the compiler are not initialized
+                 * before they are sent to the compilation queue.
+                 */
+                lastCount = target.getCallAndLoopCount();
+                lastTime = timestamp;
+            }
+        }
     }
 
     static CompilationTask createInitializationTask(WeakReference<OptimizedCallTarget> targetRef, Consumer<CompilationTask> action) {
-        return new CompilationTask(BackgroundCompileQueue.Priority.INITIALIZATION, targetRef, action, 0);
+        return new CompilationTask(BackgroundCompileQueue.Priority.INITIALIZATION, targetRef, action, 0, SubmissionReason.EXPLICIT);
     }
 
-    static CompilationTask createCompilationTask(BackgroundCompileQueue.Priority priority, WeakReference<OptimizedCallTarget> targetRef, long id) {
-        return new CompilationTask(priority, targetRef, COMPILATION_ACTION, id);
+    static CompilationTask createCompilationTask(BackgroundCompileQueue.Priority priority, WeakReference<OptimizedCallTarget> targetRef, long id, SubmissionReason submissionReason) {
+        return new CompilationTask(priority, targetRef, COMPILATION_ACTION, id, submissionReason);
     }
 
     public void awaitCompletion(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
@@ -126,9 +203,9 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
     public synchronized boolean cancel() {
         if (!cancelled) {
             cancelled = true;
-            if (!started) {
+            if (!started && claimCompletion()) {
                 future.cancel(false);
-                finished();
+                resetCompilationTask();
             }
             return true;
         }
@@ -139,7 +216,22 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
         cancelled = false;
     }
 
-    public void finished() {
+    /* Also used by the queue for tasks it removes without executing. */
+    void finish() {
+        if (claimCompletion()) {
+            resetCompilationTask();
+        }
+    }
+
+    private synchronized boolean claimCompletion() {
+        if (!completionHandled) {
+            completionHandled = true;
+            return true;
+        }
+        return false;
+    }
+
+    private void resetCompilationTask() {
         final OptimizedCallTarget target = targetRef.get();
         if (target != null) {
             target.resetCompilationTask();
@@ -147,17 +239,53 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
     }
 
     public synchronized boolean start() {
-        assert !started : "Should not start a stared task";
-        if (cancelled) {
+        assert !started : "Should not start a started task";
+        if (cancelled || isStale()) {
             return false;
         }
         started = true;
         return true;
     }
 
+    private boolean isStale() {
+        OptimizedCallTarget target = targetRef.get();
+        if (target == null) {
+            return true;
+        }
+        long maxNoActivity = engineData.traversingStaleTaskMaxNoActivityNs;
+        if (maxNoActivity <= 0 || !submissionReason.canBecomeStale()) {
+            return false;
+        }
+
+        int callAndLoopCount = target.getCallAndLoopCount();
+        if (callAndLoopCount == Integer.MAX_VALUE) {
+            // The counter saturates, so further activity is no longer observable via increments.
+            return false;
+        }
+        int thresholdBase = (engineData.multiTier && isLastTier()) ? engineData.callAndLoopThresholdInFirstTier : engineData.callAndLoopThresholdInInterpreter;
+        int threshold = OptimizedCallTarget.scaledThreshold(thresholdBase);
+        if (callAndLoopCount < threshold) {
+            return true;
+        }
+
+        long now = System.nanoTime();
+        boolean observedActivity = updateLastActivity(callAndLoopCount, now);
+        return !observedActivity && (now - lastActivityTime) >= maxNoActivity;
+    }
+
+    private boolean updateLastActivity(int callAndLoopCount, long timestamp) {
+        if (callAndLoopCount > lastActivityCount) {
+            lastActivityCount = callAndLoopCount;
+            lastActivityTime = timestamp;
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public boolean isCancelled() {
-        return cancelled;
+        BooleanSupplier cancelPredicate = cancelledPredicate;
+        return cancelled || (cancelPredicate != null && cancelPredicate.getAsBoolean());
     }
 
     @Override
@@ -239,22 +367,13 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
      * corrupt a queue data structure.
      */
     boolean isHigherPriorityThan(CompilationTask other) {
-        if (action != COMPILATION_ACTION) {
+        if (action != COMPILATION_ACTION || other.action != COMPILATION_ACTION) {
             // Any non-compilation action (e.g. compiler init) is higher priority.
-            return true;
-        }
-        if (this.isOSR && other.isLastTier()) {
-            return true;
+            return action != COMPILATION_ACTION;
         }
         int tier = tier();
         if (engineData.traversingFirstTierPriority && tier != other.tier()) {
             return tier < other.tier();
-        }
-        int otherCompileTier = other.targetHighestCompiledTier();
-        int compiledTier = targetHighestCompiledTier();
-        if (tier == other.tier() && compiledTier != otherCompileTier) {
-            // tasks previously compiled with higher tier are better
-            return compiledTier > otherCompileTier;
         }
         if (engineData.weightingBothTiers || isFirstTier()) {
             return lastWeight > other.lastWeight;
@@ -271,17 +390,44 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
             return false;
         }
         long elapsed = currentTime - lastTime;
-        if (elapsed < 1_000_000) {
+        // A last weight > 0 indicates that it has been initialized. If so, only update its weight
+        // if 1_000_000ns have elapsed since its last calculation. The elapsed time may be negative
+        // since tasks may be added to the queue while traversing it.
+        if (lastWeight >= 0 && elapsed < 1_000_000 || elapsed < 0) {
             return true;
         }
         int count = target.getCallAndLoopCount();
-        lastRate = rate(count, elapsed);
+        double currentRate = rate(count, elapsed);
+        if (lastWeight < 0) {
+            lastRate = currentRate;
+        } else {
+            /*
+             * "Assembles" the new rate from the last rate and the current rate by applying a decay
+             * from the interval (0, 1) to the last rate. The decay is computed using the configured
+             * rate half-life. For example, if the elapsed time is equal to the half-life, then <new
+             * rate> = <last rate> * 0.5 + <current rate> * 0.5; if the elapsed time is twice the
+             * half-life, then <new rate> = <last rate> * 0.25 + <current rate> * 0.75. The reason
+             * we do this is that the current interval, which has an unpredictable size, might not
+             * capture the current hotness of the compilation unit very well. Using the decay makes
+             * the computed rate capture a longer time interval while still giving priority to more
+             * recent executions.
+             */
+            double decay = Math.pow(2.0d, -1.0d * elapsed / engineData.traversingRateHalfLifeNs);
+            lastRate = lastRate * decay + currentRate * (1 - decay);
+        }
         lastTime = currentTime;
         lastCount = count;
+        updateLastActivity(count, currentTime);
         double weight = (1 + lastRate) * lastCount;
-        if (engineData.traversingFirstTierPriority) {
-            lastWeight = weight;
-        } else {
+        assert weight >= 0.0 : "weight must be positive";
+        lastWeight = weight * bonus();
+
+        return true;
+    }
+
+    private double bonus() {
+        double bonus = 1.0;
+        if (!engineData.traversingFirstTierPriority && isFirstTier()) {
             // @formatter:off
             // We multiply first tier compilations with this bonus to bring first and last tier
             // compilation weights to roughly the same order of magnitude and give first tier compilations some priority.
@@ -295,15 +441,46 @@ public final class CompilationTask extends AbstractCompilationTask implements Ca
             //                                   This controls for the fact that weight is a multiple of the callAndLoopCount and this
             //                                   count is on the order of the thresholds which is much smaller for first tier compilations
             // @formatter:on
-            lastWeight = weight * (isFirstTier() ? engineData.traversingFirstTierBonus : 1);
+            bonus *= engineData.traversingFirstTierBonus;
         }
-        assert weight >= 0.0 : "weight must be positive";
-        return true;
+        if (targetHighestCompiledTier() >= tier()) {
+            // If the task has already been compiled with the same or a higher tier, implying the
+            // previous compilation has been invalidated, boost its priority.
+            // This bonus is 1.0 by default, i.e. it has no effect.
+            bonus *= engineData.traversingInvalidatedBonus;
+        }
+        if (isOSR) {
+            // Boost OSR tasks' priority. This bonus is 1.0 by default, i.e. it has no effect.
+            bonus *= engineData.traversingOSRBonus;
+        }
+        return bonus;
+    }
+
+    public List<String> bonusDescriptors() {
+        List<String> bonuses = new ArrayList<>(3);
+        if (!engineData.traversingFirstTierPriority && isFirstTier() && hasEffect(engineData.traversingFirstTierBonus)) {
+            bonuses.add("first tier");
+        }
+        if (targetHighestCompiledTier() >= tier() && hasEffect(engineData.traversingInvalidatedBonus)) {
+            bonuses.add("invalidation");
+        }
+        if (isOSR && hasEffect(engineData.traversingOSRBonus)) {
+            bonuses.add("OSR");
+        }
+        return bonuses;
+    }
+
+    private static final double EPSILON = 1E-6;
+
+    private static boolean hasEffect(double bonus) {
+        // Checks if the given bonus differs from 1.
+        return Math.abs(bonus - 1.0) > EPSILON;
     }
 
     private double rate(int count, long elapsed) {
-        lastRate = ((double) count - lastCount) / elapsed;
-        return (Double.isNaN(lastRate) ? 0 : lastRate);
+        // Divide by a minimum of 1000 to prevent division by zero/very small numbers.
+        // Multiply by 1_000_000 to get per-millisecond rate.
+        return ((double) count - lastCount) / Math.max(elapsed, 1000) * 1_000_000;
     }
 
     public int targetHighestCompiledTier() {

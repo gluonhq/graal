@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -109,6 +109,7 @@ final class PolyglotContextConfig {
     final Runnable onCancelled;
     final Consumer<Integer> onExited;
     final Runnable onClosed;
+    final Consumer<String> threadAccessDeniedHandler;
 
     /**
      * Groups PolyglotContext's filesystem related configurations.
@@ -155,6 +156,7 @@ final class PolyglotContextConfig {
         final ZoneId timeZone;
         final boolean allowValueSharing;
         final boolean useSystemExit;
+        final boolean allowExperimentalOptions;
 
         private PreinitConfig() {
             this(false);
@@ -169,6 +171,7 @@ final class PolyglotContextConfig {
             this.timeZone = null;
             this.allowValueSharing = true;
             this.useSystemExit = false;
+            this.allowExperimentalOptions = false;
         }
 
         /**
@@ -183,6 +186,7 @@ final class PolyglotContextConfig {
             this.timeZone = config.timeZone;
             this.allowValueSharing = config.allowValueSharing;
             this.useSystemExit = config.useSystemExit;
+            this.allowExperimentalOptions = config.allowExperimentalOptions;
         }
 
         /**
@@ -199,6 +203,7 @@ final class PolyglotContextConfig {
             this.timeZone = Objects.equals(prev.timeZone, config.timeZone) ? config.timeZone : DEFAULT.timeZone;
             this.allowValueSharing = prev.allowValueSharing == config.allowValueSharing ? config.allowValueSharing : DEFAULT.allowValueSharing;
             this.useSystemExit = prev.useSystemExit == config.useSystemExit ? config.useSystemExit : DEFAULT.useSystemExit;
+            this.allowExperimentalOptions = prev.allowExperimentalOptions == config.allowExperimentalOptions ? config.allowExperimentalOptions : DEFAULT.allowExperimentalOptions;
         }
 
         private static Map<String, String> computeCommonOptions(Map<String, String> options1, Map<String, String> options2) {
@@ -231,9 +236,10 @@ final class PolyglotContextConfig {
                         sharableConfig.polyglotAccess == null ? engine.getAPIAccess().getPolyglotAccessAll() : sharableConfig.polyglotAccess,
                         sharableConfig.nativeAccessAllowed,
                         sharableConfig.createThreadAllowed,
+                        null,
                         false,
                         false,
-                        false,
+                        sharableConfig.allowExperimentalOptions,
                         null,
                         Collections.emptyMap(),
                         Collections.emptySet(),
@@ -256,7 +262,7 @@ final class PolyglotContextConfig {
     PolyglotContextConfig(PolyglotEngineImpl engine, SandboxPolicy sandboxPolicy, Boolean forceSharing,
                     OutputStream out, OutputStream err, InputStream in,
                     boolean hostLookupAllowed, Object polyglotAccess, boolean nativeAccessAllowed,
-                    boolean createThreadAllowed, boolean hostClassLoadingAllowed,
+                    boolean createThreadAllowed, Consumer<String> threadAccessDeniedHandler, boolean hostClassLoadingAllowed,
                     boolean contextOptionsAllowed, boolean allowExperimentalOptions,
                     Predicate<String> classFilter, Map<String, String[]> applicationArguments,
                     Set<String> onlyLanguages, Map<String, String> options, FileSystemConfig fileSystemConfig, LogHandler logHandler,
@@ -278,6 +284,7 @@ final class PolyglotContextConfig {
         this.polyglotAccess = polyglotAccess;
         this.nativeAccessAllowed = nativeAccessAllowed;
         this.createThreadAllowed = createThreadAllowed;
+        this.threadAccessDeniedHandler = threadAccessDeniedHandler;
         this.hostClassLoadingAllowed = hostClassLoadingAllowed;
         this.innerContextOptionsAllowed = contextOptionsAllowed;
         this.allowExperimentalOptions = allowExperimentalOptions;
@@ -285,7 +292,7 @@ final class PolyglotContextConfig {
         this.classFilter = classFilter;
         this.applicationArguments = applicationArguments;
         this.onlyLanguages = onlyLanguages;
-        this.allowedPublicLanguages = onlyLanguages.isEmpty() ? engine.getLanguages().keySet() : onlyLanguages;
+        this.allowedPublicLanguages = onlyLanguages.isEmpty() ? engine.getPublicLanguages().keySet() : onlyLanguages;
         this.fileSystemConfig = fileSystemConfig;
         this.optionsById = new HashMap<>();
         this.logHandler = logHandler;
@@ -333,8 +340,9 @@ final class PolyglotContextConfig {
                 targetOptions = engineOptionValues.copy();
                 optionsById.put(id, targetOptions);
             }
-            OptionDescriptor d = targetOptions.put(engine, optionKey, options.get(optionKey), allowExperimentalOptions);
-            if (d != null && d.isDeprecated()) {
+
+            OptionDescriptor d = targetOptions.put(optionKey, options.get(optionKey), allowExperimentalOptions, engine::getAllOptions);
+            if (d.isDeprecated()) {
                 if (deprecatedOptions == null) {
                     deprecatedOptions = new ArrayList<>();
                 }
@@ -451,7 +459,15 @@ final class PolyglotContextConfig {
         if (values == null) {
             values = instrument.getEngineOptionValues();
         }
-        return values.copy();
+        return values;
+    }
+
+    OptionValuesImpl getInstrumentOptionValuesIfExists(PolyglotInstrument instrument) {
+        OptionValuesImpl values = optionsById.get(instrument.getId());
+        if (values == null) {
+            values = instrument.getOptionValuesIfExists();
+        }
+        return values;
     }
 
     Set<PolyglotLanguage> getConfiguredLanguages() {

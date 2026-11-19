@@ -24,9 +24,8 @@
  */
 package com.oracle.svm.core.identityhashcode;
 
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.word.LocationIdentity;
-
-import com.oracle.svm.core.config.ConfigurationValues;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.graph.NodeClass;
@@ -70,6 +69,6 @@ public final class SubstrateIdentityHashCodeNode extends IdentityHashCodeNode {
 
     @Fold
     static boolean isIdentityHashFieldOptional() {
-        return ConfigurationValues.getObjectLayout().isIdentityHashFieldOptional();
+        return ObjectLayout.singleton().isIdentityHashFieldOptional();
     }
 }

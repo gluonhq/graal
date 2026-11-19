@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -53,7 +53,6 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 
-import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 import org.graalvm.options.OptionCategory;
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionKey;
@@ -79,13 +78,15 @@ import org.junit.runners.Parameterized;
 import com.oracle.truffle.api.Option;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleOptions;
 import com.oracle.truffle.api.impl.DefaultTruffleRuntime;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 @RunWith(Parameterized.class)
 public class SandboxPolicyTest {
 
-    private static final String MISSING_ISOLATE_LIBRARY_MESSAGE = "No native isolate library found for language";
+    private static final String MISSING_ISOLATE_LIBRARY_MESSAGE = "No native isolate library is available for the requested language(s)";
     private static final String UNSUPPORTED_ISOLATE_POLICY_MESSAGE = "but the current Truffle runtime only supports the TRUSTED or CONSTRAINED sandbox policies.";
 
     private final Configuration configuration;
@@ -128,10 +129,20 @@ public class SandboxPolicyTest {
         }
     }
 
+    /**
+     * A mirror of the method {@link SandboxInstrument#isInterpreterCallStackHeadRoomSupported()}
+     * taking into account the possibility to run in polyglot isolate spawned form HotSpot.
+     */
+    private static boolean isInterpreterCallStackHeadRoomSupported() {
+        Runtime.Version jdkVersion = Runtime.version();
+        return (TruffleTestAssumptions.isIsolateEncapsulation() || TruffleOptions.AOT) && jdkVersion.feature() >= 23;
+    }
+
     @Before
     public void setUp() {
         Assume.assumeFalse("Restricted Truffle compiler options are specified on the command line.",
                         configuration.sandboxPolicy != SandboxPolicy.TRUSTED && executedWithXCompOptions());
+        Assume.assumeTrue(configuration.sandboxPolicy != SandboxPolicy.UNTRUSTED || isInterpreterCallStackHeadRoomSupported());
     }
 
     private static boolean executedWithXCompOptions() {
@@ -148,9 +159,8 @@ public class SandboxPolicyTest {
 
     private static boolean supportsSandboxInstrument() {
         try (Engine engine = Engine.create()) {
-            // Polyglot sandbox limits can only be used with runtimes that support enterprise
-            // extensions.
-            return engine.getInstruments().containsKey("sandbox") && TruffleTestAssumptions.isEnterpriseRuntime();
+            // Polyglot sandbox limits can only be used with optimized runtime.
+            return engine.getInstruments().containsKey("sandbox") && TruffleTestAssumptions.isOptimizingRuntime();
         }
     }
 
@@ -218,6 +228,30 @@ public class SandboxPolicyTest {
                 throw iae;
             }
         }
+    }
+
+    @Test
+    public void testIsolateSpecificOptionsRequireIsolation() {
+        // Run only for TRUSTED policy, no need to repeat this with other policies
+        Assume.assumeTrue(configuration.sandboxPolicy == SandboxPolicy.TRUSTED);
+        // Ensure isolation is not implicitly enabled
+        TruffleTestAssumptions.assumeNoIsolateEncapsulation();
+
+        assertIsolateSpecificOptionRejectedWithoutSpawnIsolate("engine.HostCallStackHeadRoom", "256KB");
+        assertIsolateSpecificOptionRejectedWithoutSpawnIsolate("engine.IsolateOption.MaxHeapSize", "128MB");
+        assertIsolateSpecificOptionRejectedWithoutSpawnIsolate("engine.IsolateMemoryProtection", "true");
+        assertIsolateSpecificOptionRejectedWithoutSpawnIsolate("engine.UntrustedCodeMitigation", "software");
+        assertIsolateSpecificOptionRejectedWithoutSpawnIsolate("engine.MaxIsolateMemory", "128MB");
+    }
+
+    private static void assertIsolateSpecificOptionRejectedWithoutSpawnIsolate(String optionName, String optionValue) {
+        AbstractPolyglotTest.assertFails(() -> {
+            Engine engine = Engine.newBuilder(TrustedLanguage.ID).allowExperimentalOptions(true).option(optionName, optionValue).build();
+            engine.close();
+        },
+                        IllegalArgumentException.class, (iae) -> {
+                            assertTrue(iae.getMessage().contains("The isolated heap is not enabled, but isolate specific option " + optionName + " is set."));
+                        });
     }
 
     private Engine.Builder newEngineWithIsolateOptions(String... permittedLanguages) {
@@ -750,7 +784,7 @@ public class SandboxPolicyTest {
             assertAtMost(SandboxPolicy.TRUSTED, configuration.sandboxPolicy);
         } catch (IllegalArgumentException iae) {
             if (filterUnsupportedIsolate(configuration, iae)) {
-                assertSandboxPolicyException(iae, "Builder.allowEnvironmentAccess(EnvironmentAccess) is set to INHERIT, but must be set to EnvironmentAccess.NONE.");
+                assertSandboxPolicyException(iae, "Builder.allowEnvironmentAccess(EnvironmentAccess) is set to EnvironmentAccess.INHERIT, but must be set to EnvironmentAccess.NONE.");
                 assertAtLeast(SandboxPolicy.CONSTRAINED, configuration.sandboxPolicy);
             }
         }
@@ -781,6 +815,16 @@ public class SandboxPolicyTest {
             if (filterUnsupportedIsolate(configuration, iae)) {
                 assertSandboxPolicyException(iae,
                                 "Builder.allowHostAccess(HostAccess) is set to a HostAccess which was created with HostAccess.Builder.allowPublicAccess(boolean) set to true");
+                assertAtLeast(SandboxPolicy.CONSTRAINED, configuration.sandboxPolicy);
+            }
+        }
+        hostAccess = HostAccess.newBuilder().allowPublicAccess(member -> false).build();
+        try (Context context = newContextBuilder(null, ConstrainedLanguage.ID).sandbox(configuration.sandboxPolicy).allowHostAccess(hostAccess).build()) {
+            assertAtMost(SandboxPolicy.TRUSTED, configuration.sandboxPolicy);
+        } catch (IllegalArgumentException iae) {
+            if (filterUnsupportedIsolate(configuration, iae)) {
+                assertSandboxPolicyException(iae,
+                                "Builder.allowHostAccess(HostAccess) is set to a HostAccess which was created with HostAccess.Builder.allowPublicAccess(Predicate) configured");
                 assertAtLeast(SandboxPolicy.CONSTRAINED, configuration.sandboxPolicy);
             }
         }

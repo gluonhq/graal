@@ -24,28 +24,32 @@
  */
 package com.oracle.svm.core.threadlocal;
 
-import java.util.EnumSet;
-
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.BuildPhaseProvider.ReadyForCompilation;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.heap.InstanceReferenceMapDecoder;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
-import com.oracle.svm.core.heap.UnknownObjectField;
-import com.oracle.svm.core.heap.UnknownPrimitiveField;
-import com.oracle.svm.core.layeredimagesingleton.InitialLayerOnlyImageSingleton;
-import com.oracle.svm.core.layeredimagesingleton.LayeredImageSingletonBuilderFlags;
+import com.oracle.svm.guest.staging.core.heap.InstanceReferenceMapDecoder;
+import com.oracle.svm.guest.staging.core.heap.InstanceReferenceMapDecoder.InstanceReferenceMap;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.BuildPhaseProvider.ReadyForCompilation;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
-public class VMThreadLocalSupport implements InitialLayerOnlyImageSingleton {
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public class VMThreadLocalSupport {
     @UnknownPrimitiveField(availability = ReadyForCompilation.class) public int vmThreadSize = -1;
     @UnknownObjectField(availability = ReadyForCompilation.class) public byte[] vmThreadReferenceMapEncoding;
     @UnknownPrimitiveField(availability = ReadyForCompilation.class) public long vmThreadReferenceMapIndex = -1;
@@ -54,9 +58,22 @@ public class VMThreadLocalSupport implements InitialLayerOnlyImageSingleton {
     public VMThreadLocalSupport() {
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static VMThreadLocalSupport singleton() {
         return ImageSingletons.lookup(VMThreadLocalSupport.class);
+    }
+
+    @AlwaysInline("Must be reduced to a constant")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public int sizeOfIsolateThread() {
+        /* At the moment, the IsolateThread only contains the thread-locals. */
+        return sizeOfThreadLocals();
+    }
+
+    @AlwaysInline("Must be reduced to a constant")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public int sizeOfThreadLocals() {
+        return vmThreadSize;
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -76,11 +93,7 @@ public class VMThreadLocalSupport implements InitialLayerOnlyImageSingleton {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public void walk(IsolateThread isolateThread, ObjectReferenceVisitor referenceVisitor) {
         NonmovableArray<Byte> threadRefMapEncoding = NonmovableArrays.fromImageHeap(vmThreadReferenceMapEncoding);
-        InstanceReferenceMapDecoder.walkOffsetsFromPointer((Pointer) isolateThread, threadRefMapEncoding, vmThreadReferenceMapIndex, referenceVisitor, null);
-    }
-
-    @Override
-    public EnumSet<LayeredImageSingletonBuilderFlags> getImageBuilderFlags() {
-        return LayeredImageSingletonBuilderFlags.ALL_ACCESS;
+        InstanceReferenceMap referenceMap = InstanceReferenceMapDecoder.getReferenceMap(threadRefMapEncoding, vmThreadReferenceMapIndex);
+        InstanceReferenceMapDecoder.walkReferences((Pointer) isolateThread, referenceMap, referenceVisitor, null);
     }
 }

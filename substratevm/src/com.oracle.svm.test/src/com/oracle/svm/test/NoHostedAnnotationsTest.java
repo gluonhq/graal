@@ -30,12 +30,12 @@ import java.lang.annotation.Annotation;
 import org.junit.Assert;
 import org.junit.Test;
 
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
 
 public class NoHostedAnnotationsTest {
 
     @DuplicatedInNativeCode
-    private static class TestClass {
+    private static final class TestClass {
     }
 
     @Test

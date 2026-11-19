@@ -30,11 +30,12 @@ import java.io.InputStream;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Equivalence;
+
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.bytecode.Bytecode;
 import jdk.graal.compiler.bytecode.BytecodeProvider;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.graal.compiler.serviceprovider.GraalServices;
-
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -58,6 +59,7 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  * avoid this is to have a completely isolated {@code jdk.vm.ci.meta} implementation for parsing
  * snippet/intrinsic bytecodes.
  */
+@LibGraalSupport.HostedOnly
 public final class ClassfileBytecodeProvider implements BytecodeProvider {
 
     private final ClassLoader loader;
@@ -108,6 +110,7 @@ public final class ClassfileBytecodeProvider implements BytecodeProvider {
         if (classfile == null) {
             try {
                 ResolvedJavaType type = metaAccess.lookupJavaType(c);
+                // Parfait_ALLOW impossible-redundant-condition (Parfait bug PARSEC-7191)
                 try (InputStream in = GraalServices.getClassfileAsStream(c)) {
                     if (in != null) {
                         DataInputStream stream = new DataInputStream(in);

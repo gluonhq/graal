@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -40,7 +40,7 @@ import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.DebugContext.Activation;
 import jdk.graal.compiler.debug.DebugContext.Description;
 import jdk.graal.compiler.debug.DebugContext.Scope;
-import jdk.graal.compiler.debug.DebugHandlersFactory;
+import jdk.graal.compiler.debug.DebugDumpHandlersFactory;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.vm.ci.common.JVMCIError;
 
@@ -118,7 +118,7 @@ public class CompletionExecutor {
          * {@link DebugContext#disabled} is used by default to avoid the cost of creating a
          * {@link DebugContext}, so the task should override this if one is needed.
          */
-        default DebugContext getDebug(@SuppressWarnings("unused") OptionValues options, @SuppressWarnings("unused") List<DebugHandlersFactory> factories) {
+        default DebugContext getDebug(@SuppressWarnings("unused") OptionValues options, @SuppressWarnings("unused") List<DebugDumpHandlersFactory> factories) {
             return DebugContext.disabled(null);
         }
     }
@@ -158,11 +158,11 @@ public class CompletionExecutor {
         if (timing != null) {
             startTime = System.nanoTime();
         }
-        bb.getHostVM().recordActivity();
         Throwable thrown = null;
         try (DebugContext localDebug = command.getDebug(bb.getOptions(), bb.getDebugHandlerFactories());
                         Scope s = localDebug.scope("Operation");
                         Activation a = localDebug.activate()) {
+            bb.getHostVM().recordActivity();
             command.run(localDebug);
         } catch (Throwable x) {
             thrown = x;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,6 @@
  */
 package org.graalvm.wasm;
 
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
@@ -52,7 +51,7 @@ public class WasmConstant implements TruffleObject {
     public static final WasmConstant VOID = new WasmConstant("wasm-void-result", WasmType.VOID, false);
     public static final WasmConstant NULL = new WasmConstant("wasm-ref-null", WasmType.NULL, true);
     public static final WasmConstant MULTI_VALUE = new WasmConstant("wasm-multi-value-result", WasmType.MULTI_VALUE, false);
-    public static final Object RETURN_VALUE = new Object();
+    public static final WasmConstant RETURN_CALL_VALUE = new WasmConstant("wasm-return-call-result", WasmType.VOID, false);
     private final String name;
     private final Object metaObject;
     private final boolean isNull;
@@ -64,13 +63,13 @@ public class WasmConstant implements TruffleObject {
     }
 
     @ExportMessage
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @ExportMessage
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return WasmLanguage.class;
+    String getLanguageId() {
+        return WasmLanguage.ID;
     }
 
     @ExportMessage

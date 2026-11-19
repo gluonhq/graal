@@ -1,0 +1,364 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.util;
+
+import java.io.InputStream;
+import java.io.Serializable;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.SoftReference;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Executable;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.lang.reflect.RecordComponent;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Formattable;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.c.function.CEntryPoint;
+import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
+import org.graalvm.word.WordBase;
+
+import com.oracle.svm.core.annotate.Delete;
+import com.oracle.svm.shared.singletons.ImageSingletonsSupportImpl;
+
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.vmaccess.VMAccess;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+/**
+ * This class contains common guest elements ({@link ResolvedJavaType}, {@link ResolvedJavaMethod},
+ * {@link ResolvedJavaField}) used throughout the code base. They are looked up via the
+ * {@code lookup*} methods from {@link VMAccess}. Use the static {@link GuestAccess#elements()}
+ * method or the {@link GuestAccess#elements} instance field to retrieve an instance of this class.
+ */
+@Platforms(Platform.HOSTED_ONLY.class)
+public abstract sealed class GuestElements permits GuestAccess.GuestElementsImpl {
+
+    // Checkstyle: stop field name check
+    public final ResolvedJavaType java_lang_AutoCloseable = lookupType(AutoCloseable.class);
+
+    public final ResolvedJavaType java_lang_Boolean = lookupType(Boolean.class);
+    public final ResolvedJavaMethod java_lang_Boolean_valueOf = lookupMethod(java_lang_Boolean, "valueOf", boolean.class);
+    public final ResolvedJavaMethod java_lang_Boolean_booleanValue = lookupMethod(java_lang_Boolean, "booleanValue");
+
+    public final ResolvedJavaType java_lang_Byte = lookupType(Byte.class);
+    public final ResolvedJavaMethod java_lang_Byte_valueOf = lookupMethod(java_lang_Byte, "valueOf", byte.class);
+    public final ResolvedJavaMethod java_lang_Byte_byteValue = lookupMethod(java_lang_Byte, "byteValue");
+
+    public final ResolvedJavaType java_lang_Character = lookupType(Character.class);
+    public final ResolvedJavaMethod java_lang_Character_valueOf = lookupMethod(java_lang_Character, "valueOf", char.class);
+    public final ResolvedJavaMethod java_lang_Character_charValue = lookupMethod(java_lang_Character, "charValue");
+
+    public final ResolvedJavaType java_lang_Integer = lookupType(Integer.class);
+    public final ResolvedJavaMethod java_lang_Integer_valueOf = lookupMethod(java_lang_Integer, "valueOf", int.class);
+    public final ResolvedJavaMethod java_lang_Integer_intValue = lookupMethod(java_lang_Integer, "intValue");
+
+    public final ResolvedJavaType java_lang_Short = lookupType(Short.class);
+    public final ResolvedJavaMethod java_lang_Short_valueOf = lookupMethod(java_lang_Short, "valueOf", short.class);
+    public final ResolvedJavaMethod java_lang_Short_shortValue = lookupMethod(java_lang_Short, "shortValue");
+
+    public final ResolvedJavaType java_lang_Long = lookupType(Long.class);
+    public final ResolvedJavaMethod java_lang_Long_valueOf = lookupMethod(java_lang_Long, "valueOf", long.class);
+    public final ResolvedJavaMethod java_lang_Long_longValue = lookupMethod(java_lang_Long, "longValue");
+
+    public final ResolvedJavaType java_lang_Float = lookupType(Float.class);
+    public final ResolvedJavaMethod java_lang_Float_valueOf = lookupMethod(java_lang_Float, "valueOf", float.class);
+    public final ResolvedJavaMethod java_lang_Float_floatValue = lookupMethod(java_lang_Float, "floatValue");
+
+    public final ResolvedJavaType java_lang_Double = lookupType(Double.class);
+    public final ResolvedJavaMethod java_lang_Double_valueOf = lookupMethod(java_lang_Double, "valueOf", double.class);
+    public final ResolvedJavaMethod java_lang_Double_doubleValue = lookupMethod(java_lang_Double, "doubleValue");
+
+    public final Set<ResolvedJavaType> primitiveBoxTypes = Set.of(
+                    java_lang_Boolean,
+                    java_lang_Byte,
+                    java_lang_Short,
+                    java_lang_Character,
+                    java_lang_Integer,
+                    java_lang_Long,
+                    java_lang_Float,
+                    java_lang_Double);
+
+    public final ResolvedJavaType java_lang_Void = lookupType(Void.class);
+
+    public final ResolvedJavaType java_lang_Enum = lookupType(Enum.class);
+    public final ResolvedJavaMethod java_lang_Enum_name = lookupMethod(java_lang_Enum, "name");
+
+    public final ResolvedJavaType java_lang_Class = lookupType(Class.class);
+    public final ResolvedJavaMethod java_lang_Class_forName = lookupMethod(java_lang_Class, "forName", String.class, boolean.class, ClassLoader.class);
+    public final ResolvedJavaMethod java_lang_Class_getAnnotation = lookupMethod(java_lang_Class, "getAnnotation", Class.class);
+    public final ResolvedJavaMethod java_lang_Class_getClassLoader = lookupMethod(java_lang_Class, "getClassLoader");
+    public final ResolvedJavaMethod java_lang_Class_getGenericSignature0 = lookupMethod(java_lang_Class, "getGenericSignature0");
+    public final ResolvedJavaMethod java_lang_Class_getNestMembers = lookupMethod(java_lang_Class, "getNestMembers");
+    public final ResolvedJavaMethod java_lang_Class_getRecordComponents = lookupMethod(java_lang_Class, "getRecordComponents");
+    public final ResolvedJavaMethod java_lang_Class_getSigners = lookupMethod(java_lang_Class, "getSigners");
+    public final ResolvedJavaMethod java_lang_Class_getModifiers = lookupMethod(java_lang_Class, "getModifiers");
+    public final ResolvedJavaMethod java_lang_Class_getResourceAsStream = lookupMethod(java_lang_Class, "getResourceAsStream", String.class);
+
+    public final ResolvedJavaType java_lang_ClassLoader = lookupType(ClassLoader.class);
+    public final ResolvedJavaMethod java_lang_ClassLoader_getName = lookupMethod(java_lang_ClassLoader, "getName");
+    public final ResolvedJavaMethod java_lang_ClassLoader_getParent = lookupMethod(java_lang_ClassLoader, "getParent");
+    public final ResolvedJavaMethod java_lang_ClassLoader_getPlatformClassLoader = lookupMethod(java_lang_ClassLoader, "getPlatformClassLoader");
+    public final ResolvedJavaMethod java_lang_ClassLoader_getSystemClassLoader = lookupMethod(java_lang_ClassLoader, "getSystemClassLoader");
+
+    public final ResolvedJavaType java_lang_ClassNotFoundException = lookupType(ClassNotFoundException.class);
+
+    public final ResolvedJavaType java_lang_Cloneable = lookupType(Cloneable.class);
+
+    public final ResolvedJavaType java_lang_ExceptionInInitializerError = lookupType(ExceptionInInitializerError.class);
+
+    public final ResolvedJavaType java_lang_Iterable = lookupType(Iterable.class);
+
+    public final ResolvedJavaType java_lang_invoke_DirectMethodHandle = lookupType("java.lang.invoke.DirectMethodHandle");
+    public final ResolvedJavaMethod java_lang_invoke_DirectMethodHandle_allocateInstance = lookupMethod(java_lang_invoke_DirectMethodHandle, "allocateInstance", Object.class);
+
+    public final ResolvedJavaType java_lang_invoke_DirectMethodHandle_Accessor = lookupType("java.lang.invoke.DirectMethodHandle$Accessor");
+    public final ResolvedJavaMethod java_lang_invoke_DirectMethodHandle_Accessor_checkCast = lookupMethod(java_lang_invoke_DirectMethodHandle_Accessor, "checkCast", Object.class);
+
+    public final ResolvedJavaType java_lang_invoke_DirectMethodHandle_StaticAccessor = lookupType("java.lang.invoke.DirectMethodHandle$StaticAccessor");
+    public final ResolvedJavaMethod java_lang_invoke_DirectMethodHandle_StaticAccessor_checkCast = lookupMethod(java_lang_invoke_DirectMethodHandle_StaticAccessor, "checkCast", Object.class);
+
+    public final ResolvedJavaType java_lang_invoke_Invokers = lookupType("java.lang.invoke.Invokers");
+    public final ResolvedJavaMethod java_lang_invoke_Invokers_maybeCustomize = lookupMethod(java_lang_invoke_Invokers, "maybeCustomize", MethodHandle.class);
+
+    public final ResolvedJavaType java_lang_invoke_MethodHandle = lookupType(MethodHandle.class);
+    public final ResolvedJavaMethod java_lang_invoke_MethodHandle_type = lookupMethod(java_lang_invoke_MethodHandle, "type");
+    public final ResolvedJavaMethod java_lang_invoke_MethodHandle_maybeCustomize = lookupMethod(java_lang_invoke_MethodHandle, "maybeCustomize");
+
+    public final ResolvedJavaType java_lang_invoke_VarHandle = lookupType(VarHandle.class);
+
+    public final ResolvedJavaType java_lang_NoClassDefFoundError = lookupType(NoClassDefFoundError.class);
+
+    public final ResolvedJavaType java_lang_Object = lookupType(Object.class);
+    public final ResolvedJavaMethod java_lang_Object_clone = lookupMethod(java_lang_Object, "clone");
+    public final ResolvedJavaMethod java_lang_Object_equals = lookupMethod(java_lang_Object, "equals", Object.class);
+    public final ResolvedJavaMethod java_lang_Object_hashCode = lookupMethod(java_lang_Object, "hashCode");
+    public final ResolvedJavaMethod java_lang_Object_toString = lookupMethod(java_lang_Object, "toString");
+
+    public final ResolvedJavaType java_lang_String = lookupType(String.class);
+
+    public final ResolvedJavaType java_lang_Package = lookupType(Package.class);
+
+    public final ResolvedJavaType java_lang_Runnable = lookupType(Runnable.class);
+
+    public final ResolvedJavaType java_lang_StackWalker = lookupType(StackWalker.class);
+
+    public final ResolvedJavaType java_lang_Thread = lookupType(Thread.class);
+
+    public final ResolvedJavaType java_lang_Throwable = lookupType(Throwable.class);
+    public final ResolvedJavaMethod java_lang_Throwable_getCause = lookupMethod(java_lang_Throwable, "getCause");
+    public final ResolvedJavaMethod java_lang_Throwable_getMessage = lookupMethod(java_lang_Throwable, "getMessage");
+    public final ResolvedJavaMethod java_lang_Throwable_init_String_Throwable_boolean_boolean = JVMCIReflectionUtil.getDeclaredConstructor(java_lang_Throwable,
+                    java_lang_String, java_lang_Throwable, lookupType(boolean.class), lookupType(boolean.class));
+
+    public final ResolvedJavaType java_lang_ref_Reference = lookupType(Reference.class);
+    public final ResolvedJavaMethod java_lang_ref_Reference_refersTo = lookupMethod(java_lang_ref_Reference, "refersTo", Object.class);
+
+    public final ResolvedJavaType java_lang_ref_ReferenceQueue = lookupType(ReferenceQueue.class);
+
+    public final ResolvedJavaType java_lang_ref_SoftReference = lookupType(SoftReference.class);
+
+    public final ResolvedJavaType java_lang_reflect_Array = lookupType(Array.class);
+    public final ResolvedJavaMethod java_lang_reflect_Array_newInstance = lookupMethod(java_lang_reflect_Array, "newInstance", Class.class, int.class);
+    public final ResolvedJavaMethod java_lang_reflect_Array_newArray = lookupMethod(java_lang_reflect_Array, "newArray", Class.class, int.class);
+
+    public final ResolvedJavaType java_lang_reflect_Executable = lookupType(Executable.class);
+    public final ResolvedJavaMethod java_lang_reflect_Executable_getExceptionTypes = lookupMethod(java_lang_reflect_Executable, "getExceptionTypes");
+
+    public final ResolvedJavaType java_lang_reflect_Field = lookupType(Field.class);
+    public final ResolvedJavaMethod java_lang_reflect_Field_getGenericSignature = lookupMethod(java_lang_reflect_Field, "getGenericSignature");
+    public final ResolvedJavaMethod java_lang_reflect_Field_setAccessible = lookupMethod(java_lang_reflect_Field, "setAccessible", boolean.class);
+    public final ResolvedJavaMethod java_lang_reflect_Field_set = lookupMethod(java_lang_reflect_Field, "set", Object.class, Object.class);
+
+    public final ResolvedJavaType java_lang_reflect_Method = lookupType(Method.class);
+    public final ResolvedJavaMethod java_lang_reflect_Method_getGenericSignature = lookupMethod(java_lang_reflect_Method, "getGenericSignature");
+
+    public final ResolvedJavaType java_lang_reflect_Constructor = lookupType(Constructor.class);
+    public final ResolvedJavaMethod java_lang_reflect_Constructor_getSignature = lookupMethod(java_lang_reflect_Constructor, "getSignature");
+
+    public final ResolvedJavaType java_lang_reflect_RecordComponent = lookupType(RecordComponent.class);
+    public final ResolvedJavaMethod java_lang_reflect_RecordComponent_getGenericSignature = lookupMethod(java_lang_reflect_RecordComponent, "getGenericSignature");
+
+    public final ResolvedJavaType java_lang_System = lookupType(System.class);
+    public final ResolvedJavaMethod java_lang_System_arraycopy = lookupMethod(java_lang_System, "arraycopy", Object.class, int.class, Object.class, int.class, int.class);
+
+    public final ResolvedJavaType java_lang_reflect_Proxy = lookupType(Proxy.class);
+    public final ResolvedJavaMethod java_lang_reflect_Proxy_isProxyClass = lookupMethod(java_lang_reflect_Proxy, "isProxyClass", Class.class);
+    public final ResolvedJavaType jdk_internal_loader_ClassLoaders = lookupType("jdk.internal.loader.ClassLoaders");
+
+    public final ResolvedJavaType java_io_InputStream = lookupType(InputStream.class);
+    public final ResolvedJavaMethod java_io_Input_Stream_readAllBytesMethod = lookupMethod(java_io_InputStream, "readAllBytes");
+
+    public final ResolvedJavaType java_io_Serializable = lookupType(Serializable.class);
+
+    public final ResolvedJavaType java_util_Arrays = lookupType(Arrays.class);
+    public final ResolvedJavaMethod java_util_Arrays_copyOf = lookupMethod(java_util_Arrays, "copyOf", Object[].class, int.class);
+    public final ResolvedJavaMethod java_util_Arrays_copyOfRange = lookupMethod(java_util_Arrays, "copyOfRange", Object[].class, int.class, int.class);
+
+    public final ResolvedJavaType java_util_Collection = lookupType(Collection.class);
+    public final ResolvedJavaMethod java_util_Collection_toArray = lookupMethod(java_util_Collection, "toArray");
+    public final ResolvedJavaMethod java_util_Collection_toArray_withArray = lookupMethod(java_util_Collection, "toArray", Object[].class);
+
+    public final ResolvedJavaType java_util_Formattable = lookupType(Formattable.class);
+
+    public final ResolvedJavaType java_util_List = lookupType(List.class);
+
+    public final ResolvedJavaType java_util_Map = lookupType(Map.class);
+    public final ResolvedJavaMethod java_util_Map_entrySet = lookupMethod(java_util_Map, "entrySet");
+
+    public final ResolvedJavaType java_util_Set = lookupType(Set.class);
+    public final ResolvedJavaMethod java_util_Set_of = lookupMethod(java_util_Set, "of", Object[].class);
+
+    public final ResolvedJavaType java_util_concurrent_atomic_AtomicIntegerFieldUpdater = lookupType(AtomicIntegerFieldUpdater.class);
+    public final ResolvedJavaType java_util_concurrent_atomic_AtomicLongFieldUpdater = lookupType(AtomicLongFieldUpdater.class);
+    public final ResolvedJavaType java_util_concurrent_atomic_AtomicReferenceFieldUpdater = lookupType(AtomicReferenceFieldUpdater.class);
+
+    public final ResolvedJavaType java_util_Map_Entry = lookupType("java.util.Map$Entry");
+    public final ResolvedJavaMethod java_util_Map_Entry_getKey = lookupMethod(java_util_Map_Entry, "getKey");
+    public final ResolvedJavaMethod java_util_Map_Entry_getValue = lookupMethod(java_util_Map_Entry, "getValue");
+
+    public final ResolvedJavaType java_nio_ByteOrder = lookupType(ByteOrder.class);
+
+    public final ResolvedJavaType java_util_Objects = lookupType(Objects.class);
+    public final ResolvedJavaMethod java_util_Objects_deepEquals = lookupMethod(java_util_Objects, "deepEquals", Object.class, Object.class);
+    public final ResolvedJavaMethod java_util_Objects_requireNonNull = lookupMethod(java_util_Objects, "requireNonNull", Object.class);
+    public final ResolvedJavaMethod java_util_Objects_requireNonNull_withMessage = lookupMethod(java_util_Objects, "requireNonNull", Object.class, String.class);
+    public final ResolvedJavaMethod java_util_Objects_requireNonNull_withMessageSupplier = lookupMethod(java_util_Objects, "requireNonNull", Object.class, Supplier.class);
+
+    public final ResolvedJavaType java_util_function_BooleanSupplier = lookupType(BooleanSupplier.class);
+    public final ResolvedJavaMethod java_util_function_BooleanSupplier_getAsBoolean = lookupMethod(java_util_function_BooleanSupplier, "getAsBoolean");
+
+    public final ResolvedJavaType java_util_function_Consumer = lookupType(Consumer.class);
+    public final ResolvedJavaMethod java_util_function_Consumer_accept = lookupMethod(java_util_function_Consumer, "accept", Object.class);
+
+    public final ResolvedJavaType java_util_function_Function = lookupType(Function.class);
+    public final ResolvedJavaMethod java_util_function_Function_apply = lookupMethod(java_util_function_Function, "apply", Object.class);
+
+    public final ResolvedJavaType java_util_function_Predicate = lookupType(Predicate.class);
+    public final ResolvedJavaMethod java_util_function_Predicate_test = lookupMethod(java_util_function_Predicate, "test", Object.class);
+
+    public final ResolvedJavaType jdk_graal_compiler_options_OptionKey = lookupType(OptionKey.class);
+
+    public final ResolvedJavaType jdk_internal_foreign_AbstractMemorySegmentImpl = lookupType("jdk.internal.foreign.AbstractMemorySegmentImpl");
+    public final ResolvedJavaMethod jdk_internal_foreign_AbstractMemorySegmentImpl_equals = lookupMethod(jdk_internal_foreign_AbstractMemorySegmentImpl, "equals", Object.class);
+
+    public final ResolvedJavaType jdk_internal_foreign_abi_NativeEntryPoint = lookupType("jdk.internal.foreign.abi.NativeEntryPoint");
+    public final ResolvedJavaMethod jdk_internal_foreign_abi_NativeEntryPoint_type = lookupMethod(jdk_internal_foreign_abi_NativeEntryPoint, "type");
+    public final ResolvedJavaType jdk_internal_foreign_abi_SoftReferenceCache = lookupType("jdk.internal.foreign.abi.SoftReferenceCache");
+    public final ResolvedJavaType jdk_internal_foreign_abi_NativeEntryPoint_CacheKey = lookupType("jdk.internal.foreign.abi.NativeEntryPoint$CacheKey");
+    public final ResolvedJavaType jdk_internal_foreign_abi_SoftReferenceCache_Node = lookupType("jdk.internal.foreign.abi.SoftReferenceCache$Node");
+    public final ResolvedJavaType jdk_internal_foreign_abi_VMStorage = lookupType("jdk.internal.foreign.abi.VMStorage");
+
+    public final ResolvedJavaType Uninterruptible = lookupType("com.oracle.svm.shared.Uninterruptible");
+    public final ResolvedJavaType Delete = lookupType(Delete.class);
+    public final ResolvedJavaType CEntryPoint_IsolateContext = lookupType(CEntryPoint.IsolateContext.class);
+    public final ResolvedJavaType CEntryPoint_IsolateThreadContext = lookupType(CEntryPoint.IsolateThreadContext.class);
+    public final ResolvedJavaType CEntryPointOptions_NoCallerEpilogue = lookupType("com.oracle.svm.guest.staging.c.function.CEntryPointOptions$NoCallerEpilogue");
+    public final ResolvedJavaType CFunction = lookupType(CFunction.class);
+    public final ResolvedJavaType InvokeCFunctionPointer = lookupType(InvokeCFunctionPointer.class);
+    public final ResolvedJavaType InternalVMMethod = lookupType("com.oracle.svm.guest.staging.jdk.InternalVMMethod");
+    public final ResolvedJavaType FieldValueTransformer = lookupType(FieldValueTransformer.class);
+    public final ResolvedJavaMethod FieldValueTransformer_transform = lookupMethod(FieldValueTransformer, "transform", Object.class, Object.class);
+    public final ResolvedJavaMethod FieldValueTransformer_isAvailable = lookupMethod(FieldValueTransformer, "isAvailable");
+
+    public final ResolvedJavaType WordBase = lookupType(WordBase.class);
+
+    public final ResolvedJavaType ImageSingletons = lookupType(ImageSingletons.class);
+    public final ResolvedJavaMethod ImageSingletons_add = lookupMethod(ImageSingletons, "add", Class.class, Object.class);
+    public final ResolvedJavaMethod ImageSingletons_lookup = lookupMethod(ImageSingletons, "lookup", Class.class);
+    public final ResolvedJavaMethod ImageSingletons_contains = lookupMethod(ImageSingletons, "contains", Class.class);
+
+    public final ResolvedJavaType HostedManagement = lookupType(ImageSingletonsSupportImpl.HostedManagement.class);
+    public final ResolvedJavaMethod HostedManagement_install = lookupMethod(HostedManagement, "install");
+    public final ResolvedJavaMethod HostedManagement_clear = lookupMethod(HostedManagement, "clear");
+
+    public final ResolvedJavaType RuntimeOptionKey = lookupType("com.oracle.svm.guest.staging.option.RuntimeOptionKey");
+    public final ResolvedJavaMethod RuntimeOptionKey_getValue = lookupMethod(RuntimeOptionKey, "getValue");
+
+    public final ResolvedJavaType sun_invoke_util_ValueConversions = lookupType("sun.invoke.util.ValueConversions");
+    // Checkstyle: resume field name check
+
+    public final Set<ResolvedJavaMethod> abstractMemorySegmentGetSetMethods = computeAbstractMemorySegmentGetSetMethods();
+
+    protected abstract ResolvedJavaType lookupType(Class<?> clazz);
+
+    protected abstract ResolvedJavaType lookupType(String className);
+
+    protected abstract ResolvedJavaMethod lookupMethod(ResolvedJavaType type, String name, Class<?>... parameterTypes);
+
+    private Set<ResolvedJavaMethod> computeAbstractMemorySegmentGetSetMethods() {
+        ResolvedJavaType longType = lookupType(long.class);
+
+        Set<ResolvedJavaMethod> roots = new HashSet<>();
+        for (JavaKind kind : JavaKind.values()) {
+            if (kind.isPrimitive() && kind != JavaKind.Void) {
+                ResolvedJavaType valueLayoutType = lookupType("java.lang.foreign.ValueLayout$Of" + kind.name());
+                addGetSetMethods(roots, jdk_internal_foreign_AbstractMemorySegmentImpl, valueLayoutType, longType, lookupType(kind.toJavaClass()));
+            }
+        }
+
+        ResolvedJavaType addressLayoutType = lookupType("java.lang.foreign.AddressLayout");
+        ResolvedJavaType memorySegmentType = lookupType("java.lang.foreign.MemorySegment");
+        addGetSetMethods(roots, jdk_internal_foreign_AbstractMemorySegmentImpl, addressLayoutType, longType, memorySegmentType);
+        return Collections.unmodifiableSet(roots);
+    }
+
+    private static void addGetSetMethods(Set<ResolvedJavaMethod> intrinsificationRoots, ResolvedJavaType abstractMemorySegment, ResolvedJavaType valueLayoutType, ResolvedJavaType longType,
+                    ResolvedJavaType carrierType) {
+        intrinsificationRoots.add(JVMCIReflectionUtil.getUniqueDeclaredMethod(abstractMemorySegment, "get", valueLayoutType, longType));
+        intrinsificationRoots.add(JVMCIReflectionUtil.getUniqueDeclaredMethod(abstractMemorySegment, "getAtIndex", valueLayoutType, longType));
+        intrinsificationRoots.add(JVMCIReflectionUtil.getUniqueDeclaredMethod(abstractMemorySegment, "set", valueLayoutType, longType, carrierType));
+        intrinsificationRoots.add(JVMCIReflectionUtil.getUniqueDeclaredMethod(abstractMemorySegment, "setAtIndex", valueLayoutType, longType, carrierType));
+    }
+}

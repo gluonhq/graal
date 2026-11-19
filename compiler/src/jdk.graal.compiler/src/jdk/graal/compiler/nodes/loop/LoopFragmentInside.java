@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -53,6 +53,7 @@ import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.FrameState;
 import jdk.graal.compiler.nodes.GraphState;
+import jdk.graal.compiler.nodes.GuardNode;
 import jdk.graal.compiler.nodes.GuardPhiNode;
 import jdk.graal.compiler.nodes.GuardProxyNode;
 import jdk.graal.compiler.nodes.IfNode;
@@ -75,7 +76,6 @@ import jdk.graal.compiler.nodes.VirtualState;
 import jdk.graal.compiler.nodes.calc.AddNode;
 import jdk.graal.compiler.nodes.calc.CompareNode;
 import jdk.graal.compiler.nodes.calc.ConditionalNode;
-import jdk.graal.compiler.nodes.calc.IntegerBelowNode;
 import jdk.graal.compiler.nodes.calc.SubNode;
 import jdk.graal.compiler.nodes.extended.AnchoringNode;
 import jdk.graal.compiler.nodes.extended.GuardingNode;
@@ -87,6 +87,9 @@ import jdk.graal.compiler.nodes.memory.MemoryPhiNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.nodes.util.IntegerHelper;
 
+/**
+ * Loop fragment that is capable of partially unrolling inverted loops.
+ */
 public class LoopFragmentInside extends LoopFragment {
 
     /**
@@ -129,7 +132,7 @@ public class LoopFragmentInside extends LoopFragment {
 
     @Override
     public LoopFragmentInside duplicate() {
-        assert !isDuplicate();
+        assert !isDuplicate() : this + " most not be a duplicate already";
         return new LoopFragmentInside(this);
     }
 
@@ -149,8 +152,84 @@ public class LoopFragmentInside extends LoopFragment {
         return super.loop();
     }
 
+    /**
+     * Collects all floating guards with outside anchors.
+     *
+     * Floating guards and loop peeling: when peeling loops while we have floating guards we have to
+     * take special care about the position of a guard after peeling. A guard has 2 things that
+     * define its position: the anchor and the condition. Both are relevant to execute the guard at
+     * the correct point in time. The correct point is as early as possible without being to eager.
+     * Peeling can now "free" guards of their conditional scheduling position. What does that mean?
+     *
+     * Consider the following loop
+     *
+     * <pre>
+     * int phi = 0;
+     * int sum = 0;
+     * while (true) {
+     *     if (phi > 0) {
+     *         // Guard of the second iteration should not float before the
+     *         // first
+     *         // break
+     *         GraalDirectives.deoptimizeAndInvalidate();
+     *     }
+     *     phi = (int) Math.tan(phi + 1);
+     *     sum += phi;
+     *     if (flag) {
+     *         break;
+     *     }
+     * }
+     * </pre>
+     *
+     * The position of the guard is determined by the scheduling of the inputs: that is the phi. The
+     * anchor is already outside of the loop. If we peel this loop now 2 times and duplicate the
+     * guard, the fact that the phi input is gone lets the guard float up above the original part of
+     * the loop's previous iteration. That means we have 2 duplicates of this guard one that evals
+     * the condition {@code 0>0} which evaluates to {@code false}. The other one, of iteration 1
+     * evals then the condition {@code 1>0} which is true and thus unconditionally will yield a
+     * deopt. That guard however can float to the beginning of the method and cause too eager
+     * deopts. The fact that peeling replaces phi nodes with their inputs at the respective
+     * iteration "frees" the guards of their scheduling positions. Thus, we manually inject the
+     * anchor to be the end of the last iteration that was peeled. That naturally is the correct
+     * position. Later optimization can specualtively move guards further.
+     */
+    private static NodeBitMap collectExistingGuardsWithOutsideAnchors(StructuredGraph graph, Loop loop) {
+        NodeBitMap guardsWithOutsideAnchors = null;
+        if (graph.getGuardsStage().allowsFloatingGuards()) {
+            for (Node inside : loop.inside().nodes()) {
+                if (inside instanceof GuardNode g) {
+                    // the anchor is already outside the loop
+                    if (!loop.whole().contains(g.getAnchor().asNode())) {
+                        if (guardsWithOutsideAnchors == null) {
+                            guardsWithOutsideAnchors = graph.createNodeBitMap();
+                        }
+                        guardsWithOutsideAnchors.mark(g);
+                    }
+                }
+            }
+        }
+        return guardsWithOutsideAnchors;
+    }
+
+    private static void reconnectAnchors(Loop loop, LoopFragment fragment, StructuredGraph graph, NodeBitMap guardsWithOutsideAnchors) {
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "Before correcting floating guard anchors for loop %s", loop.loopBegin());
+        AnchoringNode newAnchor = AbstractBeginNode.prevBegin(fragment.getDuplicatedNode(loop.loopBegin()));
+        for (Node originalGuard : guardsWithOutsideAnchors) {
+            assert originalGuard instanceof GuardNode : Assertions.errorMessage(originalGuard, guardsWithOutsideAnchors);
+            GuardNode g = (GuardNode) originalGuard;
+            GuardNode duplicate = (GuardNode) fragment.getDuplicatedNode(g.asNode());
+            if (duplicate != null) {
+                duplicate.setAnchor(newAnchor);
+            }
+        }
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After correcting floating guard anchors for loop %s", loop.loopBegin());
+    }
+
     @Override
     public void insertBefore(Loop loop) {
+        StructuredGraph graph = loop.loopBegin().graph();
+        NodeBitMap guardsWithOutsideAnchors = collectExistingGuardsWithOutsideAnchors(graph, loop);
+
         assert this.isDuplicate();
         assert this.original().loop() == loop : "Original loop " + this.original().loop() + " != " + loop;
 
@@ -165,6 +244,10 @@ public class LoopFragmentInside extends LoopFragment {
         AbstractBeginNode entry = getDuplicatedNode(loop.loopBegin());
         loop.entryPoint().replaceAtPredecessor(entry);
         end.setNext(loop.entryPoint());
+
+        if (graph.getGuardsStage().allowsFloatingGuards() && guardsWithOutsideAnchors != null) {
+            reconnectAnchors(loop, this, graph, guardsWithOutsideAnchors);
+        }
     }
 
     /**
@@ -204,7 +287,7 @@ public class LoopFragmentInside extends LoopFragment {
             backedgeValues.add(duplicatedNode);
         }
         int index = 0;
-        for (PhiNode mainPhiNode : mainLoopBegin.phis()) {
+        for (PhiNode mainPhiNode : mainLoopBegin.phis().snapshot()) {
             ValueNode duplicatedNode = backedgeValues.get(index++);
             if (duplicatedNode != null) {
                 mainPhiNode.setValueAt(1, duplicatedNode);
@@ -230,7 +313,7 @@ public class LoopFragmentInside extends LoopFragment {
             if (opaque == null || opaque.isDeleted()) {
                 ValueNode limit = counted.getLimit();
                 opaque = new OpaqueValueNode(AddNode.add(counterStride, counterStride, NodeView.DEFAULT));
-                ValueNode newLimit = partialUnrollOverflowCheck(opaque, limit, counted);
+                ValueNode newLimit = partialUnrollLimit(opaque, limit, counted);
                 GraalError.guarantee(condition.hasExactlyOneUsage(),
                                 "Unrolling loop %s with condition %s, which has multiple usages. Usages other than the loop exit check would get an incorrect condition.", loop.loopBegin(), condition);
                 condition.replaceFirstInput(limit, graph.addOrUniqueWithInputs(newLimit));
@@ -249,28 +332,55 @@ public class LoopFragmentInside extends LoopFragment {
         mainLoopBegin.getDebug().dump(DebugContext.VERBOSE_LEVEL, mainLoopBegin.graph(), "After insertWithinAfter %s", mainLoopBegin);
     }
 
-    public static ValueNode partialUnrollOverflowCheck(OpaqueNode opaque, ValueNode limit, CountedLoopInfo counted) {
+    public static ValueNode partialUnrollLimit(OpaqueNode opaque, ValueNode limit, CountedLoopInfo counted) {
         int bits = ((IntegerStamp) limit.stamp(NodeView.DEFAULT)).getBits();
         ValueNode newLimit = SubNode.create(limit, opaque, NodeView.DEFAULT);
         IntegerHelper helper = counted.getCounterIntegerHelper();
-        LogicNode overflowCheck;
         ConstantNode extremum;
         if (counted.getDirection() == InductionVariable.Direction.Up) {
-            // limit - counterStride could overflow negatively if limit - min <
-            // counterStride
             extremum = ConstantNode.forIntegerBits(bits, helper.minValue());
-            overflowCheck = IntegerBelowNode.create(SubNode.create(limit, extremum, NodeView.DEFAULT), opaque, NodeView.DEFAULT);
         } else {
             assert counted.getDirection() == InductionVariable.Direction.Down : counted.getDirection();
-            // limit - counterStride could overflow if max - limit < -counterStride
-            // i.e., counterStride < limit - max
             extremum = ConstantNode.forIntegerBits(bits, helper.maxValue());
-            overflowCheck = IntegerBelowNode.create(opaque, SubNode.create(limit, extremum, NodeView.DEFAULT), NodeView.DEFAULT);
         }
+        LogicNode overflowCheck = partialUnrollOverflowCheck(limit, newLimit, counted);
         return ConditionalNode.create(overflowCheck, extremum, newLimit, NodeView.DEFAULT);
     }
 
-    protected CompareNode placeNewSegmentAndCleanup(Loop loop, EconomicMap<Node, Node> new2OldPhis, @SuppressWarnings("unused") EconomicMap<Node, Node> originalPhi2Backedges) {
+    /**
+     * Determines whether adjusting a counted loop's limit after partial unrolling would overflow,
+     * that is, whether {@code newLimit = limit - opaque} would go past the minimum or maximum value
+     * in the counted loop's signed or unsigned ordering.
+     *
+     * <p>Partial unrolling uses the accumulated {@code opaque} stride to compute
+     * {@code newLimit = limit - opaque}. If that arithmetic would wrap, the caller selects the
+     * directional extremum for the same ordering instead of
+     * {@code newLimit}:
+     *
+     * <pre>{@code
+     * LogicNode overflowCheck = partialUnrollOverflowCheck(limit, newLimit, counted);
+     * return ConditionalNode.create(overflowCheck, extremum, newLimit, NodeView.DEFAULT);
+     * }</pre>
+     *
+     * <p>For an ascending loop, {@code opaque} is positive, so {@code newLimit} must be less than
+     * {@code limit}. If {@code newLimit} is greater than {@code limit} according to the loop's
+     * ordering, the subtraction went past the minimum value.
+     *
+     * <p>For a descending loop, {@code opaque} is negative, so {@code newLimit} must be greater than
+     * {@code limit}. If {@code newLimit} is less than {@code limit} according to the loop's
+     * ordering, the subtraction went past the maximum value.
+     */
+    private static LogicNode partialUnrollOverflowCheck(ValueNode limit, ValueNode newLimit, CountedLoopInfo counted) {
+        IntegerHelper helper = counted.getCounterIntegerHelper();
+        if (counted.getDirection() == InductionVariable.Direction.Up) {
+            return helper.createCompareNode(limit, newLimit, NodeView.DEFAULT);
+        } else {
+            assert counted.getDirection() == InductionVariable.Direction.Down : counted.getDirection();
+            return helper.createCompareNode(newLimit, limit, NodeView.DEFAULT);
+        }
+    }
+
+    protected CompareNode placeNewSegmentAndCleanup(Loop loop, EconomicMap<Node, Node> new2OldPhis, EconomicMap<Node, Node> originalPhi2Backedges) {
         CountedLoopInfo mainCounted = loop.counted();
         LoopBeginNode mainLoopBegin = loop.loopBegin();
         // Discard the segment entry and its flow, after if merging it into the loop
@@ -331,7 +441,7 @@ public class LoopFragmentInside extends LoopFragment {
                 newSegmentBegin.clearSuccessors();
                 if (newSegmentBegin.hasAnchored()) {
                     /*
-                     * LoopPartialUnrollPhase runs after guard lowering, thus we cannot see any
+                     * SimpleLoopPartialUnrollPhase runs after guard lowering, thus we cannot see any
                      * floating guards here except multi-guard nodes (pointing to abstract begins)
                      * and other anchored nodes. We need to ensure anything anchored on the original
                      * loop begin will be anchored on the unrolled iteration. Thus we create an
@@ -343,6 +453,11 @@ public class LoopFragmentInside extends LoopFragment {
                         lastCodeNode = newAnchoringPointAfterPrevIteration;
                     }
                     newSegmentBegin.replaceAtUsages(lastCodeNode, InputType.Guard, InputType.Anchor);
+
+                    // at this point only safepoint usages can live here
+                    assert newSegmentBegin.usages().filter(x -> !(x instanceof SafepointNode)).count() == 0 : "Must only have safepoint(association) usages left for " + newSegmentBegin + " usages=" +
+                                    newSegmentBegin.usages();
+                    newSegmentBegin.replaceAtUsages(mainLoopBegin, InputType.Association);
                 }
                 lastCodeNode.replaceFirstSuccessor(loopEndNode, newSegmentFirstNode);
                 newSegmentLastNode.replaceFirstSuccessor(newSegmentEnd, loopEndNode);
@@ -353,7 +468,56 @@ public class LoopFragmentInside extends LoopFragment {
             graph.getDebug().dump(DebugContext.DETAILED_LEVEL, graph, "After placing segment");
             return (CompareNode) loopTest.condition();
         } else {
-            throw GraalError.shouldNotReachHere("Cannot unroll inverted loop"); // ExcludeFromJacocoGeneratedReport
+            // INVERTED case
+
+            // Redirect anchors
+            AbstractBeginNode falseSuccessor = loopTest.falseSuccessor();
+            for (Node usage : falseSuccessor.anchored().snapshot()) {
+                usage.replaceFirstInput(falseSuccessor, newSegmentLoopTest.falseSuccessor());
+            }
+            AbstractBeginNode trueSuccessor = loopTest.trueSuccessor();
+            for (Node usage : trueSuccessor.anchored().snapshot()) {
+                usage.replaceFirstInput(trueSuccessor, newSegmentLoopTest.trueSuccessor());
+            }
+
+            mergeEarlyLoopExits(graph, mainLoopBegin, mainCounted, new2OldPhis, loop);
+
+            AbstractBeginNode newSegmentBegin = getDuplicatedNode(mainLoopBegin);
+
+            FixedWithNextNode oldSegementLastNode = (FixedWithNextNode) loopTest.predecessor();
+            oldSegementLastNode.setNext(null);
+            oldSegementLastNode.setNext(newSegmentBegin);
+
+            LoopEndNode len = loop.loopBegin().getSingleLoopEnd();
+            // no need to replace phis, they are correct
+
+            FixedWithNextNode oldLenEdge = (FixedWithNextNode) len.predecessor();
+            FixedNode oldLenNext = getDuplicatedNode(len);
+            oldLenEdge.setNext(null);
+            getDuplicatedNode(oldLenEdge).setNext(len);
+
+            LoopExitNode lex = (LoopExitNode) loop.counted().getCountedExit();
+            processInvertedExitProxies(loop, lex, originalPhi2Backedges);
+
+            FixedWithNextNode oldLexEdge = lex;
+            if (loopTest.trueSuccessor() == lex) {
+                loopTest.setTrueSuccessor(null);
+            } else {
+                loopTest.setFalseSuccessor(null);
+            }
+            getDuplicatedNode(oldLexEdge).setNext(lex);
+
+            // finally, remove the old test
+            GraphUtil.killCFG(loopTest);
+            GraphUtil.killCFG(oldLenNext);
+            graph.getDebug().dump(DebugContext.DETAILED_LEVEL, graph, "After placing segment");
+
+            // remove superfluous begin node
+            FixedWithNextNode fwn = (FixedWithNextNode) lex.predecessor();
+            GraphUtil.unlinkFixedNode(fwn);
+            fwn.safeDelete();
+
+            return (CompareNode) newSegmentLoopTest.condition();
         }
     }
 
@@ -415,9 +579,21 @@ public class LoopFragmentInside extends LoopFragment {
         }
     }
 
-    public static ValueNode patchProxyAtPhi(PhiNode phi, LoopExitNode lex, ValueNode proxyInput) {
+    public static ProxyNode patchProxyAtPhi(PhiNode phi, LoopExitNode lex, ValueNode proxyInput) {
+        return patchProxyAtPhi(phi, lex, proxyInput, false);
+    }
+
+    public static ProxyNode patchProxyAtPhi(PhiNode phi, LoopExitNode lex, ValueNode proxyInput, boolean unrestrictedStamp) {
         if (phi instanceof ValuePhiNode) {
-            return phi.graph().addOrUnique(new ValueProxyNode(proxyInput, lex));
+            if (unrestrictedStamp) {
+                /*
+                 * Delay precise stamp injection to the first time #inferStamp is called on the
+                 * value proxy.
+                 */
+                return phi.graph().addOrUnique(new ValueProxyNode(proxyInput.stamp(NodeView.DEFAULT).unrestricted(), proxyInput, lex));
+            } else {
+                return phi.graph().addOrUnique(new ValueProxyNode(proxyInput, lex));
+            }
         } else if (phi instanceof MemoryPhiNode) {
             return phi.graph().addOrUnique(new MemoryProxyNode((MemoryKill) proxyInput, lex, ((MemoryPhiNode) phi).getLocationIdentity()));
         } else if (phi instanceof GuardPhiNode) {
@@ -795,6 +971,21 @@ public class LoopFragmentInside extends LoopFragment {
             if (state != null) {
                 duplicateState = state.duplicateWithVirtualState();
                 newExitMerge.setStateAfter(duplicateState);
+                /*
+                 * For complex phi cycles with floating nodes in between the phi and the state we
+                 * have to replace each node that is part of the new state with the respective node
+                 * in the duplicated region.
+                 */
+                duplicateState.applyToNonVirtual(new VirtualState.NodePositionClosure<>() {
+                    @Override
+                    public void apply(Node from, Position p) {
+                        Node usage = p.get(from);
+                        if (usage != null && !loopBegin.isPhiAtMerge(usage) && original().contains(usage)) {
+                            Node duplicated = getDuplicatedNode(usage);
+                            p.set(from, duplicated);
+                        }
+                    }
+                });
             }
             for (EndNode end : endsToMerge) {
                 newExitMerge.addForwardEnd(end);
@@ -828,5 +1019,39 @@ public class LoopFragmentInside extends LoopFragment {
             }
         }
         return newExit;
+    }
+
+    private void processInvertedExitProxies(Loop loop, LoopExitNode lex, EconomicMap<Node, Node> originalPhi2Backedges) {
+        for (ProxyNode proxy : lex.proxies().snapshot()) {
+            ValueNode originalNode = proxy.getOriginalNode();
+            ValueNode duplicatedPendant = getDuplicatedNode(originalNode);
+            if (duplicatedPendant == null) {
+                /*
+                 * Special case canonicalizations between pre/main/post insertion and unrolling: If
+                 * the node inside the loop canonicalizes to something above the loop we dont need
+                 * to reset it.
+                 */
+                if (loop.isOutsideLoop(originalNode)) {
+                    proxy.graph().getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, proxy.graph(), "Ignoring proxy rewrite of %s since input %s is above the loop", proxy, originalNode);
+                    continue;
+                }
+                /*
+                 * We unrolled the inverted loop: if the original proxy proxied a phi (which is last
+                 * assigned at the loop end) it means it always took the value of the phi on the
+                 * last iteration not the current iteration. If we now unroll the new body after the
+                 * original one, the proxy must still proxy the value of the last iteration. That
+                 * is, the value at the end of iteration 1 (of 2 after unrolling) may be a phi node
+                 * as well. However, since cycles are resolved already at this point, we must use
+                 * the old original value.
+                 */
+                assert originalNode instanceof PhiNode p && p.merge() == loop.loopBegin() : originalNode + " " + ((PhiNode) originalNode).merge();
+                duplicatedPendant = (ValueNode) originalPhi2Backedges.get(originalNode);
+                assert duplicatedPendant != null;
+                GraalError.guarantee(duplicatedPendant != null, "Must have a pendant for proxy %s but node is null", proxy);
+            }
+            ValueNode replacement = proxy.duplicateOn(lex, duplicatedPendant);
+            proxy.graph().getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, proxy.graph(), "Creating new proxy %s for proxy %s", replacement, proxy);
+            proxy.replaceAtUsages(replacement);
+        }
     }
 }

@@ -26,14 +26,14 @@
 
 package com.oracle.svm.core.nmt;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicLong;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicLong;
 
 class NmtMallocMemoryInfo {
     private final AtomicLong count = new AtomicLong(0);

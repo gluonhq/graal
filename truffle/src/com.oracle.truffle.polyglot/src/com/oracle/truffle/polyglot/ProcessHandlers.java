@@ -51,7 +51,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.ThreadScope;
 import org.graalvm.polyglot.io.ProcessHandler;
 
@@ -239,12 +238,12 @@ final class ProcessHandlers {
 
         private static final int BUFSIZE = 8192;
 
-        private final AbstractPolyglotImpl polyglot;
+        private final PolyglotImpl polyglot;
         private final InputStream in;
         private final OutputStream out;
         private final byte[] buffer;
 
-        CopierThread(AbstractPolyglotImpl polyglot, String name, InputStream in, OutputStream out) {
+        CopierThread(PolyglotImpl polyglot, String name, InputStream in, OutputStream out) {
             Objects.requireNonNull(polyglot, "Polyglot must be non null.");
             Objects.requireNonNull(name, "Name must be non null.");
             Objects.requireNonNull(in, "In must be non null.");
@@ -259,7 +258,7 @@ final class ProcessHandlers {
         @Override
         @SuppressWarnings("try")
         public void run() {
-            try (ThreadScope scope = polyglot.getRootImpl().createThreadScope()) {
+            try (ThreadScope scope = polyglot.createThreadScope()) {
                 while (true) {
                     if (isInterrupted()) {
                         return;

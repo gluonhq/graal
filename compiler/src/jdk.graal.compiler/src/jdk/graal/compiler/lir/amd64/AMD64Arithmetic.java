@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,6 +35,7 @@ import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
+import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.meta.AllocatableValue;
@@ -51,20 +52,21 @@ public enum AMD64Arithmetic {
         @Use protected AllocatableValue x;
         @Use protected AllocatableValue y;
         @Temp protected AllocatableValue raxTemp;
+        @Temp({OperandFlag.STACK, OperandFlag.ILLEGAL}) protected AllocatableValue temp;
 
-        public FPDivRemOp(AMD64Arithmetic opcode, AllocatableValue result, AllocatableValue x, AllocatableValue y) {
+        public FPDivRemOp(LIRGeneratorTool tool, AMD64Arithmetic opcode, AllocatableValue result, AllocatableValue x, AllocatableValue y) {
             super(TYPE);
             this.opcode = opcode;
             this.result = result;
             this.raxTemp = AMD64.rax.asValue(LIRKind.value(AMD64Kind.DWORD));
             this.x = x;
             this.y = y;
+            this.temp = tool.getResult().getFrameMapBuilder().allocateSpillSlot(LIRKind.value(opcode == FREM ? AMD64Kind.SINGLE : AMD64Kind.DOUBLE));
         }
 
         @Override
         public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
-            AMD64Address tmp = new AMD64Address(AMD64.rsp);
-            masm.subq(AMD64.rsp, 8);
+            AMD64Address tmp = (AMD64Address) crb.asAddress(temp);
             if (opcode == FREM) {
                 masm.movflt(tmp, asRegister(y));
                 masm.flds(tmp);
@@ -95,7 +97,6 @@ public enum AMD64Arithmetic {
                 masm.fstpd(tmp);
                 masm.movdbl(asRegister(result), tmp);
             }
-            masm.addq(AMD64.rsp, 8);
         }
 
         @Override
@@ -104,11 +105,6 @@ public enum AMD64Arithmetic {
             assert (opcode.name().startsWith("F") && result.getPlatformKind() == AMD64Kind.SINGLE && x.getPlatformKind() == AMD64Kind.SINGLE && y.getPlatformKind() == AMD64Kind.SINGLE) ||
                             (opcode.name().startsWith("D") && result.getPlatformKind() == AMD64Kind.DOUBLE && x.getPlatformKind() == AMD64Kind.DOUBLE &&
                                             y.getPlatformKind() == AMD64Kind.DOUBLE) : Assertions.errorMessage(x, y, result);
-        }
-
-        @Override
-        public boolean modifiesStackPointer() {
-            return true;
         }
     }
 }

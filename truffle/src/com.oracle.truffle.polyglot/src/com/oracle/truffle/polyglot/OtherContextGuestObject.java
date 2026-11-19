@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -66,6 +66,7 @@ final class OtherContextGuestObject implements TruffleObject {
 
     static final Object OTHER_VALUE = new Object();
     static final ReflectionLibrary OTHER_VALUE_UNCACHED = ReflectionLibrary.getFactory().getUncached(OTHER_VALUE);
+    private static final Message MESSAGE_AS_HOST_OBJECT = Message.resolveExact(InteropLibrary.class, "asHostObject", Object.class);
 
     final PolyglotContextImpl receiverContext;
     final Object delegate;
@@ -105,7 +106,7 @@ final class OtherContextGuestObject implements TruffleObject {
 
         @Specialization(guards = "canCache(cachedLayer, receiver.receiverContext, receiver.delegateContext)", limit = "1")
         static Object doCached(OtherContextGuestObject receiver, Message message, Object[] args,
-                        @Bind("this") Node node,
+                        @Bind Node node,
                         @SuppressWarnings("unused") @CachedLibrary("receiver") ReflectionLibrary receiverLibrary,
                         @Cached(value = "getCachedLayer(receiverLibrary)") PolyglotSharingLayer cachedLayer,
                         @CachedLibrary(limit = "CACHE_LIMIT") ReflectionLibrary delegateLibrary,
@@ -117,7 +118,7 @@ final class OtherContextGuestObject implements TruffleObject {
 
         @TruffleBoundary
         @Specialization(replaces = "doCached")
-        static Object doSlowPath(OtherContextGuestObject receiver, Message message, Object[] args, @Bind("this") Node node) throws Exception {
+        static Object doSlowPath(OtherContextGuestObject receiver, Message message, Object[] args, @Bind Node node) throws Exception {
             return sendImpl(node, receiver.receiverContext.layer, receiver.delegate, message, args, receiver.receiverContext,
                             receiver.delegateContext,
                             ReflectionLibrary.getUncached(receiver.delegate),
@@ -126,7 +127,7 @@ final class OtherContextGuestObject implements TruffleObject {
 
     }
 
-    private static final Message IDENTICAL = Message.resolve(InteropLibrary.class, "isIdentical");
+    private static final Message IDENTICAL = Message.resolveExact(InteropLibrary.class, "isIdentical", Object.class, Object.class, InteropLibrary.class);
 
     static Object sendImpl(Node node, PolyglotSharingLayer layer, Object receiver, Message message, Object[] args, PolyglotContextImpl receiverContext,
                     PolyglotContextImpl delegateContext,
@@ -156,7 +157,10 @@ final class OtherContextGuestObject implements TruffleObject {
                     } else {
                         returnValue = delegateLibrary.send(receiver, message, migratedArgs);
                     }
-                    return migrateReturn(returnValue, receiverContext, delegateContext);
+                    if (message.getReturnType() == void.class) {
+                        return null;
+                    }
+                    return migrateReturn(returnValue, message, receiverContext, delegateContext);
                 } catch (Throwable e) {
                     seenError.enter(node);
                     throw migrateException(receiverContext, e, delegateContext);
@@ -177,10 +181,16 @@ final class OtherContextGuestObject implements TruffleObject {
     @TruffleBoundary
     static <T extends Throwable> RuntimeException migrateException(PolyglotContextImpl receiverContext, Throwable e, PolyglotContextImpl valueContext) throws T {
         if (e instanceof OtherContextException) {
+            // Same logic as in migrateValue()
             OtherContextException other = (OtherContextException) e;
             if (other.receiverContext == receiverContext && other.delegateContext == valueContext) {
+                // reuse wrapper it is already wrapped
                 throw other;
+            } else if (other.receiverContext == valueContext && other.delegateContext == receiverContext) {
+                // unpack foreign value it belongs to that context
+                throw (T) other.delegate;
             } else {
+                // Preserve original context of the delegate when forwarding through third context
                 throw new OtherContextException(receiverContext, other.delegate, other.delegateContext);
             }
         } else if (InteropLibrary.getUncached().isException(e)) {
@@ -261,8 +271,10 @@ final class OtherContextGuestObject implements TruffleObject {
         return OTHER_VALUE_UNCACHED.send(OTHER_VALUE, message, args);
     }
 
-    private static Object migrateReturn(Object arg, PolyglotContextImpl receiverContext, PolyglotContextImpl delegateContext) {
-        if (arg instanceof TruffleObject) {
+    private static Object migrateReturn(Object arg, Message message, PolyglotContextImpl receiverContext, PolyglotContextImpl delegateContext) {
+        if (message == MESSAGE_AS_HOST_OBJECT) {
+            return arg;
+        } else if (arg instanceof TruffleObject) {
             return receiverContext.migrateValue(arg, delegateContext);
         } else {
             assert InteropLibrary.isValidProtocolValue(arg) : "unexpected interop primitive";
@@ -332,13 +344,13 @@ final class OtherContextGuestObject implements TruffleObject {
         }
 
         @TruffleBoundary
-        OtherContextException(PolyglotContextImpl thisContext, Exception delegate, PolyglotContextImpl delegateContext) {
+        OtherContextException(PolyglotContextImpl receiverContext, Exception delegate, PolyglotContextImpl delegateContext) {
             super(delegate.getMessage());
             assert !(delegate instanceof OtherContextException) : "recursive host foreign value found";
-            assert thisContext != null && delegateContext != null : "Must have associated contexts.";
-            assert thisContext != delegateContext : "no need for foreign value if contexts match";
+            assert receiverContext != null && delegateContext != null : "Must have associated contexts.";
+            assert receiverContext != delegateContext : "no need for foreign value if contexts match";
             this.delegate = delegate;
-            this.receiverContext = thisContext;
+            this.receiverContext = receiverContext;
             this.delegateContext = delegateContext;
         }
 
@@ -348,7 +360,7 @@ final class OtherContextGuestObject implements TruffleObject {
 
             @Specialization(guards = "canCache(cachedLayer, receiver.receiverContext, receiver.delegateContext)", limit = "1")
             static Object doCached(OtherContextException receiver, Message message, Object[] args,
-                            @Bind("this") Node node,
+                            @Bind Node node,
                             @SuppressWarnings("unused") @CachedLibrary("receiver") ReflectionLibrary receiverLibrary,
                             @Cached(value = "getCachedLayer(receiverLibrary)") PolyglotSharingLayer cachedLayer,
                             @CachedLibrary(limit = "CACHE_LIMIT") ReflectionLibrary delegateLibrary,
@@ -361,7 +373,7 @@ final class OtherContextGuestObject implements TruffleObject {
             @TruffleBoundary
             @Specialization(replaces = "doCached")
             static Object doSlowPath(OtherContextException receiver, Message message, Object[] args,
-                            @Bind("this") Node node) throws Exception {
+                            @Bind Node node) throws Exception {
                 return sendImpl(node, receiver.receiverContext.layer, receiver.delegate, message, args, receiver.receiverContext,
                                 receiver.delegateContext,
                                 ReflectionLibrary.getUncached(receiver.delegate),

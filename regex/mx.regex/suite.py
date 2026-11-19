@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -39,12 +39,12 @@
 # SOFTWARE.
 #
 suite = {
-  "mxversion": "7.27.0",
+  "mxversion": "7.65.0",
 
   "name" : "regex",
 
-  "version" : "24.2.0",
-  "release" : False,
+  "version_from" : "truffle",
+  "release_from" : "truffle",
   "groupId" : "org.graalvm.regex",
   "url" : "http://www.graalvm.org/",
   "developer" : {
@@ -67,7 +67,7 @@ suite = {
       },
     ]
   },
-  "ignore_suite_commit_info": True,
+  "capture_suite_commit_info": False,
   "licenses" : {
     "upl" : {
       "name" : "Universal Permissive License, Version 1.0",
@@ -92,10 +92,7 @@ suite = {
         "jdk.unsupported", # sun.misc.Unsafe
       ],
       "annotationProcessors" : ["truffle:TRUFFLE_DSL_PROCESSOR"],
-      "exports" : [
-        "com.oracle.truffle.regex.chardata",
-      ],
-      "checkstyleVersion" : "10.7.0",
+      "checkstyleVersion" : "10.21.0",
       "javaCompliance" : "17+",
       "workingSets" : "Truffle,Regex",
       "spotbugsIgnoresGenerated" : True,
@@ -116,6 +113,8 @@ suite = {
       "checkstyle" : "com.oracle.truffle.regex",
       "javaCompliance" : "17+",
       "workingSets" : "Truffle,Regex",
+      "testProject" : True,
+      "jacoco" : "exclude",
     },
 
     "com.oracle.truffle.regex.test.dummylang" : {
@@ -130,6 +129,8 @@ suite = {
       "checkstyle" : "com.oracle.truffle.regex",
       "javaCompliance" : "17+",
       "workingSets" : "Truffle,Regex",
+      "testProject" : True,
+      "jacoco" : "exclude",
     },
   },
 
@@ -137,6 +138,9 @@ suite = {
     "TREGEX" : {
       "moduleInfo" : {
         "name" : "com.oracle.truffle.regex",
+        "exports": [
+            "com.oracle.truffle.regex.chardata",
+        ],
         "requires" : [
           "java.logging",
           "jdk.unsupported", # sun.misc.Unsafe
@@ -164,19 +168,19 @@ suite = {
       "moduleInfo" : {
         "name" : "com.oracle.truffle.regex.test.dummylang",
         "requires": [
+          "org.graalvm.polyglot",
           "org.graalvm.truffle",
         ],
       },
       "subDir" : "src",
       "dependencies" : ["com.oracle.truffle.regex.test.dummylang"],
       "distDependencies" : [
-        "regex:TREGEX"
-      ],
-      "exclude" : [
+        "regex:TREGEX",
       ],
       "description" : "Truffle regular expressions testing dummy language.",
       "allowsJavadocWarnings": True,
       "maven" : False,
+      "testDistribution": True,
     },
 
     "TREGEX_UNIT_TESTS" : {
@@ -192,6 +196,7 @@ suite = {
         "regex:TREGEX_TEST_DUMMY_LANG",
       ],
       "maven" : False,
+      "testDistribution": True,
     },
 
     "TREGEX_GRAALVM_SUPPORT" : {

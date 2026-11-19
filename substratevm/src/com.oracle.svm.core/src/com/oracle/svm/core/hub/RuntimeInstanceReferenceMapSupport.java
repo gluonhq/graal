@@ -1,0 +1,173 @@
+/*
+ * Copyright (c) 2025, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.hub;
+
+import java.util.Arrays;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
+import com.oracle.svm.core.c.NonmovableArrays;
+import com.oracle.svm.guest.staging.core.heap.InstanceReferenceMapDecoder;
+import com.oracle.svm.guest.staging.core.heap.InstanceReferenceMapDecoder.InstanceReferenceMap;
+import com.oracle.svm.core.heap.InstanceReferenceMapEncoder;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.core.heap.SubstrateReferenceMap;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import com.oracle.svm.core.util.ByteArrayReader;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.core.common.util.UnsafeArrayTypeWriter;
+
+/**
+ * Manages and deduplicates {@link InstanceReferenceMap}s for {@link DynamicHub}s that are loaded at
+ * run-time. Each {@link InstanceReferenceMap} is stored in a {@code byte[]} that lives in the
+ * {@link Metaspace}.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+public class RuntimeInstanceReferenceMapSupport {
+    private final EconomicMap<ReferenceMapHolder, ReferenceMapHolder> refMaps = EconomicMap.create();
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public RuntimeInstanceReferenceMapSupport() {
+    }
+
+    @Fold
+    public static RuntimeInstanceReferenceMapSupport singleton() {
+        return ImageSingletons.lookup(RuntimeInstanceReferenceMapSupport.class);
+    }
+
+    /**
+     * If no matching reference map exists, a new one is created. Otherwise, the existing reference
+     * map is reused.
+     *
+     * @return a compressed offset, relative to the heap base, that points to an
+     *         {@link InstanceReferenceMap}.
+     */
+    public int getOrCreateReferenceMap(DynamicHub superHub, int monitorOffset, int... declaredInstanceReferenceFieldsOffsets) {
+        /* If there are no declared object fields, reuse the reference map from the super class. */
+        if (declaredInstanceReferenceFieldsOffsets.length == 0 && monitorOffset == superHub.getMonitorOffset()) {
+            return superHub.getReferenceMapCompressedOffset();
+        }
+
+        SubstrateReferenceMap map = new SubstrateReferenceMap();
+
+        /*
+         * Add the object fields that are declared and inherited in the super class to the bitmap,
+         * except for the monitor field, which is not inherited by subclasses.
+         */
+        MarkInheritedFieldsInBitmapVisitor markInheritedFields = new MarkInheritedFieldsInBitmapVisitor(map, superHub.getMonitorOffset());
+        InstanceReferenceMap superMap = DynamicHubUtils.getInstanceReferenceMap(superHub);
+        InstanceReferenceMapDecoder.walkReferences(Word.nullPointer(), superMap, markInheritedFields, null);
+
+        /* Mark object fields declared in this class. */
+        for (int offset : declaredInstanceReferenceFieldsOffsets) {
+            map.markReferenceAtOffset(offset, true);
+        }
+
+        assert monitorOffset >= 0 : "Monitor offset must not be negative " + monitorOffset;
+        if (monitorOffset > 0) {
+            map.markReferenceAtOffset(monitorOffset, true);
+        }
+
+        /*
+         * Encode the bitmap as a reference map and check if there is already a matching one. If
+         * there is none, create a new one in the metaspace.
+         */
+        UnsafeArrayTypeWriter buffer = UnsafeArrayTypeWriter.create(ByteArrayReader.supportsUnalignedMemoryAccess());
+        long start = InstanceReferenceMapEncoder.encode(buffer, map.getOffsets());
+        assert start == 0;
+        return putIfAbsent(buffer.toArray());
+    }
+
+    private synchronized int putIfAbsent(byte[] newHeapMap) {
+        ReferenceMapHolder newHeapMapHolder = new ReferenceMapHolder(newHeapMap);
+        ReferenceMapHolder existingMetaspaceMapHolder = refMaps.get(newHeapMapHolder);
+        if (existingMetaspaceMapHolder != null) {
+            return toCompressedOffset(existingMetaspaceMapHolder.refMap);
+        }
+
+        /* Copy the data to the metaspace and store the new reference map in the hash map. */
+        byte[] newMetaspaceMap = Metaspace.singleton().copyToMetaspace(newHeapMap);
+        ReferenceMapHolder newMetaspaceMapHolder = new ReferenceMapHolder(newMetaspaceMap);
+        refMaps.put(newMetaspaceMapHolder, newMetaspaceMapHolder);
+        return toCompressedOffset(newMetaspaceMapHolder.refMap);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static int toCompressedOffset(byte[] metaspaceRefMapArray) {
+        assert Metaspace.singleton().isInAddressSpace(metaspaceRefMapArray);
+
+        NonmovableArray<Byte> array = (NonmovableArray<Byte>) Word.objectToUntrackedPointer(metaspaceRefMapArray);
+        InstanceReferenceMap metaspaceMap = NonmovableArrays.getArrayBase(array);
+        return InstanceReferenceMapEncoder.computeReferenceMapCompressedOffset(metaspaceMap);
+    }
+
+    private record ReferenceMapHolder(byte[] refMap) {
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(refMap);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+
+            ReferenceMapHolder that = (ReferenceMapHolder) o;
+            return Arrays.equals(refMap, that.refMap);
+        }
+    }
+
+    public record MarkInheritedFieldsInBitmapVisitor(SubstrateReferenceMap map, int monitorOffset) implements ObjectReferenceVisitor {
+        @Override
+        public void visitObjectReferences(Pointer firstObjRef, boolean compressed, int referenceSize, Object holderObject, int count) {
+            Pointer pos = firstObjRef;
+            Pointer end = firstObjRef.add(Word.unsigned(count).multiply(referenceSize));
+            while (pos.belowThan(end)) {
+                visitObjectReference(pos, compressed);
+                pos = pos.add(referenceSize);
+            }
+        }
+
+        private void visitObjectReference(Pointer objRef, boolean compressed) {
+            int offset = NumUtil.safeToInt(objRef.rawValue());
+            if (monitorOffset == 0 || offset != monitorOffset) {
+                map.markReferenceAtOffset(offset, compressed);
+            }
+        }
+    }
+}

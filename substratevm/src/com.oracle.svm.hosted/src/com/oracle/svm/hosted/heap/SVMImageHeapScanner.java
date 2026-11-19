@@ -24,11 +24,8 @@
  */
 package com.oracle.svm.hosted.heap;
 
-import java.lang.reflect.Executable;
-import java.lang.reflect.Field;
 import java.util.function.Consumer;
 
-import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.BigBang;
@@ -40,50 +37,43 @@ import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
+import com.oracle.graal.pointsto.util.CompletionExecutor;
+import com.oracle.svm.shared.BuildPhaseProvider;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.hosted.ImageClassLoader;
 import com.oracle.svm.hosted.ameta.AnalysisConstantReflectionProvider;
 import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
 import com.oracle.svm.hosted.reflect.ReflectionHostedSupport;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.OriginalClassProvider;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class SVMImageHeapScanner extends ImageHeapScanner {
 
-    private final ImageClassLoader loader;
-    private final Class<?> economicMapImpl;
-    private final Field economicMapImplEntriesField;
-    private final Field economicMapImplHashArrayField;
-    private final Field economicMapImplTotalEntriesField;
-    private final Field economicMapImplDeletedEntriesField;
+    private final ResolvedJavaType economicMapImplType;
+    private final ResolvedJavaField economicMapImplEntriesField;
+    private final ResolvedJavaField economicMapImplHashArrayField;
+    private final ResolvedJavaField economicMapImplTotalEntriesField;
+    private final ResolvedJavaField economicMapImplDeletedEntriesField;
     private final ReflectionHostedSupport reflectionSupport;
     private final FieldValueInterceptionSupport fieldValueInterceptionSupport;
 
     @SuppressWarnings("this-escape")
-    public SVMImageHeapScanner(BigBang bb, ImageHeap imageHeap, ImageClassLoader loader, AnalysisMetaAccess metaAccess, SnippetReflectionProvider snippetReflection,
+    public SVMImageHeapScanner(BigBang bb, ImageHeap imageHeap, AnalysisMetaAccess metaAccess, SnippetReflectionProvider snippetReflection,
                     ConstantReflectionProvider aConstantReflection, ObjectScanningObserver aScanningObserver, HostedValuesProvider hostedValuesProvider) {
         super(bb, imageHeap, metaAccess, snippetReflection, aConstantReflection, aScanningObserver, hostedValuesProvider);
-        this.loader = loader;
-        economicMapImpl = getClass("org.graalvm.collections.EconomicMapImpl");
-        economicMapImplEntriesField = ReflectionUtil.lookupField(economicMapImpl, "entries");
-        economicMapImplHashArrayField = ReflectionUtil.lookupField(economicMapImpl, "hashArray");
-        economicMapImplTotalEntriesField = ReflectionUtil.lookupField(economicMapImpl, "totalEntries");
-        economicMapImplDeletedEntriesField = ReflectionUtil.lookupField(economicMapImpl, "deletedEntries");
-        ImageSingletons.add(ImageHeapScanner.class, this);
+        economicMapImplType = GuestAccess.get().lookupType("org.graalvm.collections.EconomicMapImpl");
+        economicMapImplEntriesField = JVMCIReflectionUtil.getUniqueDeclaredField(economicMapImplType, "entries");
+        economicMapImplHashArrayField = JVMCIReflectionUtil.getUniqueDeclaredField(economicMapImplType, "hashArray");
+        economicMapImplTotalEntriesField = JVMCIReflectionUtil.getUniqueDeclaredField(economicMapImplType, "totalEntries");
+        economicMapImplDeletedEntriesField = JVMCIReflectionUtil.getUniqueDeclaredField(economicMapImplType, "deletedEntries");
         reflectionSupport = ImageSingletons.lookup(ReflectionHostedSupport.class);
         fieldValueInterceptionSupport = FieldValueInterceptionSupport.singleton();
-    }
-
-    public static ImageHeapScanner instance() {
-        return ImageSingletons.lookup(ImageHeapScanner.class);
-    }
-
-    @Override
-    protected Class<?> getClass(String className) {
-        return loader.findClassOrFail(className);
     }
 
     @Override
@@ -92,8 +82,8 @@ public class SVMImageHeapScanner extends ImageHeapScanner {
     }
 
     @Override
-    public boolean isValueAvailable(AnalysisField field) {
-        return fieldValueInterceptionSupport.isValueAvailable(field);
+    public boolean isValueAvailable(AnalysisField field, JavaConstant receiver) {
+        return fieldValueInterceptionSupport.isValueAvailable(field, receiver);
     }
 
     /**
@@ -104,32 +94,51 @@ public class SVMImageHeapScanner extends ImageHeapScanner {
     @Override
     public JavaConstant readStaticFieldValue(AnalysisField field) {
         AnalysisConstantReflectionProvider aConstantReflection = (AnalysisConstantReflectionProvider) this.constantReflection;
-        return aConstantReflection.readValue(field, null, true);
+        return aConstantReflection.readValue(field, null, true, true);
     }
 
     @Override
-    protected void rescanEconomicMap(EconomicMap<?, ?> map) {
-        super.rescanEconomicMap(map);
+    protected void rescanEconomicMap(JavaConstant map, ScanReason reason) {
+        super.rescanEconomicMap(map, reason);
         /* Make sure any EconomicMapImpl$CollisionLink objects are scanned. */
-        if (map.getClass() == economicMapImpl) {
-            rescanField(map, economicMapImplEntriesField);
-            rescanField(map, economicMapImplHashArrayField);
-            rescanField(map, economicMapImplTotalEntriesField);
-            rescanField(map, economicMapImplDeletedEntriesField);
+        ResolvedJavaType mapType = GuestAccess.get().getProviders().getMetaAccess().lookupJavaType(map);
+        if (economicMapImplType.equals(mapType)) {
+            rescanFieldConstant(map, economicMapImplEntriesField, reason);
+            rescanFieldConstant(map, economicMapImplHashArrayField, reason);
+            rescanFieldConstant(map, economicMapImplTotalEntriesField, reason);
+            rescanFieldConstant(map, economicMapImplDeletedEntriesField, reason);
         }
-
     }
 
     @Override
     protected void onObjectReachable(ImageHeapConstant imageHeapConstant, ScanReason reason, Consumer<ScanReason> onAnalysisModified) {
         super.onObjectReachable(imageHeapConstant, reason, onAnalysisModified);
-        Object object = snippetReflection.asObject(Object.class, imageHeapConstant);
-        if (object instanceof Field field) {
-            reflectionSupport.registerHeapReflectionField(field, reason);
-        } else if (object instanceof Executable executable) {
-            reflectionSupport.registerHeapReflectionExecutable(executable, reason);
-        } else if (object instanceof DynamicHub hub) {
+        JavaConstant hostedObject = imageHeapConstant.getHostedObject();
+        if (hostedObject == null) {
+            return;
+        }
+        ResolvedJavaType type = OriginalClassProvider.getOriginalType(imageHeapConstant.getType());
+        var elements = GuestAccess.elements();
+        if (elements.java_lang_reflect_Field.isAssignableFrom(type)) {
+            reflectionSupport.registerHeapReflectionField(hostedObject, reason);
+        } else if (elements.java_lang_reflect_Executable.isAssignableFrom(type)) {
+            reflectionSupport.registerHeapReflectionExecutable(hostedObject, reason);
+        } else if (snippetReflection.asObject(Object.class, imageHeapConstant) instanceof DynamicHub hub) {
+            // GR-78110: avoid unwrapping the constant once DynamicHub is guest-visible.
             reflectionSupport.registerHeapDynamicHub(hub, reason);
+        }
+    }
+
+    @Override
+    protected void maybeRunInExecutor(CompletionExecutor.DebugContextRunnable task) {
+        if (BuildPhaseProvider.isAnalysisStarted()) {
+            super.maybeRunInExecutor(task);
+        } else {
+            /*
+             * Before the analysis is started post all scanning tasks to the executor. They will be
+             * executed after the analysis starts.
+             */
+            bb.postTask(task);
         }
     }
 }

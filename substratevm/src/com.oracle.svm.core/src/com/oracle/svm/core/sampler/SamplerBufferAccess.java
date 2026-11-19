@@ -25,16 +25,16 @@
 
 package com.oracle.svm.core.sampler;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.Uninterruptible;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -48,7 +48,7 @@ public final class SamplerBufferAccess {
 
     @Fold
     static UnsignedWord getHeaderSize() {
-        return UnsignedUtils.roundUp(SizeOf.unsigned(SamplerBuffer.class), WordFactory.unsigned(ConfigurationValues.getTarget().wordSize));
+        return UnsignedUtils.roundUp(SizeOf.unsigned(SamplerBuffer.class), Word.unsigned(SubstrateTarget.getWordSize()));
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
@@ -56,7 +56,7 @@ public final class SamplerBufferAccess {
         return SamplerBufferAccess.getHeaderSize().add(dataSize);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Accesses a sampler buffer.")
     public static void reinitialize(SamplerBuffer buffer) {
         assert buffer.isNonNull();
         Pointer dataStart = getDataStart(buffer);

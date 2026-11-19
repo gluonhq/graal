@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,8 +40,14 @@
  */
 package org.graalvm.nativeimage.impl;
 
-public interface RuntimeForeignAccessSupport {
-    void registerForDowncall(ConfigurationCondition condition, Object desc, Object... options);
+import java.lang.invoke.MethodHandle;
 
-    void registerForUpcall(ConfigurationCondition condition, Object desc, Object... options);
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+
+public interface RuntimeForeignAccessSupport {
+    void registerForDowncall(AccessCondition condition, Object desc, Object... options);
+
+    void registerForUpcall(AccessCondition condition, Object desc, Object... options);
+
+    void registerForDirectUpcall(AccessCondition condition, MethodHandle target, Object desc, Object... options);
 }

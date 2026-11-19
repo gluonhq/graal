@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2024, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -34,6 +34,7 @@ import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.Cached.Exclusive;
@@ -90,7 +91,9 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
     @CompilationFinal private long nativePointer;
 
     private static long tagSulongFunctionPointer(int id) {
-        return id | SULONG_FUNCTION_POINTER_TAG;
+        // Keep synthetic function pointers aligned. The Itanium C++ ABI uses bit 0 of a member
+        // function pointer to distinguish virtual functions from direct function addresses.
+        return (Integer.toUnsignedLong(id) << 1) | SULONG_FUNCTION_POINTER_TAG;
     }
 
     public LLVMFunction getLLVMFunction() {
@@ -150,15 +153,22 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
     @ExportMessage
     public LLVMFunctionDescriptor toNative() {
         if (nativeWrapper == null) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            nativeWrapper = functionCode.getFunction().createNativeWrapper(this);
-            try {
-                nativePointer = InteropLibrary.getFactory().getUncached().asPointer(nativeWrapper);
-            } catch (UnsupportedMessageException ex) {
-                nativePointer = tagSulongFunctionPointer(llvmFunction.getSymbolIndexIllegalOk());
+            if (CompilerDirectives.isPartialEvaluationConstant(this)) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
             }
+            initNativeWrapper();
         }
         return this;
+    }
+
+    @TruffleBoundary
+    private void initNativeWrapper() {
+        nativeWrapper = functionCode.getFunction().createNativeWrapper(this);
+        try {
+            nativePointer = InteropLibrary.getFactory().getUncached().asPointer(nativeWrapper);
+        } catch (UnsupportedMessageException ex) {
+            nativePointer = tagSulongFunctionPointer(llvmFunction.getSymbolIndexIllegalOk());
+        }
     }
 
     @ExportMessage
@@ -279,14 +289,14 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @Specialization(guards = {"ident == CREATE_NATIVE_CLOSURE", "ctxExtKey != null"})
         static boolean doCreate(@SuppressWarnings("unused") LLVMFunctionDescriptor function, @SuppressWarnings("unused") String ident,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached(value = "getCtxExtKey()", allowUncached = true) ContextExtension.Key<NativeContextExtension> ctxExtKey) {
             return ctxExtKey.get(LLVMContext.get(node)) != null;
         }
 
         @Specialization(guards = {"CREATE_NATIVE_CLOSURE.equals(ident)", "ctxExtKey != null"}, replaces = "doCreate")
         static boolean doEqualsCheck(@SuppressWarnings("unused") LLVMFunctionDescriptor function, @SuppressWarnings("unused") String ident,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached(value = "getCtxExtKey()", allowUncached = true) ContextExtension.Key<NativeContextExtension> ctxExtKey) {
             return doCreate(function, ident, node, ctxExtKey);
         }
@@ -406,7 +416,7 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @Specialization(guards = "ident == CREATE_NATIVE_CLOSURE")
         static Object doCreate(LLVMFunctionDescriptor function, String ident, Object[] args,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached CreateNativeClosureNode createNativeClosure) throws ArityException, UnknownIdentifierException, UnsupportedTypeException {
             assert CREATE_NATIVE_CLOSURE.equals(ident);
             try {
@@ -418,7 +428,7 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @Specialization(guards = "CREATE_NATIVE_CLOSURE.equals(ident)", replaces = "doCreate")
         static Object doEqualsCheck(LLVMFunctionDescriptor function, String ident, Object[] args,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached CreateNativeClosureNode createNativeClosure) throws ArityException, UnknownIdentifierException, UnsupportedTypeException {
             return doCreate(function, ident, args, node, createNativeClosure);
         }
@@ -446,7 +456,7 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @ExportMessage
         Object execute(Object[] args,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached CreateNativeClosureNode createNativeClosure) throws ArityException, UnsupportedMessageException, UnsupportedTypeException {
             return createNativeClosure.execute(node, function, args);
         }
@@ -457,7 +467,7 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @Specialization(guards = {"ident == CREATE_NATIVE_CLOSURE", "ctxExtKey != null"})
         static Object doCreate(LLVMFunctionDescriptor function, String ident,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached(value = "getCtxExtKey()", allowUncached = true) ContextExtension.Key<NativeContextExtension> ctxExtKey,
                         @Cached InlinedBranchProfile exception) throws UnknownIdentifierException {
             assert CREATE_NATIVE_CLOSURE.equals(ident);
@@ -470,7 +480,7 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
         @Specialization(guards = {"CREATE_NATIVE_CLOSURE.equals(ident)", "ctxExtKey != null"}, replaces = "doCreate")
         static Object doEqualsCheck(LLVMFunctionDescriptor function, String ident,
-                        @Bind("$node") Node node,
+                        @Bind Node node,
                         @Cached(value = "getCtxExtKey()", allowUncached = true) ContextExtension.Key<NativeContextExtension> ctxExtKey,
                         @Cached InlinedBranchProfile exception) throws UnknownIdentifierException {
             return doCreate(function, ident, node, ctxExtKey, exception);
@@ -518,9 +528,16 @@ public final class LLVMFunctionDescriptor extends LLVMInternalTruffleObject impl
 
     @ExportMessage
     Object getMembers(@SuppressWarnings("unused") boolean includeInternal,
-                    @Bind("$node") Node node,
+                    @Bind Node node,
                     @Cached(value = "getCtxExtKey()", allowUncached = true) ContextExtension.Key<NativeContextExtension> ctxExtKey) {
         boolean hasCreateNativeClosure = ctxExtKey != null && ctxExtKey.get(LLVMContext.get(node)) != null;
         return new MembersList(hasCreateNativeClosure);
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    boolean isInternal() {
+        CallTarget callTarget = functionCode.getLLVMIRFunctionSlowPath();
+        return callTarget instanceof RootCallTarget rootCallTarget && rootCallTarget.getRootNode().isInternal();
     }
 }

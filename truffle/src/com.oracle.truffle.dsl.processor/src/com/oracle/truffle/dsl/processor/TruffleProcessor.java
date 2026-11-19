@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -58,6 +58,12 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.tools.Diagnostic.Kind;
 
+import com.oracle.truffle.dsl.processor.bytecode.generator.BytecodeDSLCodeGenerator;
+import com.oracle.truffle.dsl.processor.bytecode.generator.InstructionRewriterTestGenerator;
+import com.oracle.truffle.dsl.processor.bytecode.parser.BytecodeDSLParser;
+import com.oracle.truffle.dsl.processor.bytecode.parser.CustomOperationParser;
+import com.oracle.truffle.dsl.processor.bytecode.parser.InstructionRewriterTestParser;
+import com.oracle.truffle.dsl.processor.generator.CodeTypeElementFactory;
 import com.oracle.truffle.dsl.processor.generator.NodeCodeGenerator;
 import com.oracle.truffle.dsl.processor.generator.StaticConstants;
 import com.oracle.truffle.dsl.processor.generator.TypeSystemCodeGenerator;
@@ -144,7 +150,7 @@ public final class TruffleProcessor extends AbstractProcessor {
                 }
             }
         }
-        return false;
+        return true;
     }
 
     private static void processElement(AnnotationProcessor<?> generator, Element e) {
@@ -179,6 +185,9 @@ public final class TruffleProcessor extends AbstractProcessor {
         annotations.add(TruffleTypes.ExportLibrary_Name);
         annotations.add(TruffleTypes.ExportMessage_Name);
         annotations.add(TruffleTypes.ExportLibrary_Repeat_Name);
+        annotations.add(TruffleTypes.GenerateBytecode_Name);
+        annotations.add(TruffleTypes.OperationProxy_Proxyable_Name);
+        annotations.add(TruffleTypes.GenerateInstructionRewriter_Name);
         return annotations;
     }
 
@@ -188,6 +197,9 @@ public final class TruffleProcessor extends AbstractProcessor {
         generators.add(new AnnotationProcessor<>(NodeParser.createDefaultParser(), new NodeCodeGenerator()));
         generators.add(new AnnotationProcessor<>(new LibraryParser(), new LibraryGenerator()));
         generators.add(new AnnotationProcessor<>(new ExportsParser(), new ExportsGenerator(new StaticConstants())));
+        generators.add(new AnnotationProcessor<>(CustomOperationParser.forProxyValidation(), CodeTypeElementFactory.noOpFactory()));
+        generators.add(new AnnotationProcessor<>(new BytecodeDSLParser(), new BytecodeDSLCodeGenerator()));
+        generators.add(new AnnotationProcessor<>(new InstructionRewriterTestParser(), new InstructionRewriterTestGenerator()));
         return generators;
     }
 

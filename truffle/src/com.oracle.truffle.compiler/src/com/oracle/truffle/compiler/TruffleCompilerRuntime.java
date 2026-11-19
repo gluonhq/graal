@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,8 +47,6 @@ import java.util.function.Supplier;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
-import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
@@ -163,40 +161,6 @@ public interface TruffleCompilerRuntime {
      * @param installedCode code that has just been installed in the code cache
      */
     void onCodeInstallation(TruffleCompilable compilable, InstalledCode installedCode);
-
-    /**
-     * Returns Truffle related method information during host compilation. Do not call this method
-     * directly use PartialEvaluator#getMethodInfo instead.
-     *
-     * TODO GR-44222 as soon as the annotation API is available in libgraal this can be moved to the
-     * compiler implementation side.
-     */
-    PartialEvaluationMethodInfo getPartialEvaluationMethodInfo(ResolvedJavaMethod method);
-
-    /**
-     * Returns Truffle related method information during host compilation. Do not call this method
-     * directly use TruffleHostEnvironment#getHostMethodInfo instead.
-     *
-     * TODO GR-44222 as soon as the annotation API is available in libgraal this can be moved to the
-     * compiler implementation side.
-     *
-     * @see #getPartialEvaluationMethodInfo(ResolvedJavaMethod) for guest compilation related
-     *      information.
-     */
-    HostMethodInfo getHostMethodInfo(ResolvedJavaMethod method);
-
-    /**
-     * Gets an object describing how a read of {@code field} can be constant folded based on Truffle
-     * annotations. Do not call this method directly use PartialEvaluator#getConstantFieldInfo
-     * instead.
-     *
-     * TODO GR-44222 as soon as the annotation API is available in libgraal this can be moved to the
-     * compiler implementation side.
-     *
-     * @return {@code null} if there are no constant folding related Truffle annotations on
-     *         {@code field}
-     */
-    ConstantFieldInfo getConstantFieldInfo(ResolvedJavaField field);
 
     /**
      * Gets the {@link TruffleCompilable} represented by {@code constant}.
@@ -348,15 +312,16 @@ public interface TruffleCompilerRuntime {
     ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String className, boolean required);
 
     /**
-     * Determines if {@code type} is a value type. Reference comparisons (==) between value type
-     * instances have undefined semantics and can either return true or false.
-     */
-    boolean isValueType(ResolvedJavaType type);
-
-    /**
      * Determines if the exception which happened during the compilation is suppressed and should be
      * silent.
      */
     boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException);
 
+    /**
+     * Returns {@code true} if Java VM level instrumentation, such as Java Flight Recorder, is
+     * enabled.
+     */
+    default boolean isJavaInstrumentationActive() {
+        return false;
+    }
 }

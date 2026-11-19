@@ -31,7 +31,7 @@ See `language-launcher --help:tools` for more `--cpusampler` options.
 The CPU sampler does not show information about time spent in compiled code. 
 This was, at least in part, motivated by the introduction of multi-tier compilation where "compiled code" was not descriptive enough.
 Using the `--cpusampler.ShowTiers` option allows users to control whether they wish to see compilation data at all, as well as to specify exactly which compilation tiers should be considered in the report.
-For example, adding `--cpusampler.ShowTiers=true` will show all the compilation tiers encountered during execution as shown bellow.
+For example, adding `--cpusampler.ShowTiers=true` will show all the compilation tiers encountered during execution as shown below.
 
 ```
 -----------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -54,7 +54,7 @@ Thread[main,5,main]
 -----------------------------------------------------------------------------------------------------------------------------------------------------------
 ```
 
-Alternatively `--cpusampler.ShowTiers=0,2` will only show interpreted time and time spent in tier two compiled code, as shown bellow.
+Alternatively `--cpusampler.ShowTiers=0,2` will only show interpreted time and time spent in tier two compiled code, as shown below.
 
 ```
 -----------------------------------------------------------------------------------------------------------------------------------------
@@ -110,7 +110,7 @@ While loading the file in such an application may render a graph, it likely will
 
 [Oracle Developer Studio](https://www.oracle.com/technetwork/server-storage/developerstudio/overview/index.html) includes a
 [Performance Analyzer](https://www.oracle.com/technetwork/server-storage/solarisstudio/features/performance-analyzer-2292312.html) that can be used with GraalVM.
-Developer Studio can be [downloaded from OTN](https://www.oracle.com/technetwork/server-storage/developerstudio/downloads/index.html) and the current version at time of writing (12.6) provides a perpetual no-cost license for production use and the development of commercial applications.
+Developer Studio can be [downloaded from Oracle](https://www.oracle.com/tools/developerstudio/downloads/developer-studio-jsp.html) and the current version at time of writing (12.6) provides a perpetual no-cost license for production use and the development of commercial applications.
 
 Using the Developer Studio Performance Analyser is straightforward. Include the path to the Developer Studio binaries in your `PATH` and then prefix your normal command-line with `collect`.
 For example:

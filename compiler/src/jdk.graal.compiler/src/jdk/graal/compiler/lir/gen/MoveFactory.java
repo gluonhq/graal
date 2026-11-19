@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,8 @@
  */
 package jdk.graal.compiler.lir.gen;
 
+import java.util.List;
+
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Equivalence;
 
@@ -34,7 +36,6 @@ import jdk.graal.compiler.lir.VirtualStackSlot;
 import jdk.graal.compiler.lir.framemap.FrameMapBuilder;
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterArray;
 import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.Constant;
@@ -97,7 +98,7 @@ public abstract class MoveFactory {
             this.frameMapBuilder = frameMapBuilder;
         }
 
-        public RegisterBackupPair getScratchRegister(PlatformKind kind) {
+        public RegisterBackupPair getScratchRegister(PlatformKind kind, Register preferredScratchRegister) {
             PlatformKind.Key key = kind.getKey();
             if (categorized == null) {
                 categorized = EconomicMap.create(Equivalence.DEFAULT);
@@ -105,12 +106,19 @@ public abstract class MoveFactory {
                 return categorized.get(key);
             }
 
-            RegisterConfig registerConfig = frameMapBuilder.getRegisterConfig();
+            Register scratchRegister = preferredScratchRegister;
 
-            RegisterArray availableRegister = registerConfig.filterAllocatableRegisters(kind, registerConfig.getAllocatableRegisters());
-            assert availableRegister != null;
-            assert availableRegister.size() > 1 : Assertions.errorMessageContext("availableReg", availableRegister);
-            Register scratchRegister = availableRegister.get(0);
+            if (scratchRegister == null || scratchRegister.equals(Register.None)) {
+                RegisterConfig registerConfig = frameMapBuilder.getRegisterConfig();
+
+                List<Register> availableRegister = registerConfig.filterAllocatableRegisters(kind, registerConfig.getAllocatableRegisters());
+                assert availableRegister != null;
+                assert availableRegister.size() > 1 : Assertions.errorMessageContext("availableReg", availableRegister);
+                // Prefer using the last register to minimize potential conflicts with register
+                // allocation. Note that in HotSpot, the register allocation order differs slightly
+                // from the default order
+                scratchRegister = availableRegister.getLast();
+            }
 
             Architecture arch = frameMapBuilder.getCodeCache().getTarget().arch;
             LIRKind largestKind = LIRKind.value(arch.getLargestStorableKind(scratchRegister.getRegisterCategory()));

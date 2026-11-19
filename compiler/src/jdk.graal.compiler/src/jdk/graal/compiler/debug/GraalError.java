@@ -25,6 +25,8 @@
 package jdk.graal.compiler.debug;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 
 import jdk.vm.ci.code.Architecture;
@@ -36,6 +38,9 @@ public class GraalError extends Error {
 
     private static final long serialVersionUID = 531632331813456233L;
     private final ArrayList<String> context = new ArrayList<>();
+
+    private final transient Object[] arguments;
+    private final String rawFormat;
 
     public static RuntimeException unimplemented(String msg) {
         throw new GraalError("unimplemented: %s", msg);
@@ -244,6 +249,8 @@ public class GraalError extends Error {
      */
     public GraalError(String msg) {
         super(msg);
+        this.rawFormat = msg;
+        this.arguments = null;
     }
 
     /**
@@ -255,8 +262,12 @@ public class GraalError extends Error {
      * @param args parameters to String.format - parameters that implement {@link Iterable} will be
      *            expanded into a [x, x, ...] representation.
      */
+    @SuppressWarnings("this-escape")
     public GraalError(String msg, Object... args) {
         super(format(msg, args));
+        this.rawFormat = msg;
+        this.arguments = args;
+        potentiallyAddContext(args);
     }
 
     /**
@@ -266,14 +277,77 @@ public class GraalError extends Error {
      */
     public GraalError(Throwable cause) {
         super(cause);
+        this.rawFormat = null;
+        this.arguments = null;
     }
 
     /**
      * This constructor creates a {@link GraalError} for a given causing Throwable instance with
      * detailed error message.
      */
+    @SuppressWarnings("this-escape")
     public GraalError(Throwable cause, String msg, Object... args) {
         super(format(msg, args), cause);
+        this.rawFormat = msg;
+        this.arguments = args;
+        potentiallyAddContext(args);
+    }
+
+    /**
+     * Return the raw format String passed into the constructor.
+     */
+    public String getRawFormat() {
+        return rawFormat;
+    }
+
+    /**
+     * Return the arguments passed into the constructor, with {@link Iterable} arguments expanded
+     * into a {@link List}. The expansion is performed by {@link #format(String, Object...)} when it
+     * formats the message for the constructor.
+     */
+    public Object[] getArguments() {
+        return arguments;
+    }
+
+    private void potentiallyAddContext(Object[] args) {
+        // be pessimistic here and ensure better reporting never causes a follow up error that is
+        // unhandled
+        try {
+            if (args != null) {
+                List<String> betterContext = new ArrayList<>();
+                for (int i = 0; i < args.length; i++) {
+                    if (args[i] instanceof Iterable<?>) {
+                        for (Object o : (Iterable<?>) args[i]) {
+                            String potentialBetterString = potentialBetterString(o);
+                            if (potentialBetterString != null) {
+                                betterContext.add(potentialBetterString);
+                            }
+                        }
+                    } else {
+                        String potentialBetterString = potentialBetterString(args[i]);
+                        if (potentialBetterString != null) {
+                            betterContext.add(potentialBetterString);
+                        }
+                    }
+                }
+                if (!betterContext.isEmpty()) {
+                    addContext(Arrays.toString(betterContext.toArray()));
+                }
+            }
+        } catch (Throwable t) {
+            addContext("Intercepted error in potentiallyAddContext: " + t);
+        }
+    }
+
+    private static String potentialBetterString(Object o) {
+        if (o == null) {
+            return null;
+        }
+        Object potentialBetterString = Assertions.decorateObjectErrorContext(o);
+        if (!potentialBetterString.toString().equals(o.toString())) {
+            return potentialBetterString.toString();
+        }
+        return null;
     }
 
     /**
@@ -285,14 +359,20 @@ public class GraalError extends Error {
     public GraalError(GraalError e) {
         super(e);
         context.addAll(e.context);
+        this.rawFormat = null;
+        this.arguments = null;
+    }
+
+    public static GraalError asGraalError(Throwable t) {
+        if (t instanceof GraalError g) {
+            return g;
+        }
+        return new GraalError(t);
     }
 
     @Override
     public String toString() {
-        StringBuilder str = new StringBuilder();
-        str.append(super.toString());
-        str.append(context());
-        return str.toString();
+        return super.toString() + context();
     }
 
     public String context() {

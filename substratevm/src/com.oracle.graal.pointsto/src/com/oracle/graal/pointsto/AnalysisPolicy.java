@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -40,16 +40,18 @@ import com.oracle.graal.pointsto.flow.MethodTypeFlow;
 import com.oracle.graal.pointsto.flow.TypeFlow;
 import com.oracle.graal.pointsto.flow.context.AnalysisContext;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
-import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.heap.ImageHeapRelocatableConstant;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.typestate.MultiTypeState;
 import com.oracle.graal.pointsto.typestate.SingleTypeState;
 import com.oracle.graal.pointsto.typestate.TypeState;
 import com.oracle.graal.pointsto.typestore.ArrayElementsTypeStore;
 import com.oracle.graal.pointsto.typestore.FieldTypeStore;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.svm.common.meta.MethodVariant;
 
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.replacements.nodes.BasicArrayCopyNode;
@@ -68,7 +70,13 @@ public abstract class AnalysisPolicy {
     protected final int maxHeapContextDepth;
     protected final boolean limitObjectArrayLength;
     protected final int maxObjectSetSize;
+    protected final int maxTypeStateObjects;
     protected final boolean hybridStaticContext;
+    protected final boolean useConservativeUnsafeAccess;
+    private final int parsingContextMaxDepth;
+    private final boolean trackAccessChain;
+    protected final int multiTypeStateArrayBitSetThreshold;
+    protected final int multiTypeStateArrayBitSetIntersectionSpeculationThreshold;
 
     public AnalysisPolicy(OptionValues options) {
         this.options = options;
@@ -81,7 +89,16 @@ public abstract class AnalysisPolicy {
         maxHeapContextDepth = PointstoOptions.MaxHeapContextDepth.getValue(options);
         limitObjectArrayLength = PointstoOptions.LimitObjectArrayLength.getValue(options);
         maxObjectSetSize = PointstoOptions.MaxObjectSetSize.getValue(options);
+        maxTypeStateObjects = PointstoOptions.MaxTypeStateObjects.getValue(options);
         hybridStaticContext = PointstoOptions.HybridStaticContext.getValue(options);
+        useConservativeUnsafeAccess = PointstoOptions.UseConservativeUnsafeAccess.getValue(options);
+        trackAccessChain = PointstoOptions.TrackAccessChain.getValue(options);
+        parsingContextMaxDepth = PointstoOptions.ParsingContextMaxDepth.getValue(options);
+        multiTypeStateArrayBitSetThreshold = PointstoOptions.MultiTypeStateArrayBitSetThreshold.getValue(options);
+        multiTypeStateArrayBitSetIntersectionSpeculationThreshold = PointstoOptions.MultiTypeStateArrayBitSetIntersectionSpeculationThreshold.getValue(options);
+        AnalysisError.guarantee(multiTypeStateArrayBitSetIntersectionSpeculationThreshold >= multiTypeStateArrayBitSetThreshold,
+                        "The MultiTypeStateArrayBitSetIntersectionSpeculationThreshold (%d) should always be larger than MultiTypeStateArrayBitSetThreshold (%d)",
+                        multiTypeStateArrayBitSetIntersectionSpeculationThreshold, multiTypeStateArrayBitSetThreshold);
     }
 
     public abstract boolean isContextSensitiveAnalysis();
@@ -114,8 +131,24 @@ public abstract class AnalysisPolicy {
         return maxObjectSetSize;
     }
 
+    public int maxTypeStateObjects() {
+        return maxTypeStateObjects;
+    }
+
     public boolean useHybridStaticContext() {
         return hybridStaticContext;
+    }
+
+    public boolean useConservativeUnsafeAccess() {
+        return useConservativeUnsafeAccess;
+    }
+
+    public boolean trackAccessChain() {
+        return trackAccessChain;
+    }
+
+    public int parsingContextMaxDepth() {
+        return parsingContextMaxDepth;
     }
 
     public abstract MethodTypeFlow createMethodTypeFlow(PointsToAnalysisMethod method);
@@ -152,7 +185,19 @@ public abstract class AnalysisPolicy {
     public abstract AnalysisObject createConstantObject(PointsToAnalysis bb, JavaConstant constant, AnalysisType exactType);
 
     /** Wrap a constant into a type state abstraction. */
-    public abstract TypeState constantTypeState(PointsToAnalysis bb, JavaConstant constant, AnalysisType exactType);
+    public final TypeState constantTypeState(PointsToAnalysis bb, JavaConstant constant, AnalysisType exactType) {
+        if (constant instanceof ImageHeapRelocatableConstant relocatableConstant) {
+            /*
+             * Relocatable constants are placeholders for unknown non-null objects supplied by a
+             * later layer. Both analysis policies must model them with the type's summary object.
+             */
+            return TypeState.forType(bb, relocatableConstant.getType(), false);
+        }
+        return concreteConstantTypeState(bb, constant, exactType);
+    }
+
+    /** Wrap a non-relocatable constant using the policy-specific representation. */
+    protected abstract TypeState concreteConstantTypeState(PointsToAnalysis bb, JavaConstant constant, AnalysisType exactType);
 
     /** Create type state for dynamic new instance. */
     public abstract TypeState dynamicNewInstanceState(PointsToAnalysis bb, TypeState currentState, TypeState newState, BytecodePosition allocationSite, AnalysisContext allocationContext);
@@ -166,26 +211,27 @@ public abstract class AnalysisPolicy {
      */
     public abstract void linkClonedObjects(PointsToAnalysis bb, TypeFlow<?> inputFlow, CloneTypeFlow cloneFlow, BytecodePosition source);
 
-    public abstract FieldTypeStore createFieldTypeStore(PointsToAnalysis bb, AnalysisObject object, AnalysisField field, AnalysisUniverse universe);
+    public abstract FieldTypeStore createFieldTypeStore(PointsToAnalysis bb, AnalysisObject object, PointsToAnalysisField field, AnalysisUniverse universe);
 
     public abstract ArrayElementsTypeStore createArrayElementsTypeStore(AnalysisObject object, AnalysisUniverse universe);
 
     /** Provides implementation for the virtual invoke type flow. */
     public abstract AbstractVirtualInvokeTypeFlow createVirtualInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethod.MultiMethodKey callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariant.MethodVariantKey callerMethodVariantKey);
 
     /** Provides implementation for the special invoke type flow. */
     public abstract AbstractSpecialInvokeTypeFlow createSpecialInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethod.MultiMethodKey callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariant.MethodVariantKey callerMethodVariantKey);
 
     /** Provides implementation for the static invoke type flow. */
     public abstract AbstractStaticInvokeTypeFlow createStaticInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethod.MultiMethodKey callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariant.MethodVariantKey callerMethodVariantKey);
 
     public abstract InvokeTypeFlow createDeoptInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethod.MultiMethodKey callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariant.MethodVariantKey callerMethodVariantKey);
 
-    public abstract MethodFlowsGraphInfo staticRootMethodGraph(PointsToAnalysis bb, PointsToAnalysisMethod method);
+    /** Get the method flows graph; trigger parsing and create the flows graph if necessary. */
+    public abstract MethodFlowsGraphInfo getOrCreateMethodGraph(PointsToAnalysis bb, PointsToAnalysisMethod method);
 
     public abstract AnalysisContext allocationContext(PointsToAnalysis bb, MethodFlowsGraph callerGraph);
 
@@ -287,5 +333,21 @@ public abstract class AnalysisPolicy {
      */
     protected static boolean areTypesCompatibleForSystemArraycopy(AnalysisType srcType, AnalysisType dstType) {
         return dstType.isAssignableFrom(srcType) || srcType.isAssignableFrom(dstType);
+    }
+
+    /**
+     * @return The maximum number of types represented in {@link MultiTypeState} as an array before
+     *         converting to bitset-based implementation.
+     */
+    public int multiTypeStateArrayBitSetThreshold() {
+        return multiTypeStateArrayBitSetThreshold;
+    }
+
+    /**
+     * @return The maximum number of types on which the analysis should speculate that the result
+     *         will be small enough to be array-based.
+     */
+    public int multiTypeStateArrayBitSetIntersectionSpeculationThreshold() {
+        return multiTypeStateArrayBitSetIntersectionSpeculationThreshold;
     }
 }

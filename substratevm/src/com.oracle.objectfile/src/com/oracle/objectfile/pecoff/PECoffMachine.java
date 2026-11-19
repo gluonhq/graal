@@ -31,6 +31,8 @@ import com.oracle.objectfile.pecoff.PECoff.IMAGE_FILE_HEADER;
 import com.oracle.objectfile.pecoff.PECoff.IMAGE_RELOCATION;
 import com.oracle.objectfile.pecoff.PECoffRelocationTable.PECoffRelocationMethod;
 
+import jdk.graal.compiler.serviceprovider.GraalServices;
+
 /**
  * PECoff machine type (incomplete). Each machine type also defines its set of relocation types.
  */
@@ -54,6 +56,8 @@ public enum PECoffMachine/* implements Integral */ {
                         return PECoffX86_64Relocation.ADDR32;
                     case PC_RELATIVE_4:
                         return PECoffX86_64Relocation.REL32;
+                    case ADDR32NB_4:
+                        return PECoffX86_64Relocation.ADDR32NB;
                     case SECTION_2:
                         return PECoffX86_64Relocation.SECTION;
                     case SECREL_4:
@@ -85,7 +89,7 @@ public enum PECoffMachine/* implements Integral */ {
     }
 
     public static PECoffMachine getSystemNativeValue() {
-        String arch = System.getProperty("os.arch");
+        String arch = GraalServices.getSavedProperty("os.arch");
         return switch (arch) {
             case "amd64", "x86_64" -> X86_64;
             default -> throw new IllegalArgumentException("Unsupported PECoff machine type: " + arch);
@@ -125,10 +129,16 @@ enum PECoffX86_64Relocation implements PECoffRelocationMethod {
             return IMAGE_RELOCATION.IMAGE_REL_AMD64_ADDR32;
         }
     },
-    SECREL {
+    ADDR32NB {
         @Override
         public long toLong() {
-            return IMAGE_RELOCATION.IMAGE_REL_AMD64_SECREL;
+            return IMAGE_RELOCATION.IMAGE_REL_AMD64_ADDR32NB;
+        }
+    },
+    REL32 {
+        @Override
+        public long toLong() {
+            return IMAGE_RELOCATION.IMAGE_REL_AMD64_REL32;
         }
     },
     SECTION {
@@ -137,10 +147,10 @@ enum PECoffX86_64Relocation implements PECoffRelocationMethod {
             return IMAGE_RELOCATION.IMAGE_REL_AMD64_SECTION;
         }
     },
-    REL32 {
+    SECREL {
         @Override
         public long toLong() {
-            return IMAGE_RELOCATION.IMAGE_REL_AMD64_REL32;
+            return IMAGE_RELOCATION.IMAGE_REL_AMD64_SECREL;
         }
     };
 }

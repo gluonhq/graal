@@ -123,6 +123,9 @@ public final class HotSpotZapRegistersPhase extends PostAllocationOptimizationPh
                             destroyedRegisters.remove(reg);
                         }
                     };
+                    // Zap insertion only needs the clobbering side of @UseKill, so it is grouped
+                    // with temps in this single pass.
+                    inst.visitEachUseKill(tempConsumer);
                     inst.visitEachTemp(tempConsumer);
                     inst.visitEachOutput(defConsumer);
 

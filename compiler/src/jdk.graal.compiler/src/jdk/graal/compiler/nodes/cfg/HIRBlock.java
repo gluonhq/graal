@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,6 +29,7 @@ import static jdk.graal.compiler.core.common.cfg.AbstractControlFlowGraph.INVALI
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 
 import org.graalvm.word.LocationIdentity;
 
@@ -80,9 +81,29 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
     private LocationSet killLocations;
     private LocationSet killLocationsBetweenThisAndDominator;
 
+    private boolean canUseBlockAsSpillTarget = true;
+    private boolean fastPathBlock;
+
     HIRBlock(AbstractBeginNode node, ControlFlowGraph cfg) {
         super(cfg);
         this.beginNode = node;
+    }
+
+    @Override
+    public void setCanUseBlockAsSpillTarget(boolean canUseBlockAsSpillTarget) {
+        this.canUseBlockAsSpillTarget = canUseBlockAsSpillTarget;
+    }
+
+    @Override
+    public boolean canUseBlockAsSpillTarget() {
+        return canUseBlockAsSpillTarget;
+    }
+
+    @Override
+    public void resetDominators() {
+        super.resetDominators();
+        postdominator = INVALID_BLOCK_ID;
+        fastPathBlock = false;
     }
 
     public AbstractBeginNode getBeginNode() {
@@ -111,6 +132,15 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
     @Override
     public boolean isLoopHeader() {
         return getBeginNode() instanceof LoopBeginNode;
+    }
+
+    @Override
+    public boolean isFastPathBlock() {
+        return fastPathBlock;
+    }
+
+    public void markFastPathBlock() {
+        fastPathBlock = true;
     }
 
     @Override
@@ -162,6 +192,9 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
 
         @Override
         public FixedNode next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
             FixedNode result = cur;
             if (result instanceof FixedWithNextNode) {
                 FixedWithNextNode fixedWithNextNode = (FixedWithNextNode) result;
@@ -253,6 +286,8 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
         }
         return sb.toString();
     }
+
+    public abstract ModifiableBlock copyWithBegin(AbstractBeginNode newBegin, ControlFlowGraph newCFG);
 
     /**
      * Get the relative Frequency of a basic block.
@@ -569,6 +604,7 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
          * blocks being deleted during LIR control flow optimization.
          */
         private boolean markedAsLoopEnd = false;
+        private boolean markedAsLoopHeader = false;
         /**
          * Index into {@link #getBlocks} of this block's first predecessor.
          */
@@ -596,6 +632,27 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
 
         ModifiableBlock(AbstractBeginNode node, ControlFlowGraph cfg) {
             super(node, cfg);
+        }
+
+        @Override
+        public ModifiableBlock copyWithBegin(AbstractBeginNode newBegin, ControlFlowGraph newCFG) {
+            ModifiableBlock b = new ModifiableBlock(newBegin, newCFG);
+            if (isLoopEnd()) {
+                b.markedAsLoopEnd = true;
+            }
+            if (isLoopHeader()) {
+                b.markedAsLoopHeader = true;
+            }
+            return b;
+        }
+
+        @Override
+        public boolean isLoopHeader() {
+            return markedAsLoopHeader || super.isLoopHeader();
+        }
+
+        public void markAsLoopHeader() {
+            this.markedAsLoopHeader = true;
         }
 
         @Override
@@ -681,7 +738,6 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
             this.firstPredecessor = firstPredecessor;
         }
 
-        @SuppressWarnings("unchecked")
         public void setPredecessors(int firstPredecessor, int[] extraPredecessors) {
             this.firstPredecessor = firstPredecessor;
             this.extraPredecessors = extraPredecessors;
@@ -692,7 +748,6 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
             firstSuccessorProbability = 1.0D;
         }
 
-        @SuppressWarnings("unchecked")
         public void setSuccessors(int firstSuccessor, int secondSuccessor, double firstSuccP, double secondSuccP) {
             this.firstSuccessor = firstSuccessor;
             this.secondSuccessor = secondSuccessor;
@@ -700,7 +755,6 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
             this.secondSuccessorProbability = secondSuccP;
         }
 
-        @SuppressWarnings("unchecked")
         public void setSuccessors(int firstSuccessor, int secondSuccessor, int[] extraSuccessors, double firstSuccP, double secondSuccP, double[] restSuccP) {
             this.firstSuccessor = firstSuccessor;
             this.secondSuccessor = secondSuccessor;
@@ -727,7 +781,7 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
             GraalError.guarantee(getSuccessorCount() == 1, "can only delete blocks with exactly one successor.");
             ModifiableBlock next = (ModifiableBlock) getSuccessorAt(0);
             int predecessorCount = getPredecessorCount();
-            for (int i = 0; i < getPredecessorCount(); i++) {
+            for (int i = 0; i < predecessorCount; i++) {
                 ModifiableBlock pred = (ModifiableBlock) getPredecessorAt(i);
                 int[] newPredSuccs = new int[pred.getSuccessorCount()];
                 double[] newPredSuccP = new double[pred.getSuccessorCount()];
@@ -735,11 +789,10 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
                     HIRBlock predSuccAt = pred.getSuccessorAt(j);
                     if (predSuccAt == this) {
                         newPredSuccs[j] = next.getId();
-                        newPredSuccP[j] = pred.getSuccessorProbabilityAt(0);
                     } else {
-                        newPredSuccP[j] = pred.getSuccessorProbabilityAt(j);
                         newPredSuccs[j] = predSuccAt.getId();
                     }
+                    newPredSuccP[j] = pred.getSuccessorProbabilityAt(j);
                 }
                 if (newPredSuccs.length == 1) {
                     pred.setSuccessor(newPredSuccs[0]);
@@ -758,15 +811,19 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
                 }
             }
             if (isLoopEnd()) {
-                GraalError.guarantee(next.isLoopHeader(), "a loop end's successor must be a loop header");
+                GraalError.guarantee(next.isLoopHeader(), "a loop end's successor must be a loop header, this=%s next=%s", this.getBeginNode(), next.getBeginNode());
                 next.numBackedges += predecessorCount - 1;
+            }
+
+            if (isLoopHeader()) {
+                next.markAsLoopHeader();
             }
 
             ArrayList<HIRBlock> newPreds = new ArrayList<>();
             for (int i = 0; i < next.getPredecessorCount(); i++) {
                 HIRBlock curPred = next.getPredecessorAt(i);
                 if (curPred == this) {
-                    for (int j = 0; j < getPredecessorCount(); j++) {
+                    for (int j = 0; j < predecessorCount; j++) {
                         newPreds.add(getPredecessorAt(j));
                     }
                 } else {
@@ -801,6 +858,11 @@ public abstract class HIRBlock extends BasicBlock<HIRBlock> {
 
         UnmodifiableBlock(AbstractBeginNode node, ControlFlowGraph cfg) {
             super(node, cfg);
+        }
+
+        @Override
+        public ModifiableBlock copyWithBegin(AbstractBeginNode newBegin, ControlFlowGraph newCFG) {
+            throw unsupported("do not use control flow graph transplant early in the compilation pipeline"); // ExcludeFromJacocoGeneratedReport
         }
 
         @Override

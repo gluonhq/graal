@@ -33,6 +33,8 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -47,8 +49,11 @@ import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.AnnotationValue;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.ArrayType;
+import javax.lang.model.type.TypeMirror;
 import javax.tools.Diagnostic.Kind;
 import javax.tools.FileObject;
 import javax.tools.StandardLocation;
@@ -70,14 +75,17 @@ import jdk.graal.compiler.processor.AbstractProcessor;
 @SupportedAnnotationTypes({BasedOnJDKFileProcessor.ANNOTATION_CLASS_NAME, BasedOnJDKFileProcessor.ANNOTATION_LIST_CLASS_NAME})
 public class BasedOnJDKFileProcessor extends AbstractProcessor {
 
-    static final String ANNOTATION_CLASS_NAME = "com.oracle.svm.core.util.BasedOnJDKFile";
-    static final String ANNOTATION_LIST_CLASS_NAME = "com.oracle.svm.core.util.BasedOnJDKFile.List";
-    static final Pattern FILE_PATTERN = Pattern
-                    .compile("^https://github.com/openjdk/jdk/blob/(?<committish>[^/]+)/(?<path>[-_.A-Za-z0-9][-_./A-Za-z0-9]*)(#L(?<lineStart>[0-9]+)(-L(?<lineEnd>[0-9]+))?)?$");
-    static final String FILE_PATTERN_STR = "https://github.com/openjdk/jdk/blob/<tag|revision>/path/to/file.ext(#L[0-9]+(-L[0-9]+)?)?";
+    static final String ANNOTATION_CLASS_NAME = "com.oracle.svm.shared.util.BasedOnJDKFile";
+    static final String ANNOTATION_LIST_CLASS_NAME = "com.oracle.svm.shared.util.BasedOnJDKFile.List";
+    static final Pattern BLOB_PATTERN = Pattern
+                    .compile("^https://github.com/graalvm/labs-openjdk/blob/(?<committish>[^/]+)/(?<path>[-_.A-Za-z0-9][-_./A-Za-z0-9]*)(#L(?<lineStart>[0-9]+)(-L(?<lineEnd>[0-9]+))?)?$");
+    static final String BLOB_PATTERN_STR = "https://github.com/graalvm/labs-openjdk/blob/<tag|revision>/path/to/file.ext[#L<from>[-L<to>]]";
+    static final Pattern TREE_PATTERN = Pattern
+                    .compile("^https://github.com/graalvm/labs-openjdk/tree/(?<committish>[^/]+)/(?<path>[-_.A-Za-z0-9][-_./A-Za-z0-9]*[-_.A-Za-z0-9](?<trailingSlash>/)?)$");
+    static final String TREE_PATTERN_STR = "https://github.com/graalvm/labs-openjdk/tree/<tag|revision>/path/to/dir/";
     public static final int FULL_FILE_LINE_MARKER = 0;
 
-    private final Set<Element> processed = new HashSet<>();
+    private final Set<Element> processed = new HashSet<>(); // noEconomicSet(dependencies)
     private Trees trees;
     private boolean isECJ = false;
 
@@ -131,10 +139,14 @@ public class BasedOnJDKFileProcessor extends AbstractProcessor {
             return;
         }
 
-        String qualifiedName = getQualifiedName(annotatedElement);
+        String qualifiedShortName = getQualifiedName(annotatedElement);
+        String qualifiedSignature = getQualifiedSignature(annotatedElement);
+        String simpleName = getSimpleName(annotatedElement);
+        String qualifiedName = qualifiedShortName + qualifiedSignature;
+        String qualifiedNameHash = byteArrayToHexString(sha256encode(qualifiedName));
 
         Element[] originatingElements = new Element[]{annotatedElement};
-        String uniqueName = getUniqueName(qualifiedName, targetSourceInfo.committish, targetSourceInfo.path, targetSourceInfo.lineStart, targetSourceInfo.lineEnd);
+        String uniqueName = getUniqueName(qualifiedName, qualifiedNameHash, simpleName, targetSourceInfo.committish, targetSourceInfo.path, targetSourceInfo.lineStart, targetSourceInfo.lineEnd);
 
         String filename = "jdk_source_info/" + URLEncoder.encode(uniqueName, StandardCharsets.UTF_8) + ".json";
         SourceInfo annotatedSourceInfo = getAnnotatedSourceInfo(annotatedElement);
@@ -160,6 +172,23 @@ public class BasedOnJDKFileProcessor extends AbstractProcessor {
         }
     }
 
+    private static byte[] sha256encode(String text) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return digest.digest(text.getBytes(StandardCharsets.UTF_8));
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String byteArrayToHexString(byte[] a) {
+        StringBuilder sb = new StringBuilder(a.length * 2);
+        for (byte b : a) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
     private static String getQualifiedName(Element annotatedElement) {
         if (annotatedElement instanceof TypeElement typeElement) {
             return typeElement.getQualifiedName().toString();
@@ -172,30 +201,88 @@ public class BasedOnJDKFileProcessor extends AbstractProcessor {
             TypeElement enclosingElement = (TypeElement) variableElement.getEnclosingElement();
             return enclosingElement.getQualifiedName().toString() + "#" + variableElement.getSimpleName();
         }
+        if (annotatedElement instanceof PackageElement packageElement) {
+            return packageElement.getQualifiedName().toString();
+        }
         throw new RuntimeException("Unexpected element class: " + annotatedElement.getClass().getSimpleName());
     }
 
-    private SourceInfo parseBasedOnJDKFileAnnotation(String annotationValue) {
-        Matcher matcher = FILE_PATTERN.matcher(annotationValue);
-        if (!matcher.matches()) {
-            env().getMessager().printMessage(ERROR, String.format("Invalid path: %s%nShould be %s", annotationValue, FILE_PATTERN_STR));
-            return null;
-        }
-        String lineStartStr = matcher.group("lineStart");
-        String lineEndStr = matcher.group("lineEnd");
-        long lineStart = lineStartStr == null ? FULL_FILE_LINE_MARKER : Long.parseLong(lineStartStr);
-        final long lineEnd;
-        if (lineEndStr == null) {
-            if (lineStartStr != null) {
-                // no lineEnd but lineStart -> single line url
-                lineEnd = lineStart;
-            } else {
-                lineEnd = FULL_FILE_LINE_MARKER;
+    private static String getSimpleName(Element annotatedElement) {
+        if (annotatedElement instanceof ExecutableElement executableElement) {
+            TypeElement enclosingElement = (TypeElement) executableElement.getEnclosingElement();
+            String simpleName = executableElement.getSimpleName().toString();
+            if ("<init>".equals(simpleName)) {
+                // constructor
+                return enclosingElement.getSimpleName().toString();
             }
-        } else {
-            lineEnd = Long.parseLong(lineEndStr);
+            return enclosingElement.getSimpleName().toString() + "#" + simpleName;
         }
-        return new SourceInfo(matcher.group("committish"), matcher.group("path"), lineStart, lineEnd);
+        return null;
+    }
+
+    private static String getQualifiedSignature(Element annotatedElement) {
+        if (annotatedElement instanceof ExecutableElement executableElement) {
+            return getMethodDescriptor(executableElement);
+        }
+        return "";
+    }
+
+    private static String getDescriptorForClass(TypeMirror c) {
+        return switch (c.getKind()) {
+            case BOOLEAN -> "Z";
+            case BYTE -> "B";
+            case CHAR -> "C";
+            case SHORT -> "S";
+            case INT -> "I";
+            case LONG -> "J";
+            case FLOAT -> "F";
+            case DOUBLE -> "D";
+            case VOID -> "V";
+            case ARRAY -> "[" + getDescriptorForClass(((ArrayType) c).getComponentType());
+            case DECLARED -> "L" + c.toString().replace('.', '/') + ";";
+            default -> throw new RuntimeException("Unexpected null type: " + c);
+        };
+    }
+
+    private static String getMethodDescriptor(ExecutableElement m) {
+        String s = "(";
+        for (var parameter : m.getParameters()) {
+            s += getDescriptorForClass(parameter.asType());
+        }
+        s += ')';
+        return s + getDescriptorForClass(m.getReturnType());
+    }
+
+    private SourceInfo parseBasedOnJDKFileAnnotation(String annotationValue) {
+        Matcher blobMatcher = BLOB_PATTERN.matcher(annotationValue);
+        if (blobMatcher.matches()) {
+            String lineStartStr = blobMatcher.group("lineStart");
+            String lineEndStr = blobMatcher.group("lineEnd");
+            long lineStart = lineStartStr == null ? FULL_FILE_LINE_MARKER : Long.parseLong(lineStartStr);
+            final long lineEnd;
+            if (lineEndStr == null) {
+                if (lineStartStr != null) {
+                    // no lineEnd but lineStart -> single line url
+                    lineEnd = lineStart;
+                } else {
+                    lineEnd = FULL_FILE_LINE_MARKER;
+                }
+            } else {
+                lineEnd = Long.parseLong(lineEndStr);
+            }
+            return new SourceInfo(blobMatcher.group("committish"), blobMatcher.group("path"), lineStart, lineEnd);
+        }
+        Matcher treeMatcher = TREE_PATTERN.matcher(annotationValue);
+        if (treeMatcher.matches()) {
+            if (treeMatcher.group("trailingSlash") == null) {
+                env().getMessager().printMessage(ERROR, String.format("Invalid path: %s%nTree references should end with a slash (/). Please replace with:%n%s/", annotationValue, annotationValue));
+                return null;
+            }
+            String path = treeMatcher.group("path");
+            return new SourceInfo(treeMatcher.group("committish"), path, FULL_FILE_LINE_MARKER, FULL_FILE_LINE_MARKER);
+        }
+        env().getMessager().printMessage(ERROR, String.format("Invalid path: %s%nShould be either %s%nor%n%s", annotationValue, BLOB_PATTERN_STR, TREE_PATTERN_STR));
+        return null;
     }
 
     private SourceInfo getAnnotatedSourceInfo(Element annotatedElement) {
@@ -212,8 +299,15 @@ public class BasedOnJDKFileProcessor extends AbstractProcessor {
         return new SourceInfo(null, sourceFileName, lineMap.getLineNumber(start), lineMap.getLineNumber(end));
     }
 
-    private static String getUniqueName(String qualifiedName, String committish, String path, long lineStart, long lineEnd) {
-        return String.format("%s/%s/%s-%s/%s", committish, path, lineStart, lineEnd, qualifiedName);
+    private static String getUniqueName(String qualifiedName, String qualifiedNameHash, String simpleName, String committish, String path, long lineStart, long lineEnd) {
+        String strippedPath = path.charAt(path.length() - 1) == '/' ? path.substring(0, path.length() - 1) : path;
+        if (simpleName == null) {
+            // packages, classes
+            return String.format("%s/%s/%s-%s/%s", committish, strippedPath, lineStart, lineEnd, qualifiedName);
+        } else {
+            // methods, ctors
+            return String.format("%s/%s/%s-%s/%s_%s", committish, strippedPath, lineStart, lineEnd, simpleName, qualifiedNameHash);
+        }
     }
 
     private static void printSourceInfo(PrintWriter writer, SourceInfo annotatedSourceInfo, String indent) {

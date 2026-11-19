@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,9 +37,9 @@ import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.LIRValueUtil;
 import jdk.graal.compiler.lir.Opcode;
+import jdk.graal.compiler.lir.StandardOp;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.DiagnosticLIRGeneratorTool;
-
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.CallingConvention;
@@ -53,7 +53,7 @@ import jdk.vm.ci.meta.Value;
 
 public class AMD64Call {
 
-    public abstract static class CallOp extends AMD64LIRInstruction {
+    public abstract static class CallOp extends AMD64LIRInstruction implements StandardOp.CallOp {
         public static final LIRInstructionClass<CallOp> TYPE = LIRInstructionClass.create(CallOp.class);
 
         @Def({OperandFlag.REG, OperandFlag.ILLEGAL}) protected Value result;
@@ -61,10 +61,14 @@ public class AMD64Call {
         @Temp({OperandFlag.REG, OperandFlag.STACK}) protected Value[] temps;
         @State protected LIRFrameState state;
 
-        protected CallOp(LIRInstructionClass<? extends CallOp> c, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
+        @Def({OperandFlag.REG, OperandFlag.STACK}) protected Value[] additionalReturns;
+
+        protected CallOp(LIRInstructionClass<? extends CallOp> c, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
             super(c);
             this.result = result;
             this.parameters = parameters;
+            this.additionalReturns = additionalReturns;
             this.state = state;
             this.temps = addStackSlotsToTemporaries(parameters, temps);
             assert temps != null;
@@ -81,19 +85,25 @@ public class AMD64Call {
 
         protected final ResolvedJavaMethod callTarget;
 
-        protected MethodCallOp(LIRInstructionClass<? extends MethodCallOp> c, ResolvedJavaMethod callTarget, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
-            super(c, result, parameters, temps, state);
+        protected MethodCallOp(LIRInstructionClass<? extends MethodCallOp> c, ResolvedJavaMethod callTarget, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
+            super(c, result, parameters, temps, additionalReturns, state);
             this.callTarget = callTarget;
         }
-
     }
 
     @Opcode("CALL_DIRECT")
     public abstract static class DirectCallOp extends MethodCallOp {
         public static final LIRInstructionClass<DirectCallOp> TYPE = LIRInstructionClass.create(DirectCallOp.class);
 
-        protected DirectCallOp(LIRInstructionClass<? extends DirectCallOp> c, ResolvedJavaMethod callTarget, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
-            super(c, callTarget, result, parameters, temps, state);
+        protected DirectCallOp(LIRInstructionClass<? extends DirectCallOp> c, ResolvedJavaMethod callTarget, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
+            super(c, callTarget, result, parameters, temps, additionalReturns, state);
+        }
+
+        protected DirectCallOp(LIRInstructionClass<? extends DirectCallOp> c, ResolvedJavaMethod callTarget, Value result,
+                        Value[] parameters, Value[] temps, LIRFrameState state) {
+            super(c, callTarget, result, parameters, temps, Value.NO_VALUES, state);
         }
     }
 
@@ -107,9 +117,9 @@ public class AMD64Call {
             this(TYPE, callTarget, result, parameters, temps, targetAddress, state);
         }
 
-        protected IndirectCallOp(LIRInstructionClass<? extends IndirectCallOp> c, ResolvedJavaMethod callTarget, Value result, Value[] parameters, Value[] temps, Value targetAddress,
-                        LIRFrameState state) {
-            super(c, callTarget, result, parameters, temps, state);
+        protected IndirectCallOp(LIRInstructionClass<? extends IndirectCallOp> c, ResolvedJavaMethod callTarget, Value result,
+                        Value[] parameters, Value[] temps, Value targetAddress, LIRFrameState state) {
+            super(c, callTarget, result, parameters, temps, Value.NO_VALUES, state);
             this.targetAddress = targetAddress;
         }
 
@@ -130,8 +140,9 @@ public class AMD64Call {
 
         protected final ForeignCallLinkage callTarget;
 
-        public ForeignCallOp(LIRInstructionClass<? extends ForeignCallOp> c, ForeignCallLinkage callTarget, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
-            super(c, result, parameters, temps, state);
+        public ForeignCallOp(LIRInstructionClass<? extends ForeignCallOp> c, ForeignCallLinkage callTarget, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
+            super(c, result, parameters, temps, additionalReturns, state);
             this.callTarget = callTarget;
         }
 
@@ -150,8 +161,9 @@ public class AMD64Call {
     public static final class DirectNearForeignCallOp extends ForeignCallOp {
         public static final LIRInstructionClass<DirectNearForeignCallOp> TYPE = LIRInstructionClass.create(DirectNearForeignCallOp.class);
 
-        public DirectNearForeignCallOp(ForeignCallLinkage linkage, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
-            super(TYPE, linkage, result, parameters, temps, state);
+        public DirectNearForeignCallOp(ForeignCallLinkage linkage, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
+            super(TYPE, linkage, result, parameters, temps, additionalReturns, state);
         }
 
         @Override
@@ -166,8 +178,9 @@ public class AMD64Call {
 
         @Temp({OperandFlag.REG}) protected AllocatableValue callTemp;
 
-        public DirectFarForeignCallOp(ForeignCallLinkage callTarget, Value result, Value[] parameters, Value[] temps, LIRFrameState state) {
-            super(TYPE, callTarget, result, parameters, temps, state);
+        public DirectFarForeignCallOp(ForeignCallLinkage callTarget, Value result,
+                        Value[] parameters, Value[] temps, Value[] additionalReturns, LIRFrameState state) {
+            super(TYPE, callTarget, result, parameters, temps, additionalReturns, state);
             /*
              * The register allocator does not support virtual registers that are used at the call
              * site, so use a fixed register.
@@ -197,7 +210,7 @@ public class AMD64Call {
             }
             crb.recordExceptionHandlers(after, info);
             if (masm.position() == after) {
-                masm.postCallNop(call);
+                crb.postCallNop(call, info);
             }
         };
         if (scratch != null) {
@@ -240,7 +253,7 @@ public class AMD64Call {
             checkCallDisplacementAlignment(crb, before, call);
             crb.recordExceptionHandlers(after, info);
             if (masm.position() == after) {
-                masm.postCallNop(call);
+                crb.postCallNop(call, info);
             }
         }, callTarget);
     }
@@ -289,7 +302,7 @@ public class AMD64Call {
             Call call = crb.recordIndirectCall(before, after, callTarget, info);
             crb.recordExceptionHandlers(after, info);
             if (masm.position() == after) {
-                masm.postCallNop(call);
+                crb.postCallNop(call, info);
             }
         };
         return masm.indirectCall(postCallAction, dst, mitigateDecodingAsDirectCall, callTarget, callingConventionType);

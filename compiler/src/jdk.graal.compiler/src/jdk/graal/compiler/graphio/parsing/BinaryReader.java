@@ -91,6 +91,8 @@ import jdk.graal.compiler.graphio.parsing.model.InputGraph;
 public class BinaryReader implements GraphParser, ModelControl {
     private static final Logger LOG = Logger.getLogger(BinaryReader.class.getName());
 
+    static final boolean TRACE_PARSE_TIME = false;
+
     private final Logger instLog;
 
     private final DataSource dataSource;
@@ -103,7 +105,7 @@ public class BinaryReader implements GraphParser, ModelControl {
 
     private final Builder builder;
 
-    private static class ErrorReporter {
+    private static final class ErrorReporter {
         /**
          * Accumulates names of objects as they are parsed out of stream Used to report context for
          * irrecoverable errors which happen during reading BGV stream.
@@ -184,7 +186,7 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
-    private static class ContextStrings {
+    private static final class ContextStrings {
         private static String propertyGraph(Object s) {
             return String.format("Property %s graph", s);
         }
@@ -240,12 +242,14 @@ public class BinaryReader implements GraphParser, ModelControl {
 
     private final ErrorReporter reporter;
 
-    private abstract static class Member implements LengthToString {
-        final Klass holder;
-        final int accessFlags;
-        final String name;
+    public abstract static class Member implements LengthToString {
+        public final Klass holder;
+        public final int accessFlags;
+        public final String name;
 
         private Member(Klass holder, String name, int accessFlags) {
+            assert holder != null : "GraphElements.methodDeclaringClass must not return null!";
+            assert name != null;
             this.holder = holder;
             this.accessFlags = accessFlags;
             this.name = name;
@@ -279,10 +283,11 @@ public class BinaryReader implements GraphParser, ModelControl {
     }
 
     public static final class Method extends Member {
-        final Signature signature;
+        public final Signature signature;
         public final byte[] code;
 
-        /* package-private */ Method(String name, Signature signature, byte[] code, Klass holder, int accessFlags) {
+        /* package-private */
+        public Method(String name, Signature signature, byte[] code, Klass holder, int accessFlags) {
             super(holder, name, accessFlags);
             this.signature = signature;
             this.code = code;
@@ -340,12 +345,12 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
-    /* package-private */ static final class Signature {
+    public static final class Signature {
         public final String returnType;
         public final String[] argTypes;
         private final int hash;
 
-        Signature(String returnType, String[] argTypes) {
+        public Signature(String returnType, String[] argTypes) {
             this.returnType = returnType;
             this.argTypes = argTypes;
             this.hash = toString().hashCode();
@@ -380,10 +385,10 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
-    /* package-private */ static final class Field extends Member {
+    public static final class Field extends Member {
         public final String type;
 
-        Field(String type, Klass holder, String name, int accessFlags) {
+        public Field(String type, Klass holder, String name, int accessFlags) {
             super(holder, name, accessFlags);
             this.type = type;
         }
@@ -413,7 +418,7 @@ public class BinaryReader implements GraphParser, ModelControl {
         public final String simpleName;
         private final int hash;
 
-        Klass(String name) {
+        public Klass(String name) {
             this.name = name;
             String simple;
             try {
@@ -467,17 +472,35 @@ public class BinaryReader implements GraphParser, ModelControl {
 
     }
 
-    /* package-private */ static final class EnumKlass extends Klass {
+    public static final class EnumKlass extends Klass {
         public final String[] values;
+        public final EnumValue[] enums;
+        private volatile int hashCode = 0;
 
-        EnumKlass(String name, String[] values) {
+        public EnumKlass(String name, String[] values) {
             super(name);
             this.values = values;
+            this.enums = new EnumValue[values.length];
+            for (int i = 0; i < values.length; i++) {
+                this.enums[i] = new EnumValue(this, i);
+            }
+        }
+
+        EnumValue get(int ordinal) {
+            if (ordinal >= 0 && ordinal < enums.length) {
+                return enums[ordinal];
+            }
+            return new EnumValue(this, ordinal);
         }
 
         @Override
         public int hashCode() {
-            return super.hash * 31 + Arrays.hashCode(values);
+            int h = hashCode;
+            if (h == 0) {
+                h = Objects.hash(super.hashCode(), Arrays.hashCode(values));
+                hashCode = h;
+            }
+            return h;
         }
 
         @Override
@@ -490,9 +513,9 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
-    /* package-private */ static final class EnumValue implements LengthToString {
-        EnumKlass enumKlass;
-        int ordinal;
+    public static final class EnumValue implements LengthToString {
+        public EnumKlass enumKlass;
+        public int ordinal;
 
         EnumValue(EnumKlass enumKlass, int ordinal) {
             this.enumKlass = enumKlass;
@@ -643,7 +666,7 @@ public class BinaryReader implements GraphParser, ModelControl {
             case POOL_ENUM: {
                 EnumKlass enumClass = readPoolObject(EnumKlass.class);
                 int ordinal = dataSource.readInt();
-                obj = new EnumValue(enumClass, ordinal);
+                obj = enumClass.get(ordinal);
                 break;
             }
             case POOL_NODE_CLASS: {
@@ -805,6 +828,7 @@ public class BinaryReader implements GraphParser, ModelControl {
         hashStack.push(null);
 
         boolean restart = false;
+        long start = System.nanoTime();
         try {
             while (true) { // TERMINATION ARGUMENT: finite length of data source will result in
                            // EOFException eventually.
@@ -828,6 +852,11 @@ public class BinaryReader implements GraphParser, ModelControl {
         } finally {
             // also terminates the builder
             closeDanglingGroups();
+            if (TRACE_PARSE_TIME) {
+                long end = System.nanoTime();
+                System.err.println(((System.nanoTime() - timeStart) / 1_000_000) + " Parsed file in " + ((end - start) / 1_000_000) + " ms");
+            }
+
         }
         return builder.rootDocument();
     }
@@ -987,7 +1016,10 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
+    private static final long timeStart = System.nanoTime();
+
     private InputGraph parseGraph(int dumpId, String format, Object[] args, boolean toplevel) throws IOException {
+        long start = System.nanoTime();
         InputGraph g = builder.startGraph(dumpId, format, args);
         try {
             parseProperties();
@@ -1011,6 +1043,10 @@ public class BinaryReader implements GraphParser, ModelControl {
             // we have to finish the graph.
             reporter.popContext();
             g = builder.endGraph();
+            if (TRACE_PARSE_TIME) {
+                long end = System.nanoTime();
+                System.err.println(((System.nanoTime() - timeStart) / 1_000_000) + " Parsed " + dumpId + " " + String.format(format, args) + " in " + ((end - start) / 1000000) + " ms");
+            }
         }
         return g;
     }
@@ -1046,7 +1082,7 @@ public class BinaryReader implements GraphParser, ModelControl {
         }
     }
 
-    private void createEdges(int id, int preds, List<? extends Port> portList, EdgeBuilder factory) throws IOException {
+    private void createEdges(int id, int startNum, List<? extends Port> portList, EdgeBuilder factory) throws IOException {
         int portNum = 0;
         for (Port p : portList) {
             if (p.isList) {
@@ -1054,18 +1090,14 @@ public class BinaryReader implements GraphParser, ModelControl {
                 for (int j = 0; j < size; j++) {
                     int in = dataSource.readInt();
                     p.ids.add(in);
-                    if (in >= 0) {
-                        factory.edge(p, in, id, (char) (preds + portNum), j);
-                        portNum++;
-                    }
+                    factory.edge(p, in, id, (char) (startNum + portNum), j);
+                    portNum++;
                 }
             } else {
                 int in = dataSource.readInt();
                 p.ids.add(in);
-                if (in >= 0) {
-                    factory.edge(p, in, id, (char) (preds + portNum), -1);
-                    portNum++;
-                }
+                factory.edge(p, in, id, (char) (startNum + portNum), -1);
+                portNum++;
             }
             p.ids = new ArrayList<>();
         }

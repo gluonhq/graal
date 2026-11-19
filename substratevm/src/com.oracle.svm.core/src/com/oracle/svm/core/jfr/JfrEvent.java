@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,21 +24,21 @@
  */
 package com.oracle.svm.core.jfr;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.collections.EnumBitmask;
 import com.oracle.svm.core.thread.JavaThreads;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.collections.EnumBitmask;
 
 /**
  * This file contains the VM-level events that Native Image supports on all JDK versions. The event
  * IDs depend on the JDK version (see metadata.xml file) and are computed at image build time.
  */
 public final class JfrEvent {
-    public static final JfrEvent ThreadStart = create("jdk.ThreadStart");
+    public static final JfrEvent ThreadStart = create("jdk.ThreadStart", 4);
     public static final JfrEvent ThreadEnd = create("jdk.ThreadEnd");
     public static final JfrEvent ThreadCPULoad = create("jdk.ThreadCPULoad");
     public static final JfrEvent DataLoss = create("jdk.DataLoss");
@@ -60,39 +60,55 @@ public final class JfrEvent {
     public static final JfrEvent SafepointBegin = create("jdk.SafepointBegin", JfrEventFlags.HasDuration);
     public static final JfrEvent SafepointEnd = create("jdk.SafepointEnd", JfrEventFlags.HasDuration);
     public static final JfrEvent ExecuteVMOperation = create("jdk.ExecuteVMOperation", JfrEventFlags.HasDuration);
-    public static final JfrEvent JavaMonitorEnter = create("jdk.JavaMonitorEnter", JfrEventFlags.HasDuration);
-    public static final JfrEvent ThreadPark = create("jdk.ThreadPark", JfrEventFlags.HasDuration);
-    public static final JfrEvent JavaMonitorWait = create("jdk.JavaMonitorWait", JfrEventFlags.HasDuration);
-    public static final JfrEvent JavaMonitorInflate = create("jdk.JavaMonitorInflate", JfrEventFlags.HasDuration);
-    public static final JfrEvent ObjectAllocationInNewTLAB = create("jdk.ObjectAllocationInNewTLAB");
+    public static final JfrEvent JavaMonitorEnter = create("jdk.JavaMonitorEnter", 5, JfrEventFlags.HasDuration);
+    public static final JfrEvent ThreadPark = create("jdk.ThreadPark", 5, JfrEventFlags.HasDuration);
+    public static final JfrEvent JavaMonitorWait = create("jdk.JavaMonitorWait", 5, JfrEventFlags.HasDuration);
+    public static final JfrEvent JavaMonitorInflate = create("jdk.JavaMonitorInflate", 5, JfrEventFlags.HasDuration);
+    public static final JfrEvent ObjectAllocationInNewTLAB = create("jdk.ObjectAllocationInNewTLAB", 5);
+    public static final JfrEvent ObjectAllocationOutsideTLAB = create("jdk.ObjectAllocationOutsideTLAB", 5);
     public static final JfrEvent GCHeapSummary = create("jdk.GCHeapSummary");
     public static final JfrEvent ThreadAllocationStatistics = create("jdk.ThreadAllocationStatistics");
-    public static final JfrEvent SystemGC = create("jdk.SystemGC", JfrEventFlags.HasDuration);
-    public static final JfrEvent AllocationRequiringGC = create("jdk.AllocationRequiringGC");
-    public static final JfrEvent OldObjectSample = create("jdk.OldObjectSample");
-    public static final JfrEvent ObjectAllocationSample = create("jdk.ObjectAllocationSample", JfrEventFlags.SupportsThrottling);
+    public static final JfrEvent SystemGC = create("jdk.SystemGC", 5, JfrEventFlags.HasDuration);
+    public static final JfrEvent AllocationRequiringGC = create("jdk.AllocationRequiringGC", 5);
+    public static final JfrEvent OldObjectSample = create("jdk.OldObjectSample", 7);
+    public static final JfrEvent ObjectAllocationSample = create("jdk.ObjectAllocationSample", 5, JfrEventFlags.SupportsThrottling);
     public static final JfrEvent NativeMemoryUsage = create("jdk.NativeMemoryUsage");
     public static final JfrEvent NativeMemoryUsageTotal = create("jdk.NativeMemoryUsageTotal");
+    public static final JfrEvent DumpReason = create("jdk.DumpReason");
+    public static final JfrEvent Shutdown = create("jdk.Shutdown", 5);
 
     private final long id;
     private final String name;
     private final int flags;
+    private final int skipCount;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public static JfrEvent create(String name, JfrEventFlags... flags) {
-        return new JfrEvent(name, flags);
+    private static JfrEvent create(String name, JfrEventFlags... flags) {
+        return new JfrEvent(name, -1, flags);
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    private JfrEvent(String name, JfrEventFlags... flags) {
+    private static JfrEvent create(String name, int skipCount, JfrEventFlags... flags) {
+        return new JfrEvent(name, skipCount, flags);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private JfrEvent(String name, int skipCount, JfrEventFlags... flags) {
         this.id = JfrMetadataTypeLibrary.lookupPlatformEvent(name);
         this.name = name;
         this.flags = EnumBitmask.computeBitmask(flags);
+        this.skipCount = skipCount;
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public long getId() {
         return id;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public int getSkipCount() {
+        assert skipCount >= 0 : "method may only be called for events that need a stack trace";
+        return skipCount;
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)

@@ -29,7 +29,6 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.stream.Stream;
 
-import org.graalvm.nativeimage.AnnotationAccess;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.nativeimage.hosted.Feature;
@@ -38,6 +37,7 @@ import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jni.CallVariant;
 import com.oracle.svm.core.jni.functions.JNIFunctionTables;
 import com.oracle.svm.core.jni.functions.JNIFunctions;
@@ -46,8 +46,11 @@ import com.oracle.svm.core.jni.functions.JNIFunctions.UnimplementedWithJavaVMArg
 import com.oracle.svm.core.jni.functions.JNIInvocationInterface;
 import com.oracle.svm.core.jni.headers.JNIInvokeInterface;
 import com.oracle.svm.core.jni.headers.JNINativeInterface;
-import com.oracle.svm.core.meta.MethodPointer;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.BeforeCompilationAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.CompilationAccessImpl;
@@ -59,6 +62,7 @@ import com.oracle.svm.hosted.code.CEntryPointCallStubSupport;
 import com.oracle.svm.hosted.code.CEntryPointData;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedType;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -68,6 +72,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * Prepares the initialization of the JNI function table structures at image generation time,
  * creating and registering methods that implement JNI functions as necessary.
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = SingleLayer.class)
 public class JNIFunctionTablesFeature implements Feature {
 
     private final EnumSet<JavaKind> jniKinds = EnumSet.of(JavaKind.Object, JavaKind.Boolean, JavaKind.Byte, JavaKind.Char,
@@ -92,6 +97,11 @@ public class JNIFunctionTablesFeature implements Feature {
     private StructInfo invokeInterfaceMetadata;
 
     @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
+    @Override
     public List<Class<? extends Feature>> getRequiredFeatures() {
         return Arrays.asList(JNIAccessFeature.class);
     }
@@ -113,12 +123,11 @@ public class JNIFunctionTablesFeature implements Feature {
         AnalysisType invokes = metaAccess.lookupJavaType(JNIInvocationInterface.class);
         AnalysisType exports = metaAccess.lookupJavaType(JNIInvocationInterface.Exports.class);
         AnalysisType functions = metaAccess.lookupJavaType(JNIFunctions.class);
-        Stream<AnalysisMethod> analysisMethods = Stream.of(invokes, functions, exports).filter(type -> type != null).flatMap(type -> Stream.of(type.getDeclaredMethods(false)));
+        Stream<AnalysisMethod> analysisMethods = Stream.of(invokes, functions, exports).flatMap(type -> Stream.of(type.getDeclaredMethods(false)));
         Stream<AnalysisMethod> unimplementedMethods = Stream.of((AnalysisMethod) getSingleMethod(metaAccess, UnimplementedWithJNIEnvArgument.class),
                         (AnalysisMethod) getSingleMethod(metaAccess, UnimplementedWithJavaVMArgument.class));
         Stream.concat(analysisMethods, unimplementedMethods).forEach(method -> {
-            CEntryPoint annotation = AnnotationAccess.getAnnotation(method, CEntryPoint.class);
-            assert annotation != null : "only entry points allowed in class";
+            assert GuestAnnotationAccess.isAnnotationPresent(method, CEntryPoint.class) : "only entry points allowed in class";
             CEntryPointCallStubSupport.singleton().registerStubForMethod(method, () -> {
                 CEntryPointData data = CEntryPointData.create(method);
                 if (!SubstrateOptions.JNIExportSymbols.getValue() && data.getPublishAs() != CEntryPoint.Publish.NotPublished) {
@@ -142,7 +151,7 @@ public class JNIFunctionTablesFeature implements Feature {
         HostedMethod hostedTrampoline = access.getUniverse().lookup(analysisTrampoline);
         hostedTrampoline.compilationInfo.setCustomParseFunction(trampolineMethod.createCustomParseFunction());
         hostedTrampoline.compilationInfo.setCustomCompileFunction(trampolineMethod.createCustomCompileFunction());
-        return new MethodPointer(hostedTrampoline);
+        return MethodRefSupport.createMethodPointer(hostedTrampoline);
     }
 
     private static ResolvedJavaMethod getSingleMethod(MetaAccessProvider metaAccess, Class<?> holder) {
@@ -153,7 +162,7 @@ public class JNIFunctionTablesFeature implements Feature {
 
     private static CFunctionPointer getStubFunctionPointer(CompilationAccessImpl access, HostedMethod method) {
         AnalysisMethod stub = CEntryPointCallStubSupport.singleton().getStubForMethod(method.getWrapped());
-        return new MethodPointer(access.getUniverse().lookup(stub));
+        return MethodRefSupport.createMethodPointer(access.getUniverse().lookup(stub));
     }
 
     private void fillJNIInvocationInterfaceTable(CompilationAccessImpl access) {

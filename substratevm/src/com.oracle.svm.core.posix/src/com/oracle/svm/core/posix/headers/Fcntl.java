@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,8 @@ package com.oracle.svm.core.posix.headers;
 
 import static org.graalvm.nativeimage.c.function.CFunction.Transition.NO_TRANSITION;
 
+import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.shared.Uninterruptible;
 import org.graalvm.nativeimage.c.CContext;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
@@ -42,6 +44,9 @@ public class Fcntl {
 
     @CConstant
     public static native int O_RDONLY();
+
+    @CConstant
+    public static native int O_CLOEXEC();
 
     @CConstant
     public static native int O_NOFOLLOW();
@@ -73,6 +78,26 @@ public class Fcntl {
 
         @CFunction(transition = NO_TRANSITION)
         public static native int unlinkat(int dirfd, CCharPointer pathname, int flags);
+
+        @Uninterruptible(reason = "LibC.errno() must not be overwritten accidentally.")
+        public static int restartableOpen(CCharPointer directory, int flags, int mode) {
+            int result;
+            do {
+                result = open(directory, flags, mode);
+            } while (result == -1 && LibC.errno() == Errno.EINTR());
+
+            return result;
+        }
+
+        @Uninterruptible(reason = "LibC.errno() must not be overwritten accidentally.")
+        public static int restartableOpenat(int fd, @CConst CCharPointer filename, int flags, int mode) {
+            int result;
+            do {
+                result = openat(fd, filename, flags, mode);
+            } while (result == -1 && LibC.errno() == Errno.EINTR());
+
+            return result;
+        }
 
     }
 }

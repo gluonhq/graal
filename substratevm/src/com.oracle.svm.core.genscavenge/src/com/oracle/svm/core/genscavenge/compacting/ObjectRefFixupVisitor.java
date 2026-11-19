@@ -24,56 +24,77 @@
  */
 package com.oracle.svm.core.genscavenge.compacting;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import java.lang.ref.Reference;
 
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.genscavenge.HeapImpl;
 import com.oracle.svm.core.genscavenge.ObjectHeaderImpl;
-import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.core.genscavenge.DerivedReferenceUpdater;
+import com.oracle.svm.core.heap.DerivedReferenceSupport;
 import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.core.heap.UninterruptibleObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import org.graalvm.word.impl.Word;
 
 /**
  * Updates each reference after marking and before compaction to point to the referenced object's
  * future location.
  */
-public final class ObjectRefFixupVisitor implements ObjectReferenceVisitor {
-    @Override
-    public boolean visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
-        return visitObjectReferenceInline(objRef, 0, compressed, holderObject);
-    }
+public final class ObjectRefFixupVisitor implements UninterruptibleObjectReferenceVisitor {
+    private final DerivedReferenceUpdater derivedRefUpdater = new DerivedReferenceUpdater();
 
     @Override
     @AlwaysInline("GC performance")
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    public boolean visitObjectReferenceInline(Pointer objRef, int innerOffset, boolean compressed, Object holderObject) {
-        assert innerOffset == 0;
+    public void visitObjectReferences(Pointer firstObjRef, boolean compressed, int referenceSize, Object holderObject, int count) {
+        Pointer pos = firstObjRef;
+        Pointer end = firstObjRef.add(Word.unsigned(count).multiply(referenceSize));
+        while (pos.belowThan(end)) {
+            visitObjectReference(pos, compressed, holderObject);
+            pos = pos.add(referenceSize);
+        }
+    }
+
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
         Pointer p = ReferenceAccess.singleton().readObjectAsUntrackedPointer(objRef, compressed);
-        if (p.isNull() || HeapImpl.getHeapImpl().isInImageHeap(p)) {
-            return true;
+        if (p.isNull() || HeapImpl.getHeapImpl().isInImageHeap(p) || Metaspace.singleton().isInAddressSpace(p)) {
+            return;
         }
 
-        Object obj;
-        Object original = p.toObject();
+        Object original = p.toObjectNonNull();
         if (ObjectHeaderImpl.isAlignedObject(original)) {
             Pointer newLocation = ObjectMoveInfo.getNewObjectAddress(p);
             assert newLocation.isNonNull() //
                             || holderObject == null // references from CodeInfo, invalidated or weak
                             || holderObject instanceof Reference<?>; // cleared referent
 
-            obj = newLocation.toObject();
+            Object obj = newLocation.toObject();
             ReferenceAccess.singleton().writeObjectAt(objRef, obj, compressed);
-        } else {
-            obj = original;
         }
-        if (HeapImpl.usesImageHeapCardMarking() && HeapImpl.getHeapImpl().isInImageHeap(holderObject)) {
-            RememberedSet.get().dirtyCardIfNecessary(holderObject, obj);
-        }
-        return true;
+        // Note that image heap cards have already been cleaned and re-marked during the scan
+    }
+
+    @Override
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void visitDerivedReferenceBase(Pointer baseObjRef, boolean compressed, int referenceSize, Object holderObject) {
+        derivedRefUpdater.captureBaseBeforeUpdate(baseObjRef, compressed);
+        visitObjectReference(baseObjRef, compressed, holderObject);
+        derivedRefUpdater.captureBaseAfterUpdate(baseObjRef, compressed);
+    }
+
+    @Override
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void visitDerivedReference(Pointer baseObjRef, Pointer derivedObjRef, boolean compressed, Object holderObject) {
+        Pointer derivedBefore = DerivedReferenceSupport.readReferenceAsPointer(derivedObjRef, compressed);
+        derivedRefUpdater.updateDerivedReference(derivedObjRef, compressed, derivedBefore);
     }
 }

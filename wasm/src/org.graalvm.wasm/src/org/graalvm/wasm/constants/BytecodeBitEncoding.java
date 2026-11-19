@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,21 +47,23 @@ package org.graalvm.wasm.constants;
 public class BytecodeBitEncoding {
     // Labels
 
-    public static final int LABEL_U8_RESULT_MASK = 0b1100_0000;
-    public static final int LABEL_U8_RESULT_NUM = 0b1000_0000;
-    public static final int LABEL_U8_RESULT_OBJ = 0b1100_0000;
-    public static final int LABEL_U8_STACK_VALUE = 0b0011_1111;
+    public static final int LABEL_U8_VALUE_TYPE_MASK = 0b1100_0000;
+    public static final int LABEL_U8_VALUE_TYPE_NONE = 0b0000_0000;
+    public static final int LABEL_U8_VALUE_TYPE_NUM = 0b0100_0000;
+    public static final int LABEL_U8_VALUE_TYPE_OBJ = 0b1000_0000;
+    public static final int LABEL_U8_VALUE_TYPE_SHIFT = 6;
+    public static final int LABEL_U8_STACK_SIZE = 0b0011_1111;
 
-    public static final int LABEL_U16_RESULT_TYPE_MASK = 0b1100_0000;
-    public static final int LABEL_U16_RESULT_TYPE_NUM = 0b0100_0000;
-    public static final int LABEL_U16_RESULT_TYPE_OBJ = 0b1000_0000;
-    public static final int LABEL_U16_RESULT_TYPE_MIX = 0b1100_0000;
-    public static final int LABEL_U16_RESULT_TYPE_SHIFT = 6;
-    public static final int LABEL_U16_RESULT_VALUE = 0b0011_1111;
+    public static final int LABEL_U16_VALUE_TYPE_MASK = 0b1100_0000;
+    public static final int LABEL_U16_VALUE_TYPE_NUM = 0b0100_0000;
+    public static final int LABEL_U16_VALUE_TYPE_OBJ = 0b1000_0000;
+    public static final int LABEL_U16_VALUE_TYPE_MIX = 0b1100_0000;
+    public static final int LABEL_U16_VALUE_TYPE_SHIFT = 6;
+    public static final int LABEL_U16_ARITY = 0b0011_1111;
 
-    public static final int LABEL_RESULT_TYPE_NUM = 0b0000_0001;
-    public static final int LABEL_RESULT_TYPE_OBJ = 0b0000_0010;
-    public static final int LABEL_RESULT_TYPE_MIX = 0b0000_0011;
+    public static final int LABEL_VALUE_TYPE_NUM = 0b0000_0001;
+    public static final int LABEL_VALUE_TYPE_OBJ = 0b0000_0010;
+    public static final int LABEL_VALUE_TYPE_MIX = 0b0000_0011;
 
     public static final int MEMORY_64_FLAG = 0b1000_0000;
     public static final int MEMORY_INDEX_MASK = 0b0110_0000;
@@ -105,17 +107,9 @@ public class BytecodeBitEncoding {
     public static final int DATA_SEG_MEMORY_INDEX_I32 = 0b1100_0000;
     public static final int DATA_SEG_MEMORY_INDEX_VALUE = 0b0011_1111;
 
-    // Runtime data sections
-    public static final int DATA_SEG_RUNTIME_HEADER_LENGTH = 1;
-    public static final int DATA_SEG_RUNTIME_LENGTH_MASK = 0b1100_0000;
-    public static final int DATA_SEG_RUNTIME_LENGTH_INLINE = 0b0000_0000;
-    public static final int DATA_SEG_RUNTIME_LENGTH_U8 = 0b0100_0000;
-    public static final int DATA_SEG_RUNTIME_LENGTH_U16 = 0b1000_0000;
-    public static final int DATA_SEG_RUNTIME_LENGTH_I32 = 0b1100_0000;
-    public static final int DATA_SEG_RUNTIME_UNSAFE_ADDRESS_LENGTH = 8;
-
     // Elem sections
 
+    // byte 1
     public static final int ELEM_SEG_COUNT_MASK = 0b1100_0000;
     public static final int ELEM_SEG_COUNT_U8 = 0b0100_0000;
     public static final int ELEM_SEG_COUNT_U16 = 0b1000_0000;
@@ -127,20 +121,22 @@ public class BytecodeBitEncoding {
     public static final int ELEM_SEG_TABLE_INDEX_U16 = 0b0010_0000;
     public static final int ELEM_SEG_TABLE_INDEX_I32 = 0b0011_0000;
 
-    public static final int ELEM_SEG_OFFSET_BYTECODE_MASK = 0b0000_1100;
-    public static final int ELEM_SEG_OFFSET_BYTECODE_UNDEFINED = 0b0000_0000;
-    public static final int ELEM_SEG_OFFSET_BYTECODE_LENGTH_U8 = 0b0000_0100;
-    public static final int ELEM_SEG_OFFSET_BYTECODE_LENGTH_U16 = 0b0000_1000;
-    public static final int ELEM_SEG_OFFSET_BYTECODE_LENGTH_I32 = 0b0000_1100;
+    public static final int ELEM_SEG_BYTECODE_OR_OFFSET_MASK = 0b0000_1000;
+    public static final int ELEM_SEG_BYTECODE = 0b0000_0000;
+    public static final int ELEM_SEG_OFFSET = 0b0000_1000;
 
-    public static final int ELEM_SEG_OFFSET_ADDRESS_MASK = 0b0000_0011;
-    public static final int ELEM_SEG_OFFSET_ADDRESS_UNDEFINED = 0b0000_0000;
-    public static final int ELEM_SEG_OFFSET_ADDRESS_U8 = 0b0000_0001;
-    public static final int ELEM_SEG_OFFSET_ADDRESS_U16 = 0b0000_0010;
-    public static final int ELEM_SEG_OFFSET_ADDRESS_I32 = 0b0000_0011;
+    public static final int ELEM_SEG_VALUE_MASK = 0b0000_0111;
+    public static final int ELEM_SEG_VALUE_UNDEFINED = 0b0000_0000;
+    public static final int ELEM_SEG_VALUE_U8 = 0b0000_0001;
+    public static final int ELEM_SEG_VALUE_U16 = 0b0000_0010;
+    public static final int ELEM_SEG_VALUE_U32 = 0b0000_0011;
+    public static final int ELEM_SEG_VALUE_I64 = 0b0000_0100;
 
-    public static final int ELEM_SEG_TYPE_FUNREF = 0b0001_0000;
-    public static final int ELEM_SEG_TYPE_EXTERNREF = 0b0010_0000;
+    // byte 2
+    public static final int ELEM_SEG_TYPE_MASK = 0b0011_0000;
+    public static final int ELEM_SEG_TYPE_I8 = 0b0001_0000;
+    public static final int ELEM_SEG_TYPE_I16 = 0b0010_0000;
+    public static final int ELEM_SEG_TYPE_I32 = 0b0011_0000;
 
     public static final int ELEM_SEG_MODE_VALUE = 0b0000_1111;
 
@@ -148,7 +144,7 @@ public class BytecodeBitEncoding {
 
     public static final int ELEM_ITEM_TYPE_MASK = 0b1000_0000;
     public static final int ELEM_ITEM_TYPE_FUNCTION_INDEX = 0b0000_0000;
-    public static final int ELEM_ITEM_TYPE_GLOBAL_INDEX = 0b1000_0000;
+    public static final int ELEM_ITEM_TYPE_BYTECODE = 0b1000_0000;
 
     public static final int ELEM_ITEM_LENGTH_MASK = 0b0110_0000;
     public static final int ELEM_ITEM_LENGTH_INLINE = 0b0000_0000;
@@ -156,9 +152,8 @@ public class BytecodeBitEncoding {
     public static final int ELEM_ITEM_LENGTH_U16 = 0b0100_0000;
     public static final int ELEM_ITEM_LENGTH_I32 = 0b0110_0000;
 
-    public static final int ELEM_ITEM_NULL_FLAG = 0b0001_0000;
-
-    public static final int ELEM_ITEM_INLINE_VALUE = 0b0000_1111;
+    public static final int ELEM_ITEM_INLINE_VALUE = 0b0001_1111;
+    public static final int ELEM_ITEM_MAX_INLINE_VALUE = ELEM_ITEM_INLINE_VALUE;
 
     // Code entries
 
@@ -181,4 +176,12 @@ public class BytecodeBitEncoding {
 
     public static final int CODE_ENTRY_LOCALS_FLAG = 0b0000_0010;
     public static final int CODE_ENTRY_RESULT_FLAG = 0b0000_0001;
+
+    // Exception handlers
+
+    public static final int INVALID_EXCEPTION_TABLE_OFFSET = -1;
+
+    public static final int BR_TABLE_U8_HEADER_SIZE = 4;
+    public static final int BR_TABLE_I32_HEADER_SIZE = 7;
+    public static final int BR_TABLE_ITEM_SIZE = 6;
 }

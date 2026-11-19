@@ -1,0 +1,17 @@
+[[rule]]
+files = "*"
+all = [
+    "christian.haeubl@oracle.com",
+]
+any = [
+]
+[[rule]]
+files = "RuntimeClassLoading.java RuntimeDynamicHubMetadata.java RuntimeReflectionMetadata.java"
+all = [
+    "gilles.m.duboscq@oracle.com",
+]
+[[rule]]
+files = ["DynamicHub.java", "DynamicHubCompanion.java"]
+all = [
+    "peter.hofer@oracle.com",
+]

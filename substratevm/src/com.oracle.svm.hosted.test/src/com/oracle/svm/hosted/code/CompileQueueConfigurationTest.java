@@ -1,0 +1,244 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted.code;
+
+import java.util.List;
+
+import org.graalvm.collections.EconomicMap;
+import org.junit.Assert;
+import org.junit.Test;
+
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.graal.GraalConfiguration;
+import com.oracle.svm.core.graal.HostedOptimisticAliasingAnalysis;
+
+import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.core.phases.EconomyHighTier;
+import jdk.graal.compiler.core.phases.EconomyLowTier;
+import jdk.graal.compiler.core.phases.EconomyMarkFixReadsPhase;
+import jdk.graal.compiler.core.phases.EconomyMidTier;
+import jdk.graal.compiler.core.phases.LowTier;
+import jdk.graal.compiler.core.phases.MidTier;
+import jdk.graal.compiler.core.phases.HighTier;
+import jdk.graal.compiler.duplication.phases.PullThroughPhiPhase;
+import jdk.graal.compiler.guards.optimistic.memory.OptimisticAliasingAnalysisPhase;
+import jdk.graal.compiler.loop.phases.AggressivePartialUnrollPhase;
+import jdk.graal.compiler.loop.phases.CountedStripMiningPhase;
+import jdk.graal.compiler.loop.phases.CountedStripMiningReassociationPhase;
+import jdk.graal.compiler.loop.phases.LoopInversionPhase;
+import jdk.graal.compiler.loop.phases.LoopRotationPhase;
+import jdk.graal.compiler.loop.phases.NonCountedStripMiningPhase;
+import jdk.graal.compiler.loop.phases.SimpleLoopPartialUnrollPhase;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.PhaseSuite;
+import jdk.graal.compiler.phases.common.FixReadsPhase;
+import jdk.graal.compiler.phases.schedule.PartialRedundancySchedulePhase;
+import jdk.graal.compiler.phases.tiers.Suites;
+import jdk.graal.compiler.vector.phases.ConditionalMoveOptimizationPhase;
+import jdk.graal.compiler.vector.phases.LoopVectorizationPhase;
+import jdk.graal.compiler.vector.phases.VectorLoweringPhaseSuite;
+import jdk.graal.compiler.vector.replacements.VectorIntrinsics;
+
+/// Verifies CE compile-queue suite and code-size configuration policies.
+public class CompileQueueConfigurationTest {
+
+    @Test
+    public void hostedSuitesUseNonDeoptimizingAliasingGuards() {
+        OptionValues defaults = new OptionValues(OptionValues.newOptionMap());
+        Suites hostedSuites = createRegularTestSuites(defaults);
+        long aliasAnalysisCount = exactPhaseCount(hostedSuites.getMidTier(), OptimisticAliasingAnalysisPhase.class);
+        Assert.assertTrue(aliasAnalysisCount > 0);
+        TestGraalConfiguration.configureOptimisticAliasing(true, hostedSuites);
+        Assert.assertEquals(0, exactPhaseCount(hostedSuites.getMidTier(), OptimisticAliasingAnalysisPhase.class));
+        Assert.assertEquals(aliasAnalysisCount, exactPhaseCount(hostedSuites.getMidTier(), HostedOptimisticAliasingAnalysis.class));
+
+        Suites runtimeSuites = createRegularTestSuites(defaults);
+        TestGraalConfiguration.configureOptimisticAliasing(false, runtimeSuites);
+        Assert.assertEquals(aliasAnalysisCount, exactPhaseCount(runtimeSuites.getMidTier(), OptimisticAliasingAnalysisPhase.class));
+        Assert.assertEquals(0, exactPhaseCount(runtimeSuites.getMidTier(), HostedOptimisticAliasingAnalysis.class));
+    }
+
+    @Test
+    public void regularSuitesHonorOptimizationLevelAndExplicitOverrides() {
+        OptionValues defaults = new OptionValues(OptionValues.newOptionMap());
+        Suites original = createRegularTestSuites(defaults);
+        Suites tuned = CompileQueue.applyRegularSuiteTuning(original, defaults, false);
+
+        Assert.assertNotSame(original, tuned);
+        Assert.assertNull(tuned.getHighTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNull(tuned.getMidTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNull(tuned.getMidTier().findPhase(SimpleLoopPartialUnrollPhase.class));
+        Assert.assertNull(tuned.getMidTier().findPhase(LoopVectorizationPhase.class));
+        Assert.assertNull(tuned.getMidTier().findPhase(NonCountedStripMiningPhase.class));
+        Assert.assertEquals(-1, phaseIndex(tuned.getMidTier(), LoopRotationPhase.class));
+        Assert.assertNotNull(tuned.getMidTier().findPhase(CountedStripMiningPhase.class));
+        Assert.assertNotNull(original.getHighTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNotNull(original.getMidTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNotNull(original.getMidTier().findPhase(SimpleLoopPartialUnrollPhase.class));
+        Assert.assertNotNull(original.getMidTier().findPhase(LoopVectorizationPhase.class));
+        Assert.assertNotNull(original.getMidTier().findPhase(NonCountedStripMiningPhase.class));
+        Assert.assertTrue(phaseIndex(original.getMidTier(), LoopRotationPhase.class) >= 0);
+        Assert.assertNotNull(original.getMidTier().findPhase(CountedStripMiningPhase.class));
+
+        EconomicMap<OptionKey<?>, Object> optionsMap = OptionValues.newOptionMap();
+        optionsMap.put(GraalOptions.PartialUnroll, true);
+        optionsMap.put(LoopVectorizationPhase.Options.VectorizeLoops, true);
+        optionsMap.put(LoopRotationPhase.Options.LoopRotation, true);
+        OptionValues explicit = new OptionValues(optionsMap);
+        Suites explicitSuites = CompileQueue.applyRegularSuiteTuning(createRegularTestSuites(explicit), explicit, false);
+        Assert.assertNotNull(explicitSuites.getHighTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNotNull(explicitSuites.getMidTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNotNull(explicitSuites.getMidTier().findPhase(SimpleLoopPartialUnrollPhase.class));
+        Assert.assertNotNull(explicitSuites.getMidTier().findPhase(LoopVectorizationPhase.class));
+        Assert.assertTrue(phaseIndex(explicitSuites.getMidTier(), LoopRotationPhase.class) >= 0);
+
+        EconomicMap<OptionKey<?>, Object> aggressiveOptionsMap = OptionValues.newOptionMap();
+        aggressiveOptionsMap.put(AggressivePartialUnrollPhase.Options.AggressivePartialUnroll, false);
+        OptionValues aggressiveDisabled = new OptionValues(aggressiveOptionsMap);
+        Suites aggressiveDisabledSuites = CompileQueue.applyRegularSuiteTuning(createRegularTestSuites(aggressiveDisabled), aggressiveDisabled, false);
+        Assert.assertNull(aggressiveDisabledSuites.getHighTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNull(aggressiveDisabledSuites.getMidTier().findPhase(AggressivePartialUnrollPhase.class));
+        Assert.assertNull(aggressiveDisabledSuites.getMidTier().findPhase(SimpleLoopPartialUnrollPhase.class));
+
+        EconomicMap<OptionKey<?>, Object> aggressiveEnabledOptionsMap = OptionValues.newOptionMap();
+        aggressiveEnabledOptionsMap.put(AggressivePartialUnrollPhase.Options.AggressivePartialUnroll, true);
+        OptionValues aggressiveEnabled = new OptionValues(aggressiveEnabledOptionsMap);
+        Suites aggressiveEnabledSuites = CompileQueue.applyRegularSuiteTuning(createRegularTestSuites(aggressiveEnabled), aggressiveEnabled, false);
+        Assert.assertNotNull(aggressiveEnabledSuites.getMidTier().findPhase(SimpleLoopPartialUnrollPhase.class));
+
+        Suites maximumSuites = createRegularTestSuites(defaults);
+        Assert.assertSame(maximumSuites, CompileQueue.applyRegularSuiteTuning(maximumSuites, defaults, true));
+    }
+
+    @Test
+    public void sizePolicyConfiguresCommunityOptions() {
+        EconomicMap<OptionKey<?>, Object> map = OptionValues.newOptionMap();
+        SubstrateOptions.configureOptimizeForCodeSize(map, true, true, true);
+        OptionValues options = new OptionValues(map);
+
+        Assert.assertFalse(VectorIntrinsics.Options.Vectorization.getValue(options));
+        Assert.assertFalse(LoopVectorizationPhase.Options.VectorizeLoops.getValue(options));
+        Assert.assertFalse(MidTier.Options.OptimisticAliasingAnalysis.getValue(options));
+        Assert.assertFalse(LoopRotationPhase.Options.LoopRotation.getValue(options));
+        Assert.assertFalse(MidTier.Options.OptExactArithmetic.getValue(options));
+        Assert.assertTrue(ConditionalMoveOptimizationPhase.Options.CMoveALot.getValue(options));
+        Assert.assertFalse(GraalOptions.OptDuplication.getValue(options));
+        Assert.assertFalse(PullThroughPhiPhase.Options.OptPullThroughPhi.getValue(options));
+        Assert.assertFalse(PartialRedundancySchedulePhase.Options.PartialRedundancyScheduling.getValue(options));
+        Assert.assertFalse(GraalOptions.EarlyExpandCheckCast.getValue(options));
+        Assert.assertFalse(LowTier.Options.BreakChainedPhis.getValue(options));
+
+        map = OptionValues.newOptionMap();
+        SubstrateOptions.configureOptimizeForCodeSize(map, false, true, true);
+        options = new OptionValues(map);
+        Assert.assertTrue(VectorIntrinsics.Options.Vectorization.getValue(options));
+        Assert.assertFalse(LoopVectorizationPhase.Options.VectorizeLoops.getValue(options));
+        Assert.assertFalse(MidTier.Options.OptimisticAliasingAnalysis.getValue(options));
+        Assert.assertFalse(MidTier.Options.StripMineCountedLoops.getValue(options));
+        Assert.assertFalse(MidTier.Options.StripMineNonCountedLoops.getValue(options));
+        Assert.assertFalse(MidTier.Options.StripMiningPreparationPhases.getValue(options));
+        Assert.assertFalse(LoopInversionPhase.Options.LoopInversion.getValue(options));
+        Assert.assertFalse(LoopRotationPhase.Options.LoopRotation.getValue(options));
+        Assert.assertFalse(CountedStripMiningReassociationPhase.Options.StripMiningReassociation.getValue(options));
+        Assert.assertFalse(MidTier.Options.OptExactArithmetic.getValue(options));
+        Assert.assertTrue(ConditionalMoveOptimizationPhase.Options.CMoveALot.getValue(options));
+        Assert.assertFalse(GraalOptions.OptDuplication.getValue(options));
+        Assert.assertFalse(PullThroughPhiPhase.Options.OptPullThroughPhi.getValue(options));
+        Assert.assertFalse(PartialRedundancySchedulePhase.Options.PartialRedundancyScheduling.getValue(options));
+        Assert.assertFalse(GraalOptions.EarlyExpandCheckCast.getValue(options));
+        Assert.assertFalse(LowTier.Options.BreakChainedPhis.getValue(options));
+
+        map = OptionValues.newOptionMap();
+        SubstrateOptions.configureOptimizeForCodeSize(map, false, false, false);
+        options = new OptionValues(map);
+        Assert.assertTrue(VectorIntrinsics.Options.Vectorization.getValue(options));
+        Assert.assertTrue(LoopVectorizationPhase.Options.VectorizeLoops.getValue(options));
+        Assert.assertTrue(MidTier.Options.OptimisticAliasingAnalysis.getValue(options));
+        Assert.assertTrue(LoopRotationPhase.Options.LoopRotation.getValue(options));
+        Assert.assertFalse(MidTier.Options.OptExactArithmetic.getValue(options));
+        Assert.assertTrue(ConditionalMoveOptimizationPhase.Options.CMoveALot.getValue(options));
+        Assert.assertFalse(GraalOptions.OptDuplication.getValue(options));
+        Assert.assertFalse(PullThroughPhiPhase.Options.OptPullThroughPhi.getValue(options));
+        Assert.assertFalse(PartialRedundancySchedulePhase.Options.PartialRedundancyScheduling.getValue(options));
+        Assert.assertFalse(GraalOptions.EarlyExpandCheckCast.getValue(options));
+        Assert.assertFalse(LowTier.Options.BreakChainedPhis.getValue(options));
+    }
+
+    @Test
+    public void fallbackSuitesAddVectorLoweringAndFixReads() {
+        OptionValues defaults = new OptionValues(OptionValues.newOptionMap());
+        Suites original = createFallbackTestSuites(defaults);
+        Suites tuned = CompileQueue.applyFallbackSuiteTuning(original, defaults);
+
+        Assert.assertNotSame(original, tuned);
+        Assert.assertNull(tuned.getHighTier().findPhase(EconomyMarkFixReadsPhase.class));
+        Assert.assertNotNull(tuned.getLowTier().findPhase(VectorLoweringPhaseSuite.class));
+        Assert.assertNotNull(tuned.getLowTier().findPhase(FixReadsPhase.class));
+        Assert.assertTrue(phaseIndex(tuned.getLowTier(), VectorLoweringPhaseSuite.class) < phaseIndex(tuned.getLowTier(), FixReadsPhase.class));
+        Assert.assertNotNull(original.getHighTier().findPhase(EconomyMarkFixReadsPhase.class));
+    }
+
+    @Test
+    public void fallbackSuitesStayUnchangedWhenVectorizationIsDisabled() {
+        EconomicMap<OptionKey<?>, Object> disabledMap = OptionValues.newOptionMap();
+        disabledMap.put(VectorIntrinsics.Options.Vectorization, false);
+        OptionValues disabled = new OptionValues(disabledMap);
+        Suites disabledSuites = createFallbackTestSuites(disabled);
+        Assert.assertSame(disabledSuites, CompileQueue.applyFallbackSuiteTuning(disabledSuites, disabled));
+        Assert.assertNotNull(disabledSuites.getHighTier().findPhase(EconomyMarkFixReadsPhase.class));
+        Assert.assertNull(disabledSuites.getLowTier().findPhase(VectorLoweringPhaseSuite.class));
+    }
+
+    private static Suites createRegularTestSuites(OptionValues options) {
+        return new Suites(new HighTier(options), new MidTier(options), new PhaseSuite<>());
+    }
+
+    private static Suites createFallbackTestSuites(OptionValues options) {
+        return new Suites(new EconomyHighTier(), new EconomyMidTier(), new EconomyLowTier(options));
+    }
+
+    private static int phaseIndex(PhaseSuite<?> suite, Class<?> phaseClass) {
+        List<?> phases = suite.getPhases();
+        for (int i = 0; i < phases.size(); i++) {
+            if (phaseClass.isInstance(phases.get(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static long exactPhaseCount(PhaseSuite<?> suite, Class<?> phaseClass) {
+        return suite.getPhases().stream().filter(phase -> phase.getClass() == phaseClass).count();
+    }
+
+    /// Exposes protected suite configuration for focused tests.
+    private static final class TestGraalConfiguration extends GraalConfiguration {
+        static void configureOptimisticAliasing(boolean hosted, Suites suites) {
+            maybeUseHostedOptimisticAliasingAnalysis(hosted, suites);
+        }
+    }
+
+}

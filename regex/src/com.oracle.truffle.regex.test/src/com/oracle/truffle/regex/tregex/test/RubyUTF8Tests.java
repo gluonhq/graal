@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,23 +40,34 @@
  */
 package com.oracle.truffle.regex.tregex.test;
 
-import com.oracle.truffle.regex.tregex.string.Encodings;
+import java.util.Map;
+
 import org.junit.Test;
+
+import com.oracle.truffle.regex.tregex.string.Encoding;
+import com.oracle.truffle.regex.tregex.test.generated.RubyGeneratedTests;
 
 public class RubyUTF8Tests extends RegexTestBase {
 
+    public static final Map<String, String> ENGINE_OPTIONS = Map.of("regexDummyLang.Flavor", "Ruby");
+
     @Override
-    String getEngineOptions() {
-        return "Flavor=Ruby";
+    Map<String, String> getEngineOptions() {
+        return ENGINE_OPTIONS;
     }
 
     @Override
-    Encodings.Encoding getTRegexEncoding() {
-        return Encodings.UTF_8;
+    Encoding getTRegexEncoding() {
+        return Encoding.UTF_8;
     }
 
     @Test
     public void ignoreCaseBackReferences() {
         test("^(\uff21)(a)\\1\\2$", "i", "\uff21a\uff41A", 0, true, 0, 8, 0, 3, 3, 4);
+    }
+
+    @Test
+    public void generatedTests() {
+        runGeneratedTests(RubyGeneratedTests.TESTS);
     }
 }

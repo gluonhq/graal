@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +30,6 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.EnumSet;
 import java.util.Formatter;
-import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Locale;
@@ -46,6 +45,7 @@ import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.BasePhase.NotApplicable;
 import jdk.graal.compiler.phases.PhaseSuite;
+import jdk.graal.compiler.util.EconomicHashSet;
 
 /**
  * {@link AbstractTierPlan} that only contains the phases required to satisfy a given set of
@@ -72,7 +72,7 @@ class MinimalFuzzedTierPlan<C> extends AbstractTierPlan<C> {
                     long randomSeed,
                     String tierName) {
         super(originalPhases, tierName);
-        this.ignoredPhases = new HashSet<>();
+        this.ignoredPhases = new EconomicHashSet<>();
         this.randomSeed = randomSeed;
         computeMinimalFuzzedTierPlan(graphState, mandatoryStages);
     }
@@ -143,7 +143,7 @@ class MinimalFuzzedTierPlan<C> extends AbstractTierPlan<C> {
         });
         Collections.shuffle(minimalPhases, random);
         ListIterator<BasePhase<? super C>> phasesIterator = minimalPhases.listIterator();
-        // The the maximum number of attempts is determined with this logic:
+        // The maximum number of attempts is determined with this logic:
         // If we have minimalPhases = [phaseA, phaseB, phaseC]
         // During attempt 0, in the worst case, we can only insert phaseC because the others phases
         // need to be after phaseC.
@@ -227,7 +227,7 @@ class MinimalFuzzedTierPlan<C> extends AbstractTierPlan<C> {
         phases.addAll(getMultiApplyPhases());
         Supplier<BasePhase<? super C>> phaseThatMustApplySupplier = () -> phases.stream().filter(p -> mustApplyAfterSuite(p, graphState)).findFirst().orElse(null);
         BasePhase<? super C> phaseThatMustApply = phaseThatMustApplySupplier.get();
-        // The the maximum number of attempts is determined with this logic:
+        // The maximum number of attempts is determined with this logic:
         // In the worst case, all phases must apply and
         // phaseThatMustApplyQueue = [phaseA, phaseB, phaseC]
         // Attempt 0: We try to insert phaseA but cannot since it needs to run after phaseB so we
@@ -316,8 +316,8 @@ class MinimalFuzzedTierPlan<C> extends AbstractTierPlan<C> {
     }
 
     public MinimalFuzzedTierPlan<C> copy() {
-        return new MinimalFuzzedTierPlan<>(new ArrayList<>(getSingleApplyPhases()), new ArrayList<>(getMultiApplyPhases()), new HashSet<>(getIgnoredPhases()), getPhaseSuite().copy(),
-                        getRandomSeed(), getTierName());
+        return new MinimalFuzzedTierPlan<>(new ArrayList<>(getSingleApplyPhases()), new ArrayList<>(getMultiApplyPhases()), new EconomicHashSet<>(getIgnoredPhases()),
+                        getPhaseSuite().copy(), getRandomSeed(), getTierName());
     }
 
 }

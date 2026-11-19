@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,7 +39,7 @@ import jdk.graal.compiler.nodes.spi.Canonicalizable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import jdk.graal.compiler.nodes.util.GraphUtil;
-
+import jdk.graal.compiler.vector.nodes.simd.SimdConstant;
 import jdk.vm.ci.code.CodeUtil;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.PrimitiveConstant;
@@ -114,6 +114,9 @@ public final class XorNode extends BinaryArithmeticNode<Xor> implements Canonica
                     return new NotNode(forX);
                 }
             }
+            if (c instanceof SimdConstant simdConstant && simdConstant.isAllOnes()) {
+                return new NotNode(forX);
+            }
             return reassociateMatchedValues(self != null ? self : (XorNode) new XorNode(forX, forY).maybeCommuteInputs(), ValueNode.isConstantPredicate(), forX, forY, view);
         }
         if (forX instanceof NotNode && forY instanceof NotNode) {
@@ -122,7 +125,17 @@ public final class XorNode extends BinaryArithmeticNode<Xor> implements Canonica
         }
         if (forY instanceof NotNode && ((NotNode) forY).getValue() == forX) {
             // x ^ ~x |-> -1
-            return ConstantNode.forIntegerStamp(forX.stamp(NodeView.DEFAULT), -1L);
+            return BinaryArithmeticNode.createIntegerConstant(forX.stamp(NodeView.DEFAULT), -1L);
+        }
+        if (forY instanceof XorNode innerXor && (innerXor.getX() == forX || innerXor.getY() == forX)) {
+            // x ^ (x ^ y) |-> y
+            // x ^ (y ^ x) |-> y
+            return innerXor.getX() == forX ? innerXor.getY() : innerXor.getX();
+        }
+        if (forX instanceof XorNode innerXor && (innerXor.getX() == forY || innerXor.getY() == forY)) {
+            // (y ^ x) ^ y |-> x
+            // (x ^ y) ^ y |-> x
+            return innerXor.getX() == forY ? innerXor.getY() : innerXor.getX();
         }
         return self != null ? self : new XorNode(forX, forY).maybeCommuteInputs();
     }

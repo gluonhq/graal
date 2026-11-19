@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,9 +28,9 @@ import jdk.graal.compiler.core.common.type.ArithmeticOpTable;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable.ShiftOp;
 import jdk.graal.compiler.core.common.type.ArithmeticOpTable.ShiftOp.Shl;
 import jdk.graal.compiler.core.common.type.IntegerStamp;
-import jdk.graal.compiler.core.common.type.PrimitiveStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.Assertions;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.lir.gen.ArithmeticLIRGeneratorTool;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
@@ -39,9 +39,8 @@ import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
-import jdk.vm.ci.meta.Constant;
+import jdk.graal.compiler.vector.nodes.simd.SimdStamp;
 import jdk.vm.ci.meta.JavaKind;
-import jdk.vm.ci.meta.PrimitiveConstant;
 
 @NodeInfo(shortName = "<<")
 public final class LeftShiftNode extends ShiftNode<Shl> {
@@ -54,7 +53,7 @@ public final class LeftShiftNode extends ShiftNode<Shl> {
 
     public static ValueNode create(ValueNode x, ValueNode y, NodeView view) {
         ArithmeticOpTable.ShiftOp<Shl> op = ArithmeticOpTable.forStamp(x.stamp(view)).getShl();
-        Stamp stamp = op.foldStamp(x.stamp(view), (IntegerStamp) y.stamp(view));
+        Stamp stamp = op.foldStamp(x.stamp(view), y.stamp(view));
         ValueNode value = ShiftNode.canonical(op, stamp, x, y, view);
         if (value != null) {
             return value;
@@ -104,28 +103,29 @@ public final class LeftShiftNode extends ShiftNode<Shl> {
      * @see #tryReplaceWithMulNode()
      */
     public MulNode getEquivalentMulNode() {
-        if (this.getY().isConstant() && stamp(NodeView.DEFAULT) instanceof IntegerStamp selfStamp) {
-            Constant c = getY().asConstant();
-            if (c instanceof PrimitiveConstant && ((PrimitiveConstant) c).getJavaKind().isNumericInteger()) {
-                IntegerStamp xStamp = (IntegerStamp) getX().stamp(NodeView.DEFAULT);
-                if (xStamp.getBits() == selfStamp.getBits()) {
-                    long i = ((PrimitiveConstant) c).asLong();
-                    /*
-                     * If i == 63, this will give Long.MIN_VALUE, which is negative but still
-                     * correct as the multiplier. We have to do a shift here, computing this as
-                     * (long) Math.pow(2, 63) would round to the wrong value.
-                     */
-                    long multiplier = 1L << i;
-                    return new MulNode(getX(), ConstantNode.forIntegerStamp(xStamp, multiplier));
-                }
+        if (getY().isJavaConstant() && stamp(NodeView.DEFAULT) instanceof IntegerStamp selfStamp) {
+            IntegerStamp xStamp = (IntegerStamp) getX().stamp(NodeView.DEFAULT);
+            if (xStamp.getBits() == selfStamp.getBits()) {
+                int shiftAmount = getConstantShiftAmount();
+                /*
+                 * If shiftAmount == 63, this will give Long.MIN_VALUE, which is negative but
+                 * still correct as the multiplier. We have to do a shift here, computing this
+                 * as (long) Math.pow(2, 63) would round to the wrong value.
+                 */
+                long multiplier = 1L << shiftAmount;
+                return new MulNode(getX(), ConstantNode.forIntegerStamp(xStamp, multiplier));
             }
         }
         return null;
     }
 
     private static ValueNode canonical(LeftShiftNode leftShiftNode, ArithmeticOpTable.ShiftOp<Shl> op, Stamp stamp, ValueNode forX, ValueNode forY) {
+        if (forY.isConstant() && op.isNeutral(forY.asConstant())) {
+            return forX;
+        }
+
         LeftShiftNode self = leftShiftNode;
-        if (forY.isConstant()) {
+        if (forY.isJavaConstant()) {
             int amount = forY.asJavaConstant().asInt();
             int originalAmount = amount;
             int mask = op.getShiftAmountMask(stamp);
@@ -136,15 +136,20 @@ public final class LeftShiftNode extends ShiftNode<Shl> {
             if (forX instanceof ShiftNode) {
                 ShiftNode<?> other = (ShiftNode<?>) forX;
                 if (other.getY().isConstant()) {
-                    int otherAmount = other.getY().asJavaConstant().asInt() & mask;
+                    int otherAmount = other.getConstantShiftAmount();
                     if (other instanceof LeftShiftNode) {
                         int total = amount + otherAmount;
                         if (total != (total & mask)) {
-                            return ConstantNode.forIntegerBits(PrimitiveStamp.getBits(stamp), 0);
+                            return BinaryArithmeticNode.createIntegerConstant(stamp, 0);
                         }
                         return new LeftShiftNode(other.getX(), ConstantNode.forInt(total));
                     } else if ((other instanceof RightShiftNode || other instanceof UnsignedRightShiftNode) && otherAmount == amount) {
-                        if (stamp.getStackKind() == JavaKind.Long) {
+                        if (stamp instanceof SimdStamp simdStamp) {
+                            JavaKind componentKind = simdStamp.getComponent(0).getStackKind();
+                            GraalError.guarantee(componentKind == JavaKind.Int || componentKind == JavaKind.Long, "unexpected SIMD component kind: %s", componentKind);
+                            long constantMask = componentKind == JavaKind.Long ? -1L << amount : -1 << amount;
+                            return new AndNode(other.getX(), BinaryArithmeticNode.createIntegerConstant(stamp, constantMask));
+                        } else if (stamp.getStackKind() == JavaKind.Long) {
                             return new AndNode(other.getX(), ConstantNode.forLong(-1L << amount));
                         } else {
                             assert stamp.getStackKind() == JavaKind.Int : Assertions.errorMessage(leftShiftNode, op, stamp, forX, forY);

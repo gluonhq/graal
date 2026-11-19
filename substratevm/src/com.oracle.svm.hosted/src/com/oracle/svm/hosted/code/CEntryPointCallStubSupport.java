@@ -25,25 +25,39 @@
 package com.oracle.svm.hosted.code;
 
 import java.lang.reflect.Executable;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
+import com.oracle.svm.core.BuilderUtil;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.SubstrateUtil;
 import com.oracle.svm.core.c.BoxedRelocatedPointer;
 import com.oracle.svm.core.code.IsolateLeaveStub;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.meta.MethodPointer;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
+/**
+ * This singleton is made layer aware automatically by the matching of
+ * {@link CEntryPointCallStubMethod} across layers with their analysis id. However, the
+ * {@link CEntryPointCallStubSupport#cFunctionPointerCache} is currently duplicated across layers as
+ * we cannot reload the {@link BoxedRelocatedPointer} across layers.
+ */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public final class CEntryPointCallStubSupport {
     public static CEntryPointCallStubSupport singleton() {
         return ImageSingletons.lookup(CEntryPointCallStubSupport.class);
@@ -68,9 +82,9 @@ public final class CEntryPointCallStubSupport {
         return getStubForMethod(method);
     }
 
-    public AnalysisMethod registerStubForMethod(Executable reflectionMethod, Supplier<CEntryPointData> entryPointDataSupplier) {
-        AnalysisMethod method = bb.getMetaAccess().lookupJavaMethod(reflectionMethod);
-        return registerStubForMethod(method, entryPointDataSupplier);
+    public void registerStubForMethod(ResolvedJavaMethod originalMethod, Supplier<CEntryPointData> entryPointDataSupplier) {
+        AnalysisMethod method = bb.getUniverse().lookup(originalMethod);
+        registerStubForMethod(method, entryPointDataSupplier);
     }
 
     public AnalysisMethod getStubForMethod(AnalysisMethod method) {
@@ -82,14 +96,18 @@ public final class CEntryPointCallStubSupport {
     }
 
     public AnalysisMethod registerStubForMethod(AnalysisMethod method, Supplier<CEntryPointData> entryPointDataSupplier) {
-        return methodToStub.compute(method, (key, existingValue) -> {
+        return registerStubForMethod(method, entryPointDataSupplier, List.of());
+    }
+
+    public AnalysisMethod registerStubForMethod(AnalysisMethod method, Supplier<CEntryPointData> entryPointDataSupplier, List<AnnotationValue> injectedAnnotations) {
+        return methodToStub.compute(method, (_, existingValue) -> {
             AnalysisMethod value = existingValue;
             if (value == null) {
                 assert !bb.getUniverse().sealed();
                 CEntryPointData entryPointData = entryPointDataSupplier.get();
-                CEntryPointCallStubMethod stub = CEntryPointCallStubMethod.create(bb, method, entryPointData);
+                CEntryPointCallStubMethod stub = CEntryPointCallStubMethod.create(bb, method, entryPointData, injectedAnnotations);
                 AnalysisMethod wrapped = bb.getUniverse().lookup(stub);
-                bb.addRootMethod(wrapped, true, "Registered in " + CEntryPointCallStubSupport.class).registerAsEntryPoint(entryPointData);
+                bb.addRootMethod(wrapped, true, "Registered in " + CEntryPointCallStubSupport.class).registerAsNativeEntryPoint(entryPointData);
                 value = wrapped;
             }
             return value;
@@ -97,13 +115,13 @@ public final class CEntryPointCallStubSupport {
     }
 
     public AnalysisMethod registerJavaStubForMethod(AnalysisMethod method) {
-        return methodToJavaStub.compute(method, (key, existingValue) -> {
+        return methodToJavaStub.compute(method, (_, existingValue) -> {
             AnalysisMethod value = existingValue;
             if (value == null) {
                 assert !bb.getUniverse().sealed();
                 AnalysisMethod nativeStub = registerStubForMethod(method, () -> CEntryPointData.create(method));
-                CFunctionPointer nativeStubAddress = new MethodPointer(nativeStub);
-                String stubName = SubstrateUtil.uniqueStubName(method);
+                CFunctionPointer nativeStubAddress = MethodRefSupport.createMethodPointer(nativeStub);
+                String stubName = BuilderUtil.uniqueStubName(method);
                 ResolvedJavaType holderClass = bb.getMetaAccess().lookupJavaType(IsolateLeaveStub.class).getWrapped();
                 CEntryPointJavaCallStubMethod stub = new CEntryPointJavaCallStubMethod(method.getWrapped(), stubName, holderClass, nativeStubAddress);
                 value = bb.getUniverse().lookup(stub);

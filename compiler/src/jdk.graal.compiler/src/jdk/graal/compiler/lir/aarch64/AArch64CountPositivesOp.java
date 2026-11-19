@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
  */
 package jdk.graal.compiler.lir.aarch64;
 
-import static jdk.vm.ci.aarch64.AArch64.r10;
+import static jdk.vm.ci.aarch64.AArch64.r11;
 import static jdk.vm.ci.aarch64.AArch64.r3;
 import static jdk.vm.ci.aarch64.AArch64.r4;
 import static jdk.vm.ci.aarch64.AArch64.r5;
@@ -69,10 +69,10 @@ import jdk.vm.ci.meta.Value;
  * Returns the number of positive bytes.
  */
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/aaaa86b57172d45d1126c50efc270c6e49aba7a5/src/hotspot/cpu/aarch64/macroAssembler_aarch64.cpp#L5481-L5550",
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/58853f39377ea6168c4570327347294899d51f95/src/hotspot/cpu/aarch64/macroAssembler_aarch64.cpp#L5828-L5897",
           sha1 = "ce54a7cf2fcfe7ccb8f6604c038887fc1c4ebce1")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/43a2f17342af8f5bf1f5823df9fa0bf0bdfdfce2/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L4967-L5133",
-          sha1 = "3b4e6edb4372e8babb009763c2d05961348dd723")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/c59e44a7aa2aeff0823830b698d524523b996650/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L8083-L8250",
+          sha1 = "45239b79c957ea992a4d05afa358d5b953fe84fe")
 // @formatter:on
 @Opcode("AARCH64_COUNT_POSITIVES")
 public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
@@ -86,17 +86,17 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
     @LIRInstruction.Temp({LIRInstruction.OperandFlag.REG}) private Value lengthTempValue;
     @LIRInstruction.Temp({LIRInstruction.OperandFlag.REG}) private Value[] temp;
 
-    private final int vmPageSize;
+    private final int pageSizeForReadBoundaryCheck;
     private final int softwarePrefetchHintDistance;
 
     public AArch64CountPositivesOp(AArch64LIRGenerator tool, AllocatableValue resultValue, AllocatableValue arrayValue, AllocatableValue lengthValue,
-                    int vmPageSize, int softwarePrefetchHintDistance) {
+                    int pageSizeForReadBoundaryCheck, int softwarePrefetchHintDistance) {
         super(TYPE);
         this.resultValue = resultValue;
         this.arrayValue = arrayValue;
         this.lengthValue = lengthValue;
 
-        this.vmPageSize = vmPageSize;
+        this.pageSizeForReadBoundaryCheck = pageSizeForReadBoundaryCheck;
         this.softwarePrefetchHintDistance = softwarePrefetchHintDistance;
 
         this.arrayTempValue = tool.newVariable(arrayValue.getValueKind());
@@ -108,8 +108,8 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
                         r5.asValue(),
                         r6.asValue(),
                         r7.asValue(),
-                        // r8 and r9 are scratch registers
-                        r10.asValue(),
+                        // r8 and r9 are scratch registers on HotSpot, r9/r10 on SubstrateVM
+                        r11.asValue(),
                         v0.asValue(),
                         v1.asValue(),
                         v2.asValue(),
@@ -152,13 +152,13 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
             // size > 32 then go to stub
             masm.branchConditionally(ConditionFlag.GE, labelStubLong);
 
-            if (vmPageSize > 0) {
-                GraalError.guarantee(CodeUtil.isPowerOf2(vmPageSize), "vmPageSize is not power of 2: %d", vmPageSize);
-                int shift = 64 - CodeUtil.log2(vmPageSize);
+            if (pageSizeForReadBoundaryCheck > 0) {
+                GraalError.guarantee(CodeUtil.isPowerOf2(pageSizeForReadBoundaryCheck), "pageSizeForReadBoundaryCheck is not power of 2: %d", pageSizeForReadBoundaryCheck);
+                int shift = 64 - CodeUtil.log2(pageSizeForReadBoundaryCheck);
                 masm.lsl(64, rscratch1, ary1, shift);
                 masm.mov(rscratch2, (4L * wordSize) << shift);
                 masm.adds(64, rscratch2, rscratch1, rscratch2);
-                // at the end of page then go to stub
+                // At the end of a page, go to the stub to avoid crossing a runtime page boundary.
                 masm.branchConditionally(ConditionFlag.HS, labelStub);
             }
             masm.subs(64, len, len, wordSize);
@@ -217,7 +217,7 @@ public final class AArch64CountPositivesOp extends AArch64ComplexVectorOp {
         Register tmp3 = r5;
         Register tmp4 = r6;
         Register tmp5 = r7;
-        Register tmp6 = r10;
+        Register tmp6 = r11;
 
         Register vtmp0 = v0;
         Register vtmp1 = v1;

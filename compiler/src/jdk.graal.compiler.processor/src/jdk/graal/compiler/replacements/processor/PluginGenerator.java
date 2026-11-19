@@ -28,9 +28,11 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -51,7 +53,7 @@ public class PluginGenerator {
     private final Map<Element, List<GeneratedPlugin>> plugins;
 
     public PluginGenerator() {
-        this.plugins = new HashMap<>();
+        this.plugins = new LinkedHashMap<>();
     }
 
     public void addPlugin(GeneratedPlugin plugin) {
@@ -110,10 +112,25 @@ public class PluginGenerator {
         disambiguateWith(plugins, plugin -> plugin.getPluginName() + "__" + nextId[0]++);
     }
 
+    /**
+     * Map from an architecture's name as it appears in a package name to its name returned by
+     * {@code jdk.vm.ci.code.Architecture.getName()}.
+     */
+    private static final Map<String, String> SUPPORTED_JVMCI_ARCHITECTURES;
+
+    static {
+        LinkedHashMap<String, String> supportedArchitectures = new LinkedHashMap<>();
+        supportedArchitectures.put("amd64", "AMD64");
+        supportedArchitectures.put("aarch64", "aarch64");
+        supportedArchitectures.put("riscv64", "riscv64");
+        SUPPORTED_JVMCI_ARCHITECTURES = Collections.unmodifiableMap(supportedArchitectures);
+    }
+
     private static void createPluginFactory(AbstractProcessor processor, Element topLevelClass, List<GeneratedPlugin> plugins) {
         PackageElement pkg = (PackageElement) topLevelClass.getEnclosingElement();
 
         String genClassName = "PluginFactory_" + topLevelClass.getSimpleName();
+        String arch = SUPPORTED_JVMCI_ARCHITECTURES.get(pkg.getSimpleName().toString());
 
         String qualifiedGenClassName = pkg.getQualifiedName() + "." + genClassName;
         try {
@@ -131,7 +148,15 @@ public class PluginGenerator {
                     plugin.generate(processor, out);
                     out.printf("\n");
                 }
-                out.printf("public class %s implements GeneratedPluginFactory {\n", genClassName);
+                if (arch != null) {
+                    out.printf("public class %s implements GeneratedPluginFactory, jdk.graal.compiler.core.ArchitectureSpecific {\n", genClassName);
+                    out.printf("    @Override\n");
+                    out.printf("    public String getArchitecture() {\n");
+                    out.printf("        return \"%s\";\n", arch);
+                    out.printf("    }\n");
+                } else {
+                    out.printf("public class %s implements GeneratedPluginFactory {\n", genClassName);
+                }
                 createPluginFactoryMethod(out, plugins);
                 out.printf("}\n");
             }
@@ -142,10 +167,9 @@ public class PluginGenerator {
     }
 
     protected static void createImports(PrintWriter out, AbstractProcessor processor, List<GeneratedPlugin> plugins, String importingPackage) {
-        HashSet<String> extra = new HashSet<>();
+        HashSet<String> extra = new LinkedHashSet<>();
 
         extra.add("jdk.vm.ci.meta.ResolvedJavaMethod");
-        extra.add("java.lang.annotation.Annotation");
         extra.add("jdk.graal.compiler.nodes.ValueNode");
         extra.add("jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext");
         extra.add("jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin");
@@ -158,7 +182,6 @@ public class PluginGenerator {
             extra.add("jdk.graal.compiler.nodes.graphbuilderconf." + plugin.pluginSuperclass());
             if (plugin.needsReplacement(processor)) {
                 extra.add("jdk.graal.compiler.options.ExcludeFromJacocoGeneratedReport");
-                extra.add("jdk.graal.compiler.graph.NodeInputList");
                 if (plugin.isWithExceptionReplacement(processor)) {
                     extra.add("jdk.graal.compiler.nodes.PluginReplacementWithExceptionNode");
                 } else {

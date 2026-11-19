@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -57,7 +57,6 @@ import com.oracle.truffle.regex.charset.CodePointSetAccumulator;
 import com.oracle.truffle.regex.charset.Range;
 import com.oracle.truffle.regex.tregex.buffer.CompilationBuffer;
 import com.oracle.truffle.regex.tregex.parser.CaseUnfoldingTrie.Unfolding;
-import com.oracle.truffle.regex.tregex.parser.flavors.OracleDBCharClassTrieNode;
 
 public class MultiCharacterCaseFolding {
 
@@ -259,18 +258,17 @@ public class MultiCharacterCaseFolding {
                     CodePointSet allowedCodePoints, boolean transitiveEquivalence) {
         tmp.clear();
         caseFoldCharClass(algorithm, charClass, (from, to) -> {
-            if (transitiveEquivalence || hasNoCaseFolding(algorithm, to[0])) {
-                if (to.length == 1) {
-                    // Add the case-folded version to the character class...
-                    if (filter.test(from, to[0])) {
-                        tmp.addCodePoint(to[0]);
-                    }
+            if (to.length == 1 && (transitiveEquivalence || hasNoCaseFolding(algorithm, to[0]))) {
+                // Add the case-folded version to the character class.
+                if (filter.test(from, to[0])) {
+                    tmp.addCodePoint(to[0]);
                 }
-                // ... and also any characters which case-fold to the same.
-                for (int unfolding : CaseUnfoldingTrie.findSingleCharUnfoldings(algorithm, to)) {
-                    if (unfolding != from && filter.test(from, unfolding)) {
-                        tmp.addCodePoint(unfolding);
-                    }
+            }
+            // Add any characters which case-fold to the same, even if the common case-folded value
+            // itself has another case-folding.
+            for (int unfolding : CaseUnfoldingTrie.findSingleCharUnfoldings(algorithm, to)) {
+                if (unfolding != from && filter.test(from, unfolding)) {
+                    tmp.addCodePoint(unfolding);
                 }
             }
         });

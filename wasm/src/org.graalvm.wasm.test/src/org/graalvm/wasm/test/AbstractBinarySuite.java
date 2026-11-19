@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,10 +52,12 @@ import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.ByteSequence;
 import org.graalvm.wasm.WasmLanguage;
+import org.graalvm.wasm.WasmType;
 import org.graalvm.wasm.collection.ByteArrayList;
+import org.graalvm.wasm.collection.IntArrayList;
 
 public abstract class AbstractBinarySuite {
-    protected static final byte[] EMPTY_BYTES = {};
+    protected static final int[] EMPTY_INTS = {};
 
     protected static void runRuntimeTest(byte[] binary, Consumer<Context.Builder> options, Consumer<Value> testCase) throws IOException {
         final Context.Builder contextBuilder = Context.newBuilder(WasmLanguage.ID);
@@ -66,8 +68,7 @@ public abstract class AbstractBinarySuite {
         try (Context context = contextBuilder.build()) {
             Source.Builder sourceBuilder = Source.newBuilder(WasmLanguage.ID, ByteSequence.create(binary), "main");
             Source source = sourceBuilder.build();
-            context.eval(source);
-            testCase.accept(context.getBindings(WasmLanguage.ID).getMember("main"));
+            testCase.accept(context.eval(source).newInstance().getMember("exports"));
         }
     }
 
@@ -99,12 +100,12 @@ public abstract class AbstractBinarySuite {
         return Byte.parseByte(hexString, 16);
     }
 
-    private static class BinaryTypes {
+    private static final class BinaryTypes {
 
-        private final List<byte[]> paramEntries = new ArrayList<>();
-        private final List<byte[]> resultEntries = new ArrayList<>();
+        private final List<int[]> paramEntries = new ArrayList<>();
+        private final List<int[]> resultEntries = new ArrayList<>();
 
-        private void add(byte[] params, byte[] results) {
+        private void add(int[] params, int[] results) {
             paramEntries.add(params);
             resultEntries.add(results);
         }
@@ -113,29 +114,38 @@ public abstract class AbstractBinarySuite {
             ByteArrayList b = new ByteArrayList();
             b.add(getByte("01"));
             b.add((byte) 0); // length is patched in the end
-            b.add((byte) paramEntries.size());
+            b.addUnsignedInt32(paramEntries.size());
             for (int i = 0; i < paramEntries.size(); i++) {
                 b.add(getByte("60"));
-                byte[] params = paramEntries.get(i);
-                byte[] results = resultEntries.get(i);
-                b.add((byte) params.length);
-                for (byte param : params) {
-                    b.add(param);
+                int[] params = paramEntries.get(i);
+                int[] results = resultEntries.get(i);
+                b.addUnsignedInt32(params.length);
+                for (int param : params) {
+                    addValueType(b, param);
                 }
-                b.add((byte) results.length);
-                for (byte result : results) {
-                    b.add(result);
+                b.addUnsignedInt32(results.length);
+                for (int result : results) {
+                    addValueType(b, result);
                 }
             }
             b.set(1, (byte) (b.size() - 2));
             return b.toArray();
         }
+
+        private static void addValueType(ByteArrayList b, int type) {
+            if (WasmType.isReferenceType(type) && (!WasmType.isNullable(type) || WasmType.isConcreteReferenceType(type))) {
+                b.addSignedInt32(WasmType.isNullable(type) ? WasmType.REF_NULL_TYPE_HEADER : WasmType.REF_TYPE_HEADER);
+                b.addSignedInt32(WasmType.getHeapType(type));
+            } else {
+                b.addSignedInt32(type);
+            }
+        }
     }
 
-    private static class BinaryTables {
-        private final ByteArrayList tables = new ByteArrayList();
+    private static final class BinaryTables {
+        private final IntArrayList tables = new IntArrayList();
 
-        private void add(byte initSize, byte maxSize, byte elemType) {
+        private void add(int initSize, int maxSize, int elemType) {
             tables.add(initSize);
             tables.add(maxSize);
             tables.add(elemType);
@@ -148,20 +158,20 @@ public abstract class AbstractBinarySuite {
             final int tableCount = tables.size() / 3;
             b.add((byte) tableCount);
             for (int i = 0; i < tables.size(); i += 3) {
-                b.add(tables.get(i + 2));
+                b.addSignedInt32(tables.get(i + 2));
                 b.add(getByte("01"));
-                b.add(tables.get(i));
-                b.add(tables.get(i + 1));
+                b.addUnsignedInt32(tables.get(i));
+                b.addUnsignedInt32(tables.get(i + 1));
             }
             b.set(1, (byte) (b.size() - 2));
             return b.toArray();
         }
     }
 
-    private static class BinaryMemories {
-        private final ByteArrayList memories = new ByteArrayList();
+    private static final class BinaryMemories {
+        private final IntArrayList memories = new IntArrayList();
 
-        private void add(byte initSize, byte maxSize) {
+        private void add(int initSize, int maxSize) {
             memories.add(initSize);
             memories.add(maxSize);
         }
@@ -174,20 +184,20 @@ public abstract class AbstractBinarySuite {
             b.add((byte) memoryCount);
             for (int i = 0; i < memories.size(); i += 2) {
                 b.add(getByte("01"));
-                b.add(memories.get(i));
-                b.add(memories.get(i + 1));
+                b.addUnsignedInt32(memories.get(i));
+                b.addUnsignedInt32(memories.get(i + 1));
             }
             b.set(1, (byte) (b.size() - 2));
             return b.toArray();
         }
     }
 
-    private static class BinaryFunctions {
-        private final ByteArrayList types = new ByteArrayList();
-        private final List<byte[]> localEntries = new ArrayList<>();
+    private static final class BinaryFunctions {
+        private final IntArrayList types = new IntArrayList();
+        private final List<int[]> localEntries = new ArrayList<>();
         private final List<byte[]> codeEntries = new ArrayList<>();
 
-        private void add(byte typeIndex, byte[] locals, byte[] code) {
+        private void add(int typeIndex, int[] locals, byte[] code) {
             types.add(typeIndex);
             localEntries.add(locals);
             codeEntries.add(code);
@@ -198,9 +208,9 @@ public abstract class AbstractBinarySuite {
             b.add(getByte("03"));
             b.add((byte) 0); // length is patched at the end
             final int functionCount = types.size();
-            b.add((byte) functionCount);
+            b.addUnsignedInt32(functionCount);
             for (int i = 0; i < functionCount; i++) {
-                b.add(types.get(i));
+                b.addUnsignedInt32(types.get(i));
             }
             b.set(1, (byte) (b.size() - 2));
             return b.toArray();
@@ -208,34 +218,39 @@ public abstract class AbstractBinarySuite {
 
         private byte[] generateCodeSection() {
             ByteArrayList b = new ByteArrayList();
-            b.add(getByte("0A"));
-            b.add((byte) 0); // length is patched at the end
             final int functionCount = types.size();
-            b.add((byte) functionCount);
+            b.addUnsignedInt32(functionCount);
             for (int i = 0; i < functionCount; i++) {
-                byte[] locals = localEntries.get(i);
-                byte[] code = codeEntries.get(i);
-                int length = 1 + locals.length + code.length;
-                b.add((byte) length);
-                b.add((byte) locals.length);
-                for (byte l : locals) {
-                    b.add(l);
-                }
-                for (byte op : code) {
-                    b.add(op);
-                }
+                byte[] body = generateFunctionBody(localEntries.get(i), codeEntries.get(i));
+                b.addUnsignedInt32(body.length);
+                b.addRange(body, 0, body.length);
             }
-            b.set(1, (byte) (b.size() - 2));
-            return b.toArray();
+            byte[] payload = b.toArray();
+            ByteArrayList section = new ByteArrayList();
+            section.add(getByte("0A"));
+            section.addUnsignedInt32(payload.length);
+            section.addRange(payload, 0, payload.length);
+            return section.toArray();
+        }
+
+        private static byte[] generateFunctionBody(int[] locals, byte[] code) {
+            ByteArrayList body = new ByteArrayList();
+            body.addUnsignedInt32(locals.length);
+            for (int local : locals) {
+                body.addUnsignedInt32(1);
+                body.addSignedInt32(local);
+            }
+            body.addRange(code, 0, code.length);
+            return body.toArray();
         }
     }
 
-    private static class BinaryExports {
+    private static final class BinaryExports {
         private final ByteArrayList types = new ByteArrayList();
-        private final ByteArrayList indices = new ByteArrayList();
+        private final IntArrayList indices = new IntArrayList();
         private final List<byte[]> names = new ArrayList<>();
 
-        private void addFunctionExport(byte functionIndex, String name) {
+        private void addFunctionExport(int functionIndex, String name) {
             types.add(getByte("00"));
             indices.add(functionIndex);
             names.add(name.getBytes(StandardCharsets.UTF_8));
@@ -245,22 +260,22 @@ public abstract class AbstractBinarySuite {
             ByteArrayList b = new ByteArrayList();
             b.add(getByte("07"));
             b.add((byte) 0); // length is patched at the end
-            b.add((byte) types.size());
+            b.addUnsignedInt32(types.size());
             for (int i = 0; i < types.size(); i++) {
                 final byte[] name = names.get(i);
-                b.add((byte) name.length);
+                b.addUnsignedInt32(name.length);
                 for (byte value : name) {
                     b.add(value);
                 }
                 b.add(types.get(i));
-                b.add(indices.get(i));
+                b.addUnsignedInt32(indices.get(i));
             }
             b.set(1, (byte) (b.size() - 2));
             return b.toArray();
         }
     }
 
-    private static class BinaryElements {
+    private static final class BinaryElements {
         private final List<byte[]> elementEntries = new ArrayList<>();
 
         private void add(byte[] elements) {
@@ -282,7 +297,7 @@ public abstract class AbstractBinarySuite {
         }
     }
 
-    private static class BinaryDatas {
+    private static final class BinaryDatas {
         private final List<byte[]> dataEntries = new ArrayList<>();
 
         private void add(byte[] data) {
@@ -312,12 +327,12 @@ public abstract class AbstractBinarySuite {
         }
     }
 
-    private static class BinaryGlobals {
+    private static final class BinaryGlobals {
         private final ByteArrayList mutabilities = new ByteArrayList();
-        private final ByteArrayList valueTypes = new ByteArrayList();
+        private final IntArrayList valueTypes = new IntArrayList();
         private final List<byte[]> expressions = new ArrayList<>();
 
-        private void add(byte mutability, byte valueType, byte[] expression) {
+        private void add(byte mutability, int valueType, byte[] expression) {
             mutabilities.add(mutability);
             valueTypes.add(valueType);
             expressions.add(expression);
@@ -329,7 +344,7 @@ public abstract class AbstractBinarySuite {
             b.add((byte) 0); // length is patched at the end
             b.add((byte) mutabilities.size());
             for (int i = 0; i < mutabilities.size(); i++) {
-                b.add(valueTypes.get(i));
+                b.addSignedInt32(valueTypes.get(i));
                 b.add(mutabilities.get(i));
                 for (byte e : expressions.get(i)) {
                     b.add(e);
@@ -340,7 +355,30 @@ public abstract class AbstractBinarySuite {
         }
     }
 
-    private static class BinaryCustomSections {
+    private static final class BinaryTags {
+        private final ByteArrayList attributes = new ByteArrayList();
+        private final ByteArrayList typeIndices = new ByteArrayList();
+
+        private void add(byte attribute, byte typeIndex) {
+            attributes.add(attribute);
+            typeIndices.add(typeIndex);
+        }
+
+        private byte[] generateTagSection() {
+            ByteArrayList b = new ByteArrayList();
+            b.add(getByte("0d"));
+            b.add((byte) 0); // length is patched at the end
+            b.add((byte) attributes.size());
+            for (int i = 0; i < attributes.size(); i++) {
+                b.add(attributes.get(i));
+                b.add(typeIndices.get(i));
+            }
+            b.set(1, (byte) (b.size() - 2));
+            return b.toArray();
+        }
+    }
+
+    private static final class BinaryCustomSections {
         private final List<byte[]> names = new ArrayList<>();
         private final List<byte[]> sections = new ArrayList<>();
 
@@ -356,8 +394,8 @@ public abstract class AbstractBinarySuite {
                 final byte[] name = names.get(i);
                 final byte[] section = sections.get(i);
                 final int size = 1 + name.length + section.length;
-                b.add((byte) size); // length is patched at the end
-                b.add((byte) name.length);
+                b.addUnsignedInt32(size);
+                b.addUnsignedInt32(name.length);
                 b.addRange(name, 0, name.length);
                 b.addRange(section, 0, section.length);
             }
@@ -374,30 +412,32 @@ public abstract class AbstractBinarySuite {
         private final BinaryElements binaryElements = new BinaryElements();
         private final BinaryDatas binaryDatas = new BinaryDatas();
         private final BinaryGlobals binaryGlobals = new BinaryGlobals();
+        private final BinaryTags binaryTags = new BinaryTags();
 
+        private final BinaryCustomSections binaryCustomSectionsBeforeCode = new BinaryCustomSections();
         private final BinaryCustomSections binaryCustomSections = new BinaryCustomSections();
 
-        public BinaryBuilder addType(byte[] params, byte[] results) {
+        public BinaryBuilder addType(int[] params, int[] results) {
             binaryTypes.add(params, results);
             return this;
         }
 
-        public BinaryBuilder addTable(byte initSize, byte maxSize, byte elemType) {
+        public BinaryBuilder addTable(int initSize, int maxSize, int elemType) {
             binaryTables.add(initSize, maxSize, elemType);
             return this;
         }
 
-        public BinaryBuilder addMemory(byte initSize, byte maxSize) {
+        public BinaryBuilder addMemory(int initSize, int maxSize) {
             binaryMemories.add(initSize, maxSize);
             return this;
         }
 
-        public BinaryBuilder addFunction(byte typeIndex, byte[] locals, String hexCode) {
+        public BinaryBuilder addFunction(int typeIndex, int[] locals, String hexCode) {
             binaryFunctions.add(typeIndex, locals, WasmTestUtils.hexStringToByteArray(hexCode));
             return this;
         }
 
-        public BinaryBuilder addFunctionExport(byte functionIndex, String name) {
+        public BinaryBuilder addFunctionExport(int functionIndex, String name) {
             binaryExports.addFunctionExport(functionIndex, name);
             return this;
         }
@@ -412,8 +452,18 @@ public abstract class AbstractBinarySuite {
             return this;
         }
 
-        public BinaryBuilder addGlobal(byte mutability, byte valueType, String hexCode) {
+        public BinaryBuilder addGlobal(byte mutability, int valueType, String hexCode) {
             binaryGlobals.add(mutability, valueType, WasmTestUtils.hexStringToByteArray(hexCode));
+            return this;
+        }
+
+        public BinaryBuilder addTag(byte attribute, byte typeIndex) {
+            binaryTags.add(attribute, typeIndex);
+            return this;
+        }
+
+        public BinaryBuilder addCustomSectionBeforeCode(String name, byte[] section) {
+            binaryCustomSectionsBeforeCode.add(name, section);
             return this;
         }
 
@@ -441,11 +491,13 @@ public abstract class AbstractBinarySuite {
             final byte[] exportSection = binaryExports.generateExportSection();
             final byte[] elementSection = binaryElements.generateElementSection();
             final byte[] dataCountSection = binaryDatas.generateDataCountSection();
+            final byte[] customSectionsBeforeCode = binaryCustomSectionsBeforeCode.generateCustomSections();
             final byte[] codeSection = binaryFunctions.generateCodeSection();
             final byte[] dataSection = binaryDatas.generateDataSection();
             final byte[] customSections = binaryCustomSections.generateCustomSections();
+            final byte[] tagSection = binaryTags.generateTagSection();
             final int totalLength = preamble.length + typeSection.length + functionSection.length + tableSection.length + memorySection.length + globalSection.length + exportSection.length +
-                            elementSection.length + dataCountSection.length + codeSection.length + dataSection.length + customSections.length;
+                            elementSection.length + dataCountSection.length + customSectionsBeforeCode.length + codeSection.length + dataSection.length + customSections.length + tagSection.length;
             final byte[] binary = new byte[totalLength];
             int length = 0;
             System.arraycopy(preamble, 0, binary, length, preamble.length);
@@ -458,6 +510,8 @@ public abstract class AbstractBinarySuite {
             length += tableSection.length;
             System.arraycopy(memorySection, 0, binary, length, memorySection.length);
             length += memorySection.length;
+            System.arraycopy(tagSection, 0, binary, length, tagSection.length);
+            length += tagSection.length;
             System.arraycopy(globalSection, 0, binary, length, globalSection.length);
             length += globalSection.length;
             System.arraycopy(exportSection, 0, binary, length, exportSection.length);
@@ -466,6 +520,8 @@ public abstract class AbstractBinarySuite {
             length += elementSection.length;
             System.arraycopy(dataCountSection, 0, binary, length, dataCountSection.length);
             length += dataCountSection.length;
+            System.arraycopy(customSectionsBeforeCode, 0, binary, length, customSectionsBeforeCode.length);
+            length += customSectionsBeforeCode.length;
             System.arraycopy(codeSection, 0, binary, length, codeSection.length);
             length += codeSection.length;
             System.arraycopy(dataSection, 0, binary, length, dataSection.length);

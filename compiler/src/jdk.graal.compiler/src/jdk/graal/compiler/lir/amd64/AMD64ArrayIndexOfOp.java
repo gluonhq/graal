@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,14 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
-import static jdk.vm.ci.amd64.AMD64.r8;
-import static jdk.vm.ci.amd64.AMD64.rax;
-import static jdk.vm.ci.amd64.AMD64.rcx;
-import static jdk.vm.ci.amd64.AMD64.rdi;
-import static jdk.vm.ci.amd64.AMD64.rdx;
-import static jdk.vm.ci.amd64.AMD64.rsi;
+import static jdk.graal.compiler.asm.amd64.AMD64MacroAssembler.ExtendMode.ZERO_EXTEND;
+import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.XMM;
+import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.YMM;
 import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.vm.ci.code.ValueUtil.isRegister;
 import static jdk.vm.ci.code.ValueUtil.isStackSlot;
-import static jdk.graal.compiler.asm.amd64.AMD64MacroAssembler.ExtendMode.ZERO_EXTEND;
 
+import java.util.Arrays;
 import java.util.EnumSet;
 
 import jdk.graal.compiler.asm.Label;
@@ -48,6 +45,8 @@ import jdk.graal.compiler.asm.amd64.AMD64Assembler.VexRVMOp;
 import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandSize;
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
 import jdk.graal.compiler.asm.amd64.AVXKind.AVXSize;
+import jdk.graal.compiler.code.DataSection;
+import jdk.graal.compiler.core.common.LIRKind;
 import jdk.graal.compiler.core.common.Stride;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
@@ -56,11 +55,9 @@ import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
 import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.Value;
 
@@ -69,13 +66,6 @@ import jdk.vm.ci.meta.Value;
 @Opcode("AMD64_ARRAY_INDEX_OF")
 public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
     public static final LIRInstructionClass<AMD64ArrayIndexOfOp> TYPE = LIRInstructionClass.create(AMD64ArrayIndexOfOp.class);
-
-    private static final Register REG_ARRAY = rsi;
-    private static final Register REG_OFFSET = rax;
-    private static final Register REG_LENGTH = rdx;
-    private static final Register REG_FROM_INDEX = rdi;
-    private static final Register REG_SEARCH_VALUE_1 = rcx;
-    private static final Register REG_SEARCH_VALUE_2 = r8;
 
     private final Stride stride;
     private final int nValues;
@@ -88,19 +78,14 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
 
     @Def({OperandFlag.REG}) Value resultValue;
 
-    @Use({OperandFlag.REG}) Value arrayReg;
-    @Use({OperandFlag.REG}) Value offsetReg;
-    @Use({OperandFlag.REG}) Value lengthReg;
-    @Use({OperandFlag.REG}) Value fromIndexReg;
-    @Use({OperandFlag.REG}) Value searchValue1;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) Value searchValue2;
+    @UseKill({OperandFlag.REG}) Value arrayReg;
+    @UseKill({OperandFlag.REG}) Value offsetReg;
+    @UseKill({OperandFlag.REG}) Value lengthReg;
+    @UseKill({OperandFlag.REG}) Value fromIndexReg;
+    @UseKill({OperandFlag.REG}) Value searchValue1;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) Value searchValue2;
 
-    @Temp({OperandFlag.REG}) Value arrayTmp;
-    @Temp({OperandFlag.REG}) Value offsetTmp;
-    @Temp({OperandFlag.REG}) Value lengthTmp;
-    @Temp({OperandFlag.REG}) Value fromIndexTmp;
-    @Temp({OperandFlag.REG}) Value searchValue1Tmp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) Value searchValue2Tmp;
+    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) Value tableLookupTemp;
 
     @Alive({OperandFlag.REG, OperandFlag.STACK, OperandFlag.ILLEGAL}) Value searchValue3;
     @Alive({OperandFlag.REG, OperandFlag.STACK, OperandFlag.ILLEGAL}) Value searchValue4;
@@ -109,7 +94,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
     @Temp({OperandFlag.REG}) Value[] vectorArray;
     @Temp({OperandFlag.REG}) Value[] vectorTemp;
 
-    private AMD64ArrayIndexOfOp(Stride stride, LIRGeneratorTool.ArrayIndexOfVariant variant, int constOffset, int nValues, LIRGeneratorTool tool,
+    public AMD64ArrayIndexOfOp(Stride stride, LIRGeneratorTool.ArrayIndexOfVariant variant, int constOffset, int nValues, LIRGeneratorTool tool,
                     EnumSet<CPUFeature> runtimeCheckedCPUFeatures, Value result, Value arrayPtr, Value arrayOffset, Value arrayLength, Value fromIndex, Value searchValue1, Value searchValue2,
                     Value searchValue3, Value searchValue4) {
         super(TYPE, tool, runtimeCheckedCPUFeatures, AVXSize.YMM);
@@ -123,35 +108,36 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         GraalError.guarantee(supports(tool.target(), runtimeCheckedCPUFeatures, CPUFeature.SSE2), "needs at least SSE2 support");
 
         resultValue = result;
-        this.arrayTmp = this.arrayReg = arrayPtr;
-        this.offsetTmp = this.offsetReg = arrayOffset;
-        this.lengthTmp = this.lengthReg = arrayLength;
-        this.fromIndexTmp = this.fromIndexReg = fromIndex;
-        this.searchValue1Tmp = this.searchValue1 = searchValue1;
-        if (variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) {
-            this.searchValue2Tmp = searchValue2;
+        this.arrayReg = arrayPtr;
+        this.offsetReg = arrayOffset;
+        this.lengthReg = arrayLength;
+        this.fromIndexReg = fromIndex;
+        this.searchValue1 = searchValue1;
+        if (variant.isTable()) {
             this.searchValue2 = Value.ILLEGAL;
+            this.tableLookupTemp = tool.newVariable(LIRKind.value(AMD64Kind.QWORD));
         } else {
-            this.searchValue2Tmp = this.searchValue2 = searchValue2;
+            this.searchValue2 = searchValue2;
+            this.tableLookupTemp = Value.ILLEGAL;
         }
         this.searchValue3 = searchValue3;
         this.searchValue4 = searchValue4;
 
         this.vectorKind = getVectorKind(stride);
-        this.vectorCompareVal = allocateVectorRegisters(tool, stride, variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? 2 : nValues);
-        this.vectorArray = allocateVectorRegisters(tool, stride, variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? stride.value : 4);
-        this.vectorTemp = allocateVectorRegisters(tool, stride, getNumberOfRequiredTempVectors(variant, nValues));
+        this.vectorCompareVal = allocateVectorRegisters(tool, stride, variant.isTable() ? variant.tableCount() * 2 : nValues);
+        this.vectorArray = allocateVectorRegisters(tool, stride, variant.isTable() ? stride.value : 4);
+        this.vectorTemp = allocateVectorRegisters(tool, stride, getNumberOfRequiredTempVectors(variant, stride, nValues));
     }
 
-    private static int getNumberOfRequiredTempVectors(LIRGeneratorTool.ArrayIndexOfVariant variant, int nValues) {
-        switch (variant) {
-            case MatchRange:
-                return nValues / 2 + 1;
-            case Table:
-                return 4;
-            default:
-                return 0;
-        }
+    private static int getNumberOfRequiredTempVectors(LIRGeneratorTool.ArrayIndexOfVariant variant, Stride stride, int nValues) {
+        return switch (variant) {
+            case MatchRange, MatchRangeForeignEndian -> nValues / 2 + 1;
+            case Table, TableForeignEndian -> 4;
+            case FindTwoConsecutiveTables, FindTwoConsecutiveTablesForeignEndian -> 5;
+            case FindThreeConsecutiveTables, FindThreeConsecutiveTablesForeignEndian -> 6;
+            case FindFourConsecutiveTables, FindFourConsecutiveTablesForeignEndian -> 8 - stride.value;
+            default -> 0;
+        };
     }
 
     private static Register[] asRegisters(Value[] values) {
@@ -162,44 +148,18 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         return registers;
     }
 
-    public static AMD64ArrayIndexOfOp movParamsAndCreate(Stride stride, LIRGeneratorTool.ArrayIndexOfVariant variant, LIRGeneratorTool tool,
-                    EnumSet<CPUFeature> runtimeCheckedCPUFeatures, Value result, Value arrayPtr, Value arrayOffset, Value arrayLength, Value fromIndex, Value... searchValues) {
-
-        int nValues = searchValues.length;
-        RegisterValue regArray = REG_ARRAY.asValue(arrayPtr.getValueKind());
-        RegisterValue regOffset = REG_OFFSET.asValue(arrayOffset.getValueKind());
-        RegisterValue regLength = REG_LENGTH.asValue(arrayLength.getValueKind());
-        RegisterValue regFromIndex = REG_FROM_INDEX.asValue(fromIndex.getValueKind());
-        RegisterValue regSearchValue1 = REG_SEARCH_VALUE_1.asValue(searchValues[0].getValueKind());
-        Value regSearchValue2 = nValues > 1 ? REG_SEARCH_VALUE_2.asValue(searchValues[1].getValueKind())
-                        : variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? REG_SEARCH_VALUE_2.asValue() : Value.ILLEGAL;
-        Value regSearchValue3 = nValues > 2 ? tool.asAllocatable(searchValues[2]) : Value.ILLEGAL;
-        Value regSearchValue4 = nValues > 3 ? tool.asAllocatable(searchValues[3]) : Value.ILLEGAL;
-
-        tool.emitConvertNullToZero(regArray, arrayPtr);
-        tool.emitMove(regOffset, arrayOffset);
-        tool.emitMove(regLength, arrayLength);
-        tool.emitMove(regFromIndex, fromIndex);
-        tool.emitMove(regSearchValue1, searchValues[0]);
-        if (nValues > 1) {
-            tool.emitMove((RegisterValue) regSearchValue2, searchValues[1]);
-        }
-        final int constOffset;
-        if (isConstant(arrayOffset) && asConstant(arrayOffset).asLong() >= 0 && asConstant(arrayOffset).asLong() <= Integer.MAX_VALUE) {
-            constOffset = (int) asConstant(arrayOffset).asLong();
-        } else {
-            constOffset = -1;
-        }
-        return new AMD64ArrayIndexOfOp(stride, variant, constOffset, nValues, tool,
-                        runtimeCheckedCPUFeatures, result, regArray, regOffset, regLength, regFromIndex, regSearchValue1, regSearchValue2, regSearchValue3, regSearchValue4);
-    }
-
     private boolean useConstantOffset() {
         return constOffset >= 0;
     }
 
+    private boolean isConsecutiveTableVariant() {
+        return variant.returnsLong();
+    }
+
     @Override
     public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler asm) {
+        AMD64Assembler.AMD64SIMDInstructionEncoding oldEncoding = asm.setTemporaryAvxEncoding(AMD64Assembler.AMD64SIMDInstructionEncoding.VEX);
+
         int nVectors = getNumberOfVectorsInBulkLoop();
         Register arrayPtr = asRegister(arrayReg);
         Register arrayLength = asRegister(lengthReg);
@@ -213,6 +173,12 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         Register[] vecCmp = asRegisters(vectorCompareVal);
         Register[] vecArray = asRegisters(vectorArray);
         Register[] vecTmp = asRegisters(vectorTemp);
+        if (isConsecutiveTableVariant()) {
+            emitFindConsecutiveTablesCode(crb, asm, arrayPtr, arrayLength, index, asRegister(searchValue[0]), vecCmp, vecArray, vecTmp);
+            asm.resetAvxEncoding(oldEncoding);
+            return;
+        }
+        DataSection.Data reverseBytesMask = null;
         Label ret = new Label();
         Label bulkVectorLoop = new Label();
         Label singleVectorLoop = new Label();
@@ -230,7 +196,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         Label elementWiseNotFound = new Label();
         Label skipBulkVectorLoop = new Label();
         Label bsfAdd = new Label();
-        int vectorLength = variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? vectorKind.getSizeInBytes() : vectorKind.getVectorLength();
+        int vectorLength = variant.isTable() ? vectorKind.getSizeInBytes() : vectorKind.getVectorLength();
         int bulkSize = vectorLength * nVectors;
 
         if (useConstantOffset()) {
@@ -245,15 +211,17 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         // re-use fromIndex register as temp
         Register cmpResult = asRegister(fromIndexReg);
 
-        if (variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             // load lookup tables
-            asm.movdqu(AVXSize.XMM, vecCmp[0], new AMD64Address(asRegister(searchValue[0])));
-            asm.movdqu(AVXSize.XMM, vecCmp[1], new AMD64Address(asRegister(searchValue[0]), AVXSize.XMM.getBytes()));
             loadMask(crb, asm, Stride.S1, vecTmp[0], 0x0f);
-            if (vectorSize == AVXSize.YMM) {
+            asm.movdqu(vectorSize, vecCmp[0], new AMD64Address(asRegister(searchValue[0])));
+            if (vectorSize == AVXSize.XMM) {
+                asm.movdqu(AVXSize.XMM, vecCmp[1], new AMD64Address(asRegister(searchValue[0]), AVXSize.XMM.getBytes()));
+            } else {
+                assert vectorSize == AVXSize.YMM : Assertions.errorMessage(vectorSize);
                 // duplicate lookup tables
+                AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, AVXSize.YMM, vecCmp[1], vecCmp[0], vecCmp[0], 0x11);
                 AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, AVXSize.YMM, vecCmp[0], vecCmp[0], vecCmp[0], 0x00);
-                AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, AVXSize.YMM, vecCmp[1], vecCmp[1], vecCmp[1], 0x00);
                 if (stride == Stride.S4) {
                     // load permutation table for fixing the results of narrowing operations via
                     // PACKUSDW/PACKUSWB
@@ -267,6 +235,10 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                 broadcastSearchValue(crb, asm, vecCmp[i], searchValue[i], cmpResult, vecArray[0]);
             }
         }
+        if (variant.isForeignEndian()) {
+            GraalError.guarantee(stride.value > 1, "ForeignEndian search modes are not implemented for Stride 1");
+            reverseBytesMask = writeToDataSection(crb, getReverseBytesMask(stride));
+        }
 
         // check if vector load is in bounds
         asm.cmpqAndJcc(index, arrayLength, ConditionFlag.LessEqual, runVectorized, false);
@@ -277,12 +249,12 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             // index = fromIndex (+ 1 if findTwoConsecutive) + XMM vector size
             asm.subq(index, vectorLength / 2);
             // check if vector load is in bounds
-            asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Greater, variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? elementWise : qWordWise, false);
+            asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Greater, variant.isTable() ? elementWise : qWordWise, false);
             // do one vector comparison from fromIndex
-            emitVectorCompare(asm, AVXSize.XMM, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, xmmFound, variant != LIRGeneratorTool.ArrayIndexOfVariant.Table);
+            emitVectorCompare(crb, asm, AVXSize.XMM, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, xmmFound, false);
             // and one aligned to the array end
             asm.movq(index, arrayLength);
-            emitVectorCompare(asm, AVXSize.XMM, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, xmmFound, true);
+            emitVectorCompare(crb, asm, AVXSize.XMM, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, xmmFound, true);
             // no match, return negative
             asm.jmp(elementWiseNotFound);
             // match found, adjust index by XMM offset
@@ -293,7 +265,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         }
 
         int vectorLengthQWord = AVXSize.QWORD.getBytes() / stride.value;
-        if (variant != LIRGeneratorTool.ArrayIndexOfVariant.Table) {
+        if (!variant.isTable()) {
             asm.bind(qWordWise);
             // region is too short for XMM vectors, try QWORD
             Label[] qWordFound = {new Label()};
@@ -302,10 +274,10 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             // check if vector load is in bounds
             asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Greater, elementWise, false);
             // do one vector comparison from fromIndex
-            emitVectorCompare(asm, AVXSize.QWORD, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, qWordFound, true);
+            emitVectorCompare(crb, asm, AVXSize.QWORD, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, qWordFound, false);
             // and one aligned to the array end
             asm.movq(index, arrayLength);
-            emitVectorCompare(asm, AVXSize.QWORD, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, qWordFound, true);
+            emitVectorCompare(crb, asm, AVXSize.QWORD, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, qWordFound, true);
             // no match, return negative
             asm.jmpb(elementWiseNotFound);
             // match found, adjust index by QWORD offset
@@ -318,7 +290,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         // search range is smaller than vector size, do element-wise comparison
         asm.bind(elementWise);
         // index = fromIndex (+ 1 if findTwoConsecutive)
-        asm.subq(index, (variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) ? (supportsAVX2AndYMM() ? (vectorLength / 2) : vectorLength) : vectorLengthQWord);
+        asm.subq(index, variant.isTable() ? (supportsAVX2AndYMM() ? (vectorLength / 2) : vectorLength) : vectorLengthQWord);
         // check if enough array slots remain
         asm.cmpqAndJcc(index, arrayLength, ConditionFlag.GreaterEqual, elementWiseNotFound, true);
 
@@ -352,15 +324,18 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             case MatchAny:
                 asm.movSZx(valueSize, ZERO_EXTEND, cmpResult, arrayAddr);
                 for (int i = 0; i < nValues; i++) {
-                    cmpqAndJcc(crb, asm, cmpResult, searchValue[i], elementWiseFound, ConditionFlag.Equal, true);
+                    cmplAndJcc(crb, asm, cmpResult, searchValue[i], elementWiseFound, ConditionFlag.Equal, true);
                 }
                 break;
-            case MatchRange:
+            case MatchRange, MatchRangeForeignEndian:
                 asm.movSZx(valueSize, ZERO_EXTEND, cmpResult, arrayAddr);
+                if (variant == LIRGeneratorTool.ArrayIndexOfVariant.MatchRangeForeignEndian) {
+                    reverseBytesScalar(asm, valueSize, cmpResult);
+                }
                 for (int i = 0; i < nValues; i += 2) {
                     Label noMatch = new Label();
-                    cmpqAndJcc(crb, asm, cmpResult, searchValue[i], noMatch, ConditionFlag.Below, true);
-                    cmpqAndJcc(crb, asm, cmpResult, searchValue[i + 1], elementWiseFound, ConditionFlag.BelowEqual, true);
+                    cmplAndJcc(crb, asm, cmpResult, searchValue[i], noMatch, ConditionFlag.Below, true);
+                    cmplAndJcc(crb, asm, cmpResult, searchValue[i + 1], elementWiseFound, ConditionFlag.BelowEqual, true);
                     asm.bind(noMatch);
                 }
                 break;
@@ -379,10 +354,13 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                 asm.orq(cmpResult, asRegister(searchValue[1]));
                 asm.cmpqAndJcc(cmpResult, asRegister(searchValue[0]), AMD64Assembler.ConditionFlag.Equal, elementWiseFound, true);
                 break;
-            case Table:
+            case Table, TableForeignEndian:
                 Label greaterThan0xff = new Label();
-                Register tmp = asRegister(searchValue2Tmp);
+                Register tmp = asRegister(tableLookupTemp);
                 asm.movSZx(valueSize, ZERO_EXTEND, cmpResult, arrayAddr);
+                if (variant == LIRGeneratorTool.ArrayIndexOfVariant.TableForeignEndian) {
+                    reverseBytesScalar(asm, valueSize, cmpResult);
+                }
                 if (stride.value > 1) {
                     asm.cmpqAndJcc(cmpResult, 0xff, ConditionFlag.Above, greaterThan0xff, true);
                 }
@@ -416,7 +394,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         asm.bind(runVectorized);
 
         // do one unaligned vector comparison pass and adjust alignment afterwards
-        emitVectorCompare(asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, vectorFound, false);
+        emitVectorCompare(crb, asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, vectorFound, false);
 
         // adjust index to vector size alignment
         asm.movl(cmpResult, arrayPtr);
@@ -430,14 +408,18 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         // add bulk size
         asm.addq(index, bulkSize);
 
-        boolean bulkLoopShortJmp = !((variant == LIRGeneratorTool.ArrayIndexOfVariant.MatchRange && nValues == 4 || variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) && stride.value > 1);
-        // check if there are enough array slots remaining for the bulk loop
-        asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Greater, skipBulkVectorLoop, bulkLoopShortJmp);
+        boolean bulkLoopShortJmp = !((variant.isMatchRange() && nValues == 4 || variant.isTable()) && stride.value > 1);
+        /*
+         * Check if there are enough array slots remaining for the bulk loop. Note: The alignment
+         * following the cmpAndJcc can lead to a jump distance > 127. This prevents safely using a
+         * short jump.
+         */
+        asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Greater, skipBulkVectorLoop, false);
 
         asm.align(preferredLoopAlignment(crb));
         asm.bind(bulkVectorLoop);
         // memory-aligned bulk comparison
-        emitVectorCompare(asm, vectorSize, nVectors, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, vectorFound, false);
+        emitVectorCompare(crb, asm, vectorSize, nVectors, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, vectorFound, false);
         // adjust index
         asm.addq(index, bulkSize);
         // check if there are enough array slots remaining for the bulk loop
@@ -448,7 +430,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             // do last load from end of array
             asm.movq(index, arrayLength);
             // compare
-            emitVectorCompare(asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, vectorFound, true);
+            emitVectorCompare(crb, asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, vectorFound, true);
         } else {
             // remove bulk offset
             asm.subq(index, bulkSize);
@@ -462,7 +444,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             // if load would be over bounds, set the load to the end of the array
             asm.cmovq(AMD64Assembler.ConditionFlag.Greater, index, arrayLength);
             // compare
-            emitVectorCompare(asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, cmpResult, vectorFound, true);
+            emitVectorCompare(crb, asm, vectorSize, 1, arrayPtr, index, vecCmp, vecArray, vecTmp, reverseBytesMask, cmpResult, vectorFound, true);
             // check if there are enough array slots remaining for the loop
             asm.cmpqAndJcc(index, arrayLength, ConditionFlag.Less, singleVectorLoop, true);
         }
@@ -478,7 +460,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             }
         }
         asm.bind(bsfAdd);
-        if (variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             asm.pxor(vectorSize, vecTmp[1], vecTmp[1]);
             asm.pcmpeqb(vectorSize, vecTmp[2], vecTmp[1]);
             asm.pmovmsk(vectorSize, cmpResult, vecTmp[2]);
@@ -486,7 +468,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         }
         // find offset
         bsfq(asm, cmpResult, cmpResult);
-        if (stride.value > 1 && variant != LIRGeneratorTool.ArrayIndexOfVariant.Table) {
+        if (stride.value > 1 && !variant.isTable()) {
             // convert byte offset to chars
             asm.shrq(cmpResult, stride.log2);
         }
@@ -494,6 +476,19 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         asm.addq(index, cmpResult);
 
         asm.bind(ret);
+
+        asm.resetAvxEncoding(oldEncoding);
+    }
+
+    private static void reverseBytesScalar(AMD64MacroAssembler asm, OperandSize valueSize, Register value) {
+        switch (valueSize) {
+            case BYTE -> {
+            }
+            case WORD -> asm.rorw(value, 8);
+            case DWORD -> asm.bswapl(value);
+            case QWORD -> asm.bswapq(value);
+            default -> GraalError.shouldNotReachHereUnexpectedValue(valueSize);
+        }
     }
 
     private int getNumberOfVectorsInBulkLoop() {
@@ -507,11 +502,11 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         }
     }
 
-    private static void cmpqAndJcc(CompilationResultBuilder crb, AMD64MacroAssembler asm, Register src1, Value src2, Label branchTarget, ConditionFlag cc, boolean isShortJmp) {
+    private static void cmplAndJcc(CompilationResultBuilder crb, AMD64MacroAssembler asm, Register src1, Value src2, Label branchTarget, ConditionFlag cc, boolean isShortJmp) {
         if (isStackSlot(src2)) {
-            asm.cmpqAndJcc(src1, (AMD64Address) crb.asAddress(src2), cc, branchTarget, isShortJmp);
+            asm.cmplAndJcc(src1, (AMD64Address) crb.asAddress(src2), cc, branchTarget, isShortJmp);
         } else {
-            asm.cmpqAndJcc(src1, asRegister(src2), cc, branchTarget, isShortJmp);
+            asm.cmplAndJcc(src1, asRegister(src2), cc, branchTarget, isShortJmp);
         }
     }
 
@@ -525,7 +520,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
     }
 
     private int getResultIndexDelta(int i) {
-        if (variant == LIRGeneratorTool.ArrayIndexOfVariant.Table) {
+        if (variant.isTable()) {
             return vectorSize.getBytes();
         }
         return (i + 1) * vectorKind.getVectorLength() + (findTwoConsecutive ? 1 : 0);
@@ -611,7 +606,9 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         }
     }
 
-    private void emitVectorCompare(AMD64MacroAssembler asm,
+    @SuppressWarnings("fallthrough")
+    private void emitVectorCompare(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
                     AVXSize vSize,
                     int nVectors,
                     Register arrayPtr,
@@ -619,15 +616,16 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                     Register[] vecCmp,
                     Register[] vecArray,
                     Register[] vecTmp,
+                    DataSection.Data reverseBytesMask,
                     Register cmpResult,
                     Label[] vectorFound,
                     boolean shortJmp) {
         // load array contents into vectors
-        int nVectorLoads = variant == LIRGeneratorTool.ArrayIndexOfVariant.Table ? stride.value : nVectors;
+        int nVectorLoads = variant.isTable() ? stride.value : nVectors;
         for (int i = 0; i < nVectorLoads; i++) {
             int base = i * nValues;
-            for (int j = 0; j < (withMask || variant == LIRGeneratorTool.ArrayIndexOfVariant.MatchRange ? nValues / 2 : nValues); j++) {
-                emitArrayLoad(asm, vSize, vecArray[base + j], arrayPtr, index, getVectorOffset(nVectorLoads - (i + 1), j, vSize));
+            for (int j = 0; j < (withMask || variant.isMatchRange() ? nValues / 2 : nValues); j++) {
+                emitArrayLoad(asm, vSize, vecArray[base + j], arrayPtr, index, arrayIndexStride, getVectorOffset(nVectorLoads - (i + 1), j, vSize));
             }
         }
         switch (variant) {
@@ -647,6 +645,10 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                     emitVectorCompareCheckVectorFound(asm, vSize, cmpResult, vectorFound[nVectors - (i + 1)], shortJmp);
                 }
                 break;
+            case MatchRangeForeignEndian:
+                assert nVectors == 1 : nVectors;
+                asm.pshufb(vSize == AVXSize.QWORD ? AVXSize.XMM : vSize, vecArray[0], (AMD64Address) crb.recordDataSectionReference(reverseBytesMask));
+                // fallthrough
             case MatchRange:
                 assert nVectors == 1 : nVectors;
                 if (nValues == 2) {
@@ -699,7 +701,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                     emitVectorCompareCheckVectorFound(asm, vSize, cmpResult, vectorFound[nVectors - ((i / 2) + 1)], shortJmp);
                 }
                 break;
-            case Table:
+            case Table, TableForeignEndian:
                 Register mask0xf = vecTmp[0];
                 Register tableHi = vecCmp[0];
                 Register tableLo = vecCmp[1];
@@ -708,6 +710,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                         performTableLookup(asm, vSize, mask0xf, tableHi, tableLo, vecArray[0], vecTmp[1], vecTmp[2], vecTmp[3]);
                         break;
                     case S2:
+                        reverseBytesIfForeignEndian(crb, asm, vecArray, reverseBytesMask);
                         // narrow string chars to bytes
                         asm.packuswb(vSize, vecTmp[1], vecArray[0], vecArray[1]);
                         // right-shift chars by 8
@@ -727,6 +730,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                         }
                         break;
                     case S4:
+                        reverseBytesIfForeignEndian(crb, asm, vecArray, reverseBytesMask);
                         // narrow string ints to bytes
                         asm.packusdw(vSize, vecTmp[1], vecArray[0], vecArray[1]);
                         asm.packusdw(vSize, vecTmp[2], vecArray[2], vecArray[3]);
@@ -737,9 +741,9 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
                         asm.psrld(vSize, vecArray[3], vecArray[3], 8);
                         // finish narrowing
                         asm.packuswb(vSize, vecTmp[1], vecTmp[2]);
-                        // create a mask for all ints > 0xff
-                        asm.packusdw(vSize, vecArray[0], vecArray[1]);
-                        asm.packusdw(vSize, vecArray[2], vecArray[3]);
+                        // create a mask for all ints <= 0xff
+                        asm.packssdw(vSize, vecArray[0], vecArray[1]);
+                        asm.packssdw(vSize, vecArray[2], vecArray[3]);
                         asm.pxor(vSize, vecTmp[2], vecTmp[2]);
                         asm.packuswb(vSize, vecArray[0], vecArray[2]);
                         asm.pcmpeqb(vSize, vecArray[0], vecTmp[2]);
@@ -799,15 +803,17 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
     }
 
     @SuppressWarnings("fallthrough")
-    private void emitArrayLoad(AMD64MacroAssembler asm, AVXSize targetVectorSize, Register vecDst, Register array, Register index, int displacement) {
-        AMD64Address src = new AMD64Address(array, index, arrayIndexStride, displacement);
+    static void emitArrayLoad(AMD64MacroAssembler asm, AVXSize targetVectorSize, Register vecDst, Register array, Register index, Stride stride, int displacement) {
+        AMD64Address src = new AMD64Address(array, index, stride, displacement);
         if (asm.supports(CPUFeature.AVX)) {
             switch (targetVectorSize) {
                 case DWORD:
-                    VexMoveOp.VMOVD.emit(asm, AVXSize.DWORD, vecDst, src);
+                    // Move a dword into an XMM register
+                    VexMoveOp.VMOVD.emit(asm, AVXSize.XMM, vecDst, src);
                     break;
                 case QWORD:
-                    VexMoveOp.VMOVQ.emit(asm, AVXSize.QWORD, vecDst, src);
+                    // Move a qword into an XMM register
+                    VexMoveOp.VMOVQ.emit(asm, AVXSize.XMM, vecDst, src);
                     break;
                 case XMM:
                 case YMM:
@@ -836,7 +842,7 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
         }
     }
 
-    private static OperandSize getOpSize(Stride stride) {
+    static OperandSize getOpSize(Stride stride) {
         switch (stride) {
             case S1:
                 return OperandSize.BYTE;
@@ -858,6 +864,629 @@ public final class AMD64ArrayIndexOfOp extends AMD64ComplexVectorOp {
             default:
                 assert stride == Stride.S4 : stride;
                 return OperandSize.QWORD;
+        }
+    }
+
+    private void reverseBytesIfForeignEndian(CompilationResultBuilder crb, AMD64MacroAssembler asm, Register[] vecArray, DataSection.Data reverseBytesMask) {
+        if (reverseBytesMask != null) {
+            for (Register register : vecArray) {
+                asm.pshufb(vectorSize, register, (AMD64Address) crb.recordDataSectionReference(reverseBytesMask));
+            }
+        }
+    }
+
+    private void emitFindConsecutiveTablesCode(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
+                    Register arrayPtr,
+                    Register arrayLength,
+                    Register index,
+                    Register tables,
+                    Register[] vecCmp,
+                    Register[] vecArray,
+                    Register[] vecTmp) {
+        int tableCount = variant.tableCount();
+        assert tableCount >= 2 : tableCount;
+        assert stride.value <= 4 : stride.value;
+        assert vecArray.length >= stride.value : vecArray.length;
+
+        // arrayPtr points at the first searchable byte, index starts at fromIndex.
+        if (useConstantOffset()) {
+            asm.leaq(arrayPtr, new AMD64Address(arrayPtr, constOffset));
+        } else {
+            asm.leaq(arrayPtr, new AMD64Address(arrayPtr, asRegister(offsetReg), Stride.S1));
+        }
+        asm.movq(index, asRegister(fromIndexReg));
+
+        // Helper masks for the consecutive-table path:
+        // - reverseBytesMask byte-reverses foreign-endian S2/S4 input before narrowing
+        // - extractCandidateMask extracts the first matching byte from a candidate vector
+        // - mask0x0f isolates the two nibble indices used by the lookup tables
+        // - s4UnscrambleMap restores element order after the S4 narrowing pack operations
+        DataSection.Data reverseBytesMask = variant.isForeignEndian() ? writeToDataSection(crb, getReverseBytesMask(stride)) : null;
+        DataSection.Data extractCandidateMask = writeToDataSection(crb, createExtractCandidateMask(vectorSize));
+        DataSection.Data mask0x0f = createMask(crb, Stride.S1, 0x0f);
+        DataSection.Data s4UnscrambleMap = stride == Stride.S4 ? writeToDataSection(crb, getAVX2IntToBytePackingUnscrambleMap()) : null;
+        boolean usePackedCarry = usePackedCarryForConsecutiveTables();
+
+        // Load one hi/lo lookup-table pair per logical table. YMM duplicates each 128-bit half
+        // because PSHUFB works independently in the low and high lanes.
+        if (vectorSize == AVXSize.XMM) {
+            for (int i = 0; i < variant.tableCount() * 2; i++) {
+                asm.movdqu(vectorSize, vecCmp[i], new AMD64Address(tables, i * 16));
+            }
+        } else {
+            assert vectorSize == AVXSize.YMM : Assertions.errorMessage(vectorSize);
+            for (int i = 0; i < variant.tableCount(); i++) {
+                // load both 16-byte tables with a single YMM load
+                asm.movdqu(vectorSize, vecCmp[i * 2], new AMD64Address(tables, i * 32));
+            }
+            for (int i = 0; i < variant.tableCount(); i++) {
+                // duplicate upper half into a separate vector
+                AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, AVXSize.YMM, vecCmp[i * 2 + 1], vecCmp[i * 2], vecCmp[i * 2], 0x11);
+            }
+            for (int i = 0; i < variant.tableCount(); i++) {
+                // duplicate lower half
+                AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, AVXSize.YMM, vecCmp[i * 2], vecCmp[i * 2], vecCmp[i * 2], 0x00);
+            }
+        }
+
+        int vectorLength = vectorSize.getBytes();
+        Register lastVectorStart = asRegister(offsetReg);
+        Register cmpMask = asRegister(fromIndexReg);
+        Register tmp = asRegister(tableLookupTemp);
+        // vectorCandidate holds the final "all tables matched" byte mask for the current vector.
+        // vPrevCandidate caches the previous vector's intermediate candidates to account for
+        // matches that cross vector boundaries.
+        Register vectorCandidate = vecTmp[vecTmp.length - 1];
+        int firstPrevCandidateTempIndex = vecTmp.length - tableCount;
+        Register[] vPrevCandidate = Arrays.copyOfRange(vecTmp, firstPrevCandidateTempIndex, firstPrevCandidateTempIndex + (variant.tableCount() - 1));
+        Label vectorLoop = new Label();
+        Label vectorLoopAfterLoad = new Label();
+        Label vectorFound = new Label();
+        Label shortVector = new Label();
+        Label noMatch = new Label();
+        Label ret = new Label();
+
+        // Set previous candidate vectors to zero.
+        for (Register register : vPrevCandidate) {
+            asm.pxor(vectorSize, register, register);
+        }
+        // Calculate main loop break point.
+        asm.movq(lastVectorStart, arrayLength);
+        asm.subq(lastVectorStart, vectorLength);
+        if (vectorSize == YMM) {
+            // this intrinsic is never called with a search window (array length - fromIndex)
+            // smaller than 16, so we only need to check for window lengths less than 32 on YMM. In
+            // all other cases, the search window will always fit at least one main loop iteration.
+            asm.cmpqAndJcc(index, lastVectorStart, ConditionFlag.Greater, shortVector, false);
+        }
+
+        // main vector loop
+        asm.align(preferredLoopAlignment(crb));
+        asm.bind(vectorLoop);
+        emitConsecutiveTablesMainLoopBody(crb, asm, vectorSize, arrayPtr, index, vecCmp, vecArray, vecTmp, vPrevCandidate, vectorCandidate, reverseBytesMask, mask0x0f,
+                        s4UnscrambleMap, vectorLoopAfterLoad, vectorFound);
+        asm.addq(index, vectorLength);
+        asm.cmpqAndJcc(index, lastVectorStart, ConditionFlag.LessEqual, vectorLoop, tableCount == 2 && stride == Stride.S1);
+
+        // Tail handling. At this point, there are between 0 and vectorSize - 1 elements remaining.
+        asm.cmpqAndJcc(index, arrayLength, ConditionFlag.GreaterEqual, noMatch, false);
+        // To process the tail, we rewind the index to arrayLength - vectorSize and perform one
+        // additional main loop iteration. After that iteration, the condition above will trigger
+        // and exit the function. For correctness, we need to adjust vPrevCandidate before jumping
+        // to the main loop again: The input data loaded in the last operation will overlap with the
+        // previous "regular" iteration, but there may still be cross-boundary matches to be
+        // considered, specifically if (tailLength > vectorLength - tableCount).
+        if (tableCount == 2) {
+            // in two-table mode, we don't need to preserve the previous candidate: there is always
+            // an overlap of at least one element with the previous loop iteration, so any
+            // cross-vector-boundary match would already be found in the previous iteration.
+            asm.pxor(vectorSize, vPrevCandidate[0], vPrevCandidate[0]);
+        } else if (!usePackedCarry) {
+            // In 3 or 4 table mode, a cross-vector-boundary match is possible, so we need to
+            // preserve and adjust prevCandidate's last 1 or 2 bytes. To make the prevCandidate
+            // vectors line up with our adjusted index, we use a shuffle mask of
+            // [0x80 x ((2 * vectorSize) - 3), 0x0d, 0x0e, 0x0f], which we load offset by the tail
+            // length. This will zero all elements where the mask is 0x80, and adjust the last bytes
+            // if tail length is large enough. For example, if we're using YMM vectors, any tail
+            // length < 30 will zero the vector. Tail length 30 will move prevCandidate's elements
+            // at position 29 and 30 to position 30 and 31. Tail length 31 will move element 30 to
+            // 31.
+            asm.movq(cmpMask, arrayLength);
+            asm.subq(cmpMask, index);
+            asm.leaq(tmp, getMaskOnce(crb, createCTTailPrevShuffleMask(vectorSize), vectorSize.getBytes() * 2));
+            asm.movdqu(vectorSize, vectorCandidate, new AMD64Address(tmp, cmpMask, Stride.S1));
+            for (Register vPrev : vPrevCandidate) {
+                asm.pshufb(vectorSize, vPrev, vectorCandidate);
+            }
+        } else {
+            // Packed S2/S4 4-table mode keeps carry in packed-byte form, which we can't easily
+            // adjust to a different index. In this case, we check if the tail is long enough to
+            // need adjustment, and if so, we jump to the dedicated path for small input arrays.
+            // Otherwise, we simply clear the previous candidate vectors and jump to the main loop
+            // as before.
+            asm.movq(cmpMask, arrayLength);
+            asm.subq(cmpMask, index);
+            asm.cmpqAndJcc(cmpMask, vectorLength - (tableCount - 1), ConditionFlag.GreaterEqual, shortVector, false);
+            asm.pxor(vectorSize, vPrevCandidate[0], vPrevCandidate[0]);
+            asm.movq(index, lastVectorStart);
+            asm.jmp(vectorLoop);
+        }
+        asm.movq(index, lastVectorStart);
+        asm.jmp(vectorLoop);
+
+        asm.bind(vectorFound);
+        // vectorCandidate contains non-zero bytes at every end position of a matching sequence.
+        // Find the first one, extract the matching byte
+        Register vectorFoundScratch = vecTmp[0];
+        // convert matches to 0x00, non-matches to 0xff
+        asm.pxor(vectorSize, vectorFoundScratch, vectorFoundScratch);
+        asm.pcmpeqb(vectorSize, vectorFoundScratch, vectorCandidate);
+        // extract sign bits
+        asm.pmovmsk(vectorSize, cmpMask, vectorFoundScratch);
+        // invert
+        asm.notl(cmpMask);
+        if (vectorSize == AVXSize.XMM) {
+            asm.andl(cmpMask, 0xffff);
+        }
+        // get first match index
+        bsfq(asm, cmpMask, cmpMask);
+        // Extract match byte. For this, we use the following shuffle mask (on YMM):
+        // [0..16, 0x80 x 32, 0..16]
+        // We load from this mask using the match index as offset. This will move the match byte to
+        // position 0 if the match index is < 16, and to position 16 otherwise. The 0x80 values in
+        // the mask's "middle" ensure that when match index is < 16, vector byte 16 will be cleared
+        // by the shuffle, and vice versa. This allows us to POR the upper and lower vector half to
+        // reliably get the match byte into vector element 0.
+        asm.leaq(tmp, (AMD64Address) crb.recordDataSectionReference(extractCandidateMask));
+        asm.movdqu(vectorSize, vectorFoundScratch, new AMD64Address(tmp, cmpMask, Stride.S1));
+        asm.pshufb(vectorSize, vectorCandidate, vectorFoundScratch);
+        if (vectorSize == YMM) {
+            // split into upper and lower half vector
+            AMD64Assembler.VexMRIOp.VEXTRACTI128.emit(asm, YMM, vectorFoundScratch, vectorCandidate, 1);
+            // POR halves
+            asm.por(vectorSize, vectorCandidate, vectorFoundScratch);
+        }
+        // load match byte into general purpose register
+        asm.movdq(tmp, vectorCandidate);
+        asm.andl(tmp, 0xff);
+        asm.addl(index, cmpMask);
+        // adjust matching index to start of sequence
+        asm.subl(index, tableCount - 1);
+        // pack result into [high 32 bits = byte, low 32 bits = index].
+        asm.shlq(tmp, 32);
+        asm.orq(index, tmp);
+        asm.jmp(ret);
+
+        if (vectorSize == YMM || usePackedCarry) {
+            // Build one synthetic vector from region [index...arrayLength]. This path is used when
+            // vectorSize is YMM and arrayLength - fromIndex is less than 32, or we're in packed
+            // carry mode and (tailLength > vectorLength - tableCount).
+            asm.bind(shortVector);
+            asm.movq(cmpMask, index);
+            asm.subq(cmpMask, arrayLength);
+            switch (stride) {
+                case S1 -> {
+                    assert vectorSize == YMM : Assertions.errorMessage(vectorSize);
+                    // overlapping half vector loads from index and arrayLength-(half vector size)
+                    asm.movdqu(XMM, vecTmp[2], new AMD64Address(arrayPtr, index, arrayIndexStride));
+                    asm.movdqu(XMM, vecArray[0], new AMD64Address(arrayPtr, arrayLength, arrayIndexStride, -XMM.getBytes()));
+                    // adjust the upper half: effectively, this right-shifts the entire XMM vector
+                    // by (vectorLength - tailLength).
+                    asm.leaq(tmp, (AMD64Address) crb.recordDataSectionReference(extractCandidateMask));
+                    asm.movdqu(XMM, vecTmp[3], new AMD64Address(tmp, cmpMask, Stride.S1, vectorSize.getBytes()));
+                    asm.pshufb(XMM, vecArray[0], vecTmp[3]);
+                    // combine halves into one consecutive YMM vector
+                    AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, vectorSize, vecArray[0], vecArray[0], vecTmp[2], 0x02);
+
+                    // emit main loop body without vector loading logic
+                    emitConsecutiveTablesMatch(crb, asm, vectorSize, vecCmp, vecArray, vecTmp, vPrevCandidate, vectorCandidate, mask0x0f);
+
+                    // Ignore trailing bytes.
+                    asm.leaq(tmp, getMaskOnce(crb, createShortVectorS1TailMask(vectorSize)));
+                    asm.pandU(vectorSize, vectorCandidate, new AMD64Address(tmp, cmpMask, Stride.S1, vectorSize.getBytes()), vecTmp[2]);
+                    asm.ptest(vectorSize, vectorCandidate, vectorCandidate);
+                    asm.jcc(ConditionFlag.NotZero, vectorFound);
+                    asm.jmp(noMatch);
+                }
+                case S2 -> {
+                    // Narrow the first and last vectors to bytes, then shuffle them into one
+                    // synthetic vector that exactly covers the tail.
+                    asm.movdqu(vectorSize, vecArray[0], new AMD64Address(arrayPtr, index, arrayIndexStride));
+                    asm.movdqu(vectorSize, vecArray[1], new AMD64Address(arrayPtr, arrayLength, arrayIndexStride, -vectorSize.getBytes()));
+                    reverseBytesIfForeignEndian(crb, asm, vecArray, reverseBytesMask);
+
+                    Register vNarrowedBytes = usePackedCarry ? vPrevCandidate[2] : vecTmp[1];
+                    Register vValidMask = usePackedCarry ? vecTmp[1] : vecTmp[2];
+                    emitCTNarrowInputS2(asm, vectorSize, vecArray, vNarrowedBytes, vValidMask);
+                    // slight deviation from S1 case: in S2 and S4, we first build a continuous
+                    // shuffle mask and apply it to both vValidMask and vNarrowedBytes.
+                    Register tailShuffleMask = vecArray[0];
+                    emitShortVectorCreateShuffleMask(crb, asm, vecArray, cmpMask, tmp, extractCandidateMask);
+                    asm.pshufb(vectorSize, vValidMask, tailShuffleMask);
+                    asm.pshufb(vectorSize, vNarrowedBytes, tailShuffleMask);
+                    // on S2/S4, we can reuse the main loop because it already expects a validMask
+                    asm.jmp(vectorLoopAfterLoad);
+                }
+                case S4 -> {
+                    // S4 needs four source vectors before narrowing because each result byte is
+                    // produced from a 32-bit lane.
+                    asm.movdqu(vectorSize, vecArray[0], new AMD64Address(arrayPtr, index, arrayIndexStride));
+                    asm.movdqu(vectorSize, vecArray[1], new AMD64Address(arrayPtr, index, arrayIndexStride, vectorSize.getBytes()));
+                    asm.movdqu(vectorSize, vecArray[2], new AMD64Address(arrayPtr, arrayLength, arrayIndexStride, -(vectorSize.getBytes() * 2)));
+                    asm.movdqu(vectorSize, vecArray[3], new AMD64Address(arrayPtr, arrayLength, arrayIndexStride, -vectorSize.getBytes()));
+                    reverseBytesIfForeignEndian(crb, asm, vecArray, reverseBytesMask);
+
+                    // analogous to S2 case
+                    Register vNarrowedBytes = usePackedCarry ? vPrevCandidate[2] : vecTmp[1];
+                    Register vValidMask = vecArray[3];
+                    emitCTNarrowInputS4(crb, asm, vectorSize, vecArray, vNarrowedBytes, vValidMask, s4UnscrambleMap);
+
+                    Register tailShuffleMask = vecArray[0];
+                    emitShortVectorCreateShuffleMask(crb, asm, vecArray, cmpMask, tmp, extractCandidateMask);
+                    asm.pshufb(vectorSize, vNarrowedBytes, tailShuffleMask);
+                    asm.pshufb(vectorSize, vValidMask, tailShuffleMask);
+                    asm.jmp(vectorLoopAfterLoad);
+                }
+                default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+            }
+        }
+
+        asm.bind(noMatch);
+        asm.movl(index, -1);
+
+        asm.bind(ret);
+    }
+
+    private boolean usePackedCarryForConsecutiveTables() {
+        // Four-table S2/S4 searches pack prevCandidate vectors into a single vector to reduce
+        // register pressure, and allow the four tables to stay alive in dedicated registers across
+        // loop iterations
+        return variant.tableCount() == 4 && (stride == Stride.S2 || stride == Stride.S4);
+    }
+
+    private void emitShortVectorCreateShuffleMask(CompilationResultBuilder crb, AMD64MacroAssembler asm,
+                    Register[] vecArray,
+                    Register negativeTailLength,
+                    Register tmp,
+                    DataSection.Data extractCandidateMask) {
+        // Build the PSHUFB mask that splices bytes overlapping tail vector loads into one
+        // synthetic contiguous vector.
+        asm.leaq(tmp, (AMD64Address) crb.recordDataSectionReference(extractCandidateMask));
+        if (vectorSize == YMM) {
+            asm.movdqu(AVXSize.XMM, vecArray[0], new AMD64Address(tmp));
+            asm.movdqu(AVXSize.XMM, vecArray[1], new AMD64Address(tmp, negativeTailLength, Stride.S1, YMM.getBytes()));
+            AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, YMM, vecArray[0], vecArray[0], vecArray[1], 0x20);
+        } else {
+            asm.movdq(vecArray[0], new AMD64Address(tmp));
+            asm.movdq(vecArray[1], new AMD64Address(tmp, negativeTailLength, Stride.S1, XMM.getBytes() + 8));
+            asm.movlhps(vecArray[0], vecArray[1]);
+        }
+    }
+
+    private static byte[] createShortVectorS1TailMask(AVXSize vSize) {
+        // Keeps only the byte positions that belong to the real tail in the synthetic S1 vector.
+        byte[] mask = new byte[vSize.getBytes() * 2];
+        Arrays.fill(mask, 0, vSize.getBytes(), (byte) 0xff);
+        return mask;
+    }
+
+    private static byte[] createCTTailPrevShuffleMask(AVXSize vSize) {
+        // Keep the last three bytes from the previous candidate vector. At most three start
+        // positions can cross from one vector into the next because we handle up to four
+        // consecutive tables.
+        byte[] mask = new byte[vSize.getBytes() * 2];
+        Arrays.fill(mask, (byte) 0x80);
+        int last = mask.length - 1;
+        mask[last - 2] = 0x0d;
+        mask[last - 1] = 0x0e;
+        mask[last] = 0x0f;
+        return mask;
+    }
+
+    private static byte[] createExtractCandidateMask(AVXSize vSize) {
+        // After locating the first matching byte, this mask extracts exactly that byte so it can be
+        // moved into a general-purpose register.
+        byte[] mask = new byte[vSize.getBytes() * 2];
+        for (int i = 0; i < 16; i++) {
+            mask[i] = (byte) i;
+        }
+        Arrays.fill(mask, 16, 32, (byte) 0x80);
+        if (vSize == YMM) {
+            System.arraycopy(mask, 0, mask, 32, 32);
+        }
+        return mask;
+    }
+
+    private void emitConsecutiveTablesMainLoopBody(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register arrayPtr,
+                    Register index,
+                    Register[] vLUT,
+                    Register[] vArray,
+                    Register[] vTmp,
+                    Register[] vPrevCandidate,
+                    Register vCandidate,
+                    DataSection.Data reverseBytesMask,
+                    DataSection.Data mask0x0f,
+                    DataSection.Data s4UnscrambleMap,
+                    Label afterLoad,
+                    Label vectorFound) {
+        // Load the raw input vectors for the current stride.
+        for (int i = 0; i < stride.value; i++) {
+            emitArrayLoad(asm, vSize, vArray[i], arrayPtr, index, arrayIndexStride, i * vSize.getBytes());
+        }
+        reverseBytesIfForeignEndian(crb, asm, vArray, reverseBytesMask);
+        final boolean packedCarry = usePackedCarryForConsecutiveTables();
+        final Register vNarrowedBytes = packedCarry ? vPrevCandidate[2] : vTmp[1];
+        switch (stride) {
+            case S1 -> {
+            }
+            // S2/S4 first narrow their input to bytes and build a validity mask that clears
+            // original values above 0xff, since the lookup tables only cover byte values.
+            case S2 -> emitCTNarrowInputS2(asm, vSize, vArray, vNarrowedBytes, packedCarry ? vTmp[1] : vTmp[2]);
+            case S4 -> emitCTNarrowInputS4(crb, asm, vSize, vArray, vNarrowedBytes, vArray[3], s4UnscrambleMap);
+            default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+        }
+        // The short-tail path jumps here after constructing a synthetic input vector.
+        asm.bind(afterLoad);
+        emitConsecutiveTablesMatch(crb, asm, vSize, vLUT, vArray, vTmp, vPrevCandidate, vCandidate, mask0x0f);
+        // check for a match.
+        asm.ptest(vectorSize, vCandidate, vCandidate);
+        asm.jccb(ConditionFlag.NotZero, vectorFound);
+    }
+
+    private void emitConsecutiveTablesMatch(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register[] vLUT,
+                    Register[] vArray,
+                    Register[] vTmp,
+                    Register[] vPrevCandidate,
+                    Register vCandidate,
+                    DataSection.Data mask0x0f) {
+        int tableCount = variant.tableCount();
+        // main table matching logic. the register assignment of input data varies with stride and
+        // table count, to avoid extra register moves.
+        // @formatter:off
+        /*
+         * Register assignment summary for the input state:
+         *
+         *                     vNarrowedBytes     vValidByteMask
+         * S1 / 2,3,4 tables   vArray[0]          n/a
+         * S2 / 2,3   tables   vTmp[1]            vTmp[2]
+         * S2 /     4 tables   vPrevCandidate[2]  vTmp[1]
+         * S4 / 2,3   tables   vTmp[1]            vArray[3]
+         * S4 /     4 tables   vPrevCandidate[2]  vArray[3]
+        */
+        // @formatter:on
+
+        switch (stride) {
+            case S1 -> {
+                Register vLoNibble = vArray[0];
+                Register vHiNibble = vTmp[0];
+                Register vCurCandidate = vTmp[1];
+                Register vScratch = vTmp[2];
+
+                // S1 already operates on bytes, so one nibble split serves all tables.
+                emitSplitIntoNibbles(crb, asm, vSize, mask0x0f, vArray[0], vHiNibble, vLoNibble);
+                for (int i = 0; i < tableCount; i++) {
+                    // process table lookups one by one. result is accumulated in vCandidate.
+                    emitCTProcessTable(asm, vSize, vLUT, i, vHiNibble, vLoNibble, null, vPrevCandidate, vCurCandidate, vCandidate, vScratch);
+                }
+            }
+            case S2, S4 -> {
+                Register vCurCandidate = vArray[1];
+
+                switch (tableCount) {
+                    case 2, 3 -> {
+                        Register vLoNibble = vTmp[1];
+                        Register vHiNibble = vTmp[0];
+                        Register vValidByteMask = stride == Stride.S2 ? vTmp[2] : vArray[3];
+                        Register vScratch = stride == Stride.S2 ? vArray[0] : vArray[2];
+                        // Two- and three-table searches work the same as in the S1 variant
+                        emitSplitIntoNibbles(crb, asm, vSize, mask0x0f, vLoNibble, vHiNibble, vLoNibble);
+                        for (int i = 0; i < tableCount; i++) {
+                            emitCTProcessTable(asm, vSize, vLUT, i, vHiNibble, vLoNibble, vValidByteMask, vPrevCandidate, vCurCandidate, vCandidate, vScratch);
+                        }
+                    }
+                    case 4 -> {
+                        // S2/4 4-table variant uses a slightly more complex approach for saving
+                        // previous candidate bytes in order to leave enough registers for the
+                        // narrowing input load (2 for S2, 4 for S4), and all the lookup tables
+                        // (8 vectors)
+                        Register vLoNibble = vPrevCandidate[2];
+                        Register vHiNibble = vPrevCandidate[1];
+                        Register vCarryPrev = vPrevCandidate[0];
+                        // vCarryNext reuses vArray[0] to assemble the packed carry for the next
+                        // iteration. Its low bytes accumulate the trailing candidate bytes as:
+                        // [c2[-1], c1[-2], c1[-1], c0[-3], c0[-2], c0[-1]]
+                        // where ci[-k] is the k-th byte from the end of the current candidate-i
+                        // candidate vector.
+                        Register vCarryNext = vArray[0];
+                        Register vValidByteMask = stride == Stride.S2 ? vTmp[1] : vArray[3];
+                        Register vScratch = stride == Stride.S2 ? vTmp[0] : vArray[2];
+                        emitSplitIntoNibbles(crb, asm, vSize, mask0x0f, vLoNibble, vHiNibble, vLoNibble);
+
+                        // first table lookup
+                        emitCTLookup(asm, vSize, vLUT, 0, vHiNibble, vLoNibble, vCurCandidate, vScratch, vValidByteMask);
+                        // vCarryPrev is still
+                        // [..., c2[-1], c1[-2], c1[-1], c0[-3], c0[-2], c0[-1]],
+                        // so it can be used directly for concatenation with vCurCandidate
+                        emitPalignr(asm, vSize, vCandidate, vCarryPrev, vCurCandidate, 3);
+                        // vCarryNext = [c0[-3], c0[-2], c0[-1], ...]
+                        asm.palignr(vSize, vCarryNext, vCarryNext, vCurCandidate, 16 - 3);
+
+                        // second table lookup
+                        emitCTLookup(asm, vSize, vLUT, 1, vHiNibble, vLoNibble, vCurCandidate, vScratch, vValidByteMask);
+                        // shift out the three last bytes:
+                        // vCarryPrev = [..., c2[-1], c1[-2], c1[-1]]
+                        asm.palignr(vSize, vCarryPrev, vCarryPrev, vCarryPrev, 16 - 3);
+                        emitPalignr(asm, vSize, vScratch, vCarryPrev, vCurCandidate, 2);
+                        asm.pand(vSize, vCandidate, vScratch);
+                        // vCarryNext = [c1[-2], c1[-1], c0[-3], c0[-2], c0[-1], ...]
+                        asm.palignr(vSize, vCarryNext, vCarryNext, vCurCandidate, 16 - 2);
+
+                        emitCTLookup(asm, vSize, vLUT, 2, vHiNibble, vLoNibble, vCurCandidate, vScratch, vValidByteMask);
+                        // shift out last two bytes:
+                        // vCarryPrev = [..., c2[-1]]
+                        asm.palignr(vSize, vCarryPrev, vCarryPrev, vCarryPrev, 16 - 2);
+                        emitPalignr(asm, vSize, vScratch, vCarryPrev, vCurCandidate, 1);
+                        asm.pand(vSize, vCandidate, vScratch);
+                        // vCarryNext = [c2[-1], c1[-2], c1[-1], c0[-3], c0[-2], c0[-1], ...]
+                        asm.palignr(vSize, vCarryNext, vCarryNext, vCurCandidate, 16 - 1);
+
+                        emitCTLookup(asm, vSize, vLUT, 3, vHiNibble, vLoNibble, vCurCandidate, vScratch, vValidByteMask);
+                        asm.pand(vSize, vCandidate, vCurCandidate);
+                        // save vCarryNext into vCarryPrev for the next iteration, and move the
+                        // packed bytes towards the end of the vector at the same time:
+                        // vCarryPrev = [..., c2[-1], c1[-2], c1[-1], c0[-3], c0[-2], c0[-1]]
+                        asm.palignr(vSize, vCarryPrev, vCarryNext, vCarryNext, 16 - 10);
+
+                    }
+                    default -> throw GraalError.shouldNotReachHereUnexpectedValue(tableCount); // ExcludeFromJacocoGeneratedReport
+                }
+            }
+            default -> throw GraalError.shouldNotReachHereUnexpectedValue(stride); // ExcludeFromJacocoGeneratedReport
+        }
+    }
+
+    private static void emitSplitIntoNibbles(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    DataSection.Data mask0x0f,
+                    Register vInputBytes,
+                    Register vHiNibble,
+                    Register vLoNibble) {
+        // Split the byte input into hi/lo nibble indices for the two lookup tables.
+        asm.psrlw(vSize, vHiNibble, vInputBytes, 4);
+        asm.pand(vSize, vLoNibble, vInputBytes, (AMD64Address) crb.recordDataSectionReference(mask0x0f));
+        asm.pand(vSize, vHiNibble, vHiNibble, (AMD64Address) crb.recordDataSectionReference(mask0x0f));
+    }
+
+    private static void emitCTLookup(AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register[] vLUT,
+                    int lutIndex,
+                    Register vHiNibble,
+                    Register vLoNibble,
+                    Register vCandidateOut,
+                    Register vScratch,
+                    Register vValidByteMask) {
+        // Evaluate one logical table from its hi/lo nibble lookup pair.
+        // Look up the hi- and low-nibble masks and intersect them.
+        asm.pshufb(vSize, vCandidateOut, vLUT[lutIndex * 2], vHiNibble);
+        asm.pshufb(vSize, vScratch, vLUT[(lutIndex * 2) + 1], vLoNibble);
+        asm.pand(vSize, vCandidateOut, vScratch);
+        if (vValidByteMask != null) {
+            // filter matches of narrowed elements whose original value was > 0xff.
+            asm.pand(vSize, vCandidateOut, vValidByteMask);
+        }
+    }
+
+    private static void emitCTProcessTable(AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register[] vLUT,
+                    int lutIndex,
+                    Register vHiNibble,
+                    Register vLoNibble,
+                    Register vValidByteMask,
+                    Register[] vPrevCandidate,
+                    Register vCurCandidate,
+                    Register vCandidate,
+                    Register vScratch) {
+        int tableCount = vLUT.length >> 1;
+        if (lutIndex < tableCount - 1) {
+            // perform table lookup
+            emitCTLookup(asm, vSize, vLUT, lutIndex, vHiNibble, vLoNibble, vCurCandidate, vScratch, vValidByteMask);
+            // shift-in the previous iteration's lookup result.
+            emitPalignr(asm, vSize, lutIndex == 0 ? vCandidate : vScratch, vPrevCandidate[lutIndex], vCurCandidate, tableCount - (lutIndex + 1));
+            // save current result for next iteration
+            asm.movdqu(vSize, vPrevCandidate[lutIndex], vCurCandidate);
+            if (lutIndex != 0) {
+                // accumulate result into vCandidate. The first table instead overwrites vCandidate
+                asm.pand(vSize, vCandidate, vScratch);
+            }
+        } else {
+            // The last table doesn't need any carry-over from the previous iteration.
+            emitCTLookup(asm, vSize, vLUT, lutIndex, vHiNibble, vLoNibble, vHiNibble, vLoNibble, vValidByteMask);
+            asm.pand(vSize, vCandidate, vHiNibble);
+            // after the last table lookup, vCandidate holds the combined result of all table
+            // lookups and all vPrevCandidate registers have been updated for the next iteration.
+        }
+    }
+
+    private static void emitPalignr(AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register vShiftedCandidate,
+                    Register vPrevCandidate,
+                    Register vCurrentCandidate,
+                    int shiftCount) {
+        assert 1 <= shiftCount && shiftCount <= 3 : shiftCount;
+        if (vSize == AVXSize.YMM) {
+            // PALIGNR does not cross the 128-bit lane boundary, so first concatenate the relevant
+            // halves with VPERM2I128 and then apply PALIGNR within each lane.
+            AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, vSize, vShiftedCandidate, vPrevCandidate, vCurrentCandidate, 0x21);
+            asm.palignr(vSize, vShiftedCandidate, vCurrentCandidate, vShiftedCandidate, 16 - shiftCount);
+        } else {
+            asm.palignr(vSize, vShiftedCandidate, vCurrentCandidate, vPrevCandidate, 16 - shiftCount);
+        }
+    }
+
+    private static void emitCTNarrowInputS2(AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register[] vecArray,
+                    Register vNarrowedBytes,
+                    Register vValidMask) {
+        // Convert two vectors of 16-bit values into packed bytes plus a mask that keeps only
+        // original values in the 0..255 range.
+        // narrow string chars to bytes
+        asm.packuswb(vSize, vNarrowedBytes, vecArray[0], vecArray[1]);
+        // right-shift chars by 8
+        asm.psrlw(vSize, vecArray[0], vecArray[0], 8);
+        asm.psrlw(vSize, vecArray[1], vecArray[1], 8);
+        // create a mask for all chars <= 0xff
+        asm.packuswb(vSize, vecArray[0], vecArray[0], vecArray[1]);
+        asm.pxor(vSize, vValidMask, vValidMask);
+        asm.pcmpeqb(vSize, vValidMask, vecArray[0]);
+        if (vSize == AVXSize.YMM) {
+            VexRMIOp.VPERMQ.emit(asm, vSize, vNarrowedBytes, vNarrowedBytes, 0b11011000);
+            VexRMIOp.VPERMQ.emit(asm, vSize, vValidMask, vValidMask, 0b11011000);
+        }
+    }
+
+    private static void emitCTNarrowInputS4(CompilationResultBuilder crb,
+                    AMD64MacroAssembler asm,
+                    AVXSize vSize,
+                    Register[] vecArray,
+                    Register vNarrowedBytes,
+                    Register vValidMask,
+                    DataSection.Data vS4UnscrambleMap) {
+        GraalError.guarantee(vSize != AVXSize.YMM || vS4UnscrambleMap != null, "missing YMM S4 unscramble map");
+        // Convert four vectors of 32-bit values into packed bytes plus a mask that keeps only
+        // original values in the 0..255 range.
+        // narrow string ints to bytes
+        asm.packusdw(vSize, vNarrowedBytes, vecArray[0], vecArray[1]);
+        // right-shift ints by 8
+        asm.psrld(vSize, vecArray[0], vecArray[0], 8);
+        asm.psrld(vSize, vecArray[1], vecArray[1], 8);
+        // create the upper half of the <= 0xff validity check before reusing vecArray[1]
+        asm.packssdw(vSize, vecArray[0], vecArray[0], vecArray[1]);
+        // finish narrowing using vecArray[1] as a temporary for the second half
+        asm.packusdw(vSize, vecArray[1], vecArray[2], vecArray[3]);
+        asm.psrld(vSize, vecArray[2], vecArray[2], 8);
+        asm.psrld(vSize, vecArray[3], vecArray[3], 8);
+        asm.packuswb(vSize, vNarrowedBytes, vecArray[1]);
+        // create a mask for all ints <= 0xff
+        asm.packssdw(vSize, vecArray[2], vecArray[2], vecArray[3]);
+        asm.pxor(vSize, vValidMask, vValidMask);
+        asm.packuswb(vSize, vecArray[0], vecArray[0], vecArray[2]);
+        asm.pcmpeqb(vSize, vValidMask, vecArray[0]);
+        if (vSize == AVXSize.YMM) {
+            asm.movdqu(vSize, vecArray[2], (AMD64Address) crb.recordDataSectionReference(vS4UnscrambleMap));
+            VexRVMOp.VPERMD.emit(asm, vSize, vNarrowedBytes, vecArray[2], vNarrowedBytes);
+            VexRVMOp.VPERMD.emit(asm, vSize, vValidMask, vecArray[2], vValidMask);
         }
     }
 }

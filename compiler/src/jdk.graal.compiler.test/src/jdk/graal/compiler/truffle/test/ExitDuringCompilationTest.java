@@ -44,6 +44,8 @@ public class ExitDuringCompilationTest extends TestWithPolyglotOptions {
 
     @Test
     public void testExit() throws IOException, InterruptedException {
+        // Keep a deterministic pending-compilation window without making this test excessively
+        // slow.
         SubprocessTestUtils.newBuilder(ExitDuringCompilationTest.class, () -> {
             try {
                 var cond = new NotifyCompilation();
@@ -57,7 +59,7 @@ public class ExitDuringCompilationTest extends TestWithPolyglotOptions {
             } catch (InterruptedException ie) {
                 throw new AssertionError("Interrupted", ie);
             }
-        }).prefixVmOption("-Djdk.graal.MethodFilter=RootNode.Constant", "-Djdk.graal.InjectedCompilationDelay=100").//
+        }).prefixVmOption("-Djdk.graal.MethodFilter=RootNode.Constant", "-Djdk.graal.InjectedCompilationDelay=5").//
                         onExit((p) -> {
                             String output = String.join("\n", p.output);
                             assertFalse(output, Pattern.compile("(Exception|Error)").matcher(output).find());

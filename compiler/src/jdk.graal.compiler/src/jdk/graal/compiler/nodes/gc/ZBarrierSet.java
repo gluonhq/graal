@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,6 +33,7 @@ import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.FieldLocationIdentity;
+import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.NamedLocationIdentity;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -47,6 +48,7 @@ import jdk.graal.compiler.nodes.memory.LIRLowerableAccess;
 import jdk.graal.compiler.nodes.memory.ReadNode;
 import jdk.graal.compiler.nodes.memory.WriteNode;
 import jdk.graal.compiler.nodes.memory.address.AddressNode;
+import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.type.StampTool;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -57,14 +59,21 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  * read or write of an object from the heap should have an associated read barrier. Barriers for
  * non-heap locations like handles can be handled by subclasses.
  */
-public class ZBarrierSet implements BarrierSet {
+public class ZBarrierSet extends BarrierSet {
 
     private final ResolvedJavaType objectArrayType;
     private final ResolvedJavaField referentField;
 
     public ZBarrierSet(ResolvedJavaType objectArrayType, ResolvedJavaField referentField) {
+        super(GraphState.StageFlag.LOW_TIER_BARRIER_ADDITION, false);
         this.referentField = referentField;
         this.objectArrayType = objectArrayType;
+    }
+
+    @Override
+    public boolean supportsObjectArrayRangeBarriers() {
+        /* GR-54355: Object vectorization is not supported with ZGC. */
+        return false;
     }
 
     @Override
@@ -124,16 +133,6 @@ public class ZBarrierSet implements BarrierSet {
     }
 
     @Override
-    public BarrierType fieldWriteBarrierType(ResolvedJavaField field, JavaKind storageKind) {
-        return storageKind == JavaKind.Object ? BarrierType.FIELD : BarrierType.NONE;
-    }
-
-    @Override
-    public BarrierType arrayWriteBarrierType(JavaKind storageKind) {
-        return storageKind == JavaKind.Object ? BarrierType.ARRAY : BarrierType.NONE;
-    }
-
-    @Override
     public BarrierType readWriteBarrier(ValueNode object, ValueNode value) {
         if (value.stamp(NodeView.DEFAULT).isObjectStamp()) {
             ResolvedJavaType type = StampTool.typeOrNull(object);
@@ -150,22 +149,7 @@ public class ZBarrierSet implements BarrierSet {
     }
 
     @Override
-    public boolean hasWriteBarrier() {
-        return true;
-    }
-
-    @Override
-    public boolean hasReadBarrier() {
-        return true;
-    }
-
-    @Override
-    public void addBarriers(FixedAccessNode n) {
-    }
-
-    @Override
-    public boolean mayNeedPreWriteBarrier(JavaKind storageKind) {
-        return false;
+    public void addBarriers(FixedAccessNode n, CoreProviders context) {
     }
 
     @Override
@@ -183,22 +167,25 @@ public class ZBarrierSet implements BarrierSet {
                             node instanceof LoweredAtomicReadAndWriteNode) {
                 LIRLowerableAccess read = (LIRLowerableAccess) node;
                 Stamp stamp = read.getAccessStamp(NodeView.DEFAULT);
+                BarrierType barrierType = read.getBarrierType();
                 if (!stamp.isObjectStamp()) {
-                    GraalError.guarantee(read.getBarrierType() == BarrierType.NONE, "no barriers for primitive reads: %s", read);
+                    GraalError.guarantee(barrierType == BarrierType.NONE, "no barriers for primitive reads: %s", read);
                     continue;
                 }
 
-                BarrierType expectedBarrier = barrierForLocation(read.getBarrierType(), read.getLocationIdentity(), JavaKind.Object);
+                BarrierType expectedBarrier = barrierForLocation(barrierType, read.getLocationIdentity(), JavaKind.Object);
                 if (expectedBarrier != null) {
-                    GraalError.guarantee(expectedBarrier == read.getBarrierType(), "expected %s but found %s in %s", expectedBarrier, read.getBarrierType(), read);
+                    GraalError.guarantee(expectedBarrier == barrierType, "expected %s but found %s in %s", expectedBarrier, barrierType, read);
                     continue;
                 }
 
                 ValueNode base = read.getAddress().getBase();
                 if (!base.stamp(NodeView.DEFAULT).isObjectStamp()) {
-                    GraalError.guarantee(read.getBarrierType() == BarrierType.NONE, "no barrier for non-heap read: %s", read);
+                    GraalError.guarantee(barrierType == BarrierType.NONE, "no barrier for non-heap read: %s", read);
+                } else if (node instanceof AbstractCompareAndSwapNode || node instanceof LoweredAtomicReadAndWriteNode) {
+                    GraalError.guarantee(barrierType == BarrierType.FIELD || barrierType == BarrierType.ARRAY, "missing barriers for heap read: %s", read);
                 } else {
-                    GraalError.guarantee(read.getBarrierType() == BarrierType.READ, "missing barriers for heap read: %s", read);
+                    GraalError.guarantee(barrierType == BarrierType.READ, "missing barriers for heap read: %s", read);
                 }
             } else if (node instanceof AddressableMemoryAccess) {
                 AddressableMemoryAccess access = (AddressableMemoryAccess) node;

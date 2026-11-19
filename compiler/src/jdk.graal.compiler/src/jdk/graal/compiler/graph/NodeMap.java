@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@ package jdk.graal.compiler.graph;
 
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.function.BiFunction;
 
 import org.graalvm.collections.EconomicMap;
@@ -48,10 +49,19 @@ public class NodeMap<T> extends NodeIdAccessor implements EconomicMap<Node, T> {
     }
 
     @Override
+    public T get(Node key) {
+        return get(key, null);
+    }
+
+    @Override
     @SuppressWarnings("unchecked")
-    public T get(Node node) {
+    public T get(Node node, T defaultValue) {
         assert check(node);
-        return (T) values[getNodeId(node)];
+        T value = (T) values[getNodeId(node)];
+        if (value == null) {
+            return defaultValue;
+        }
+        return value;
     }
 
     @SuppressWarnings("unchecked")
@@ -65,6 +75,12 @@ public class NodeMap<T> extends NodeIdAccessor implements EconomicMap<Node, T> {
             this.values = Arrays.copyOf(values, Math.max(MIN_REALLOC_SIZE, graph.nodeIdCount() * 3 / 2));
         }
         assert check(node);
+    }
+
+    public void growToSize(int newSize) {
+        if (newSize > this.values.length) {
+            this.values = Arrays.copyOf(values, Math.max(MIN_REALLOC_SIZE, newSize));
+        }
     }
 
     @Override
@@ -148,6 +164,9 @@ public class NodeMap<T> extends NodeIdAccessor implements EconomicMap<Node, T> {
 
                     @Override
                     public Node next() {
+                        if (!hasNext()) {
+                            throw new NoSuchElementException();
+                        }
                         final int pos = i;
                         final Node key = NodeMap.this.getKey(pos);
                         i++;
@@ -230,6 +249,9 @@ public class NodeMap<T> extends NodeIdAccessor implements EconomicMap<Node, T> {
                     @SuppressWarnings("unchecked")
                     @Override
                     public T next() {
+                        if (!hasNext()) {
+                            throw new NoSuchElementException();
+                        }
                         final int pos = i;
                         final T value = (T) NodeMap.this.values[pos];
                         i++;

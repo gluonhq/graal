@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -65,7 +65,7 @@ import com.oracle.truffle.regex.util.EmptyArrays;
  */
 public class ByteArrayBuffer extends AbstractArrayBuffer {
 
-    private byte[] buf;
+    protected byte[] buf;
 
     public ByteArrayBuffer() {
         this(16);
@@ -73,6 +73,11 @@ public class ByteArrayBuffer extends AbstractArrayBuffer {
 
     public ByteArrayBuffer(int initialSize) {
         buf = new byte[initialSize];
+    }
+
+    public ByteArrayBuffer(ByteArrayBuffer copy) {
+        buf = Arrays.copyOf(copy.buf, copy.buf.length);
+        setLength(copy.length());
     }
 
     @Override
@@ -99,6 +104,21 @@ public class ByteArrayBuffer extends AbstractArrayBuffer {
         }
         buf[length] = b;
         length++;
+    }
+
+    public void addAll(byte[] values, int valuesLength) {
+        addAll(values, 0, valuesLength);
+    }
+
+    public void addAll(byte[] values, int fromIndex, int valuesLength) {
+        ensureCapacity(length + valuesLength);
+        System.arraycopy(values, fromIndex, buf, length, valuesLength);
+        length += valuesLength;
+    }
+
+    public int copyTo(byte[] target, int offset) {
+        System.arraycopy(buf, 0, target, offset, length);
+        return offset + length;
     }
 
     public byte[] toArray() {

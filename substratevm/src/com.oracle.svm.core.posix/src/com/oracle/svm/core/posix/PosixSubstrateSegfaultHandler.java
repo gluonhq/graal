@@ -24,30 +24,42 @@
  */
 package com.oracle.svm.core.posix;
 
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.function.CEntryPoint.Publish;
 import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
 import org.graalvm.nativeimage.c.type.VoidPointer;
 import org.graalvm.word.PointerBase;
 
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.SubstrateSegfaultHandler;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
-import com.oracle.svm.core.c.function.CEntryPointOptions.NoEpilogue;
-import com.oracle.svm.core.c.function.CEntryPointOptions.NoPrologue;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeLateStackValue;
 import com.oracle.svm.core.headers.LibC;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.os.MemoryProtectionProvider;
 import com.oracle.svm.core.posix.headers.Signal;
 import com.oracle.svm.core.posix.headers.Signal.AdvancedSignalDispatcher;
 import com.oracle.svm.core.posix.headers.Signal.siginfo_t;
 import com.oracle.svm.core.posix.headers.Signal.ucontext_t;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.threadlocal.VMThreadLocalSupport;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions.NoEpilogue;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions.NoPrologue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
-@AutomaticallyRegisteredImageSingleton(SubstrateSegfaultHandler.class)
+@AutomaticallyRegisteredImageSingleton({SubstrateSegfaultHandler.class, PosixSubstrateSegfaultHandler.class})
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class PosixSubstrateSegfaultHandler extends SubstrateSegfaultHandler {
+    static final CEntryPointLiteral<AdvancedSignalDispatcher> SIGNAL_HANDLER = CEntryPointLiteral.create(PosixSubstrateSegfaultHandler.class,
+                    "dispatch", int.class, siginfo_t.class, ucontext_t.class);
+
     @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = Publish.NotPublished)
     @CEntryPointOptions(prologue = NoPrologue.class, epilogue = NoEpilogue.class)
     @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate in segfault signal handler.")
@@ -57,8 +69,9 @@ class PosixSubstrateSegfaultHandler extends SubstrateSegfaultHandler {
             MemoryProtectionProvider.singleton().handleSegfault(sigInfo);
         }
 
-        if (tryEnterIsolate(uContext)) {
-            dump(sigInfo, uContext);
+        IsolateThread fallbackThreadMemory = UnsafeLateStackValue.get(VMThreadLocalSupport.singleton().sizeOfIsolateThread());
+        if (tryEnterIsolate(uContext, fallbackThreadMemory)) {
+            dump(sigInfo, uContext, true);
             throw VMError.shouldNotReachHereAtRuntime();
         }
 
@@ -84,13 +97,11 @@ class PosixSubstrateSegfaultHandler extends SubstrateSegfaultHandler {
         }
     }
 
-    /** The address of the signal handler for signals handled by Java code, above. */
-    private static final CEntryPointLiteral<AdvancedSignalDispatcher> advancedSignalDispatcher = CEntryPointLiteral.create(PosixSubstrateSegfaultHandler.class,
-                    "dispatch", int.class, siginfo_t.class, ucontext_t.class);
-
     @Override
-    protected void installInternal() {
-        PosixUtils.installSignalHandler(Signal.SignalEnum.SIGSEGV, advancedSignalDispatcher.getFunctionPointer(), Signal.SA_NODEFER());
-        PosixUtils.installSignalHandler(Signal.SignalEnum.SIGBUS, advancedSignalDispatcher.getFunctionPointer(), Signal.SA_NODEFER());
+    @Uninterruptible(reason = "Signal handlers can be installed during early isolate startup before thread state is set up.")
+    protected void install0() {
+        boolean isSignalHandlingAllowed = SubstrateOptions.isSignalHandlingAllowed();
+        PosixSignalHandlerSupport.installNativeSignalHandler(Signal.SignalEnum.SIGSEGV, SIGNAL_HANDLER.getFunctionPointer(), Signal.SA_NODEFER(), isSignalHandlingAllowed);
+        PosixSignalHandlerSupport.installNativeSignalHandler(Signal.SignalEnum.SIGBUS, SIGNAL_HANDLER.getFunctionPointer(), Signal.SA_NODEFER(), isSignalHandlingAllowed);
     }
 }

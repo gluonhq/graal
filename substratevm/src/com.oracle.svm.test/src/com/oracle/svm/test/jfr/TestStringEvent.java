@@ -38,13 +38,15 @@ import jdk.jfr.Recording;
 import jdk.jfr.consumer.RecordedEvent;
 
 public class TestStringEvent extends JfrRecordingTest {
+    private static final String MESSAGE = "modified-utf-event\0message \uD83D\uDE80";
+
     @Test
     public void test() throws Throwable {
         String[] events = new String[]{"com.jfr.String"};
         Recording recording = startRecording(events);
 
         StringEvent event = new StringEvent();
-        event.message = "Event has been generated!";
+        event.message = MESSAGE;
         event.commit();
 
         stopRecording(recording, TestStringEvent::validateEvents);
@@ -52,5 +54,6 @@ public class TestStringEvent extends JfrRecordingTest {
 
     private static void validateEvents(List<RecordedEvent> events) {
         assertEquals(1, events.size());
+        assertEquals(MESSAGE, events.getFirst().getString("message"));
     }
 }

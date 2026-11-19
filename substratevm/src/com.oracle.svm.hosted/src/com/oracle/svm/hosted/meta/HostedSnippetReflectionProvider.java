@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,94 +24,63 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import java.lang.reflect.Executable;
-import java.lang.reflect.Field;
-
-import com.oracle.graal.pointsto.ObjectScanner.OtherReason;
-import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.AbstractImageHeapSnippetReflectionProvider;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
+import com.oracle.svm.core.deopt.DeoptimizationSupport;
+import com.oracle.svm.core.graal.nodes.TLABObjectHeaderConstant;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
 
-import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.nodes.NodeView;
+import jdk.graal.compiler.nodes.NonFoldingConstantNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.calc.ZeroExtendNode;
 import jdk.graal.compiler.word.WordTypes;
-import jdk.vm.ci.hotspot.HotSpotObjectConstant;
 import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.JavaKind;
-import jdk.vm.ci.meta.ResolvedJavaField;
-import jdk.vm.ci.meta.ResolvedJavaMethod;
-import jdk.vm.ci.meta.ResolvedJavaType;
 
-public class HostedSnippetReflectionProvider implements SnippetReflectionProvider {
-    private ImageHeapScanner heapScanner;
-    private final WordTypes wordTypes;
-
+public class HostedSnippetReflectionProvider extends AbstractImageHeapSnippetReflectionProvider {
     public HostedSnippetReflectionProvider(ImageHeapScanner heapScanner, WordTypes wordTypes) {
-        this.heapScanner = heapScanner;
-        this.wordTypes = wordTypes;
-    }
-
-    public void setHeapScanner(ImageHeapScanner heapScanner) {
-        this.heapScanner = heapScanner;
+        super(heapScanner, wordTypes);
     }
 
     @Override
-    public JavaConstant forObject(Object object) {
-        /* Redirect object lookup through the shadow heap. */
-        return heapScanner.createImageHeapConstant(object, OtherReason.UNKNOWN);
-    }
-
-    @Override
-    public JavaConstant forBoxed(JavaKind kind, Object value) {
-        if (kind == JavaKind.Object) {
-            return forObject(value);
+    public ValueNode forTLABObjectHeader(Object hub, StructuredGraph graph) {
+        VMError.guarantee(hub instanceof DynamicHub, "must be a DynamicHub: %s", hub);
+        int constantHeaderSize = Heap.getHeap().getObjectHeader().constantHeaderSize();
+        if (constantHeaderSize < 0) {
+            return null;
         }
-        return JavaConstant.forBoxedPrimitive(value);
-    }
-
-    @Override
-    public <T> T asObject(Class<T> type, JavaConstant c) {
-        JavaConstant constant = c;
-        if (constant instanceof ImageHeapConstant imageHeapConstant) {
-            constant = imageHeapConstant.getHostedObject();
-            if (constant == null) {
-                /* Simulated image heap object without a hosted backing object. */
-                return null;
-            }
+        if (DeoptimizationSupport.enabled() && SubstrateCompilationDirectives.isDeoptTarget(graph.method())) {
+            /*
+             * This implies the existence of alternative entry points of the method. Since the
+             * object header constant is a floating node, if it moves to before a method entry, we
+             * lose its value if the method starts executing at that entry because it is not in the
+             * frame state.
+             */
+            return null;
         }
 
-        if (type == Class.class && constant instanceof HotSpotObjectConstant) {
+        JavaConstant constant = new TLABObjectHeaderConstant(forObject(hub), constantHeaderSize);
+        ValueNode res = NonFoldingConstantNode.create(constant, graph);
+        if (constantHeaderSize == Integer.BYTES) {
+            res = graph.addOrUniqueWithInputs(ZeroExtendNode.create(res, Long.SIZE, NodeView.DEFAULT));
+        }
+        return res;
+    }
+
+    @Override
+    protected <T> T asObjectFromUnwrapped(Class<T> type, JavaConstant constant) {
+        if (type == Class.class && constant.getJavaKind().isObject()) {
             /* Only unwrap the DynamicHub if a Class object is required explicitly. */
-            if (heapScanner.getHostedValuesProvider().asObject(Object.class, constant) instanceof DynamicHub hub) {
+            if (getHeapScanner().getHostedValuesProvider().asObject(Object.class, constant) instanceof DynamicHub hub) {
                 return type.cast(hub.getHostedJavaClass());
             }
         }
         VMError.guarantee(!(constant instanceof SubstrateObjectConstant));
-        return heapScanner.getHostedValuesProvider().asObject(type, constant);
-    }
-
-    @Override
-    public <T> T getInjectedNodeIntrinsicParameter(Class<T> type) {
-        if (type.isAssignableFrom(WordTypes.class)) {
-            return type.cast(wordTypes);
-        } else {
-            return null;
-        }
-    }
-
-    @Override
-    public Class<?> originalClass(ResolvedJavaType type) {
-        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
-    }
-
-    @Override
-    public Executable originalMethod(ResolvedJavaMethod method) {
-        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
-    }
-
-    @Override
-    public Field originalField(ResolvedJavaField field) {
-        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+        return getHeapScanner().getHostedValuesProvider().asObject(type, constant);
     }
 }

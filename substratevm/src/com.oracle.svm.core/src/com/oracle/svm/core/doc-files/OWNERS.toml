@@ -1,0 +1,7 @@
+[[rule]]
+files = "*FlightRecord*"
+all = [
+    "christian.haeubl@oracle.com",
+]
+any = [
+]

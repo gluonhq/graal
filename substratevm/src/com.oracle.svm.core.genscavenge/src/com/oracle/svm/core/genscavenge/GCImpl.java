@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,10 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.core.genscavenge.HeapVerifier.Occasion.After;
+import static com.oracle.svm.core.genscavenge.HeapVerifier.Occasion.Before;
+import static com.oracle.svm.core.genscavenge.HeapVerifier.Occasion.During;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import java.lang.ref.Reference;
 
@@ -38,22 +41,18 @@ import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.AlwaysInline;
+import com.oracle.svm.core.AssertionsSupport;
 import com.oracle.svm.core.Isolates;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.RuntimeAssertionsSupport;
-import com.oracle.svm.core.SubstrateGCOptions;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.c.NonmovableArray;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.RuntimeCodeInfoAccess;
 import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
+import com.oracle.svm.core.code.RuntimeCodeInstallation;
 import com.oracle.svm.core.deopt.DeoptimizedFrame;
 import com.oracle.svm.core.deopt.Deoptimizer;
 import com.oracle.svm.core.genscavenge.AlignedHeapChunk.AlignedHeader;
@@ -61,30 +60,33 @@ import com.oracle.svm.core.genscavenge.BasicCollectionPolicies.NeverCollect;
 import com.oracle.svm.core.genscavenge.HeapAccounting.HeapSizes;
 import com.oracle.svm.core.genscavenge.HeapChunk.Header;
 import com.oracle.svm.core.genscavenge.UnalignedHeapChunk.UnalignedHeader;
+import com.oracle.svm.core.genscavenge.metaspace.MetaspaceImpl;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.graal.RuntimeCompilation;
+import com.oracle.svm.core.heap.AbstractPinnedObjectSupport;
 import com.oracle.svm.core.heap.CodeReferenceMapDecoder;
-import com.oracle.svm.core.heap.GC;
-import com.oracle.svm.core.heap.GCCause;
+import com.oracle.svm.guest.staging.core.heap.GC;
+import com.oracle.svm.guest.staging.core.heap.GCCause;
 import com.oracle.svm.core.heap.NoAllocationVerifier;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
-import com.oracle.svm.core.heap.ObjectVisitor;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.heap.ObjectVisitor;
 import com.oracle.svm.core.heap.OutOfMemoryUtil;
 import com.oracle.svm.core.heap.PhysicalMemory;
 import com.oracle.svm.core.heap.ReferenceHandler;
 import com.oracle.svm.core.heap.ReferenceHandlerThread;
-import com.oracle.svm.core.heap.ReferenceMapIndex;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.core.heap.ReferenceMapIndex;
 import com.oracle.svm.core.heap.RuntimeCodeCacheCleaner;
+import com.oracle.svm.core.heap.SuspendSerialGCMaxHeapSize;
+import com.oracle.svm.core.heap.UninterruptibleObjectReferenceVisitor;
+import com.oracle.svm.core.heap.UninterruptibleObjectVisitor;
 import com.oracle.svm.core.heap.VMOperationInfos;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jfr.JfrGCWhen;
 import com.oracle.svm.core.jfr.JfrTicks;
 import com.oracle.svm.core.jfr.events.AllocationRequiringGCEvent;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.os.CommittedMemoryProvider;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
 import com.oracle.svm.core.snippets.ImplicitExceptions;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
 import com.oracle.svm.core.stack.JavaFrame;
 import com.oracle.svm.core.stack.JavaFrames;
 import com.oracle.svm.core.stack.JavaStackWalk;
@@ -96,38 +98,76 @@ import com.oracle.svm.core.thread.PlatformThreads;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
 import com.oracle.svm.core.threadlocal.VMThreadLocalSupport;
-import com.oracle.svm.core.util.TimeUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.util.Timer;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.hub.HubType;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.TimeUtils;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.nodes.java.ArrayLengthNode;
 
 /**
  * Garbage collector (incremental or complete) for {@link HeapImpl}.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public final class GCImpl implements GC {
     private static final long K = 1024;
     static final long M = K * K;
 
+    private final ChunkReleaser chunkReleaser = new ChunkReleaser();
     private final GreyToBlackObjRefVisitor greyToBlackObjRefVisitor = new GreyToBlackObjRefVisitor();
     private final GreyToBlackObjectVisitor greyToBlackObjectVisitor = new GreyToBlackObjectVisitor(greyToBlackObjRefVisitor);
     private final RuntimeCodeCacheWalker runtimeCodeCacheWalker = new RuntimeCodeCacheWalker(greyToBlackObjRefVisitor);
     private final RuntimeCodeCacheCleaner runtimeCodeCacheCleaner = new RuntimeCodeCacheCleaner();
+    private final SweepAndPromotePinnedChunkVisitor pinnedChunkPromotionVisitor = new SweepAndPromotePinnedChunkVisitor(chunkReleaser);
+    private final MarkStack markStack = new MarkStack();
+    private final MarkStack arrayMarkStack = new MarkStack();
 
     private final GCAccounting accounting = new GCAccounting();
     private final Timers timers = new Timers();
+    private final CollectionPolicies policies = new CollectionPolicies();
 
     private final CollectionVMOperation collectOperation = new CollectionVMOperation();
-    private final ChunkReleaser chunkReleaser = new ChunkReleaser();
 
-    private final CollectionPolicy policy;
+    private CollectionPolicy policy;
     private boolean completeCollection = false;
-    private UnsignedWord collectionEpoch = WordFactory.zero();
-    private long lastWholeHeapExaminedTimeMillis = -1;
+    private boolean outOfMemoryCollection = false;
+    private UnsignedWord collectionEpoch = Word.zero();
+    private long lastWholeHeapExaminedNanos = -1;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     GCImpl() {
-        this.policy = CollectionPolicy.getInitialPolicy();
-        RuntimeSupport.getRuntimeSupport().addShutdownHook(isFirstIsolate -> printGCSummary());
+        if (ImageLayerBuildingSupport.firstImageBuild()) {
+            RuntimeSupport.getRuntimeSupport().addTearDownHook(_ -> printGCSummary());
+        }
+    }
+
+    /** Updates the {@link CollectionPolicy}, according to the option value. */
+    @Uninterruptible(reason = "Called during startup.")
+    void updatePolicy() {
+        policy = policies.getSelectedPolicy();
+    }
+
+    @Uninterruptible(reason = "Tear-down in progress.")
+    public void tearDown() {
+        policy.tearDown();
+        markStack.tearDown();
+        arrayMarkStack.tearDown();
     }
 
     @Override
@@ -140,25 +180,28 @@ public final class GCImpl implements GC {
     }
 
     @Override
+    @Platforms(Platform.HOSTED_ONLY.class)
     public String getDefaultMaxHeapSize() {
         return String.format("%s%% of RAM", SerialAndEpsilonGCOptions.MaximumHeapSizePercent.getValue());
     }
 
     @Override
     public void collect(GCCause cause) {
-        collect(cause, false);
+        collect(cause, cause.collectsCompletely());
     }
 
+    @AlwaysInline("Keep the allocation GC check inline in allocation slow paths.")
     public void maybeCollectOnAllocation(UnsignedWord allocationSize) {
-        boolean outOfMemory = false;
-        if (hasNeverCollectPolicy()) {
-            UnsignedWord edenUsed = HeapImpl.getAccounting().getEdenUsedBytes();
-            outOfMemory = edenUsed.aboveThan(GCImpl.getPolicy().getMaximumHeapSize());
-        } else if (getPolicy().shouldCollectOnAllocation()) {
-            AllocationRequiringGCEvent.emit(getCollectionEpoch(), allocationSize);
-            outOfMemory = collectWithoutAllocating(GenScavengeGCCause.OnAllocation, false);
+        if (getPolicy().shouldCollectOnAllocation()) {
+            collectOnAllocation(allocationSize);
         }
-        if (outOfMemory) {
+    }
+
+    @NeverInline("Keep collection and error reporting out of allocation slow paths.")
+    private void collectOnAllocation(UnsignedWord allocationSize) {
+        AllocationRequiringGCEvent.emit(getCollectionEpoch(), allocationSize);
+        boolean outOfMemory = collectWithoutAllocating(GenScavengeGCCause.OnAllocation, false);
+        if (outOfMemory && getPolicy().isOutOfMemory(HeapImpl.getAccounting().getUsedBytes())) {
             throw OutOfMemoryUtil.heapSizeExceeded();
         }
     }
@@ -174,7 +217,7 @@ public final class GCImpl implements GC {
         if (!hasNeverCollectPolicy()) {
             boolean outOfMemory = collectWithoutAllocating(cause, forceFullGC);
             if (outOfMemory) {
-                throw OutOfMemoryUtil.heapSizeExceeded();
+                getPolicy().onMaximumHeapSizeExceeded();
             }
         }
     }
@@ -186,7 +229,7 @@ public final class GCImpl implements GC {
 
         int size = SizeOf.get(CollectionVMOperationData.class);
         CollectionVMOperationData data = StackValue.get(size);
-        UnmanagedMemoryUtil.fill((Pointer) data, WordFactory.unsigned(size), (byte) 0);
+        UnmanagedMemoryUtil.fill((Pointer) data, Word.unsigned(size), (byte) 0);
         data.setCauseId(cause.getId());
         data.setRequestingEpoch(getCollectionEpoch());
         data.setCompleteCollectionCount(GCImpl.getAccounting().getCompleteCollectionCount());
@@ -195,10 +238,15 @@ public final class GCImpl implements GC {
         enqueueCollectOperation(data);
 
         boolean outOfMemory = data.getOutOfMemory();
-        if (outOfMemory && SerialGCOptions.IgnoreMaxHeapSizeWhileInVMOperation.getValue() && inVMInternalCode()) {
+        if (outOfMemory && shouldIgnoreOutOfMemory()) {
             outOfMemory = false;
         }
         return outOfMemory;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean shouldIgnoreOutOfMemory() {
+        return SerialGCOptions.IgnoreMaxHeapSizeWhileInVMInternalCode.getValue() && (inVMInternalCode() || SuspendSerialGCMaxHeapSize.isSuspended());
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
@@ -214,46 +262,74 @@ public final class GCImpl implements GC {
     /** The body of the VMOperation to do the collection. */
     private void collectOperation(CollectionVMOperationData data) {
         assert VMOperation.isGCInProgress();
-        assert getCollectionEpoch().equal(data.getRequestingEpoch()) ||
-                        data.getForceFullGC() && GCImpl.getAccounting().getCompleteCollectionCount() == data.getCompleteCollectionCount() : "unnecessary GC?";
+        assert collectOperation.hasWork(data) : "unnecessary GC?";
 
-        timers.mutator.closeAt(data.getRequestingNanoTime());
+        /*
+         * We use the time of the GC request as the beginning of the collection because it includes
+         * the delay of entering a safepoint, which we want the policy to consider for GC cost.
+         * Other VM operations can run in between, but we expect them to have insignificant impact.
+         */
+        long beginNanoTime = data.getRequestingNanoTime();
+        if (getCollectionEpoch().notEqual(data.getRequestingEpoch())) {
+            /* Another GC happened since the GC request, use the current time instead. */
+            beginNanoTime = System.nanoTime();
+        }
+        if (!timers.mutator.wasStartedAtLeastOnce()) {
+            long origin = Isolates.isStartTimeAssigned() ? Isolates.getStartTimeNanos() : beginNanoTime;
+            timers.mutator.startAt(origin);
+        }
+        timers.mutator.stopAt(beginNanoTime);
         timers.resetAllExceptMutator();
+
+        /* The type of collection will be determined later on. */
+        completeCollection = false;
 
         JfrGCHeapSummaryEvent.emit(JfrGCWhen.BEFORE_GC);
         GCCause cause = GCCause.fromId(data.getCauseId());
         printGCBefore(cause);
 
-        ThreadLocalAllocation.disableAndFlushForAllThreads();
-        GenScavengeMemoryPoolMXBeans.singleton().notifyBeforeCollection();
-        HeapImpl.getAccounting().notifyBeforeCollection();
+        Timer collectionTimer = timers.collection.start();
+        try {
+            HeapImpl.getHeapImpl().makeParseable();
 
-        boolean outOfMemory = collectImpl(cause, data.getRequestingNanoTime(), data.getForceFullGC());
-        data.setOutOfMemory(outOfMemory);
+            GenScavengeMemoryPoolMXBeans.singleton().notifyBeforeCollection();
+            HeapImpl.getAccounting().notifyBeforeCollection();
 
+            verifyHeap(Before);
+
+            boolean outOfMemory = collectImpl(cause, beginNanoTime, data.getForceFullGC());
+            data.setOutOfMemory(outOfMemory);
+
+            verifyHeap(After);
+        } finally {
+            collectionTimer.stop();
+        }
+
+        resizeAllTlabs();
+        accounting.updateCollectionCountAndTime(completeCollection, collectionTimer.totalNanos());
         HeapImpl.getAccounting().notifyAfterCollection();
         GenScavengeMemoryPoolMXBeans.singleton().notifyAfterCollection();
+        ChunkBasedCommittedMemoryProvider.get().afterGarbageCollection();
 
         printGCAfter(cause);
         JfrGCHeapSummaryEvent.emit(JfrGCWhen.AFTER_GC);
 
         collectionEpoch = collectionEpoch.add(1);
-        timers.mutator.open();
+        timers.mutator.start();
     }
 
-    private boolean collectImpl(GCCause cause, long requestingNanoTime, boolean forceFullGC) {
+    private boolean collectImpl(GCCause cause, long beginNanoTime, boolean forceFullGC) {
         boolean outOfMemory;
         long startTicks = JfrTicks.elapsedTicks();
         try {
-            outOfMemory = doCollectImpl(cause, requestingNanoTime, forceFullGC, false);
+            outOfMemory = doCollectImpl(cause, beginNanoTime, forceFullGC, false);
             if (outOfMemory) {
-                // Avoid running out of memory with a full GC that reclaims softly reachable
-                // objects
-                ReferenceObjectProcessing.setSoftReferencesAreWeak(true);
+                outOfMemoryCollection = true; // increase eagerness to free memory
                 try {
-                    outOfMemory = doCollectImpl(cause, requestingNanoTime, true, true);
+                    verifyHeap(During);
+                    outOfMemory = doCollectImpl(cause, System.nanoTime(), true, true);
                 } finally {
-                    ReferenceObjectProcessing.setSoftReferencesAreWeak(false);
+                    outOfMemoryCollection = false;
                 }
             }
         } finally {
@@ -262,108 +338,123 @@ public final class GCImpl implements GC {
         return outOfMemory;
     }
 
-    private boolean doCollectImpl(GCCause cause, long requestingNanoTime, boolean forceFullGC, boolean forceNoIncremental) {
+    private boolean doCollectImpl(GCCause cause, long initialBeginNanoTime, boolean forceFullGC, boolean forceNoIncremental) {
         checkSanityBeforeCollection();
 
-        CommittedMemoryProvider.get().beforeGarbageCollection();
+        ChunkBasedCommittedMemoryProvider.get().beforeGarbageCollection();
 
-        boolean incremental = !forceNoIncremental && !policy.shouldCollectCompletely(false);
+        boolean incremental = !forceNoIncremental && !policy.shouldCollectCompletely(false, forceFullGC);
         boolean outOfMemory = false;
 
         if (incremental) {
             long startTicks = JfrGCEvents.startGCPhasePause();
             try {
-                outOfMemory = doCollectOnce(cause, requestingNanoTime, false, false);
+                outOfMemory = doCollectOnce(cause, initialBeginNanoTime, false, false);
             } finally {
                 JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Incremental GC", startTicks);
             }
         }
-        if (!incremental || outOfMemory || forceFullGC || policy.shouldCollectCompletely(incremental)) {
-            if (incremental) { // uncommit unaligned chunks
-                CommittedMemoryProvider.get().afterGarbageCollection();
+        if (!incremental || outOfMemory || forceFullGC || policy.shouldCollectCompletely(incremental, forceFullGC)) {
+            long beginNanoTime = initialBeginNanoTime;
+            if (incremental) {
+                beginNanoTime = System.nanoTime();
+                ChunkBasedCommittedMemoryProvider.get().uncommitUnusedMemory(); // unaligned chunks
+                verifyHeap(During);
             }
             long startTicks = JfrGCEvents.startGCPhasePause();
             try {
-                outOfMemory = doCollectOnce(cause, requestingNanoTime, true, incremental);
+                outOfMemory = doCollectOnce(cause, beginNanoTime, true, incremental);
             } finally {
                 JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Full GC", startTicks);
             }
         }
 
         HeapImpl.getChunkProvider().freeExcessAlignedChunks();
-        CommittedMemoryProvider.get().afterGarbageCollection();
+        ChunkBasedCommittedMemoryProvider.get().uncommitUnusedMemory();
 
         checkSanityAfterCollection();
         return outOfMemory;
     }
 
-    private boolean doCollectOnce(GCCause cause, long requestingNanoTime, boolean complete, boolean followsIncremental) {
+    private boolean doCollectOnce(GCCause cause, long beginNanoTime, boolean complete, boolean followsIncremental) {
         assert !followsIncremental || complete : "An incremental collection cannot be followed by another incremental collection";
+        assert !completeCollection || complete : "After a complete collection, no further incremental collections may happen";
         completeCollection = complete;
 
-        accounting.beforeCollection(completeCollection);
-        policy.onCollectionBegin(completeCollection, requestingNanoTime);
+        accounting.beforeCollectOnce(completeCollection);
+        policy.onCollectionBegin(completeCollection, beginNanoTime);
 
-        Timer collectionTimer = timers.collection.open();
-        try {
-            if (!followsIncremental) { // we would have verified the heap after the incremental GC
-                verifyBeforeGC();
-            }
-            doCollectCore(!complete);
-            verifyAfterGC();
-            if (complete) {
-                lastWholeHeapExaminedTimeMillis = System.currentTimeMillis();
-            }
-        } finally {
-            collectionTimer.close();
+        doCollectCore();
+        if (complete) {
+            lastWholeHeapExaminedNanos = System.nanoTime();
         }
 
-        accounting.afterCollection(completeCollection, collectionTimer);
+        accounting.afterCollectOnce(completeCollection);
+
+        /* Notify the GC policy. This may update the heap size target. */
+        UnsignedWord prevHeapSizeTarget = policy.getCurrentHeapSizeTarget();
         policy.onCollectionEnd(completeCollection, cause);
 
+        /* Determine how much headroom is left for soft-reference retention. */
         UnsignedWord usedBytes = getChunkBytes();
-        UnsignedWord freeBytes = policy.getCurrentHeapCapacity().subtract(usedBytes);
-        ReferenceObjectProcessing.afterCollection(freeBytes);
+        UnsignedWord newHeapSizeTarget = policy.getCurrentHeapSizeTarget();
+        UnsignedWord headroomBytes;
+        /*
+         * If the previous heap size target was already reached, do not treat a heap size target
+         * increase performed by onCollectionEnd() as soft-reference headroom.
+         */
+        if (usedBytes.aboveOrEqual(prevHeapSizeTarget) || usedBytes.aboveOrEqual(newHeapSizeTarget)) {
+            /* Allow the next GC to collect soft references. */
+            headroomBytes = Word.zero();
+        } else {
+            /* Base soft-reference retention on how much headroom is left. */
+            headroomBytes = newHeapSizeTarget.subtract(usedBytes);
+        }
+        ReferenceObjectProcessing.afterCollection(headroomBytes);
 
         return usedBytes.aboveThan(policy.getMaximumHeapSize()); // out of memory?
     }
 
-    private void verifyBeforeGC() {
-        if (SubstrateGCOptions.VerifyHeap.getValue() && SerialGCOptions.VerifyBeforeGC.getValue()) {
-            Timer verifyBeforeTimer = timers.verifyBefore.open();
-            try {
-                boolean success = true;
-                success &= HeapVerifier.singleton().verify(HeapVerifier.Occasion.BEFORE_COLLECTION);
-                success &= StackVerifier.verifyAllThreads();
+    private void verifyHeap(HeapVerifier.Occasion occasion) {
+        if (SubstrateGCOptions.VerifyHeap.getValue() && shouldVerify(occasion)) {
+            if (SubstrateGCOptions.VerboseGC.getValue()) {
+                printGCPrefixAndTime().string("Verifying ").string(occasion.name()).string(" GC ").newline();
+            }
 
-                if (!success) {
-                    String kind = getGCKind();
-                    Log.log().string("Heap verification failed before ").string(kind).string(" garbage collection.").newline();
-                    VMError.shouldNotReachHere("Heap verification failed");
-                }
-            } finally {
-                verifyBeforeTimer.close();
+            long start = System.nanoTime();
+
+            boolean success = true;
+            success &= HeapVerifier.singleton().verify(occasion);
+            success &= StackVerifier.verifyAllThreads();
+
+            if (!success) {
+                String kind = getGCKind();
+                Log.log().string("Heap verification ").string(occasion.name()).string(" GC failed (").string(kind).string(" garbage collection)").newline();
+                throw VMError.shouldNotReachHere("Heap verification failed");
+            }
+
+            if (SubstrateGCOptions.VerboseGC.getValue()) {
+                printGCPrefixAndTime().string("Verifying ").string(occasion.name()).string(" GC ")
+                                .rational(TimeUtils.nanoSecondsSince(start), TimeUtils.nanosPerMilli, 3).string("ms").newline();
             }
         }
     }
 
-    private void verifyAfterGC() {
-        if (SubstrateGCOptions.VerifyHeap.getValue() && SerialGCOptions.VerifyAfterGC.getValue()) {
-            Timer verifyAfterTime = timers.verifyAfter.open();
-            try {
-                boolean success = true;
-                success &= HeapVerifier.singleton().verify(HeapVerifier.Occasion.AFTER_COLLECTION);
-                success &= StackVerifier.verifyAllThreads();
+    private static boolean shouldVerify(HeapVerifier.Occasion occasion) {
+        RuntimeOptionKey<Boolean> key = switch (occasion) {
+            case Before -> SubstrateGCOptions.ConcealedOptions.VerifyBeforeGC;
+            case During -> SubstrateGCOptions.ConcealedOptions.VerifyDuringGC;
+            case After -> SubstrateGCOptions.ConcealedOptions.VerifyAfterGC;
+            default -> throw VMError.shouldNotReachHere("Unexpected heap verification occasion.");
+        };
 
-                if (!success) {
-                    String kind = getGCKind();
-                    Log.log().string("Heap verification failed after ").string(kind).string(" garbage collection.").newline();
-                    VMError.shouldNotReachHere("Heap verification failed");
-                }
-            } finally {
-                verifyAfterTime.close();
-            }
+        assert SubstrateGCOptions.VerifyHeap.getValue();
+        Boolean value = key.getValue();
+        if (value == null) {
+            /* The option doesn't have a value but VerifyHeap is enabled, so default to true. */
+            return true;
         }
+        return key.getValue();
     }
 
     private String getGCKind() {
@@ -381,6 +472,14 @@ public final class GCImpl implements GC {
         return youngBytes.add(oldBytes);
     }
 
+    private static void resizeAllTlabs() {
+        if (SubstrateGCOptions.ResizeTLAB.getValue()) {
+            for (IsolateThread thread = VMThreads.firstThread(); thread.isNonNull(); thread = VMThreads.nextThread(thread)) {
+                TlabSupport.resize(thread);
+            }
+        }
+    }
+
     private void printGCBefore(GCCause cause) {
         if (!SubstrateGCOptions.VerboseGC.getValue()) {
             return;
@@ -389,12 +488,8 @@ public final class GCImpl implements GC {
         if (getCollectionEpoch().equal(0)) {
             printGCPrefixAndTime().string("Using ").string(getName()).newline();
             Log log = printGCPrefixAndTime().spaces(2).string("Memory: ");
-            if (!PhysicalMemory.isInitialized()) {
-                log.string("unknown").newline();
-            } else {
-                log.rational(PhysicalMemory.getCachedSize(), M, 0).string("M").newline();
-            }
-            printGCPrefixAndTime().spaces(2).string("Heap policy: ").string(getPolicy().getName()).newline();
+            log.rational(PhysicalMemory.size(), M, 0).string("M").newline();
+            printGCPrefixAndTime().spaces(2).string("GC policy: ").string(getPolicy().getName()).newline();
             printGCPrefixAndTime().spaces(2).string("Maximum young generation size: ").rational(getPolicy().getMaximumYoungGenerationSize(), M, 0).string("M").newline();
             printGCPrefixAndTime().spaces(2).string("Maximum heap size: ").rational(getPolicy().getMaximumHeapSize(), M, 0).string("M").newline();
             printGCPrefixAndTime().spaces(2).string("Minimum heap size: ").rational(getPolicy().getMinimumHeapSize(), M, 0).string("M").newline();
@@ -420,7 +515,7 @@ public final class GCImpl implements GC {
             }
 
             if (SerialGCOptions.TraceHeapChunks.getValue()) {
-                HeapImpl.getHeapImpl().logChunks(Log.log());
+                HeapImpl.getHeapImpl().logChunks(Log.log(), false);
             }
         }
 
@@ -428,7 +523,7 @@ public final class GCImpl implements GC {
             String collectionType = completeCollection ? "Full GC" : "Incremental GC";
             printGCPrefixAndTime().string("Pause ").string(collectionType).string(" (").string(cause.getName()).string(") ")
                             .rational(beforeGc.totalUsed(), M, 2).string("M->").rational(heapAccounting.getUsedBytes(), M, 2).string("M ")
-                            .rational(timers.collection.getMeasuredNanos(), TimeUtils.nanosPerMilli, 3).string("ms").newline();
+                            .rational(timers.collection.totalNanos(), TimeUtils.nanosPerMilli, 3).string("ms").newline();
         }
     }
 
@@ -437,25 +532,32 @@ public final class GCImpl implements GC {
     }
 
     private Log printGCPrefixAndTime() {
-        long uptimeMs = Isolates.getCurrentUptimeMillis();
+        long uptimeMs = Isolates.getUptimeMillis();
         return Log.log().string("[").rational(uptimeMs, TimeUtils.millisPerSecond, 3).string("s").string("] GC(").unsigned(collectionEpoch).string(") ");
     }
 
-    private static void checkSanityBeforeCollection() {
+    private void checkSanityBeforeCollection() {
         HeapImpl heap = HeapImpl.getHeapImpl();
         heap.getYoungGeneration().checkSanityBeforeCollection();
         heap.getOldGeneration().checkSanityBeforeCollection();
+        checkSanityBeforeOrAfterCollection();
     }
 
-    private static void checkSanityAfterCollection() {
+    private void checkSanityAfterCollection() {
         HeapImpl heap = HeapImpl.getHeapImpl();
         heap.getYoungGeneration().checkSanityAfterCollection();
         heap.getOldGeneration().checkSanityAfterCollection();
+        checkSanityBeforeOrAfterCollection();
+    }
+
+    private void checkSanityBeforeOrAfterCollection() {
+        assert markStack.isEmpty();
+        assert arrayMarkStack.isEmpty();
     }
 
     @Fold
     static boolean runtimeAssertions() {
-        return RuntimeAssertionsSupport.singleton().desiredAssertionStatus(GCImpl.class);
+        return AssertionsSupport.singleton().desiredAssertionStatus(GCImpl.class);
     }
 
     @Fold
@@ -465,40 +567,79 @@ public final class GCImpl implements GC {
         return gcImpl;
     }
 
-    @Override
-    public void collectCompletely(GCCause cause) {
-        collect(cause, true);
-    }
-
+    @AlwaysInline("GC performance")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isCompleteCollection() {
         return completeCollection;
     }
 
+    /**
+     * Determines whether {@code chunk} must be swept rather than have its live objects compacted or copied.
+     *
+     * {@code originalSpace} is the chunk's current space and passed in here because it's generally
+     * readily available in callers. In a full compacting collection, this is already the old
+     * generation space. In other kinds of collections, the chunk has not been promoted yet and
+     * still resides in a from-space.
+     */
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean mustSweep(AlignedHeader chunk, Space originalSpace) {
+        assert originalSpace == HeapChunk.getSpace(chunk);
+        assert originalSpace.isFromSpace() || (completeCollection && originalSpace.isCompactingOldSpace());
+        if (AlignedHeapChunk.hasPinnedObjects(chunk)) {
+            return true;
+        }
+
+        return SerialGCOptions.PinSurvivorSpaceObjectsDuringYoungGC.getValue() &&
+                        !completeCollection &&
+                        !originalSpace.isEdenSpace();
+    }
+
+    /**
+     * Whether the current collection is intended to be more aggressive as a last resort to avoid an
+     * out of memory condition.
+     */
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isOutOfMemoryCollection() {
+        return outOfMemoryCollection;
+    }
+
     /** Collect, either incrementally or completely, and process discovered references. */
-    private void doCollectCore(boolean incremental) {
+    private void doCollectCore() {
         GreyToBlackObjRefVisitor.Counters counters = greyToBlackObjRefVisitor.openCounters();
         long startTicks;
         try {
-            Timer rootScanTimer = timers.rootScan.open();
+            Timer rootScanTimer = timers.rootScan.start();
             try {
                 startTicks = JfrGCEvents.startGCPhasePause();
                 try {
                     /* Scan reachable objects and potentially already copy them once discovered. */
-                    scan(incremental);
+                    scan();
                 } finally {
-                    JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), incremental ? "Incremental Scan" : "Scan", startTicks);
+                    JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), completeCollection ? "Scan" : "Incremental Scan", startTicks);
                 }
             } finally {
-                rootScanTimer.close();
+                rootScanTimer.stop();
             }
 
-            if (!incremental) {
-                /* Sweep or compact objects in the old generation unless already done by copying. */
-                HeapImpl.getHeapImpl().getOldGeneration().sweepAndCompact(timers, chunkReleaser);
+            boolean compacting = completeCollection && SerialGCOptions.useCompactingOldGen();
+            if (compacting) {
+                startTicks = JfrGCEvents.startGCPhasePause();
+                try {
+                    /*
+                     * Sweep and compact the entire heap. This already adjusts all pointers in the
+                     * reference objects that we process below, so we can (and need to) do it first.
+                     */
+                    var old = (CompactingOldGeneration) HeapImpl.getHeapImpl().getOldGeneration();
+                    assert chunkReleaser.isEmpty();
+                    old.sweepAndCompact(timers, chunkReleaser);
+                } finally {
+                    JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Sweep and Compact", startTicks);
+                }
             }
 
-            Timer referenceObjectsTimer = timers.referenceObjects.open();
+            Timer referenceObjectsTimer = timers.referenceObjects.start();
             try {
                 startTicks = JfrGCEvents.startGCPhasePause();
                 try {
@@ -508,11 +649,26 @@ public final class GCImpl implements GC {
                     JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Process Remembered References", startTicks);
                 }
             } finally {
-                referenceObjectsTimer.close();
+                referenceObjectsTimer.stop();
             }
 
-            if (RuntimeCompilation.isEnabled()) {
-                Timer cleanCodeCacheTimer = timers.cleanCodeCache.open();
+            if (!compacting) {
+                startTicks = JfrGCEvents.startGCPhasePause();
+                try {
+                    /*
+                     * Sweep and promote chunks containing pinned objects. This does not adjust pointers
+                     * to them in reference objects elsewhere, so we must process those first above so
+                     * that we can observe moved and dead objects before they are swept here.
+                     */
+                    assert chunkReleaser.isEmpty();
+                    sweepAndPromotePinnedChunks();
+                } finally {
+                    JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Sweep and Promote Pinned Chunks", startTicks);
+                }
+            }
+
+            if (RuntimeCodeInstallation.isEnabled()) {
+                Timer cleanCodeCacheTimer = timers.cleanCodeCache.start();
                 try {
                     /*
                      * Cleaning the code cache may invalidate code, which is a rather complex
@@ -526,13 +682,12 @@ public final class GCImpl implements GC {
                         JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Clean Runtime CodeCache", startTicks);
                     }
                 } finally {
-                    cleanCodeCacheTimer.close();
+                    cleanCodeCacheTimer.stop();
                 }
             }
 
-            Timer releaseSpacesTimer = timers.releaseSpaces.open();
+            Timer releaseSpacesTimer = timers.releaseSpaces.start();
             try {
-                assert SerialGCOptions.useCompactingOldGen() || chunkReleaser.isEmpty();
                 startTicks = JfrGCEvents.startGCPhasePause();
                 try {
                     releaseSpaces();
@@ -543,13 +698,13 @@ public final class GCImpl implements GC {
                      * chunks for copying live old objects with fewer chunk allocations. In either
                      * case, excess chunks are released later.
                      */
-                    boolean keepAllAlignedChunks = !SerialGCOptions.useCompactingOldGen() && incremental;
+                    boolean keepAllAlignedChunks = !SerialGCOptions.useCompactingOldGen() && !completeCollection;
                     chunkReleaser.release(keepAllAlignedChunks);
                 } finally {
                     JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Release Spaces", startTicks);
                 }
             } finally {
-                releaseSpacesTimer.close();
+                releaseSpacesTimer.stop();
             }
 
             startTicks = JfrGCEvents.startGCPhasePause();
@@ -564,230 +719,122 @@ public final class GCImpl implements GC {
     }
 
     /**
-     * Visit all the memory that is reserved for runtime compiled code. References from the runtime
-     * compiled code to the Java heap must be consider as either strong or weak references,
+     * Visit all memory reserved for runtime-installed code. References from runtime-installed code
+     * to the Java heap must be considered either strong or weak references,
      * depending on whether the code is currently on the execution stack.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
     private void walkRuntimeCodeCache() {
-        Timer walkRuntimeCodeCacheTimer = timers.walkRuntimeCodeCache.open();
+        Timer walkRuntimeCodeCacheTimer = timers.walkRuntimeCodeCache.start();
         try {
             RuntimeCodeInfoMemory.singleton().walkRuntimeMethodsDuringGC(runtimeCodeCacheWalker);
         } finally {
-            walkRuntimeCodeCacheTimer.close();
+            walkRuntimeCodeCacheTimer.stop();
         }
     }
 
     private void cleanRuntimeCodeCache() {
-        Timer cleanRuntimeCodeCacheTimer = timers.cleanRuntimeCodeCache.open();
+        Timer cleanRuntimeCodeCacheTimer = timers.cleanRuntimeCodeCache.start();
         try {
             RuntimeCodeInfoMemory.singleton().walkRuntimeMethodsDuringGC(runtimeCodeCacheCleaner);
         } finally {
-            cleanRuntimeCodeCacheTimer.close();
+            cleanRuntimeCodeCacheTimer.stop();
         }
     }
 
-    @Uninterruptible(reason = "We don't want any safepoint checks in the core part of the GC.")
-    private void scan(boolean incremental) {
-        if (incremental) {
-            scanFromDirtyRoots();
-        } else {
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void scan() {
+        Timer timer = completeCollection ? timers.scanFromRoots : timers.scanFromDirtyRoots;
+        timer.start();
+        try {
             scanFromRoots();
-        }
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void scanFromRoots() {
-        Timer scanFromRootsTimer = timers.scanFromRoots.open();
-        try {
-            long startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /*
-                 * Snapshot the heap so that objects that are promoted afterwards can be visited.
-                 * When using a compacting old generation, it absorbs all chunks from the young
-                 * generation at this point.
-                 */
-                beginPromotion(false);
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Snapshot Heap", startTicks);
-            }
-
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /*
-                 * Make sure all chunks with pinned objects are in toSpace, and any formerly pinned
-                 * objects are in fromSpace.
-                 */
-                promoteChunksWithPinnedObjects();
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Promote Pinned Objects", startTicks);
-            }
-
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /*
-                 * Stack references are grey at the beginning of a collection, so I need to blacken
-                 * them.
-                 */
-                blackenStackRoots();
-
-                /* Custom memory regions which contain object references. */
-                walkThreadLocals();
-
-                /*
-                 * Native image Objects are grey at the beginning of a collection, so I need to
-                 * blacken them.
-                 */
-                blackenImageHeapRoots();
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan Roots", startTicks);
-            }
-
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /* Visit all the Objects promoted since the snapshot. */
-                scanGreyObjects(false);
-
-                if (RuntimeCompilation.isEnabled()) {
-                    /*
-                     * Visit the runtime compiled code, now that we know all the reachable objects.
-                     */
-                    walkRuntimeCodeCache();
-
-                    /* Visit all objects that became reachable because of the compiled code. */
-                    scanGreyObjects(false);
-                }
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan From Roots", startTicks);
-            }
         } finally {
-            scanFromRootsTimer.close();
+            timer.stop();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void scanFromDirtyRoots() {
-        Timer scanFromDirtyRootsTimer = timers.scanFromDirtyRoots.open();
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void sweepAndPromotePinnedChunks() {
+        HeapImpl heap = HeapImpl.getHeapImpl();
+        heap.getYoungGeneration().promoteAndSweepAlignedChunksWithPinnedObjectsInFromSpaces(pinnedChunkPromotionVisitor);
+        if (completeCollection) {
+            heap.getOldGeneration().promoteAndSweepAlignedChunksWithPinnedObjectsInFromSpaces(pinnedChunkPromotionVisitor);
+        }
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void scanFromRoots() {
+        long startTicks = JfrGCEvents.startGCPhasePause();
+
         try {
-            long startTicks = JfrGCEvents.startGCPhasePause();
+            /* Snapshot the heap so that objects that are promoted afterwards can be visited. */
+            beginPromotion();
+        } finally {
+            JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Snapshot Heap", startTicks);
+        }
 
-            try {
-                /* Snapshot the heap so that objects that are promoted afterwards can be visited. */
-                beginPromotion(true);
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Snapshot Heap", startTicks);
-            }
+        startTicks = JfrGCEvents.startGCPhasePause();
+        try {
+            preparePinnedObjects();
+        } finally {
+            JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Prepare Pinned Objects", startTicks);
+        }
 
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /*
-                 * Make sure any released objects are in toSpace (because this is an incremental
-                 * collection). I do this before blackening any roots to make sure the chunks with
-                 * pinned objects are moved entirely, as opposed to promoting the objects
-                 * individually by roots. This makes the objects in those chunks grey.
-                 */
-                promoteChunksWithPinnedObjects();
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Promote Pinned Objects", startTicks);
-            }
-
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
+        startTicks = JfrGCEvents.startGCPhasePause();
+        try {
+            if (!completeCollection) {
                 /*
                  * Blacken Objects that are dirty roots. There are dirty cards in ToSpace. Do this
                  * early so I don't have to walk the cards of individually promoted objects, which
                  * will be visited by the grey object scanner.
                  */
                 blackenDirtyCardRoots();
-
-                /*
-                 * Stack references are grey at the beginning of a collection, so I need to blacken
-                 * them.
-                 */
-                blackenStackRoots();
-
-                /* Custom memory regions which contain object references. */
-                walkThreadLocals();
-
-                /*
-                 * Native image Objects are grey at the beginning of a collection, so I need to
-                 * blacken them.
-                 */
-                blackenDirtyImageHeapRoots();
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan Roots", startTicks);
             }
-
-            startTicks = JfrGCEvents.startGCPhasePause();
-            try {
-                /* Visit all the Objects promoted since the snapshot, transitively. */
-                scanGreyObjects(true);
-
-                if (RuntimeCompilation.isEnabled()) {
-                    /*
-                     * Visit the runtime compiled code, now that we know all the reachable objects.
-                     */
-                    walkRuntimeCodeCache();
-
-                    /* Visit all objects that became reachable because of the compiled code. */
-                    scanGreyObjects(true);
-                }
-            } finally {
-                JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan From Roots", startTicks);
-            }
+            blackenStackRoots();
+            blackenThreadLocals();
+            blackenImageHeapRoots();
+            blackenMetaspace();
         } finally {
-            scanFromDirtyRootsTimer.close();
+            JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan Roots", startTicks);
         }
-    }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void promoteChunksWithPinnedObjects() {
-        Timer promotePinnedObjectsTimer = timers.promotePinnedObjects.open();
+        startTicks = JfrGCEvents.startGCPhasePause();
         try {
-            // Remove closed pinned objects from the global list. This code needs to use write
-            // barriers as the PinnedObjectImpls are a linked list and we don't know in which
-            // generation each individual PinnedObjectImpl lives. So, the card table will be
-            // modified.
-            PinnedObjectImpl pinnedObjects = removeClosedPinnedObjects(PinnedObjectImpl.getPinnedObjects());
-            PinnedObjectImpl.setPinnedObjects(pinnedObjects);
+            /* Visit remaining grey objects: promoted objects and objects on mark stacks. */
+            scanGreyObjects();
 
-            // Promote all chunks that contain pinned objects. The card table of the promoted chunks
-            // will be cleaned.
-            PinnedObjectImpl cur = pinnedObjects;
-            while (cur != null) {
-                assert cur.isOpen();
-                promotePinnedObject(cur);
-                cur = cur.getNext();
+            if (RuntimeCodeInstallation.isEnabled()) {
+                /* Visit the runtime-installed code, now that we know all the reachable objects. */
+                walkRuntimeCodeCache();
+
+                /* Visit all objects that became reachable because of runtime-installed code. */
+                scanGreyObjects();
             }
         } finally {
-            promotePinnedObjectsTimer.close();
+            JfrGCEvents.emitGCPhasePauseEvent(getCollectionEpoch(), "Scan From Roots", startTicks);
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static PinnedObjectImpl removeClosedPinnedObjects(PinnedObjectImpl list) {
-        PinnedObjectImpl firstOpen = null;
-        PinnedObjectImpl lastOpen = null;
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void preparePinnedObjects() {
+        Timer preparePinnedObjectsTimer = timers.preparePinnedObjects.start();
+        try {
+            /*
+             * Remove closed pinned objects from the global list. This code needs to use write
+             * barriers as the PinnedObjectImpls are a linked list, and we don't know in which
+             * generation each individual PinnedObjectImpl lives. So, the card table will be
+             * modified.
+             */
+            AbstractPinnedObjectSupport.singleton().removeClosedObjects();
 
-        PinnedObjectImpl cur = list;
-        while (cur != null) {
-            if (cur.isOpen()) {
-                if (firstOpen == null) {
-                    assert lastOpen == null;
-                    firstOpen = cur;
-                    lastOpen = cur;
-                } else {
-                    lastOpen.setNext(cur);
-                    lastOpen = cur;
-                }
-            }
-            cur = cur.getNext();
+            /*
+             * Nothing more to do: pinned objects will be reached while scanning the global list or
+             * from other roots. Scanning will see that their chunks contain pinned objects and
+             * choose to sweep these chunks instead, without moving the objects they contain.
+             */
+        } finally {
+            preparePinnedObjectsTimer.stop();
         }
-
-        if (lastOpen != null) {
-            lastOpen.setNext(null);
-        }
-        return firstOpen;
     }
 
     @NeverInline("Starting a stack walk in the caller frame. " +
@@ -795,12 +842,12 @@ public final class GCImpl implements GC {
                     "But we don't store stack frame information for the first frame we would need to process.")
     @Uninterruptible(reason = "Required by called JavaStackWalker methods. We are at a safepoint during GC, so it does not change anything for this method.")
     private void blackenStackRoots() {
-        Timer blackenStackRootsTimer = timers.blackenStackRoots.open();
+        Timer blackenStackRootsTimer = timers.blackenStackRoots.start();
         try {
             Pointer sp = KnownIntrinsics.readCallerStackPointer();
             walkStackRoots(greyToBlackObjRefVisitor, sp, true);
         } finally {
-            blackenStackRootsTimer.close();
+            blackenStackRootsTimer.stop();
         }
     }
 
@@ -838,24 +885,30 @@ public final class GCImpl implements GC {
             VMError.guarantee(!JavaFrames.isUnknownFrame(frame), "GC must not encounter unknown frames");
 
             /* We are during a GC, so tethering of the CodeInfo is not necessary. */
-            DeoptimizedFrame deoptFrame = Deoptimizer.checkDeoptimized(frame);
+            DeoptimizedFrame deoptFrame = Deoptimizer.checkEagerDeoptimized(frame);
             if (deoptFrame == null) {
                 Pointer sp = frame.getSP();
                 CodeInfo codeInfo = CodeInfoAccess.unsafeConvert(frame.getIPCodeInfo());
-                NonmovableArray<Byte> referenceMapEncoding = CodeInfoAccess.getStackReferenceMapEncoding(codeInfo);
-                long referenceMapIndex = frame.getReferenceMapIndex();
-                if (referenceMapIndex == ReferenceMapIndex.NO_REFERENCE_MAP) {
-                    throw CodeInfoTable.fatalErrorNoReferenceMap(sp, frame.getIP(), codeInfo);
-                }
-                CodeReferenceMapDecoder.walkOffsetsFromPointer(sp, referenceMapEncoding, referenceMapIndex, visitor, null);
 
-                if (RuntimeCompilation.isEnabled() && visitRuntimeCodeInfo && !CodeInfoAccess.isAOTImageCode(codeInfo)) {
-                    /*
-                     * Runtime-compiled code that is currently on the stack must be kept alive. So,
-                     * we mark the tether as strongly reachable. The RuntimeCodeCacheWalker will
-                     * handle all other object references later on.
-                     */
-                    RuntimeCodeInfoAccess.walkTether(codeInfo, visitor);
+                if (JavaFrames.isInterpreterLeaveStub(frame) || JavaFrames.isInterpreterNativeDowncallStub(frame)) {
+                    /* nothing to scan */
+                } else {
+                    NonmovableArray<Byte> referenceMapEncoding = CodeInfoAccess.getStackReferenceMapEncoding(codeInfo);
+                    long referenceMapIndex = frame.getReferenceMapIndex();
+                    if (referenceMapIndex == ReferenceMapIndex.NO_REFERENCE_MAP) {
+                        throw CodeInfoTable.fatalErrorNoReferenceMap(sp, frame.getIP(), codeInfo);
+                    }
+
+                    CodeReferenceMapDecoder.walkOffsetsFromPointer(sp, referenceMapEncoding, referenceMapIndex, visitor, null);
+
+                    if (RuntimeCodeInstallation.isEnabled() && visitRuntimeCodeInfo && !CodeInfoAccess.isAOTImageCode(codeInfo)) {
+                        /*
+                         * Runtime-installed code that is currently on the stack must be kept alive.
+                         * So, we mark the tether as strongly reachable. The RuntimeCodeCacheWalker
+                         * will handle all other object references later on.
+                         */
+                        RuntimeCodeInfoAccess.walkTether(codeInfo, visitor);
+                    }
                 }
             } else {
                 /*
@@ -867,90 +920,65 @@ public final class GCImpl implements GC {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void walkThreadLocals() {
-        Timer walkThreadLocalsTimer = timers.walkThreadLocals.open();
+    private void blackenThreadLocals() {
+        Timer walkThreadLocalsTimer = timers.walkThreadLocals.start();
         try {
             for (IsolateThread isolateThread = VMThreads.firstThread(); isolateThread.isNonNull(); isolateThread = VMThreads.nextThread(isolateThread)) {
                 VMThreadLocalSupport.singleton().walk(isolateThread, greyToBlackObjRefVisitor);
             }
         } finally {
-            walkThreadLocalsTimer.close();
+            walkThreadLocalsTimer.stop();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void blackenDirtyImageHeapRoots() {
-        if (!HeapImpl.usesImageHeapCardMarking()) {
-            blackenImageHeapRoots();
-            return;
-        }
-
-        Timer blackenImageHeapRootsTimer = timers.blackenImageHeapRoots.open();
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void blackenImageHeapRoots() {
+        Timer blackenImageHeapRootsTimer = timers.blackenImageHeapRoots.start();
         try {
-            for (ImageHeapInfo info = HeapImpl.getFirstImageHeapInfo(); info != null; info = info.next) {
-                blackenDirtyImageHeapChunkRoots(info.getFirstWritableAlignedChunk(), info.getFirstWritableUnalignedChunk(), info.getLastWritableUnalignedChunk());
+            /*
+             * Avoid scanning the entire image heap even for complete collections: its remembered
+             * set contains references into both the runtime heap's old and young generations.
+             */
+            boolean onlyDirty = HeapImpl.usesImageHeapCardMarking();
+
+            for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+                if (onlyDirty) {
+                    blackenDirtyImageHeapChunkRoots(info);
+                } else {
+                    blackenImageHeapRoots(info);
+                }
             }
 
             if (AuxiliaryImageHeap.isPresent()) {
                 ImageHeapInfo auxInfo = AuxiliaryImageHeap.singleton().getImageHeapInfo();
                 if (auxInfo != null) {
-                    blackenDirtyImageHeapChunkRoots(auxInfo.getFirstWritableAlignedChunk(), auxInfo.getFirstWritableUnalignedChunk(), auxInfo.getLastWritableUnalignedChunk());
+                    if (onlyDirty) {
+                        blackenDirtyImageHeapChunkRoots(auxInfo);
+                    } else {
+                        blackenImageHeapRoots(auxInfo);
+                    }
                 }
             }
         } finally {
-            blackenImageHeapRootsTimer.close();
+            blackenImageHeapRootsTimer.stop();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void blackenDirtyImageHeapChunkRoots(AlignedHeader firstAligned, UnalignedHeader firstUnaligned, UnalignedHeader lastUnaligned) {
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void blackenDirtyImageHeapChunkRoots(ImageHeapInfo info) {
         /*
          * We clean and remark cards of the image heap only during complete collections when we also
          * collect the old generation and can easily remark references into it. It also only makes a
          * difference after references to the runtime heap were nulled, which is assumed to be rare.
          */
         boolean clean = completeCollection;
-
-        AlignedHeader aligned = firstAligned;
-        while (aligned.isNonNull()) {
-            RememberedSet.get().walkDirtyObjects(aligned, greyToBlackObjectVisitor, clean);
-            aligned = HeapChunk.getNext(aligned);
-        }
-
-        UnalignedHeader unaligned = firstUnaligned;
-        while (unaligned.isNonNull()) {
-            RememberedSet.get().walkDirtyObjects(unaligned, greyToBlackObjectVisitor, clean);
-            if (unaligned.equal(lastUnaligned)) {
-                break;
-            }
-            unaligned = HeapChunk.getNext(unaligned);
-        }
+        walkDirtyImageHeapChunkRoots(info, greyToBlackObjectVisitor, greyToBlackObjRefVisitor, clean);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void blackenImageHeapRoots() {
-        if (HeapImpl.usesImageHeapCardMarking()) {
-            // Avoid scanning the entire image heap even for complete collections: its remembered
-            // set contains references into both the runtime heap's old and young generations.
-            blackenDirtyImageHeapRoots();
-            return;
-        }
-
-        Timer blackenImageHeapRootsTimer = timers.blackenImageHeapRoots.open();
-        try {
-            for (ImageHeapInfo info = HeapImpl.getFirstImageHeapInfo(); info != null; info = info.next) {
-                blackenImageHeapRoots(info);
-            }
-
-            if (AuxiliaryImageHeap.isPresent()) {
-                ImageHeapInfo auxImageHeapInfo = AuxiliaryImageHeap.singleton().getImageHeapInfo();
-                if (auxImageHeapInfo != null) {
-                    blackenImageHeapRoots(auxImageHeapInfo);
-                }
-            }
-        } finally {
-            blackenImageHeapRootsTimer.close();
-        }
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    static void walkDirtyImageHeapChunkRoots(ImageHeapInfo info, UninterruptibleObjectVisitor visitor, UninterruptibleObjectReferenceVisitor refVisitor, boolean clean) {
+        assert HeapImpl.usesImageHeapCardMarking();
+        RememberedSet.get().walkDirtyObjects(info.getFirstWritableAlignedChunk(), info.getFirstWritableUnalignedChunk(), info.getLastWritableUnalignedChunk(), visitor, refVisitor, clean);
     }
 
     @Uninterruptible(reason = "Forced inlining (StoredContinuation objects must not move).")
@@ -961,61 +989,93 @@ public final class GCImpl implements GC {
     @AlwaysInline("GC Performance")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     static void walkImageHeapRoots(ImageHeapInfo imageHeapInfo, ObjectVisitor visitor) {
-        ImageHeapWalker.walkPartitionInline(imageHeapInfo.firstWritableRegularObject, imageHeapInfo.lastWritableRegularObject, visitor, true);
-        ImageHeapWalker.walkPartitionInline(imageHeapInfo.firstWritableHugeObject, imageHeapInfo.lastWritableHugeObject, visitor, false);
+        ImageHeapWalker.walkPartitionInline(imageHeapInfo.firstAlignedWritableObject, imageHeapInfo.lastAlignedWritableObject, visitor, true);
+        ImageHeapWalker.walkPartitionInline(imageHeapInfo.firstUnalignedWritableObject, imageHeapInfo.lastUnalignedWritableObject, visitor, false);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
     private void blackenDirtyCardRoots() {
-        Timer blackenDirtyCardRootsTimer = timers.blackenDirtyCardRoots.open();
+        assert !completeCollection : "only call for incremental collections";
+        Timer blackenDirtyCardRootsTimer = timers.blackenDirtyCardRoots.start();
         try {
             /*
-             * Walk To-Space looking for dirty cards, and within those for old-to-young pointers.
-             * Promote any referenced young objects.
+             * Walk old generation looking for dirty cards, and within those for old-to-young
+             * pointers. Promote any referenced young objects.
              */
-            HeapImpl.getHeapImpl().getOldGeneration().blackenDirtyCardRoots(greyToBlackObjectVisitor);
+            HeapImpl.getHeapImpl().getOldGeneration().blackenDirtyCardRoots(greyToBlackObjectVisitor, greyToBlackObjRefVisitor);
         } finally {
-            blackenDirtyCardRootsTimer.close();
+            blackenDirtyCardRootsTimer.stop();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static void beginPromotion(boolean isIncremental) {
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void blackenMetaspace() {
+        if (!Metaspace.isSupported()) {
+            return;
+        }
+
+        if (SerialGCOptions.useRememberedSet()) {
+            /*
+             * If we have a remembered set, only walk the dirty objects. Also, only clean and remark
+             * cards during complete collections (similar to the writable part of the image heap).
+             */
+            boolean clean = completeCollection;
+            MetaspaceImpl.singleton().walkDirtyObjects(greyToBlackObjectVisitor, greyToBlackObjRefVisitor, clean);
+        } else {
+            /* Scan all metaspace objects */
+            MetaspaceImpl.singleton().walkObjects(greyToBlackObjectVisitor);
+        }
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void beginPromotion() {
         HeapImpl heap = HeapImpl.getHeapImpl();
-        heap.getOldGeneration().beginPromotion(isIncremental);
-        if (isIncremental) {
+        heap.getOldGeneration().beginPromotion(completeCollection);
+        if (!completeCollection) {
             heap.getYoungGeneration().beginPromotion();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void scanGreyObjects(boolean isIncremental) {
-        Timer scanGreyObjectsTimer = timers.scanGreyObjects.open();
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void scanGreyObjects() {
+        Timer scanGreyObjectsTimer = timers.scanGreyObjects.start();
         try {
-            if (isIncremental) {
-                incrementalScanGreyObjectsLoop();
-            } else {
-                HeapImpl.getHeapImpl().getOldGeneration().scanGreyObjects(false);
-            }
+            scanGreyObjectsLoop();
         } finally {
-            scanGreyObjectsTimer.close();
+            scanGreyObjectsTimer.stop();
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static void incrementalScanGreyObjectsLoop() {
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void scanGreyObjectsLoop() {
         HeapImpl heap = HeapImpl.getHeapImpl();
         YoungGeneration youngGen = heap.getYoungGeneration();
         OldGeneration oldGen = heap.getOldGeneration();
+
         boolean hasGrey;
         do {
-            hasGrey = youngGen.scanGreyObjects();
-            hasGrey |= oldGen.scanGreyObjects(true);
+            hasGrey = !completeCollection && youngGen.scanGreyObjects();
+            hasGrey |= oldGen.scanGreyObjects(completeCollection);
+
+            /*
+             * Scan marked objects, such as live objects in chunks with pinned objects, or, in a
+             * complete collection with CompactingOldGeneration, the entire live heap.
+             */
+            while (!markStack.isEmpty() || !arrayMarkStack.isEmpty()) {
+                hasGrey = true;
+                while (!markStack.isEmpty()) {
+                    greyToBlackObjectVisitor.visitObject(markStack.popObject());
+                }
+                // Process array ranges one at a time to avoid bloating the marking stack
+                if (!arrayMarkStack.isEmpty()) {
+                    scanArrayRange(greyToBlackObjectVisitor);
+                }
+            }
         } while (hasGrey);
     }
 
     @AlwaysInline("GC performance")
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE, mayBeInlined = true)
     @SuppressWarnings("static-method")
     Object promoteObject(Object original, UnsignedWord header) {
         HeapImpl heap = HeapImpl.getHeapImpl();
@@ -1023,7 +1083,11 @@ public final class GCImpl implements GC {
         Header<?> originalChunk = getChunk(original, isAligned);
         Space originalSpace = HeapChunk.getSpace(originalChunk);
         if (originalSpace.isToSpace()) {
-            assert !SerialGCOptions.useCompactingOldGen() || !completeCollection;
+            assert !SerialGCOptions.useCompactingOldGen() || !completeCollection || originalSpace.isMetaspace();
+            return original;
+        }
+        if (isAligned && mustSweep((AlignedHeader) originalChunk, originalSpace)) {
+            mark(original, originalSpace);
             return original;
         }
 
@@ -1059,26 +1123,71 @@ public final class GCImpl implements GC {
         return UnalignedHeapChunk.getEnclosingChunk(obj);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private void promotePinnedObject(PinnedObjectImpl pinned) {
-        HeapImpl heap = HeapImpl.getHeapImpl();
-        Object referent = pinned.getObject();
-        if (referent != null && !heap.isInImageHeap(referent)) {
-            boolean isAligned = ObjectHeaderImpl.isAlignedObject(referent);
-            Header<?> originalChunk = getChunk(referent, isAligned);
-            Space originalSpace = HeapChunk.getSpace(originalChunk);
-            if (originalSpace.isFromSpace() || (originalSpace.isCompactingOldSpace() && completeCollection)) {
-                boolean promoted = false;
-                if (!completeCollection && originalSpace.getNextAgeForPromotion() < policy.getTenuringAge()) {
-                    promoted = heap.getYoungGeneration().promotePinnedObject(referent, originalChunk, isAligned, originalSpace);
-                    if (!promoted) {
-                        accounting.onSurvivorOverflowed();
-                    }
-                }
-                if (!promoted) {
-                    heap.getOldGeneration().promotePinnedObject(referent, originalChunk, isAligned, originalSpace);
-                }
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE, mayBeInlined = true)
+    void mark(Object obj, Space space) {
+        if (SerialGCOptions.useCompactingOldGen() && completeCollection) {
+            assert space.isCompactingOldSpace();
+        } else {
+            // Only objects in aligned chunks containing pinned objects may be marked.
+            AlignedHeader chunk = AlignedHeapChunk.getEnclosingChunk(obj);
+            assert mustSweep(chunk, space);
+            // Chunks with marked objects must remain in From spaces in original gen until sweeping.
+            assert space == HeapChunk.getSpace(chunk);
+            assert space.isFromSpace();
+            assert space.isYoungSpace() || (completeCollection && space.isOldSpace());
+        }
+
+        if (!ObjectHeaderImpl.isMarked(obj)) {
+            ObjectHeaderImpl.setMarked(obj);
+            pushOntoMarkStack(obj);
+        }
+    }
+
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE, mayBeInlined = true)
+    private void pushOntoMarkStack(Object obj) {
+        DynamicHub objHub = DynamicHubIntrinsics.readHub(obj);
+        if (objHub.getHubType() == HubType.OBJECT_ARRAY) {
+            if (ArrayLengthNode.arrayLength(obj) != 0) {
+                arrayMarkStack.pushObject(obj);
+                arrayMarkStack.pushInt(0);
             }
+        } else {
+            markStack.pushObject(obj);
+        }
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    private void scanArrayRange(GreyToBlackObjectVisitor visitor) {
+        int index = arrayMarkStack.popInt();
+        Object array = arrayMarkStack.popObject();
+
+        int length = ArrayLengthNode.arrayLength(array);
+        final int stride = 2048;
+        int count = length - index;
+        if (count > stride) {
+            count = stride;
+            arrayMarkStack.pushObject(array);
+            arrayMarkStack.pushInt(index + count);
+        }
+
+        visitor.visitObjectArrayRange(array, index, count);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CORE_GC_CODE)
+    void promoteAlignedChunkWithPinnedObjectsBeforeSweeping(AlignedHeader chunk, Space originalSpace) {
+        assert mustSweep(chunk, originalSpace);
+        HeapImpl heap = HeapImpl.getHeapImpl();
+        boolean promoted = false;
+        if (!completeCollection && originalSpace.getNextAgeForPromotion() < policy.getTenuringAge()) {
+            promoted = heap.getYoungGeneration().promoteAlignedChunkWithPinnedObjectsBeforeSweeping(chunk, originalSpace);
+            if (!promoted) {
+                accounting.onSurvivorOverflowed();
+            }
+        }
+        if (!promoted) {
+            heap.getOldGeneration().promoteAlignedChunkWithPinnedObjectsBeforeSweeping(chunk, originalSpace);
         }
     }
 
@@ -1123,14 +1232,14 @@ public final class GCImpl implements GC {
     }
 
     public long getMillisSinceLastWholeHeapExamined() {
-        long startMillis;
-        if (lastWholeHeapExaminedTimeMillis < 0) {
+        long start;
+        if (lastWholeHeapExaminedNanos < 0) {
             // no full GC has yet been run, use time since the first allocation
-            startMillis = Isolates.getCurrentStartTimeMillis();
+            start = Isolates.getStartTimeNanos();
         } else {
-            startMillis = lastWholeHeapExaminedTimeMillis;
+            start = lastWholeHeapExaminedNanos;
         }
-        return System.currentTimeMillis() - startMillis;
+        return TimeUtils.millisSinceNanos(start);
     }
 
     @Fold
@@ -1138,12 +1247,13 @@ public final class GCImpl implements GC {
         return GCImpl.getGCImpl().accounting;
     }
 
-    @Fold
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static CollectionPolicy getPolicy() {
+        SubstrateUtil.guaranteeRuntimeOnly();
         return GCImpl.getGCImpl().policy;
     }
 
-    @Fold
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean hasNeverCollectPolicy() {
         return getPolicy() instanceof NeverCollect;
     }
@@ -1151,6 +1261,14 @@ public final class GCImpl implements GC {
     @Fold
     GreyToBlackObjectVisitor getGreyToBlackObjectVisitor() {
         return greyToBlackObjectVisitor;
+    }
+
+    @Uninterruptible(reason = "Clean retained mark stack memory.")
+    void cleanUnusedNativeMemory() {
+        assert markStack.isEmpty();
+        assert arrayMarkStack.isEmpty();
+        markStack.clean();
+        arrayMarkStack.clean();
     }
 
     private static class CollectionVMOperation extends NativeVMOperation {
@@ -1202,9 +1320,18 @@ public final class GCImpl implements GC {
             if (d.getForceFullGC()) {
                 /* Skip if another full GC happened in the meanwhile. */
                 return GCImpl.getAccounting().getCompleteCollectionCount() == d.getCompleteCollectionCount();
+            } else if (d.getCauseId() == GenScavengeGCCause.OnAllocation.getId()) {
+                /*
+                 * The requesting thread may be stopped for another GC after the allocation check
+                 * but before capturing the collection epoch. It then records the new epoch, so an
+                 * epoch comparison would not detect the stale allocation decision. Recheck whether
+                 * Eden currently requires collection, since it may have been emptied or filled again.
+                 */
+                return GCImpl.getPolicy().shouldCollectOnAllocation();
+            } else {
+                /* Skip if another GC happened after this request captured the collection epoch. */
+                return GCImpl.getGCImpl().getCollectionEpoch().equal(d.getRequestingEpoch());
             }
-            /* Skip if any other GC happened in the meanwhile. */
-            return GCImpl.getGCImpl().getCollectionEpoch().equal(d.getRequestingEpoch());
         }
     }
 
@@ -1288,11 +1415,11 @@ public final class GCImpl implements GC {
         void release(boolean keepAllAlignedChunks) {
             if (firstAligned.isNonNull()) {
                 HeapImpl.getChunkProvider().consumeAlignedChunks(firstAligned, keepAllAlignedChunks);
-                firstAligned = WordFactory.nullPointer();
+                firstAligned = Word.nullPointer();
             }
             if (firstUnaligned.isNonNull()) {
                 HeapChunkProvider.consumeUnalignedChunks(firstUnaligned);
-                firstUnaligned = WordFactory.nullPointer();
+                firstUnaligned = Word.nullPointer();
             }
         }
 
@@ -1324,7 +1451,7 @@ public final class GCImpl implements GC {
 
         @Override
         protected void operate() {
-            ThreadLocalAllocation.disableAndFlushForAllThreads();
+            HeapImpl.getHeapImpl().makeParseable();
 
             Log log = Log.log();
             log.string("GC summary").indent(true);
@@ -1351,7 +1478,7 @@ public final class GCImpl implements GC {
 
             long gcNanos = incrementalNanos + completeNanos;
 
-            long mutatorNanos = GCImpl.getGCImpl().timers.mutator.getMeasuredNanos();
+            long mutatorNanos = GCImpl.getGCImpl().timers.mutator.totalNanos();
             long totalNanos = gcNanos + mutatorNanos;
             long roundedGCLoad = (0 < totalNanos ? TimeUtils.roundedDivide(100 * gcNanos, totalNanos) : 0);
             log.string("GC time: ").rational(gcNanos, TimeUtils.nanosPerSecond, 3).string("s").newline();

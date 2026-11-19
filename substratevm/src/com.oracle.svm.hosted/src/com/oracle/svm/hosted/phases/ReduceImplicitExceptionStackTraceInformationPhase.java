@@ -31,14 +31,14 @@ import java.util.Map;
 import org.graalvm.collections.EconomicMap;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
 import com.oracle.svm.core.graal.nodes.ThrowBytecodeExceptionNode;
 import com.oracle.svm.core.graal.phases.RemoveUnwindPhase;
 import com.oracle.svm.core.graal.snippets.NonSnippetLowerings;
 import com.oracle.svm.core.snippets.ImplicitExceptions;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
 import jdk.graal.compiler.nodes.EndNode;
@@ -58,27 +58,6 @@ import jdk.graal.compiler.phases.common.FrameStateAssignmentPhase;
 import jdk.graal.compiler.phases.tiers.LowTierContext;
 import jdk.graal.compiler.phases.tiers.Suites;
 import jdk.graal.compiler.phases.util.Providers;
-
-@AutomaticallyRegisteredFeature
-class ReduceImplicitExceptionStackTraceInformationFeature implements InternalFeature {
-    @Override
-    public void registerGraalPhases(Providers providers, Suites suites, boolean hosted) {
-        if (hosted && SubstrateOptions.ReduceImplicitExceptionStackTraceInformation.getValue()) {
-            /*
-             * Add as late as possible, before the final canonicalization. A canonicalization is
-             * necessary because this phase can make other nodes unreachable, and the canonicalizer
-             * cleans that up.
-             */
-            ListIterator<BasePhase<? super LowTierContext>> finalCanonicalizer = suites.getLowTier().findPhase(FinalCanonicalizerPhase.class);
-            if (finalCanonicalizer == null) {
-                throw VMError.shouldNotReachHere("In a reduced phase plan without a final canonicalization, the " +
-                                SubstrateOptions.ReduceImplicitExceptionStackTraceInformation.getName() + " option must be disabled.");
-            }
-            finalCanonicalizer.previous();
-            finalCanonicalizer.add(new ReduceImplicitExceptionStackTraceInformationPhase());
-        }
-    }
-}
 
 /**
  * This phase reduces the runtime metadata for implicit exceptions, at the cost of stack trace
@@ -297,5 +276,26 @@ class ReduceImplicitExceptionStackTraceInformationPhase extends BasePhase<LowTie
          * foreign call. But there are corner cases where more dead control flow gets killed.
          */
         GraphUtil.killCFG(originalForeignCall);
+    }
+}
+
+@AutomaticallyRegisteredFeature
+class ReduceImplicitExceptionStackTraceInformationFeature implements InternalFeature {
+    @Override
+    public void registerGraalPhases(Providers providers, Suites suites, boolean hosted, boolean fallback) {
+        if (hosted && !fallback && SubstrateOptions.ReduceImplicitExceptionStackTraceInformation.getValue()) {
+            /*
+             * Add as late as possible, before the final canonicalization. A canonicalization is
+             * necessary because this phase can make other nodes unreachable, and the canonicalizer
+             * cleans that up.
+             */
+            ListIterator<BasePhase<? super LowTierContext>> finalCanonicalizer = suites.getLowTier().findPhase(FinalCanonicalizerPhase.class);
+            if (finalCanonicalizer == null) {
+                throw VMError.shouldNotReachHere("In a reduced phase plan without a final canonicalization, the " +
+                                SubstrateOptions.ReduceImplicitExceptionStackTraceInformation.getName() + " option must be disabled.");
+            }
+            finalCanonicalizer.previous();
+            finalCanonicalizer.add(new ReduceImplicitExceptionStackTraceInformationPhase());
+        }
     }
 }

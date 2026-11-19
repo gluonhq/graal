@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.core.graal.stackvalue;
 
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.stackvalue.StackValueNode.StackSlotIdentity;
 
 import jdk.graal.compiler.graph.NodeClass;
@@ -50,7 +50,7 @@ public class LateStackValueNode extends AbstractStackValueNode {
     }
 
     public static LateStackValueNode create(ValueNode sizeInBytes, ResolvedJavaMethod method, int bci, boolean disallowVirtualThread) {
-        int alignmentInBytes = ConfigurationValues.getTarget().stackAlignment;
+        int alignmentInBytes = SubstrateTarget.singleton().stackAlignment;
         StackSlotIdentity slotIdentity = createStackSlotIdentity(method, bci);
         return new LateStackValueNode(sizeInBytes, alignmentInBytes, slotIdentity, needsVirtualThreadCheck(method, disallowVirtualThread));
     }

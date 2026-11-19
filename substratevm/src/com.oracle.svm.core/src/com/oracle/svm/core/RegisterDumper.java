@@ -24,12 +24,13 @@
  */
 package com.oracle.svm.core;
 
+import com.oracle.svm.shared.Uninterruptible;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.util.VMError;
+import org.graalvm.word.impl.Word;
 
 public interface RegisterDumper {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -44,7 +45,7 @@ public interface RegisterDumper {
         log.string(label).zhex(value);
         if (printLocationInfo) {
             log.spaces(1);
-            SubstrateDiagnostics.printLocationInfo(log, WordFactory.unsigned(value), allowJavaHeapAccess, allowUnsafeOperations);
+            SubstrateDiagnostics.printLocationInfo(log, Word.unsigned(value), allowJavaHeapAccess, allowUnsafeOperations);
         }
         log.newline();
     }

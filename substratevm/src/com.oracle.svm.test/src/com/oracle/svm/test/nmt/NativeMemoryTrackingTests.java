@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2023, 2023, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -30,9 +30,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 import org.junit.Test;
 
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.nmt.NativeMemoryTracking;
 import com.oracle.svm.core.nmt.NmtCategory;
@@ -72,10 +73,10 @@ public class NativeMemoryTrackingTests {
         assertEquals(0, getUsedMemory());
         Pointer ptr = NativeMemory.malloc(16 * K, NmtCategory.Code);
 
-        assertEquals(getUsedMemory(), 16 * K);
+        assertEquals(16 * K, getUsedMemory());
         assertTrue(getUsedMemory() > 0);
 
-        Pointer reallocPtr = NativeMemory.realloc(ptr, WordFactory.unsigned(8 * K), NmtCategory.Code);
+        Pointer reallocPtr = NativeMemory.realloc(ptr, Word.unsigned(8 * K), NmtCategory.Code);
         assertEquals(8 * K, getUsedMemory());
 
         NativeMemory.free(reallocPtr);
@@ -87,34 +88,74 @@ public class NativeMemoryTrackingTests {
         assertEquals(0, getUsedMemory());
 
         Pointer ptr1 = NativeMemory.malloc(M, NmtCategory.Code);
-        long peakUsed = NativeMemoryTracking.singleton().getPeakUsedMemory(NmtCategory.Code);
+        long peakUsed = NativeMemoryTracking.singleton().getPeakMallocMemory(NmtCategory.Code);
         assertEquals(M, peakUsed);
 
         Pointer ptr2 = NativeMemory.malloc(M, NmtCategory.Code);
-        peakUsed = NativeMemoryTracking.singleton().getPeakUsedMemory(NmtCategory.Code);
+        peakUsed = NativeMemoryTracking.singleton().getPeakMallocMemory(NmtCategory.Code);
         assertEquals(2 * M, peakUsed);
 
         NativeMemory.free(ptr1);
-        ptr1 = WordFactory.nullPointer();
+        ptr1 = Word.nullPointer();
 
         NativeMemory.free(ptr2);
-        ptr2 = WordFactory.nullPointer();
+        ptr2 = Word.nullPointer();
 
         assertEquals(0, getUsedMemory());
-        assertEquals(2 * M, NativeMemoryTracking.singleton().getPeakUsedMemory(NmtCategory.Code));
+        assertEquals(2 * M, NativeMemoryTracking.singleton().getPeakMallocMemory(NmtCategory.Code));
 
         Pointer ptr3 = NativeMemory.malloc(3 * M, NmtCategory.Code);
-        peakUsed = NativeMemoryTracking.singleton().getPeakUsedMemory(NmtCategory.Code);
+        peakUsed = NativeMemoryTracking.singleton().getPeakMallocMemory(NmtCategory.Code);
         assertEquals(3 * M, peakUsed);
 
         NativeMemory.free(ptr3);
-        ptr3 = WordFactory.nullPointer();
+        ptr3 = Word.nullPointer();
 
         assertEquals(0, getUsedMemory());
-        assertEquals(3 * M, NativeMemoryTracking.singleton().getPeakUsedMemory(NmtCategory.Code));
+        assertEquals(3 * M, NativeMemoryTracking.singleton().getPeakMallocMemory(NmtCategory.Code));
     }
 
     private static long getUsedMemory() {
-        return NativeMemoryTracking.singleton().getUsedMemory(NmtCategory.Code);
+        return NativeMemoryTracking.singleton().getMallocMemory(NmtCategory.Code);
+    }
+
+    @Test
+    public void testVirtualMemoryTracking() {
+        // The application should already be using some virtual memory for the heap.
+        assertTrue(NativeMemoryTracking.singleton().getReservedVirtualMemory(NmtCategory.ImageHeap) > 0);
+        assertTrue(NativeMemoryTracking.singleton().getReservedVirtualMemory(NmtCategory.JavaHeap) > 0);
+
+        /* GR-57361: G1 does not report committed Java heap memory to NMT yet. */
+        if (!SubstrateOptions.useG1GC()) {
+            assertTrue(NativeMemoryTracking.singleton().getCommittedVirtualMemory(NmtCategory.JavaHeap) > 0);
+        }
+        assertTrue(NativeMemoryTracking.singleton().getCommittedVirtualMemory(NmtCategory.ImageHeap) > 0);
+
+        /* GR-57361: G1 does not report committed Java heap memory to NMT yet. */
+        if (!SubstrateOptions.useG1GC()) {
+            assertTrue(NativeMemoryTracking.singleton().getPeakCommittedVirtualMemory(NmtCategory.JavaHeap) > 0);
+        }
+        assertTrue(NativeMemoryTracking.singleton().getPeakCommittedVirtualMemory(NmtCategory.ImageHeap) > 0);
+
+        assertTrue(NativeMemoryTracking.singleton().getPeakReservedVirtualMemory(NmtCategory.JavaHeap) > 0);
+        assertTrue(NativeMemoryTracking.singleton().getPeakReservedVirtualMemory(NmtCategory.ImageHeap) > 0);
+
+        // determine baseline
+        long codeReservedVirtualMemory = NativeMemoryTracking.singleton().getReservedVirtualMemory(NmtCategory.Code);
+        long codeCommittedVirtualMemory = NativeMemoryTracking.singleton().getCommittedVirtualMemory(NmtCategory.Code);
+        long codePeakReservedVirtualMemory = NativeMemoryTracking.singleton().getPeakReservedVirtualMemory(NmtCategory.Code);
+        long codePeakCommittedVirtualMemory = NativeMemoryTracking.singleton().getPeakCommittedVirtualMemory(NmtCategory.Code);
+
+        // Use some memory
+        NativeMemoryTracking.singleton().trackReserve(1024, NmtCategory.Code);
+        NativeMemoryTracking.singleton().trackCommit(512, NmtCategory.Code);
+        assertEquals(codeReservedVirtualMemory + 1024, NativeMemoryTracking.singleton().getReservedVirtualMemory(NmtCategory.Code));
+        assertEquals(codeCommittedVirtualMemory + 512, NativeMemoryTracking.singleton().getCommittedVirtualMemory(NmtCategory.Code));
+
+        // Uncommit and check peaks
+        NativeMemoryTracking.singleton().trackUncommit(512, NmtCategory.Code);
+        NativeMemoryTracking.singleton().trackFree(1024, NmtCategory.Code);
+        assertEquals(codePeakReservedVirtualMemory + 1024, NativeMemoryTracking.singleton().getPeakReservedVirtualMemory(NmtCategory.Code));
+        assertEquals(codePeakCommittedVirtualMemory + 512, NativeMemoryTracking.singleton().getPeakCommittedVirtualMemory(NmtCategory.Code));
     }
 }

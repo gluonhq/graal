@@ -27,19 +27,18 @@ package com.oracle.svm.hosted.code;
 import static com.oracle.svm.hosted.code.SubstrateCompilationDirectives.DEOPT_TARGET_METHOD;
 
 import java.lang.reflect.Modifier;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.ListIterator;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.Supplier;
+
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.MethodFlowsGraph;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
 import com.oracle.svm.core.code.FrameInfoEncoder;
 import com.oracle.svm.core.deopt.DeoptEntryInfopoint;
@@ -50,10 +49,11 @@ import com.oracle.svm.core.graal.nodes.DeoptTestNode;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
 import com.oracle.svm.core.graal.snippets.DeoptTester;
 import com.oracle.svm.core.graal.stackvalue.StackValueNode;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedUniverse;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.graph.Node;
@@ -136,7 +136,7 @@ public class DeoptimizationUtils {
             return false;
         }
 
-        if (method.getAnnotation(DeoptTest.class) != null) {
+        if (GuestAnnotationAccess.isAnnotationPresent(method, DeoptTest.class)) {
             return true;
         }
 
@@ -149,7 +149,7 @@ public class DeoptimizationUtils {
             return false;
         }
 
-        if (method.isEntryPoint()) {
+        if (method.isNativeEntryPoint()) {
             /*
              * Entry points from C have special entry/exit nodes added, so they cannot be
              * deoptimized.
@@ -166,10 +166,10 @@ public class DeoptimizationUtils {
         if (method.isIntrinsicMethod()) {
             return false;
         }
-        if (Uninterruptible.Utils.isUninterruptible(method)) {
+        if (UninterruptibleAnnotationUtils.isUninterruptible(method)) {
             return false;
         }
-        if (method.getAnnotation(RestrictHeapAccess.class) != null) {
+        if (GuestAnnotationAccess.isAnnotationPresent(method, RestrictHeapAccess.class)) {
             return false;
         }
         if (StubCallingConvention.Utils.hasStubCallingConvention(method)) {
@@ -219,13 +219,41 @@ public class DeoptimizationUtils {
 
     static void removeDeoptTargetOptimizations(Suites suites) {
         GraalConfiguration.hostedInstance().removeDeoptTargetOptimizations(suites);
-
         PhaseSuite<HighTierContext> highTier = suites.getHighTier();
         highTier.removePhase(PartialEscapePhase.class);
         highTier.removePhase(ReadEliminationPhase.class);
         highTier.removePhase(BoxNodeOptimizationPhase.class);
         PhaseSuite<MidTierContext> midTier = suites.getMidTier();
         midTier.removePhase(FloatingReadPhase.class);
+        replaceFixReadsPhase(suites);
+    }
+
+    static void removeDeoptTargetOptimizations(LIRSuites lirSuites) {
+        ListIterator<LIRPhase<PostAllocationOptimizationPhase.PostAllocationOptimizationContext>> it = lirSuites.getPostAllocationOptimizationStage().findPhase(RedundantMoveElimination.class);
+        if (it != null) {
+            it.remove();
+        }
+        setNeverSpillConstants(lirSuites);
+    }
+
+    static void removeDeoptTargetFallbackOptimizations(@SuppressWarnings("unused") Suites suites) {
+        replaceFixReadsPhase(suites);
+    }
+
+    static void removeDeoptTargetFallbackOptimizations(LIRSuites lirSuites) {
+        setNeverSpillConstants(lirSuites);
+    }
+
+    /**
+     * At deoptimization entry points we need to be able to recreate the stack from the
+     * {@code LIRFrameState}. As constants are not part of the state, we must not spill them. See
+     * {@code VerifyDeoptLIRFrameStatesPhase#doState}.
+     */
+    private static void setNeverSpillConstants(LIRSuites lirSuites) {
+        lirSuites.getAllocationStage().findPhaseInstance(RegisterAllocationPhase.class).setNeverSpillConstants(true);
+    }
+
+    private static void replaceFixReadsPhase(Suites suites) {
         PhaseSuite<LowTierContext> lowTier = suites.getLowTier();
         ListIterator<BasePhase<? super LowTierContext>> it = lowTier.findPhase(FixReadsPhase.class);
         if (it != null) {
@@ -234,14 +262,6 @@ public class DeoptimizationUtils {
             boolean replaceInputsWithConstants = false;
             it.add(new FixReadsPhase(replaceInputsWithConstants, fixReads.getSchedulePhase()));
         }
-    }
-
-    static void removeDeoptTargetOptimizations(LIRSuites lirSuites) {
-        ListIterator<LIRPhase<PostAllocationOptimizationPhase.PostAllocationOptimizationContext>> it = lirSuites.getPostAllocationOptimizationStage().findPhase(RedundantMoveElimination.class);
-        if (it != null) {
-            it.remove();
-        }
-        lirSuites.getAllocationStage().findPhaseInstance(RegisterAllocationPhase.class).setNeverSpillConstants(true);
     }
 
     public static boolean isDeoptEntry(HostedMethod method, CompilationResult compilation, Infopoint infopoint) {
@@ -304,7 +324,7 @@ public class DeoptimizationUtils {
                     long encodedBci = FrameInfoEncoder.encodeBci(frame.getBCI(), FrameState.StackState.of(frame));
 
                     BytecodeFrame previous = encodedBciMap.put(encodedBci, frame);
-                    assert previous == null : "duplicate encoded bci " + encodedBci + " in deopt target " + method + " found.\n\n" + frame +
+                    assert previous == null : "duplicate encoded bci " + encodedBci + " (original=" + frame.getBCI() + ") in deopt target " + method + " found.\n\n" + frame +
                                     "\n\n" + previous;
                 }
 
@@ -388,10 +408,10 @@ public class DeoptimizationUtils {
          * Because this graph will have its flowgraph immediately updated after registration, there
          * is no reason to make this method's flowgraph a stub on creation.
          */
-        Collection<ResolvedJavaMethod> recomputeMethods = DeoptimizationUtils.registerDeoptEntries(graph, true,
-                        (deoptEntryMethod -> ((PointsToAnalysisMethod) deoptEntryMethod).getOrCreateMultiMethod(DEOPT_TARGET_METHOD)));
+        Iterable<ResolvedJavaMethod> recomputeMethods = DeoptimizationUtils.registerDeoptEntries(graph, true,
+                        (deoptEntryMethod -> ((PointsToAnalysisMethod) deoptEntryMethod).getOrCreateMethodVariant(DEOPT_TARGET_METHOD)));
 
-        AnalysisMethod deoptMethod = aMethod.getMultiMethod(DEOPT_TARGET_METHOD);
+        AnalysisMethod deoptMethod = aMethod.getMethodVariant(DEOPT_TARGET_METHOD);
         if (deoptMethod != null && SubstrateCompilationDirectives.singleton().isRegisteredDeoptTarget(deoptMethod)) {
             /*
              * If there exists a deopt target for this method, then it is allowed to deopt.
@@ -411,9 +431,8 @@ public class DeoptimizationUtils {
     /**
      * @return the DeoptTarget methods which had new frame registered.
      */
-    public static Collection<ResolvedJavaMethod> registerDeoptEntries(StructuredGraph graph, boolean isRoot, DeoptTargetRetriever deoptRetriever) {
-
-        Set<ResolvedJavaMethod> changedMethods = new HashSet<>();
+    public static Iterable<ResolvedJavaMethod> registerDeoptEntries(StructuredGraph graph, boolean isRoot, DeoptTargetRetriever deoptRetriever) {
+        EconomicSet<ResolvedJavaMethod> changedMethods = EconomicSet.create();
         for (FrameState frameState : graph.getNodes(FrameState.TYPE)) {
             if (frameState.hasExactlyOneUsage()) {
                 Node usage = frameState.usages().first();

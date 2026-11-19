@@ -50,6 +50,13 @@ public class TestRecordingObjectDescription extends JfrOldObjectTest {
     }
 
     @Test
+    public void testThreadGroupEllipsisUtf8() throws Throwable {
+        String name = "\uD83E\uDD16".repeat(22);
+        String expectedDescription = "Thread Group: " + "\uD83E\uDD16".repeat(20) + "...";
+        testDescription(new MyThreadGroup(name), expectedDescription);
+    }
+
+    @Test
     public void testThreadName() throws Throwable {
         String name = "My Thread";
         String expectedDescription = "Thread Name: My Thread";

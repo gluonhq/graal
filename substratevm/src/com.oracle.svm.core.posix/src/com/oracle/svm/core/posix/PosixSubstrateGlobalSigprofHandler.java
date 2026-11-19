@@ -25,21 +25,26 @@
 
 package com.oracle.svm.core.posix;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.posix.headers.Time;
-import com.oracle.svm.core.util.TimeUtils;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.TimeUtils;
+import org.graalvm.word.impl.Word;
 
 /**
  * Support for POSIX global timer (see {@link PosixSubstrateSigprofHandler}).
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class PosixSubstrateGlobalSigprofHandler extends PosixSubstrateSigprofHandler {
 
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -58,7 +63,7 @@ public final class PosixSubstrateGlobalSigprofHandler extends PosixSubstrateSigp
         newValue.it_interval().set_tv_sec(us / TimeUtils.microsPerSecond);
         newValue.it_interval().set_tv_usec(us % TimeUtils.microsPerSecond);
 
-        int status = Time.NoTransitions.setitimer(Time.TimerTypeEnum.ITIMER_PROF, newValue, WordFactory.nullPointer());
+        int status = Time.NoTransitions.setitimer(Time.TimerTypeEnum.ITIMER_PROF, newValue, Word.nullPointer());
         PosixUtils.checkStatusIs0(status, "setitimer(which, newValue, oldValue): wrong arguments.");
     }
 

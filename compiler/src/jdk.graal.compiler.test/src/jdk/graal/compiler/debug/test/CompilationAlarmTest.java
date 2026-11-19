@@ -25,6 +25,9 @@
 package jdk.graal.compiler.debug.test;
 
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+import org.junit.Test;
 
 import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.code.CompilationResult;
@@ -41,8 +44,6 @@ import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.tiers.LowTierContext;
 import jdk.graal.compiler.phases.tiers.Suites;
-import org.junit.Test;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 public class CompilationAlarmTest extends GraalCompilerTest {
@@ -64,11 +65,11 @@ public class CompilationAlarmTest extends GraalCompilerTest {
 
             @Override
             protected void run(StructuredGraph graph, LowTierContext context) {
-                long end = (long) (workSeconds * 1000);
-                long start = System.currentTimeMillis();
+                long workNanos = (long) (workSeconds * TimeUnit.SECONDS.toNanos(1));
+                long start = System.nanoTime();
                 try {
-                    while (System.currentTimeMillis() - start < end) {
-                        CompilationAlarm.current().checkExpiration();
+                    while (System.nanoTime() - start < workNanos) {
+                        CompilationAlarm.checkProgress(graph);
                         if (withProgressCounterEvents) {
                             CompilationAlarm.checkProgress(graph);
                             testThread.events++;
@@ -76,7 +77,7 @@ public class CompilationAlarmTest extends GraalCompilerTest {
                     }
                 } finally {
                     if (CompilationAlarm.LOG_PROGRESS_DETECTION) {
-                        System.out.printf("CompilationAlarmTest: %d events after %d ms of work%n", testThread.events, System.currentTimeMillis() - start);
+                        System.out.printf("CompilationAlarmTest: %d events after %d ms of work%n", testThread.events, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
                     }
                 }
             }
@@ -111,7 +112,7 @@ public class CompilationAlarmTest extends GraalCompilerTest {
                 CompilationIdentifier compilationId = getOrCreateCompilationId(codeOwner, graph);
                 Request<CompilationResult> request = new Request<>(graph, codeOwner, getProviders(), getBackend(), getDefaultGraphBuilderSuite(), getOptimisticOptimizations(),
                                 graph.getProfilingInfo(), getSuites(thread, workSeconds, withProgressCounterEvents, opt), createLIRSuites(opt), new CompilationResult(compilationId),
-                                CompilationResultBuilderFactory.Default, null, true);
+                                CompilationResultBuilderFactory.Default, null, null, true);
                 try {
                     GraalCompiler.compile(request);
                     if (expectedExceptionText != null) {

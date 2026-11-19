@@ -37,8 +37,9 @@ import com.oracle.graal.pointsto.flow.MethodFlowsGraphInfo;
 import com.oracle.graal.pointsto.flow.TypeFlow;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.BaseLayerType;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
-import com.oracle.svm.common.meta.MultiMethod.MultiMethodKey;
+import com.oracle.svm.common.meta.MethodVariant.MethodVariantKey;
 
 import jdk.vm.ci.code.BytecodePosition;
 
@@ -50,12 +51,15 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
     private TypeState seenReceiverTypes = TypeState.forEmpty();
 
     DefaultVirtualInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey) {
-        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariantKey callerMethodVariantKey) {
+        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMethodVariantKey);
     }
 
     @Override
     public void onObservedUpdate(PointsToAnalysis bb) {
+        if (!isFlowEnabled()) {
+            return;
+        }
         if (isSaturated()) {
             /* The receiver can saturate while the invoke update was waiting to be scheduled. */
             return;
@@ -70,6 +74,7 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
         }
 
         for (AnalysisType type : receiverState.types(bb)) {
+            assert receiverType.isAssignableFrom(type) || type.getWrapped() instanceof BaseLayerType : type + " should be a subtype of " + receiverType;
             if (isSaturated()) {
                 /*-
                  * The receiver can become saturated during the callees linking, which saturates
@@ -105,7 +110,7 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
 
             assert !Modifier.isAbstract(method.getModifiers()) : method;
 
-            var calleeList = bb.getHostVM().getMultiMethodAnalysisPolicy().determineCallees(bb, PointsToAnalysis.assertPointsToAnalysisMethod(method), targetMethod, callerMultiMethodKey,
+            var calleeList = bb.getHostVM().getMethodVariantsAnalysisPolicy().determineCallees(bb, PointsToAnalysis.assertPointsToAnalysisMethod(method), targetMethod, callerMethodVariantKey,
                             this);
             for (PointsToAnalysisMethod callee : calleeList) {
                 if (!callee.isOriginalMethod() && allOriginalCallees) {
@@ -134,11 +139,14 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
 
     @Override
     public void onObservedSaturated(PointsToAnalysis bb, TypeFlow<?> observed) {
-        /* Eagerly ensure context insensitive invoke is created before the saturated flag is set. */
-        AbstractVirtualInvokeTypeFlow contextInsensitiveInvoke = (AbstractVirtualInvokeTypeFlow) targetMethod.initAndGetContextInsensitiveInvoke(bb, source, false, callerMultiMethodKey);
-        contextInsensitiveInvoke.addInvokeLocation(getSource());
+        assert isFlowEnabled() : "Should only be executed if this flow is enabled " + this;
+        if (!setSaturated()) {
+            return;
+        }
 
-        setSaturated();
+        /* Eagerly ensure context insensitive invoke is created before the saturated flag is set. */
+        AbstractVirtualInvokeTypeFlow contextInsensitiveInvoke = (AbstractVirtualInvokeTypeFlow) targetMethod.initAndGetContextInsensitiveInvoke(bb, source, false, callerMethodVariantKey);
+        contextInsensitiveInvoke.addInvokeLocation(getSource());
 
         /*
          * The receiver object flow of the invoke operation is saturated; it will stop sending
@@ -174,7 +182,6 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
          * receiver is already set in the saturated invoke.
          */
         for (int i = 1; i < actualParameters.length; i++) {
-            /* Primitive type parameters are not modeled, hence null. */
             if (actualParameters[i] != null) {
                 actualParameters[i].addUse(bb, contextInsensitiveInvoke.getActualParameter(i));
             }
@@ -186,21 +193,22 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
     }
 
     @Override
-    public void setSaturated() {
-        super.setSaturated();
+    public boolean setSaturated() {
+        var success = super.setSaturated();
         if (this.isClone()) {
             /*
              * If this is a clone, mark the original as saturated too such that
              * originalInvoke.getCallees() is redirected to the context-insensitive invoke.
              */
-            originalInvoke.setSaturated();
+            success |= originalInvoke.setSaturated();
         }
+        return success;
     }
 
     @Override
     public Collection<AnalysisMethod> getOriginalCallees() {
         if (isSaturated()) {
-            return targetMethod.getContextInsensitiveVirtualInvoke(callerMultiMethodKey).getOriginalCallees();
+            return targetMethod.getContextInsensitiveVirtualInvoke(callerMethodVariantKey).getOriginalCallees();
         } else {
             return super.getOriginalCallees();
         }
@@ -209,7 +217,7 @@ final class DefaultVirtualInvokeTypeFlow extends AbstractVirtualInvokeTypeFlow {
     @Override
     public Collection<AnalysisMethod> getAllCallees() {
         if (isSaturated()) {
-            return targetMethod.getContextInsensitiveVirtualInvoke(callerMultiMethodKey).getAllCallees();
+            return targetMethod.getContextInsensitiveVirtualInvoke(callerMethodVariantKey).getAllCallees();
         } else {
             return super.getAllCallees();
         }

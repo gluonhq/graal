@@ -26,6 +26,9 @@ package com.oracle.svm.core.windows;
 
 import static org.graalvm.nativeimage.c.function.CFunction.Transition.NO_TRANSITION;
 
+import java.util.random.RandomGenerator;
+
+import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
@@ -39,24 +42,36 @@ import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.function.CEntryPointActions;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.RuntimeRandomness;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.os.VirtualMemoryProvider;
 import com.oracle.svm.core.util.PointerUtils;
-import com.oracle.svm.core.util.UnsignedUtils;
 import com.oracle.svm.core.windows.WindowsUtils.CFunctionPointerPointer;
 import com.oracle.svm.core.windows.headers.MemoryAPI;
 import com.oracle.svm.core.windows.headers.SysinfoAPI;
 import com.oracle.svm.core.windows.headers.WinBase;
 import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 @AutomaticallyRegisteredImageSingleton(VirtualMemoryProvider.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
+
+    // Keep mappings in the lower half of the smallest commonly supported address range.
+    private static final int RANDOM_ADDRESS_BITS = Platform.includedIn(Platform.AARCH64.class) ? 38 : 47;
+    private static final long MAX_RANDOM_ADDRESS = 1L << RANDOM_ADDRESS_BITS;
+    private static final int MAX_RANDOMIZATION_ATTEMPTS = 10;
 
     private static final CGlobalData<WordPointer> CACHED_PAGE_SIZE = CGlobalDataFactory.createWord();
     private static final CGlobalData<WordPointer> CACHED_ALLOC_GRAN = CGlobalDataFactory.createWord();
@@ -65,14 +80,14 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     private static void initCaches() {
         SysinfoAPI.SYSTEM_INFO sysInfo = StackValue.get(SysinfoAPI.SYSTEM_INFO.class);
         SysinfoAPI.GetSystemInfo(sysInfo);
-        CACHED_PAGE_SIZE.get().write(WordFactory.unsigned(sysInfo.dwPageSize()));
-        CACHED_ALLOC_GRAN.get().write(WordFactory.unsigned(sysInfo.dwAllocationGranularity()));
+        CACHED_PAGE_SIZE.get().write(Word.unsigned(sysInfo.dwPageSize()));
+        CACHED_ALLOC_GRAN.get().write(Word.unsigned(sysInfo.dwAllocationGranularity()));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static UnsignedWord getPageSize() {
         UnsignedWord value = CACHED_PAGE_SIZE.get().read();
-        if (value.equal(WordFactory.zero())) {
+        if (value.equal(Word.zero())) {
             initCaches();
             value = CACHED_PAGE_SIZE.get().read();
         }
@@ -82,7 +97,7 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static UnsignedWord getAllocationGranularity() {
         UnsignedWord value = CACHED_ALLOC_GRAN.get().read();
-        if (value.equal(WordFactory.zero())) {
+        if (value.equal(Word.zero())) {
             initCaches();
             value = CACHED_ALLOC_GRAN.get().read();
         }
@@ -121,13 +136,13 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     }
 
     /** Sentinel value indicating that no special alignment is required. */
-    private static final UnsignedWord UNALIGNED = WordFactory.zero();
+    private static final UnsignedWord UNALIGNED = Word.zero();
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer reserve(UnsignedWord nbytes, UnsignedWord alignment, boolean executable) {
         if (nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         UnsignedWord requiredAlignment = alignment;
@@ -156,9 +171,9 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
         assert reservedPlaceholder.isNull();
 
         /* Reserve a container that is large enough for the requested size *and* the alignment. */
-        Pointer reserved = MemoryAPI.VirtualAlloc(WordFactory.nullPointer(), nbytes.add(requiredAlignment), MemoryAPI.MEM_RESERVE(), MemoryAPI.PAGE_NOACCESS());
+        Pointer reserved = MemoryAPI.VirtualAlloc(Word.nullPointer(), nbytes.add(requiredAlignment), MemoryAPI.MEM_RESERVE(), MemoryAPI.PAGE_NOACCESS());
         if (reserved.isNull()) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         return requiredAlignment.equal(UNALIGNED) ? reserved : PointerUtils.roundUp(reserved, requiredAlignment);
     }
@@ -169,7 +184,7 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static Pointer reservePlaceholder(UnsignedWord size, UnsignedWord alignment) {
         int allocationType = MemoryAPI.MEM_RESERVE() | MEM_RESERVE_PLACEHOLDER;
-        return invokeVirtualAlloc2(WordFactory.nullPointer(), size, allocationType, MemoryAPI.PAGE_NOACCESS(), alignment);
+        return invokeVirtualAlloc2(Word.nullPointer(), size, allocationType, MemoryAPI.PAGE_NOACCESS(), alignment);
     }
 
     private static final int MEM_REPLACE_PLACEHOLDER = 0x00004000;
@@ -179,7 +194,7 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void replacePlaceholder(PointerBase placeholder, UnsignedWord size) {
         int allocationType = MemoryAPI.MEM_RESERVE() | MEM_REPLACE_PLACEHOLDER;
-        if (invokeVirtualAlloc2(placeholder, size, allocationType, MemoryAPI.PAGE_NOACCESS(), WordFactory.zero()).isNull()) {
+        if (invokeVirtualAlloc2(placeholder, size, allocationType, MemoryAPI.PAGE_NOACCESS(), Word.zero()).isNull()) {
             CEntryPointActions.failFatally(WinBase.GetLastError(), REPLACE_PLACEHOLDER_ERROR_MESSAGE.get());
         }
     }
@@ -201,11 +216,11 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
         VirtualAlloc2 virtualAlloc2 = WindowsUtils.getAndCacheFunctionPointer(VIRTUAL_ALLOC_2_POINTER.get(), KERNELBASE_DLL.get(), VIRTUAL_ALLOC_2.get());
         if (virtualAlloc2.isNull()) {
             /* The OS does not provide VirtualAlloc2 (nor placeholders). */
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         MEM_EXTENDED_PARAMETER extendedParameter = StackValue.get(MEM_EXTENDED_PARAMETER.class);
         specifyAlignment(extendedParameter, StackValue.get(MEM_ADDRESS_REQUIREMENTS.class), alignment);
-        return virtualAlloc2.invoke(WordFactory.nullPointer(), baseAddress, size, allocationType, pageProtection, extendedParameter, 1);
+        return virtualAlloc2.invoke(Word.nullPointer(), baseAddress, size, allocationType, pageProtection, extendedParameter, 1);
     }
 
     private interface VirtualAlloc2 extends CFunctionPointer {
@@ -230,8 +245,8 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
          */
         extendedParameter.setF1Type(MemExtendedParameterAddressRequirements);
         extendedParameter.setF2Pointer(addressRequirements.rawValue());
-        addressRequirements.setF1LowestStartingAddress(WordFactory.nullPointer());
-        addressRequirements.setF2HighestEndingAddress(WordFactory.nullPointer());
+        addressRequirements.setF1LowestStartingAddress(Word.nullPointer());
+        addressRequirements.setF2HighestEndingAddress(Word.nullPointer());
         addressRequirements.setF3Alignment(alignment);
     }
 
@@ -285,7 +300,7 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer mapFile(PointerBase start, UnsignedWord nbytes, WordBase fileHandle, UnsignedWord offset, int access) {
         if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         /*
@@ -297,13 +312,13 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
              * Memory mapping to an unreserved address range imposes an additional restriction on
              * the alignment of the `offset`, which we do not currently support.
              */
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         /* First split off a placeholder from the reserved address range ... */
         if (!splitPlaceholder(start, nbytes)) {
             /* The OS does not support placeholders. */
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
 
         /* ... and then map a view into the placeholder. */
@@ -337,10 +352,10 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
         MapViewOfFile3 mapViewOfFile3 = WindowsUtils.getAndCacheFunctionPointer(MAP_VIEW_OF_FILE_3_POINTER.get(), KERNELBASE_DLL.get(), MAP_VIEW_OF_FILE_3.get());
         if (mapViewOfFile3.isNull()) {
             /* The OS does not provide MapViewOfFile3 (nor placeholders). */
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
-        return mapViewOfFile3.invoke(fileMapping, WordFactory.nullPointer(), baseAddress, offset, viewSize, MEM_REPLACE_PLACEHOLDER,
-                        pageProtection, WordFactory.nullPointer(), 0);
+        return mapViewOfFile3.invoke(fileMapping, Word.nullPointer(), baseAddress, offset, viewSize, MEM_REPLACE_PLACEHOLDER,
+                        pageProtection, Word.nullPointer(), 0);
     }
 
     private interface MapViewOfFile3 extends CFunctionPointer {
@@ -353,14 +368,36 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public Pointer commit(PointerBase start, UnsignedWord nbytes, int access) {
         if ((start.isNonNull() && !isAligned(start)) || nbytes.equal(0)) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
+        }
+
+        int pageProtection = accessAsProt(access);
+        if (start.isNull() && (access & Access.FUTURE_EXECUTE) != 0 &&
+                        SubstrateOptions.RandomizeRuntimeCodeCache.getValue()) {
+            UnsignedWord alignment = getAllocationGranularity();
+            long slotCount = (MAX_RANDOM_ADDRESS - nbytes.rawValue()) / alignment.rawValue();
+            if (slotCount <= 1) {
+                return Word.nullPointer();
+            }
+
+            RandomGenerator random = RuntimeRandomness.instance().getNonBlockingRandom();
+            int allocationType = MemoryAPI.MEM_RESERVE() | MemoryAPI.MEM_COMMIT();
+            for (int attempts = 0; attempts < MAX_RANDOMIZATION_ATTEMPTS; attempts++) {
+                long slot = Long.remainderUnsigned(random.nextLong(), slotCount - 1) + 1;
+                Pointer requested = Word.pointer(slot * alignment.rawValue());
+                Pointer allocated = MemoryAPI.VirtualAlloc(requested, nbytes, allocationType, pageProtection);
+                if (allocated.isNonNull()) {
+                    assert allocated.equal(requested);
+                    return allocated;
+                }
+            }
         }
 
         /*
          * VirtualAlloc only guarantees the zeroing for freshly committed pages (i.e., the content
          * of pages that were already committed earlier won't be touched).
          */
-        return MemoryAPI.VirtualAlloc(start, nbytes, MemoryAPI.MEM_COMMIT(), accessAsProt(access));
+        return MemoryAPI.VirtualAlloc(start, nbytes, MemoryAPI.MEM_COMMIT(), pageProtection);
     }
 
     @Override
@@ -417,7 +454,7 @@ public class WindowsVirtualMemoryProvider implements VirtualMemoryProvider {
         if (isMemoryMapped) {
             return MemoryAPI.UnmapViewOfFile(allocationBase) != 0;
         } else {
-            return MemoryAPI.VirtualFree(allocationBase, WordFactory.zero(), MemoryAPI.MEM_RELEASE()) != 0;
+            return MemoryAPI.VirtualFree(allocationBase, Word.zero(), MemoryAPI.MEM_RELEASE()) != 0;
         }
     }
 

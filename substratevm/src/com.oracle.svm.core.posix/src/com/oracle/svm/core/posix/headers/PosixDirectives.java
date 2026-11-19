@@ -32,7 +32,7 @@ import java.util.List;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.CContext;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 public class PosixDirectives implements CContext.Directives {
     private static final String[] commonLibs = new String[]{
@@ -46,6 +46,7 @@ public class PosixDirectives implements CContext.Directives {
                     "<semaphore.h>",
                     "<signal.h>",
                     "<errno.h>",
+                    "<sys/file.h>",
                     "<sys/mman.h>",
                     "<sys/resource.h>",
                     "<sys/stat.h>",

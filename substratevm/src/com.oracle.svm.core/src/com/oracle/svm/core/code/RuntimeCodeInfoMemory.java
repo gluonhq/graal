@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.core.code;
 
+import static com.oracle.svm.shared.Uninterruptible.CORE_GC_CODE;
+
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.graalvm.nativeimage.ImageSingletons;
@@ -31,20 +33,27 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
 import com.oracle.svm.core.code.CodeInfoAccess.HasInstalledCode;
 import com.oracle.svm.core.code.RuntimeCodeCache.CodeInfoVisitor;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
@@ -59,6 +68,7 @@ import jdk.graal.compiler.api.replacements.Fold;
  * guaranteed that none of these methods is executed when a GC is triggered as we would end up with
  * races between the application and the GC otherwise.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class RuntimeCodeInfoMemory {
     private static final int MAX_CODE_INFO_ENTRIES_TO_PRINT = 500_000;
 
@@ -110,11 +120,11 @@ public class RuntimeCodeInfoMemory {
     }
 
     public void clearPeakCodeAndDataCounters() {
-        peakCodeAndDataMemorySize = WordFactory.zero();
+        peakCodeAndDataMemorySize = Word.zero();
     }
 
     public void clearPeakNativeMetadataCounters() {
-        peakNativeMetadataSize = WordFactory.zero();
+        peakNativeMetadataSize = Word.zero();
     }
 
     @Uninterruptible(reason = "Manipulate the counters atomically with regard to GC.")
@@ -226,6 +236,17 @@ public class RuntimeCodeInfoMemory {
         }
     }
 
+    public boolean contains(CodeInfo info) {
+        assert !VMOperation.isGCInProgress();
+        assert info.isNonNull() : "null";
+        lock.lock();
+        try {
+            return contains0(info);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public boolean removeDuringGC(CodeInfo info) {
         assert VMOperation.isGCInProgress() : "Otherwise, we would need to protect the CodeInfo from the GC.";
         assert info.isNonNull();
@@ -276,7 +297,7 @@ public class RuntimeCodeInfoMemory {
         for (int i = 0; i < oldLength; i++) {
             UntetheredCodeInfo tag = NonmovableArrays.getWord(oldTable, i);
             if (tag.isNonNull()) {
-                NonmovableArrays.setWord(oldTable, i, WordFactory.zero());
+                NonmovableArrays.setWord(oldTable, i, Word.zero());
                 int u = hashIndex(tag, newLength);
                 while (NonmovableArrays.getWord(table, u).isNonNull()) {
                     u = nextIndex(u, newLength);
@@ -295,11 +316,26 @@ public class RuntimeCodeInfoMemory {
         UntetheredCodeInfo entry = NonmovableArrays.getWord(table, index);
         while (entry.isNonNull()) {
             if (entry.equal(info)) {
-                NonmovableArrays.setWord(table, index, WordFactory.zero());
+                NonmovableArrays.setWord(table, index, Word.zero());
                 count--;
                 assert count >= 0 : "invalid counter value";
                 rehashAfterUnregisterAt(index);
                 subtractToSizeCounters(info);
+                return true;
+            }
+            index = nextIndex(index, length);
+            entry = NonmovableArrays.getWord(table, index);
+        }
+        return false;
+    }
+
+    @Uninterruptible(reason = "Access hashtable atomically with regard to GC.")
+    private boolean contains0(CodeInfo info) {
+        int length = NonmovableArrays.lengthOf(table);
+        int index = hashIndex(info, length);
+        UntetheredCodeInfo entry = NonmovableArrays.getWord(table, index);
+        while (entry.isNonNull()) {
+            if (entry.equal(info)) {
                 return true;
             }
             index = nextIndex(index, length);
@@ -319,7 +355,7 @@ public class RuntimeCodeInfoMemory {
             int r = hashIndex(info, length);
             if ((i < r && (r <= d || d <= i)) || (r <= d && d <= i)) {
                 NonmovableArrays.setWord(table, d, info);
-                NonmovableArrays.setWord(table, i, WordFactory.zero());
+                NonmovableArrays.setWord(table, i, Word.zero());
                 d = i;
             }
             i = nextIndex(i, length);
@@ -327,7 +363,7 @@ public class RuntimeCodeInfoMemory {
         }
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CORE_GC_CODE)
     public void walkRuntimeMethodsDuringGC(CodeInfoVisitor visitor) {
         assert VMOperation.isGCInProgress() : "otherwise, we would need to make sure that the CodeInfo is not freeded by the GC";
         if (table.isNonNull()) {
@@ -372,7 +408,7 @@ public class RuntimeCodeInfoMemory {
         }
     }
 
-    @Uninterruptible(reason = "Bridge between uninterruptible and potentially interruptible code.", mayBeInlined = true, calleeMustBe = false)
+    @Uninterruptible(reason = "Bridge between uninterruptible and potentially interruptible code.", calleeMustBe = false)
     private static void callVisitor(CodeInfoVisitor visitor, CodeInfo info) {
         visitor.visitCode(info);
     }
@@ -442,7 +478,7 @@ public class RuntimeCodeInfoMemory {
         log.newline();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Tear-down in progress.")
     public void tearDown() {
         if (table.isNonNull()) {
             int length = NonmovableArrays.lengthOf(table);

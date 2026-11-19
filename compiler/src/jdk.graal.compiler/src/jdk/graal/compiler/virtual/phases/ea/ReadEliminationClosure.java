@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -41,6 +41,7 @@ import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.FieldLocationIdentity;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.GraphState.StageFlag;
@@ -69,6 +70,7 @@ import jdk.graal.compiler.nodes.memory.ReadNode;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.memory.WriteNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
+import jdk.graal.compiler.nodes.virtual.FieldAliasNode;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.virtual.phases.ea.ReadEliminationBlockState.CacheEntry;
 import jdk.graal.compiler.virtual.phases.ea.ReadEliminationBlockState.LoadCacheEntry;
@@ -121,7 +123,7 @@ public class ReadEliminationClosure extends EffectsClosure<ReadEliminationBlockS
                             deleted = true;
                         }
                         // will be a field location identity not killing array accesses
-                        killReadCacheByIdentity(state, identifier.identity);
+                        killReadCacheByIdentity(state, identifier.identity, node);
                         state.addCacheEntry(identifier, value);
                     } else if (node instanceof RawStoreNode) {
                         RawStoreNode write = (RawStoreNode) node;
@@ -134,15 +136,15 @@ public class ReadEliminationClosure extends EffectsClosure<ReadEliminationBlockS
                             effects.deleteNode(write);
                             deleted = true;
                         }
-                        killReadCacheByIdentity(state, write.getKilledLocationIdentity());
+                        killReadCacheByIdentity(state, write.getKilledLocationIdentity(), node);
                         state.addCacheEntry(identifier, value);
                     }
                 } else {
-                    killReadCacheByIdentity(state, identity);
+                    killReadCacheByIdentity(state, identity, node);
                 }
             } else if (MemoryKill.isMultiMemoryKill(node)) {
                 for (LocationIdentity identity : ((MultiMemoryKill) node).getKilledLocationIdentities()) {
-                    killReadCacheByIdentity(state, identity);
+                    killReadCacheByIdentity(state, identity, node);
                 }
             } else {
                 throw GraalError.shouldNotReachHere("Unknown memory kill " + node); // ExcludeFromJacocoGeneratedReport
@@ -177,23 +179,34 @@ public class ReadEliminationClosure extends EffectsClosure<ReadEliminationBlockS
                         LocationIdentity location = ((MemoryAccess) node).getLocationIdentity();
                         if (location.isSingle()) {
                             ValueNode object = null;
-                            if (node instanceof LoadFieldNode) {
-                                object = ((LoadFieldNode) node).object();
+                            ValueNode access = (ValueNode) node;
+                            if (node instanceof LoadFieldNode loadFieldNode) {
+                                object = loadFieldNode.object();
                             } else if (node instanceof ReadNode read) {
                                 if (!read.getBarrierType().canReadEliminate()) {
                                     assert deleted == false;
                                     return false;
                                 }
-                                object = ((ReadNode) node).getAddress();
+                                object = read.getAddress();
+                            } else if (node instanceof FieldAliasNode alias) {
+                                ValueNode receiver = GraphUtil.unproxify(alias.getReceiver());
+                                LoadCacheEntry key = new LoadCacheEntry(receiver, location);
+                                ValueNode value = getScalarAlias(alias.getAlias());
+                                ValueNode previous = state.getCacheEntry(key);
+                                GraalError.guarantee(previous == null || GraphUtil.unproxify(previous) == GraphUtil.unproxify(value), "conflicting field aliases: %s", alias);
+                                state.addCacheEntry(key, value);
+                                return false;
                             } else {
                                 // unknown node, no elimination possible
                                 assert deleted == false;
                                 return false;
                             }
                             object = GraphUtil.unproxify(object);
-                            ValueNode access = (ValueNode) node;
                             LoadCacheEntry identifier = new LoadCacheEntry(object, location);
                             ValueNode cachedValue = state.getCacheEntry(identifier);
+                            if (cachedValue == null && node instanceof LoadFieldNode loadFieldNode && loadFieldNode.field().isFinal()) {
+                                cachedValue = state.getCacheEntry(new LoadCacheEntry(object, new FieldLocationIdentity(loadFieldNode.field(), true)));
+                            }
 
                             if (cachedValue != null && areValuesReplaceable(access, cachedValue, considerGuards)) {
                                 effects.replaceAtUsages(access, cachedValue, (FixedNode) access);
@@ -227,8 +240,8 @@ public class ReadEliminationClosure extends EffectsClosure<ReadEliminationBlockS
         return null;
     }
 
-    private static void killReadCacheByIdentity(ReadEliminationBlockState state, LocationIdentity identity) {
-        state.killReadCache(identity, null, null);
+    private static void killReadCacheByIdentity(ReadEliminationBlockState state, LocationIdentity identity, Node kill) {
+        state.killReadCache(kill, identity, null, null);
     }
 
     @Override

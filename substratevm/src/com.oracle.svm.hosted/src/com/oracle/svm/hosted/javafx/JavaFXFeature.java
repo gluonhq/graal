@@ -27,17 +27,21 @@ package com.oracle.svm.hosted.javafx;
 import java.util.Objects;
 import java.util.stream.Stream;
 
-import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.nativeimage.hosted.RuntimeReflection;
+import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 
 import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.hosted.GuestTypes;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeReflection;
+
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 final class JavaFXFeature implements Feature {
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
-        return getJavaFXApplication(access) != null;
+        GuestTypes guestTypes = ((FeatureImpl.FeatureAccessImpl) access).getImageClassLoader().guestTypes;
+        return getJavaFXApplication(guestTypes) != null;
     }
 
     @Override
@@ -48,9 +52,8 @@ final class JavaFXFeature implements Feature {
          *
          * See javafx.application.Application#launch(java.lang.String...).
          */
-        ((FeatureImpl.BeforeAnalysisAccessImpl) access)
-                        .findSubclasses(getJavaFXApplication(access))
-                        .forEach(RuntimeReflection::register);
+        GuestTypes guestTypes = ((FeatureImpl.FeatureAccessImpl) access).getImageClassLoader().guestTypes;
+        guestTypes.findSubtypes(getJavaFXApplication(guestTypes), false).forEach(JVMCIRuntimeReflection::register);
 
         /*
          * Static initializers that are not supported in JavaFX.
@@ -64,8 +67,8 @@ final class JavaFXFeature implements Feature {
                         .forEach(RuntimeClassInitialization::initializeAtRunTime);
     }
 
-    private static Class<?> getJavaFXApplication(FeatureAccess access) {
-        return access.findClassByName("javafx.application.Application");
+    private static ResolvedJavaType getJavaFXApplication(GuestTypes guestTypes) {
+        return guestTypes.findType("javafx.application.Application", false).get();
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,6 +39,8 @@ import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import org.graalvm.word.Pointer;
 
+import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.JavaKind;
 
 /**
@@ -75,12 +77,21 @@ public final class CountPositivesNode extends PureFunctionStubIntrinsicNode {
     }
 
     @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return false;
+    }
+
+    @Override
     public void emitIntrinsic(NodeLIRBuilderTool gen) {
         gen.setResult(this, gen.getLIRGeneratorTool().emitCountPositives(runtimeCheckedCPUFeatures, gen.operand(array), gen.operand(len)));
     }
 
+    public static EnumSet<AMD64.CPUFeature> runtimeFeaturesAMD64() {
+        return EnumSet.of(AMD64.CPUFeature.AVX, AMD64.CPUFeature.AVX2);
+    }
+
     @NodeIntrinsic
-    @GenerateStub
+    @GenerateStub(runtimeCPUFeaturesAMD64 = "runtimeFeaturesAMD64")
     public static native int stringCodingCountPositives(Pointer array, int len);
 
     @NodeIntrinsic

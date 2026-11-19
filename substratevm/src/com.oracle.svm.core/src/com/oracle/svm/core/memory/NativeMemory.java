@@ -25,35 +25,25 @@
  */
 package com.oracle.svm.core.memory;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.UnmanagedMemory;
 import org.graalvm.nativeimage.impl.UnmanagedMemorySupport;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.nmt.NmtCategory;
+import org.graalvm.word.impl.Word;
 
 /**
  * Internal API for managing native memory. This class supports native memory tracking (NMT) and is
  * therefore preferred over the public API class {@link UnmanagedMemory} and its
  * {@link UnmanagedMemorySupport implementations}.
- *
+ * <p>
  * All methods that allocate native memory throw an {@link OutOfMemoryError} if the memory
  * allocation fails. If native memory needs to be allocated from uninterruptible code, use
  * {@link NullableNativeMemory} instead.
- *
- * Note that NMT may cause segfaults in certain scenarios:
- * <ul>
- * <li>Native memory that was allocated outside of Java (e.g., in a C library) or via some API that
- * does not support NMT (e.g., {@link UnmanagedMemory}) may only be freed with
- * {@link UntrackedNullableNativeMemory#free}. This is necessary because NMT assumes that each
- * allocation has a custom header, which isn't true for such memory.</li>
- * <li>NMT accesses the image heap. If native memory needs to be allocated before the image heap is
- * mapped or after it was unmapped, {@link UntrackedNullableNativeMemory} must be used.</li>
- * </ul>
  */
 public class NativeMemory {
     /**
@@ -78,7 +68,7 @@ public class NativeMemory {
      */
     public static <T extends PointerBase> T malloc(int size, NmtCategory category) {
         assert size >= 0;
-        return malloc(WordFactory.unsigned(size), category);
+        return malloc(Word.unsigned(size), category);
     }
 
     /**
@@ -103,7 +93,7 @@ public class NativeMemory {
      */
     public static <T extends PointerBase> T calloc(int size, NmtCategory category) {
         assert size >= 0;
-        return calloc(WordFactory.unsigned(size), category);
+        return calloc(Word.unsigned(size), category);
     }
 
     /**
@@ -130,7 +120,7 @@ public class NativeMemory {
      */
     public static <T extends PointerBase> T realloc(T ptr, int size, NmtCategory category) {
         assert size >= 0;
-        return realloc(ptr, WordFactory.unsigned(size), category);
+        return realloc(ptr, Word.unsigned(size), category);
     }
 
     /**
@@ -139,7 +129,8 @@ public class NativeMemory {
      * <p>
      * Note that this method must <b>NOT</b> be used to free memory that was allocated via other
      * classes (e.g., {@link UnmanagedMemorySupport}) or outside of Native Image code (e.g., in a C
-     * library).
+     * library). Otherwise, segfaults can occur because NMT assumes that each allocation has a
+     * custom header, which isn't true for such memory.
      */
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void free(PointerBase ptr) {

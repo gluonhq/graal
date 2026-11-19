@@ -1,0 +1,191 @@
+/*
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.pltgot;
+
+import java.nio.ByteBuffer;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.c.type.WordPointer;
+import org.graalvm.word.LocationIdentity;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.SignedWord;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.code.DynamicMethodAddressResolutionHeapSupport;
+import com.oracle.svm.core.util.PointerUtils;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.config.SubstrateGuestTarget;
+import com.oracle.svm.shared.Uninterruptible;
+
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.nodes.PauseNode;
+
+public abstract class GOTHeapSupport extends DynamicMethodAddressResolutionHeapSupport {
+
+    private static final CGlobalData<Pointer> IMAGE_CODE_SECTION_BEGIN = CGlobalDataFactory.forSymbol("__svm_code_section");
+
+    public static final String IMAGE_GOT_END_SYMBOL_NAME = "__svm_got_end";
+    public static final String IMAGE_GOT_BEGIN_SYMBOL_NAME = "__svm_got_begin";
+    public static final CGlobalData<Pointer> IMAGE_GOT_BEGIN = CGlobalDataFactory.forSymbol(IMAGE_GOT_BEGIN_SYMBOL_NAME);
+
+    private static final SignedWord GOT_UNINITIALIZED = Word.signed(-1);
+    private static final SignedWord GOT_INITIALIZATION_IN_PROGRESS = Word.signed(-2);
+    private static final CGlobalData<Pointer> GOT_STATUS = CGlobalDataFactory.createWord(GOT_UNINITIALIZED);
+    static final CGlobalData<WordPointer> GOT_START_ADDRESS = CGlobalDataFactory.createWord();
+
+    private static final CGlobalData<Word> NUMBER_OF_GOT_ENTRIES = CGlobalDataFactory.createBytes(GOTHeapSupport::createNumberOfGOTEntriesBytes);
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private long numberOfGOTEntries = -1;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void setNumberOfGOTEntries(long value) {
+        assert numberOfGOTEntries == -1 : String.format("Number of GOT entries was already initialized to %d", numberOfGOTEntries);
+        numberOfGOTEntries = value;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private static byte[] createNumberOfGOTEntriesBytes() {
+        long numberOfEntries = GOTHeapSupport.get().numberOfGOTEntries;
+        assert numberOfEntries >= 0 : "Number of GOT entries was not initialized.";
+        int wordSize = SubstrateGuestTarget.getWordSize();
+        return ByteBuffer.allocate(wordSize).order(SubstrateGuestTarget.getByteOrder()).putLong(numberOfEntries).array();
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected static void initializeGOTContent(Pointer got) {
+        Pointer gotSection = IMAGE_GOT_BEGIN.get();
+        Pointer codeSectionBase = IMAGE_CODE_SECTION_BEGIN.get();
+        int entryCount = (int) NUMBER_OF_GOT_ENTRIES.get().readWord(0).rawValue();
+        int wordSize = SubstrateGuestTarget.getWordSize();
+        for (int entry = 0; entry < entryCount; entry++) {
+            int sourceOffset = entry * Integer.BYTES;
+            int destinationOffset = entry * wordSize;
+            Word codeSectionOffset = Word.unsigned(gotSection.readInt(sourceOffset));
+            got.writeWord(destinationOffset, codeSectionBase.add(codeSectionOffset));
+        }
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected static UnsignedWord getRuntimeGOTSize() {
+        int wordSize = SubstrateGuestTarget.getWordSize();
+        UnsignedWord numberOfEntries = NUMBER_OF_GOT_ENTRIES.get().readWord(0);
+        return numberOfEntries.multiply(wordSize);
+    }
+
+    /*
+     * An empty Mach-O .svm_got section has one four-byte padding entry for object-file symbol
+     * validity, but its logical entry count remains zero. Runtime code must use this count to decide
+     * whether GOT initialization is needed.
+     */
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean hasGOTEntries() {
+        Word numberOfEntries = NUMBER_OF_GOT_ENTRIES.get().readWord(0);
+        return numberOfEntries.aboveThan(0);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected static UnsignedWord getPageAlignedGOTSize() {
+        UnsignedWord runtimeGOTSize = getRuntimeGOTSize();
+        UnsignedWord pageSize = Word.unsigned(SubstrateOptions.getPageSize());
+        return PointerUtils.roundUp((PointerBase) runtimeGOTSize, pageSize);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected static UnsignedWord getGOTOffsetFromStartOfMapping() {
+        return getPageAlignedGOTSize().subtract(getRuntimeGOTSize());
+    }
+
+    @Override
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public UnsignedWord getRequiredPreHeapMemoryInBytes() {
+        return getPageAlignedGOTSize();
+    }
+
+    @Fold
+    public static GOTHeapSupport get() {
+        return (GOTHeapSupport) ImageSingletons.lookup(DynamicMethodAddressResolutionHeapSupport.class);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected abstract int mapGOT(Pointer address);
+
+    @Override
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public int install(Pointer heapBase) {
+        if (!hasGOTEntries()) {
+            return CEntryPointErrors.NO_ERROR;
+        }
+        return mapGOT(getPreHeapMappingStartAddress(heapBase));
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected Pointer getPreHeapMappingStartAddress(PointerBase heapBase) {
+        return ((Pointer) heapBase).subtract(getRequiredPreHeapMemoryInBytes());
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called during isolate initialization.")
+    public int initialize() {
+        if (!hasGOTEntries()) {
+            return CEntryPointErrors.NO_ERROR;
+        }
+        boolean isFirstIsolate = GOT_STATUS.get().logicCompareAndSwapWord(0, GOT_UNINITIALIZED, GOT_INITIALIZATION_IN_PROGRESS, LocationIdentity.ANY_LOCATION);
+        if (!isFirstIsolate) {
+            while (true) {
+                SignedWord status = GOT_STATUS.get().readWordVolatile(0, LocationIdentity.ANY_LOCATION);
+                if (status.notEqual(GOT_INITIALIZATION_IN_PROGRESS)) {
+                    long rawStatus = status.rawValue();
+                    assert rawStatus == (int) rawStatus;
+                    return (int) rawStatus;
+                }
+                /* Being nice to the CPU while busy waiting */
+                PauseNode.pause();
+            }
+        }
+
+        // Only the first isolate can reach here.
+        int ret = initialize(GOT_START_ADDRESS.get());
+        if (ret == CEntryPointErrors.NO_ERROR) {
+            ret = GOTAccess.initializeInFirstIsolate();
+        }
+
+        GOT_STATUS.get().writeWordVolatile(0, Word.signed(ret));
+        return ret;
+    }
+
+    /**
+     * Initialize the GOT and write its address to {@code gotStartAddress}. Return
+     * {@link CEntryPointErrors#NO_ERROR} on success, an error code otherwise.
+     */
+    protected abstract int initialize(WordPointer gotStartAddress);
+}

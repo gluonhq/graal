@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,6 +28,7 @@ import static jdk.graal.compiler.debug.DebugOptions.CanonicalGraphStringsCheckCo
 import static jdk.graal.compiler.debug.DebugOptions.CanonicalGraphStringsExcludeVirtuals;
 import static jdk.graal.compiler.debug.DebugOptions.CanonicalGraphStringsRemoveIdentities;
 import static jdk.graal.compiler.debug.DebugOptions.PrintCanonicalGraphStringFlavor;
+import static jdk.graal.compiler.debug.PathUtilities.MAX_FILE_NAME_LENGTH;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -59,11 +60,11 @@ import jdk.graal.compiler.nodes.PhiNode;
 import jdk.graal.compiler.nodes.ProxyNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
+import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.virtual.VirtualObjectNode;
 import jdk.graal.compiler.options.OptionValues;
-
+import jdk.graal.compiler.phases.util.GraphSignature;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 public class CanonicalStringGraphPrinter implements GraphPrinter {
@@ -125,6 +126,7 @@ public class CanonicalStringGraphPrinter implements GraphPrinter {
     protected static void writeCanonicalExpressionCFGString(StructuredGraph graph, boolean checkConstants, boolean removeIdentities, PrintWriter writer) {
         ControlFlowGraph controlFlowGraph = getControlFlowGraph(graph);
         if (controlFlowGraph == null) {
+            writer.println("Could not compute control flow graph.");
             return;
         }
         try {
@@ -171,6 +173,7 @@ public class CanonicalStringGraphPrinter implements GraphPrinter {
     protected static void writeCanonicalGraphString(StructuredGraph graph, boolean excludeVirtual, boolean checkConstants, PrintWriter writer) {
         StructuredGraph.ScheduleResult scheduleResult = GraphPrinter.getScheduleOrNull(graph);
         if (scheduleResult == null) {
+            writer.println("Could not compute schedule.");
             return;
         }
         try {
@@ -252,6 +255,31 @@ public class CanonicalStringGraphPrinter implements GraphPrinter {
         return stringWriter.toString();
     }
 
+    /**
+     * Builds the file name for one canonical graph dump.
+     * <p>
+     * Example: {@code createDumpFileName(7, "After phase Foo")} yields a name like
+     * {@code 007-After_phase_Foo.txt}. Very long labels are truncated and get a hash suffix, for
+     * example {@code 007-Exception:_xxxxxxxx..._1a2b3c.txt}.
+     *
+     * @param id dump id used as the numeric filename prefix
+     * @param label formatted dump label before filename sanitization
+     * @return the canonical file name
+     */
+    public static String createDumpFileName(int id, String label) {
+        String prefix = String.format("%03d-", id);
+        String suffix = ".txt";
+        String sanitizedLabel = PathUtilities.sanitizeFileName(label);
+        String fileName = prefix + sanitizedLabel + suffix;
+        if (fileName.length() <= MAX_FILE_NAME_LENGTH) {
+            return fileName;
+        }
+        String hash = Integer.toHexString(fileName.hashCode());
+        String hashedSuffix = "_" + hash + suffix;
+        int labelLengthLimit = MAX_FILE_NAME_LENGTH - prefix.length() - hashedSuffix.length();
+        return prefix + sanitizedLabel.substring(0, labelLengthLimit) + hashedSuffix;
+    }
+
     private static int filteredUsageCount(Node node) {
         return node.usages().filter(n -> !(n instanceof FrameState)).count();
     }
@@ -272,23 +300,43 @@ public class CanonicalStringGraphPrinter implements GraphPrinter {
         return currentDirectory;
     }
 
+    private String getSignaturePath(DebugContext debug, StructuredGraph graph) {
+        if (graph == currentGraph) {
+            return currentDirectory;
+        }
+        currentDirectory = debug.getDumpPath(".signatures", false);
+        currentGraph = graph;
+        return currentDirectory;
+    }
+
     @Override
     public void print(DebugContext debug, Graph graph, Map<Object, Object> properties, int id, String format, Object... args) throws IOException {
         if (graph instanceof StructuredGraph) {
             OptionValues options = graph.getOptions();
             StructuredGraph structuredGraph = (StructuredGraph) graph;
-            String outDirectory = getDirectory(debug, structuredGraph);
-            String title = String.format("%03d-%s.txt", id, String.format(format, simplifyClassArgs(args)));
-            String filePath = PathUtilities.getPath(outDirectory, PathUtilities.sanitizeFileName(title));
-            try (PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(PathUtilities.openOutputStream(filePath))))) {
-                switch (PrintCanonicalGraphStringFlavor.getValue(options)) {
-                    case 1:
-                        writeCanonicalExpressionCFGString(structuredGraph, CanonicalGraphStringsCheckConstants.getValue(options), CanonicalGraphStringsRemoveIdentities.getValue(options), writer);
-                        break;
-                    case 0:
-                    default:
-                        writeCanonicalGraphString(structuredGraph, CanonicalGraphStringsExcludeVirtuals.getValue(options), CanonicalGraphStringsCheckConstants.getValue(options), writer);
-                        break;
+            String title = createDumpFileName(id, String.format(format, simplifyClassArgs(args)));
+            if (PrintCanonicalGraphStringFlavor.getValue(options) == 2) {
+                String filePath = getSignaturePath(debug, structuredGraph);
+                try (PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(PathUtilities.openOutputStream(filePath, true))))) {
+                    GraphSignature signature = new GraphSignature(structuredGraph);
+                    writer.print(signature.getSignature() == null ? "Could not compute signature." : signature.getSignatureString());
+                    writer.print(" ");
+                    writer.println(PathUtilities.sanitizeFileName(title));
+                    writer.flush();
+                }
+            } else {
+                String outDirectory = getDirectory(debug, structuredGraph);
+                String filePath = PathUtilities.getPath(outDirectory, PathUtilities.sanitizeFileName(title));
+                try (PrintWriter writer = new PrintWriter(new BufferedWriter(new OutputStreamWriter(PathUtilities.openOutputStream(filePath))))) {
+                    switch (PrintCanonicalGraphStringFlavor.getValue(options)) {
+                        case 1:
+                            writeCanonicalExpressionCFGString(structuredGraph, CanonicalGraphStringsCheckConstants.getValue(options), CanonicalGraphStringsRemoveIdentities.getValue(options), writer);
+                            break;
+                        case 0:
+                        default:
+                            writeCanonicalGraphString(structuredGraph, CanonicalGraphStringsExcludeVirtuals.getValue(options), CanonicalGraphStringsCheckConstants.getValue(options), writer);
+                            break;
+                    }
                 }
             }
         }

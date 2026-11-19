@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -96,6 +96,9 @@ public interface FrameInstance {
 
     /**
      * Accesses the underlying frame using a specified {@link FrameAccess access mode}.
+     * <p>
+     * Bytecode DSL note: This method should <strong>not</strong> be used with Bytecode DSL
+     * interpreters. See {@link com.oracle.truffle.api.bytecode.BytecodeFrame} for more information.
      *
      * @see FrameAccess
      * @since 0.23
@@ -154,7 +157,8 @@ public interface FrameInstance {
      * @return a node representing the callsite of the next new target on the stack. Returns
      *         <code>null</code> in case there is no upper target or location. The set of possible
      *         call nodes is restricted to any node that was passed to
-     *         {@link CallTarget#call(Node, Object...)} or the node set using
+     *         {@link CallTarget#call(Node, Object...)} or
+     *         {@link CallTarget#call(Node, int, Object[])} or the node set using
      *         {@link EncapsulatingNodeReference} when invoking {@link CallTarget#call(Object...)}.
      *         If a cached variant of {@link DirectCallNode} or {@link IndirectCallNode} was used
      *         then the call node will be the {@link DirectCallNode} or {@link IndirectCallNode}
@@ -163,6 +167,28 @@ public interface FrameInstance {
      * @since 0.8 or earlier
      **/
     Node getCallNode();
+
+    /**
+     * Returns an instrumentable call node from a frame instance. This method should be preferred
+     * over {@link #getCallNode()} by tools to find the instrumentable node associated with this
+     * call node. In case of bytecode interpreters the instrumentable node needs to be resolved by
+     * the language and is not directly accessible from the {@link Node#getParent() parent} chain of
+     * the regular {@link FrameInstance#getCallNode() call node}. Just like {@link #getCallNode()}
+     * this method may not directly return an instrumentable node. To find the eventual
+     * instrumentable node the {@link Node#getParent() parent} chain must be searched. There is no
+     * guarantee that an instrumentable node can be found, e.g. if the language does not support
+     * instrumentation.
+     *
+     * @see RootNode#findInstrumentableCallNode
+     * @since 24.2
+     */
+    default Node getInstrumentableCallNode() {
+        RootNode root = ((RootCallTarget) getCallTarget()).getRootNode();
+        Frame frame = captureFrame(root);
+        Node callNode = getCallNode();
+        int bytecodeIndex = FrameAccessor.NODES.findBytecodeIndex(root, callNode, frame);
+        return FrameAccessor.ACCESSOR.nodeSupport().findInstrumentableCallNode(root, callNode, frame, bytecodeIndex);
+    }
 
     /**
      * The {@link CallTarget} being invoked in this frame.
@@ -174,11 +200,18 @@ public interface FrameInstance {
     CallTarget getCallTarget();
 
     /**
-     * Returns the resolved bytecode index for this frame instance if the root node returns one.
-     * This method returns a negative integer for invalid or an unavailable bytecode index. The
-     * meaning of negative bytecode indices is not specified and should not be relied upon across
-     * guest language implementations.
+     * Returns the bytecode index of this frame's call site.
+     * <p>
+     * If this frame called the next target on the stack using
+     * {@link CallTarget#call(Node, int, Object[])}, and the supplied bytecode index
+     * was not {@code -1}, returns that explicit index. Otherwise, returns the result
+     * of {@link RootNode#findBytecodeIndex(Node, Frame)} on the root node associated
+     * with this frame's {@link #getCallTarget()}.
+     * <p>
+     * Negative values indicate invalid or unavailable indices; their meaning is
+     * language-specific.
      *
+     * @return the BCI, or a negative value if invalid or unavailable
      * @see RootNode#findBytecodeIndex
      * @since 24.1
      */

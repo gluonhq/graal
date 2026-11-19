@@ -26,6 +26,8 @@
 
 package com.oracle.svm.test.jfr;
 
+import static org.junit.Assert.assertEquals;
+
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -60,9 +62,9 @@ public class TestJfrStreamingCount extends JfrStreamingTest {
         String[] events = new String[]{"com.jfr.String", "com.jfr.Integer", "com.jfr.Class"};
         RecordingStream stream = startStream(events);
 
-        stream.onEvent("com.jfr.Class", event -> classEvents.incrementAndGet());
-        stream.onEvent("com.jfr.Integer", event -> integerEvents.incrementAndGet());
-        stream.onEvent("com.jfr.String", event -> stringEvents.incrementAndGet());
+        stream.onEvent("com.jfr.Class", _ -> classEvents.incrementAndGet());
+        stream.onEvent("com.jfr.Integer", _ -> integerEvents.incrementAndGet());
+        stream.onEvent("com.jfr.String", _ -> stringEvents.incrementAndGet());
 
         Runnable eventEmitter = () -> {
             for (int i = 0; i < COUNT; i++) {
@@ -83,8 +85,15 @@ public class TestJfrStreamingCount extends JfrStreamingTest {
         };
         Stressor.execute(THREADS, eventEmitter);
 
-        waitUntilTrue(() -> emittedEventsPerType.get() == EXPECTED_EVENTS_PER_TYPE);
-        waitUntilTrue(() -> classEvents.get() == EXPECTED_EVENTS_PER_TYPE && integerEvents.get() == EXPECTED_EVENTS_PER_TYPE && stringEvents.get() == EXPECTED_EVENTS_PER_TYPE);
+        waitUntilTrue(() -> emittedEventsPerType.get() >= EXPECTED_EVENTS_PER_TYPE);
+        waitUntilTrue(() -> integerEvents.get() >= EXPECTED_EVENTS_PER_TYPE);
+        waitUntilTrue(() -> stringEvents.get() >= EXPECTED_EVENTS_PER_TYPE);
+        waitUntilTrue(() -> classEvents.get() >= EXPECTED_EVENTS_PER_TYPE);
+
+        assertEquals(EXPECTED_EVENTS_PER_TYPE, emittedEventsPerType.get());
+        assertEquals(EXPECTED_EVENTS_PER_TYPE, integerEvents.get());
+        assertEquals(EXPECTED_EVENTS_PER_TYPE, stringEvents.get());
+        assertEquals(EXPECTED_EVENTS_PER_TYPE, classEvents.get());
 
         stopStream(stream, TestJfrStreamingCount::validateEvents);
     }

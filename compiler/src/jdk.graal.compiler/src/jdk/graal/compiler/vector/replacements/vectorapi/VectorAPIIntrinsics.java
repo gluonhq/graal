@@ -1,0 +1,566 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package jdk.graal.compiler.vector.replacements.vectorapi;
+
+import java.util.function.BiFunction;
+
+import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.core.common.type.ObjectStamp;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.core.common.type.StampPair;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.nodes.BeginNode;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.EndNode;
+import jdk.graal.compiler.nodes.IfNode;
+import jdk.graal.compiler.nodes.LogicNode;
+import jdk.graal.compiler.nodes.MergeNode;
+import jdk.graal.compiler.nodes.NamedLocationIdentity;
+import jdk.graal.compiler.nodes.NodeView;
+import jdk.graal.compiler.nodes.PiNode;
+import jdk.graal.compiler.nodes.ProfileData.BranchProbabilityData;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.ValuePhiNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin.InlineOnlyInvocationPlugin;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins.Registration;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins.TypeSymbol;
+import jdk.graal.compiler.nodes.calc.IsNullNode;
+import jdk.graal.compiler.nodes.memory.address.AddressNode;
+import jdk.graal.compiler.nodes.memory.address.OffsetAddressNode;
+import jdk.graal.compiler.nodes.type.StampTool;
+import jdk.graal.compiler.options.Option;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.replacements.nodes.MacroNode.MacroParams;
+import jdk.graal.compiler.vector.nodes.simd.SimdStamp;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIBinaryOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIBlendNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIBroadcastIntNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPICompareNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPICompressExpandOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIConvertNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIExtractNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIFromBitsCoercedNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIIndexPartiallyInUpperRangeNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIIndexVectorNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIInsertNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPILibraryBinaryOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPILibraryUnaryOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPILoadMaskedNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPILoadNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIMacroNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIMemoryAccess;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIMaskReductionCoercedNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIRearrangeOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIReductionCoercedNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIStoreMaskedNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIStoreNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPITernaryOpNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPITestNode;
+import jdk.graal.compiler.vector.replacements.vectorapi.nodes.VectorAPIUnaryOpNode;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+
+/**
+ * Graph builder plugins to intrinsify some Vector API operations. These plugins build the
+ * {@link VectorAPIMacroNode} corresponding to each supported operation from the Vector API's
+ * {@code VectorSupport} class. Shuffles, most masked operations, and gather/scatter operations are
+ * not supported at the moment.
+ */
+public class VectorAPIIntrinsics {
+
+    public static class Options {
+        // @formatter:off
+        @Option(help = "Expand Vector API operations to optimized machine instructions")
+        public static final OptionKey<Boolean> OptimizeVectorAPI = new OptionKey<>(true);
+        // @formatter:on
+    }
+
+    public static boolean intrinsificationSupported(OptionValues options) {
+        return GraalOptions.TargetVectorLowering.getValue(options) && Options.OptimizeVectorAPI.getValue(options);
+    }
+
+    /**
+     * Register the Vector API plugins.
+     */
+    public static void registerPlugins(InvocationPlugins plugins) {
+        String vectorSupportPackage = "jdk.internal.vm.vector";
+        Registration r = new Registration(plugins, vectorSupportPackage + ".Utils");
+        r.register(new InlineOnlyInvocationPlugin("isNonCapturingLambda", Object.class) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode object) {
+                /*
+                 * This method is only used in assertions in the Java slow paths of the Vector API
+                 * operations. We constant fold it to true to avoid this overhead in the compiled
+                 * slow path. If the assertion can ever fail, it will already fail in the
+                 * interpreter, while running JDK tests; it is only meant to catch unexpected
+                 * changes to the JDK code itself. When C2 generates inline code for the Vector API
+                 * intrinsics, it ignores this assertion as well.
+                 */
+                b.addPush(JavaKind.Boolean, ConstantNode.forBoolean(true));
+                return true;
+            }
+        });
+
+        String vectorSupportName = vectorSupportPackage + ".VectorSupport";
+        r = new Registration(plugins, vectorSupportName);
+
+        /* Types of vectors and related data. */
+        TypeSymbol vectorSpecies = new TypeSymbol(vectorSupportName + "$VectorSpecies");
+        TypeSymbol vector = new TypeSymbol(vectorSupportName + "$Vector");
+        TypeSymbol vectorMask = new TypeSymbol(vectorSupportName + "$VectorMask");
+        TypeSymbol vectorShuffle = new TypeSymbol(vectorSupportName + "$VectorShuffle");
+        TypeSymbol vectorPayload = new TypeSymbol(vectorSupportName + "$VectorPayload");
+
+        /* Types of operations on vectors. */
+        TypeSymbol fromBitsCoercedOperation = new TypeSymbol(vectorSupportName + "$FromBitsCoercedOperation");
+        TypeSymbol indexPartiallyInUpperRangeOp = new TypeSymbol(vectorSupportName + "$IndexPartiallyInUpperRangeOperation");
+        TypeSymbol indexOperation = new TypeSymbol(vectorSupportName + "$IndexOperation");
+        TypeSymbol reductionOperation = new TypeSymbol(vectorSupportName + "$ReductionOperation");
+        TypeSymbol extractOp = new TypeSymbol(vectorSupportName + "$VecExtractOp");
+        TypeSymbol insertOp = new TypeSymbol(vectorSupportName + "$VecInsertOp");
+        TypeSymbol unaryOperation = new TypeSymbol(vectorSupportName + "$UnaryOperation");
+        TypeSymbol binaryOperation = new TypeSymbol(vectorSupportName + "$BinaryOperation");
+        TypeSymbol ternaryOperation = new TypeSymbol(vectorSupportName + "$TernaryOperation");
+        TypeSymbol loadOperation = new TypeSymbol(vectorSupportName + "$LoadOperation");
+        TypeSymbol loadMaskedOperation = new TypeSymbol(vectorSupportName + "$LoadVectorMaskedOperation");
+        TypeSymbol storeVectorOperation = new TypeSymbol(vectorSupportName + "$StoreVectorOperation");
+        TypeSymbol storeMaskedOperation = new TypeSymbol(vectorSupportName + "$StoreVectorMaskedOperation");
+        TypeSymbol vectorCompareOp = new TypeSymbol(vectorSupportName + "$VectorCompareOp");
+        TypeSymbol vectorBlendOp = new TypeSymbol(vectorSupportName + "$VectorBlendOp");
+        TypeSymbol vectorBroadcastIntOp = new TypeSymbol(vectorSupportName + "$VectorBroadcastIntOp");
+        TypeSymbol vectorConvertOp = new TypeSymbol(vectorSupportName + "$VectorConvertOp");
+        TypeSymbol vectorRearrangeOp = new TypeSymbol(vectorSupportName + "$VectorRearrangeOp");
+        TypeSymbol compressExpandOperation = new TypeSymbol(vectorSupportName + "$CompressExpandOperation");
+        TypeSymbol vectorMaskOp = new TypeSymbol(vectorSupportName + "$VectorMaskOp");
+
+        r.register(new InlineOnlyInvocationPlugin("fromBitsCoerced", Class.class, Class.class, int.class, long.class, int.class, vectorSpecies, fromBitsCoercedOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vmClass, ValueNode eClass, ValueNode length, ValueNode bits, ValueNode mode,
+                            ValueNode s, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vmClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vmClass, eClass, length, bits, mode, s, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIFromBitsCoercedNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("indexPartiallyInUpperRange", Class.class, Class.class, int.class, long.class, long.class, indexPartiallyInUpperRangeOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode offset, ValueNode limit,
+                            ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, mClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, mClass, eClass, length, offset, limit, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIIndexPartiallyInUpperRangeNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("indexVector", Class.class, Class.class, int.class, vector, int.class, vectorSpecies, indexOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode eClass, ValueNode length, ValueNode v, ValueNode scale,
+                            ValueNode s, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vClass, eClass, length, b.nullCheckedValue(v), scale, s, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIIndexVectorNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("reductionCoerced", int.class, Class.class, Class.class, Class.class, int.class, vector, vectorMask, reductionOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oprId, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v, ValueNode m, ValueNode defaultImpl) {
+                if (maskIsPresent(m)) {
+                    /* Masked operations are not supported yet. */
+                    return false;
+                }
+                MacroParams params = MacroParams.of(b, targetMethod, oprId, vClass, mClass, eClass, length, b.nullCheckedValue(v), m, defaultImpl);
+                b.addPush(JavaKind.Long, VectorAPIReductionCoercedNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("extract", Class.class, Class.class, int.class, vectorPayload, int.class, extractOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vmClass, ValueNode eClass, ValueNode length, ValueNode vm, ValueNode i,
+                            ValueNode defaultImpl) {
+                MacroParams params = MacroParams.of(b, targetMethod, vmClass, eClass, length, b.nullCheckedValue(vm), i, defaultImpl);
+                b.addPush(JavaKind.Long, VectorAPIExtractNode.create(params, VectorAPIType.ofConstant(vmClass, b)));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("insert", Class.class, Class.class, int.class, vector, int.class, long.class, insertOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode eClass, ValueNode length, ValueNode v, ValueNode i, ValueNode val,
+                            ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vClass, eClass, length, b.nullCheckedValue(v), i, val, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIInsertNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("unaryOp", int.class, Class.class, Class.class, Class.class, int.class, vector, vectorMask, unaryOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oprId, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                ValueNode mask = m.isNullConstant() ? m : b.nullCheckedValue(m);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, oprId, vClass, mClass, eClass, length, b.nullCheckedValue(v), mask, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIUnaryOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("binaryOp", int.class, Class.class, Class.class, Class.class, int.class, vectorPayload, vectorPayload, vectorMask, binaryOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oprId, ValueNode vmClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v1, ValueNode v2, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vmClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                ValueNode mask = m.isNullConstant() ? m : b.nullCheckedValue(m);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, oprId, vmClass, mClass, eClass, length, b.nullCheckedValue(v1), b.nullCheckedValue(v2), mask, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIBinaryOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("libraryUnaryOp", long.class, Class.class, Class.class, int.class, String.class, vector, unaryOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode address, ValueNode vClass, ValueNode eClass, ValueNode length, ValueNode symbolName,
+                            ValueNode v, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, address, vClass, eClass, length, symbolName, b.nullCheckedValue(v), defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPILibraryUnaryOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("libraryBinaryOp", long.class, Class.class, Class.class, int.class, String.class, vectorPayload, vectorPayload, binaryOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode address, ValueNode vmClass, ValueNode eClass, ValueNode length, ValueNode symbolName,
+                            ValueNode v1, ValueNode v2, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vmClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, address, vmClass, eClass, length, symbolName, b.nullCheckedValue(v1), b.nullCheckedValue(v2), defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPILibraryBinaryOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("ternaryOp", int.class, Class.class, Class.class, Class.class, int.class, vector, vector, vector, vectorMask, ternaryOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oprId, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v1, ValueNode v2, ValueNode v3, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                ValueNode mask = m.isNullConstant() ? m : b.nullCheckedValue(m);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, oprId, vClass, mClass, eClass, length, b.nullCheckedValue(v1), b.nullCheckedValue(v2), b.nullCheckedValue(v3), mask,
+                                defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPITernaryOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("load", Class.class, Class.class, int.class, Object.class, long.class, boolean.class, Object.class, long.class, vectorSpecies, loadOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vmClass, ValueNode eClass, ValueNode length, ValueNode base, ValueNode offset,
+                            ValueNode fromSegment, ValueNode container, ValueNode index, ValueNode s, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vmClass);
+                VectorAPIType loadType = VectorAPIType.ofConstant(vmClass, b);
+                AddressNode address = VectorAPIUtils.buildAddress(base, offset, container, index);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vmClass, eClass, length, base, offset, fromSegment, container, index, s, defaultImpl);
+                addMemoryAccess(b, base, offset, fromSegment, address, VectorAPILoadNode.create(params, loadType, address, b), JavaKind.Object);
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("loadMasked", Class.class, Class.class, Class.class, int.class, Object.class, long.class, boolean.class, vectorMask, int.class, Object.class,
+                        long.class, vectorSpecies, loadMaskedOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode base,
+                            ValueNode offset, ValueNode fromSegment, ValueNode m, ValueNode offsetInRange, ValueNode container, ValueNode index, ValueNode s, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                VectorAPIType loadType = VectorAPIType.ofConstant(vClass, b);
+                AddressNode address = VectorAPIUtils.buildAddress(base, offset, container, index);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vClass, mClass, eClass, length, base, offset, fromSegment, m, offsetInRange, container, index, s, defaultImpl);
+                addMemoryAccess(b, base, offset, fromSegment, address, VectorAPILoadMaskedNode.create(params, loadType, address, b), JavaKind.Object);
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("store", Class.class, Class.class, int.class, Object.class, long.class, boolean.class, vectorPayload, Object.class, long.class,
+                        storeVectorOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode eClass, ValueNode length, ValueNode base, ValueNode offset,
+                            ValueNode fromSegment, ValueNode v, ValueNode container, ValueNode index, ValueNode defaultImpl) {
+                SimdStamp inputStamp = VectorAPIUtils.stampForVectorClass(vClass, eClass, length, b);
+                VectorAPIType storeType = VectorAPIType.ofConstant(vClass, b);
+                AddressNode address = VectorAPIUtils.buildAddress(base, offset, container, index);
+                MacroParams params = MacroParams.of(b, targetMethod, vClass, eClass, length, base, offset, fromSegment, b.nullCheckedValue(v), container, index, defaultImpl);
+                addMemoryAccess(b, base, offset, fromSegment, address, VectorAPIStoreNode.create(params, inputStamp, storeType, address), JavaKind.Void);
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("storeMasked", Class.class, Class.class, Class.class, int.class, Object.class, long.class, boolean.class, vector, vectorMask, Object.class,
+                        long.class, storeMaskedOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode base,
+                            ValueNode offset, ValueNode fromSegment, ValueNode v, ValueNode m, ValueNode container, ValueNode index, ValueNode defaultImpl) {
+                VectorAPIType storeType = VectorAPIType.ofConstant(vClass, b);
+                AddressNode address = VectorAPIUtils.buildAddress(base, offset, container, index);
+                MacroParams params = MacroParams.of(b, targetMethod, vClass, mClass, eClass, length, base, offset, fromSegment, b.nullCheckedValue(v), b.nullCheckedValue(m), container, index,
+                                defaultImpl);
+                addMemoryAccess(b, base, offset, fromSegment, address, VectorAPIStoreMaskedNode.create(params, storeType, address), JavaKind.Void);
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("test", int.class, Class.class, Class.class, int.class, vectorMask, vectorMask, BiFunction.class) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode cond, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode m1,
+                            ValueNode m2, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, mClass);
+                if (speciesStamp == null) {
+                    return false;
+                }
+                SimdStamp maskStamp = VectorAPIUtils.stampForMaskClass(mClass, eClass, length, b);
+                if (maskStamp == null) {
+                    return false;
+                }
+                MacroParams params = MacroParams.of(b, targetMethod, cond, mClass, eClass, length, b.nullCheckedValue(m1), b.nullCheckedValue(m2), defaultImpl);
+                b.addPush(JavaKind.Boolean, VectorAPITestNode.create(params));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("compare", int.class, Class.class, Class.class, Class.class, int.class, vector, vector, vectorMask, vectorCompareOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode cond, ValueNode vectorClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v1, ValueNode v2, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp maskStamp = VectorAPIUtils.nonNullStampForClassValue(b, mClass);
+                StampPair returnStamp = makeReturnStamp(b, maskStamp);
+                ValueNode mask = m.isNullConstant() ? m : b.nullCheckedValue(m);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, cond, vectorClass, mClass, eClass, length, b.nullCheckedValue(v1), b.nullCheckedValue(v2), mask, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPICompareNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("blend", Class.class, Class.class, Class.class, int.class, vector, vector, vectorMask, vectorBlendOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode v1,
+                            ValueNode v2, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vClass, mClass, eClass, length, b.nullCheckedValue(v1), b.nullCheckedValue(v2), b.nullCheckedValue(m), defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIBlendNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("broadcastInt", int.class, Class.class, Class.class, Class.class, int.class, vector, int.class, vectorMask, vectorBroadcastIntOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode opr, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v, ValueNode n, ValueNode m, ValueNode defaultImpl) {
+                if (maskIsPresent(m)) {
+                    /* Masked operations are not supported yet. */
+                    return false;
+                }
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, opr, vClass, mClass, eClass, length, b.nullCheckedValue(v), n, m, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIBroadcastIntNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("convert", int.class, Class.class, Class.class, int.class, Class.class, Class.class, int.class, vectorPayload, vectorSpecies, vectorConvertOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oprId, ValueNode fromVectorClass, ValueNode fromeClass, ValueNode fromVLen,
+                            ValueNode toVectorClass, ValueNode toeClass, ValueNode toVLen, ValueNode v, ValueNode s, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, fromVectorClass);
+                if (speciesStamp == null) {
+                    return false;
+                }
+                ObjectStamp destinationStamp = VectorAPIUtils.nonNullStampForClassValue(b, toVectorClass);
+                StampPair returnStamp = makeReturnStamp(b, destinationStamp);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, oprId, fromVectorClass, fromeClass, fromVLen, toVectorClass, toeClass, toVLen, b.nullCheckedValue(v), s, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIConvertNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("rearrangeOp", Class.class, Class.class, Class.class, Class.class, int.class, vector, vectorShuffle, vectorMask, vectorRearrangeOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode vClass, ValueNode shClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v, ValueNode sh, ValueNode m, ValueNode defaultImpl) {
+                ObjectStamp speciesStamp = VectorAPIUtils.nonNullStampForClassValue(b, vClass);
+                StampPair returnStamp = makeReturnStamp(b, speciesStamp);
+                ValueNode mask = m.isNullConstant() ? m : b.nullCheckedValue(m);
+                MacroParams params = MacroParams.of(b, targetMethod, returnStamp, vClass, shClass, mClass, eClass, length, b.nullCheckedValue(v), b.nullCheckedValue(sh), mask, defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPIRearrangeOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("compressExpandOp", int.class, Class.class, Class.class, Class.class, int.class, vector, vectorMask, compressExpandOperation) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode opr, ValueNode vClass, ValueNode mClass, ValueNode eClass, ValueNode length,
+                            ValueNode v, ValueNode m, ValueNode defaultImpl) {
+                MacroParams params = MacroParams.of(b, targetMethod, opr, vClass, mClass, eClass, length, v.isNullConstant() ? v : b.nullCheckedValue(v), b.nullCheckedValue(m), defaultImpl);
+                b.addPush(JavaKind.Object, VectorAPICompressExpandOpNode.create(params, b));
+                return true;
+            }
+        });
+
+        r.register(new InlineOnlyInvocationPlugin("maskReductionCoerced", int.class, Class.class, Class.class, int.class, vectorMask, vectorMaskOp) {
+            @Override
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver type, ValueNode oper, ValueNode mClass, ValueNode eClass, ValueNode length, ValueNode m,
+                            ValueNode defaultImpl) {
+                MacroParams params = MacroParams.of(b, targetMethod, oper, mClass, eClass, length, b.nullCheckedValue(m), defaultImpl);
+                b.addPush(JavaKind.Long, VectorAPIMaskReductionCoercedNode.create(params));
+                return true;
+            }
+        });
+    }
+
+    /**
+     * Adds a Vector API memory access to the graph. If the access is to a memory segment, it may be
+     * on-heap (non-null address base) or off-heap (null address base). If we cannot decide
+     * statically which variant it is, this method builds an {@code if} diamond with both variants.
+     * This branch may or may not fold away later. Compare the handling of scalar unsafe accesses in
+     * {@code UnsafeAccessPlugin#createUnsafeAccess}.
+     */
+    private static <T extends VectorAPIMacroNode & VectorAPIMemoryAccess> void addMemoryAccess(GraphBuilderContext b, ValueNode base, ValueNode offset, ValueNode fromSegment, AddressNode address,
+                    T accessNode, JavaKind resultKind) {
+        if (!(fromSegment.isJavaConstant() && fromSegment.asJavaConstant().asInt() != 0) || StampTool.isPointerAlwaysNull(base) || StampTool.isPointerNonNull(base) ||
+                        NamedLocationIdentity.isArrayLocation(accessNode.locationIdentity())) {
+            /* Not a segment access, or we know statically which variant it is. */
+            if (resultKind == JavaKind.Void) {
+                b.add(accessNode);
+            } else {
+                b.addPush(resultKind, accessNode);
+            }
+            return;
+        }
+
+        /* Set up the empty control flow diamond. */
+        StructuredGraph graph = b.getGraph();
+        LogicNode isNull = graph.addOrUniqueWithInputs(IsNullNode.create(base));
+        BeginNode offHeapPath = graph.add(new BeginNode());
+        BeginNode heapPath = graph.add(new BeginNode());
+        b.add(new IfNode(isNull, offHeapPath, heapPath, BranchProbabilityData.injected(0.5, true)));
+        EndNode offHeapEnd = graph.add(new EndNode());
+        offHeapPath.setNext(offHeapEnd);
+        EndNode heapEnd = graph.add(new EndNode());
+        heapPath.setNext(heapEnd);
+
+        PiNode nonNullBase = graph.addWithoutUnique(new PiNode(base, StampFactory.objectNonNull(), heapPath));
+        AddressNode offHeapAddress = OffsetAddressNode.create(offset);
+        AddressNode onHeapAddress = new OffsetAddressNode(nonNullBase, offset);
+
+        /*
+         * The new copy of the macro node will be the on-heap variant, the original `accessNode`
+         * will be the off-heap variant.
+         */
+        GraalError.guarantee(accessNode.locationIdentity().isAny(), "initial location identity must be any, to be refined later %s / %s", accessNode, accessNode.locationIdentity());
+        VectorAPIMacroNode heapAccess = (VectorAPIMacroNode) accessNode.copyWithInputs(false);
+        accessNode.getNodeClass().replaceFirstInput(accessNode, address, offHeapAddress);
+        accessNode.getNodeClass().replaceFirstInput(accessNode, base, ConstantNode.defaultForKind(JavaKind.Object));
+        heapAccess.getNodeClass().replaceFirstInput(heapAccess, address, onHeapAddress);
+        heapAccess.getNodeClass().replaceFirstInput(heapAccess, base, nonNullBase);
+
+        if (resultKind == JavaKind.Void) {
+            b.add(accessNode);
+            b.add(heapAccess);
+        } else {
+            b.addPush(resultKind, accessNode);
+            b.pop(resultKind);
+            b.addPush(resultKind, heapAccess);
+            /*
+             * Leave the heapAccess on the stack as a placeholder value. When we add the merge, it
+             * will be assigned a frame state, and that state's stack effect must be correct. Below
+             * we will build a phi and a new state for the merge.
+             */
+        }
+        MergeNode merge = b.add(new MergeNode());
+
+        /*
+         * We added the macro nodes via the GraphBuilderContext, which is convenient because it
+         * initializes the frame states and exception paths. But it added the macros and the merge
+         * in a row, we must unlink them from each other and wire them up correctly.
+         */
+        accessNode.replaceAtPredecessor(null);
+        heapAccess.replaceAtPredecessor(null);
+        merge.replaceAtPredecessor(null);
+
+        offHeapEnd.replaceAtPredecessor(null);
+        offHeapPath.setNext(accessNode);
+        accessNode.next().setNext(offHeapEnd);
+        heapEnd.replaceAtPredecessor(null);
+        heapPath.setNext(heapAccess);
+        heapAccess.next().setNext(heapEnd);
+
+        merge.addForwardEnd(offHeapEnd);
+        merge.addForwardEnd(heapEnd);
+
+        if (resultKind != JavaKind.Void) {
+            b.pop(resultKind);  // remove the placeholder
+            b.push(resultKind, graph.addOrUnique(new ValuePhiNode(accessNode.stamp(NodeView.DEFAULT), merge, new ValueNode[]{accessNode, heapAccess})));
+        }
+        b.setStateAfter(merge);
+    }
+
+    /**
+     * Builds the return stamp for an intrinsic. If the {@code speciesStamp} is known from the
+     * context, it is used. Otherwise, the invoke's declared return stamp is used. In the latter
+     * case, the intrinsic node must later try to canonicalize itself with a more precise species
+     * stamp.
+     */
+    private static StampPair makeReturnStamp(GraphBuilderContext b, ObjectStamp speciesStamp) {
+        return speciesStamp != null ? StampPair.createSingle(speciesStamp) : b.getInvokeReturnStamp(b.getAssumptions());
+    }
+
+    /** Return {@code true} if the provided {@code mask} value is not a null pointer constant. */
+    private static boolean maskIsPresent(ValueNode mask) {
+        boolean maskAbsent = mask.isJavaConstant() && mask.asJavaConstant().isNull();
+        return !maskAbsent;
+    }
+}

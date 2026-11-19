@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -50,18 +50,18 @@ import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.SyncPort;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
-
+import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.meta.Value;
 
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/43a2f17342af8f5bf1f5823df9fa0bf0bdfdfce2/src/hotspot/cpu/x86/stubGenerator_x86_64.cpp#L3268-L3320",
-          sha1 = "2f3b577fa7f0ced9cc2514af80d2c2833ab7caf2")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/7bb59dc8da0c61c5da5c3aab5d56a6e4880001ce/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L7432-L7466",
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/c59e44a7aa2aeff0823830b698d524523b996650/src/hotspot/cpu/x86/stubGenerator_x86_64.cpp#L3378-L3431",
+          sha1 = "fab3e655909df456c2fc5a065f98aa62aac0bc08")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/58853f39377ea6168c4570327347294899d51f95/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L6943-L6977",
           sha1 = "e68b8c7bdb37d4bd1350c7e1219fdcb419d2618a")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/7bb59dc8da0c61c5da5c3aab5d56a6e4880001ce/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L7684-L7861",
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/58853f39377ea6168c4570327347294899d51f95/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L7195-L7372",
           sha1 = "d89ad721deb560178359f86e8c6c96ffc6530878")
 // @formatter:on
 public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
@@ -70,26 +70,28 @@ public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
 
     @Def({OperandFlag.REG}) private Value result;
 
-    @Use({OperandFlag.REG}) private Value outValue;
-    @Use({OperandFlag.REG}) private Value inValue;
-    @Use({OperandFlag.REG}) private Value offsetValue;
-    @Use({OperandFlag.REG}) private Value lenValue;
-    @Use({OperandFlag.REG}) private Value kValue;
+    @Alive({OperandFlag.REG}) private Value outValue;
+    @Alive({OperandFlag.REG}) private Value inValue;
+    @UseKill({OperandFlag.REG}) private Value offsetValue;
+    @UseKill({OperandFlag.REG}) private Value lenValue;
+    @Alive({OperandFlag.REG}) private Value kValue;
 
     @Temp({OperandFlag.REG}) private Value tmp1Value;
     @Temp({OperandFlag.REG}) private Value[] tmpValues;
 
+    private final boolean spillR13;
+
     public AMD64BigIntegerMulAddOp(
+                    LIRGeneratorTool tool,
                     Value outValue,
                     Value inValue,
                     Value offsetValue,
                     Value lenValue,
-                    Value kValue,
-                    Register heapBaseRegister) {
+                    Value kValue) {
         super(TYPE);
 
-        // Due to lack of allocatable registers, we use fixed registers and mark them as @Use+@Temp.
-        // This allows the fixed registers to be reused for hosting temporary values
+        // This stub uses fixed registers. offset/len are killed in the body while out/in/k remain
+        // live for the duration of the instruction.
         GraalError.guarantee(asRegister(outValue).equals(rdi), "expect outValue at rdi, but was %s", outValue);
         GraalError.guarantee(asRegister(inValue).equals(rsi), "expect inValue at rsi, but was %s", inValue);
         GraalError.guarantee(asRegister(offsetValue).equals(r11), "expect outValue at r11, but was %s", offsetValue);
@@ -103,21 +105,26 @@ public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
         this.kValue = kValue;
         this.result = AMD64.rax.asValue(lenValue.getValueKind());
 
-        this.tmp1Value = r12.equals(heapBaseRegister) ? r14.asValue() : r12.asValue();
+        if (tool.isReservedRegister(r12)) {
+            GraalError.guarantee(!tool.isReservedRegister(r14), "One of r12 or r14 must be available");
+            this.tmp1Value = r14.asValue();
+        } else {
+            this.tmp1Value = r12.asValue();
+        }
+        this.spillR13 = tool.isReservedRegister(r13);
 
         this.tmpValues = new Value[]{
-                        rax.asValue(),
-                        rcx.asValue(),
                         rdx.asValue(),
                         rbx.asValue(),
-                        rsi.asValue(),
-                        rdi.asValue(),
-                        r8.asValue(),
                         r9.asValue(),
                         r10.asValue(),
-                        r11.asValue(),
                         r13.asValue(),
         };
+    }
+
+    @Override
+    public boolean modifiesStackPointer() {
+        return spillR13;
     }
 
     @Override
@@ -140,7 +147,13 @@ public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
         Register tmp4 = r10;
         Register tmp5 = rbx;
 
+        if (spillR13) {
+            masm.push(r13);
+        }
         mulAdd(masm, out, in, offset, len, k, tmp1, tmp2, tmp3, tmp4, tmp5, rdx, rax);
+        if (spillR13) {
+            masm.pop(r13);
+        }
     }
 
     static boolean useBMI2Instructions(AMD64MacroAssembler masm) {
@@ -183,7 +196,8 @@ public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
         masm.shrl(tmp1, 2);
 
         masm.bind(lFirstLoop);
-        masm.sublAndJcc(tmp1, 1, ConditionFlag.Negative, lFirstLoopExit, true);
+        masm.decl(tmp1);
+        masm.jccb(ConditionFlag.Negative, lFirstLoopExit);
 
         masm.subl(len, 4);
         masm.subl(offset, 4);
@@ -255,8 +269,10 @@ public final class AMD64BigIntegerMulAddOp extends AMD64LIRInstruction {
         mulAdd128X32Loop(masm, out, in, offs, len, tmp1, tmp2, tmp3, tmp4, tmp5, rdxReg, raxReg);
 
         // Multiply the trailing in[] entry using 64 bit by 32 bit, if any
-        masm.declAndJcc(len, ConditionFlag.Negative, lCarry, true);
-        masm.declAndJcc(len, ConditionFlag.Negative, lLastIn, true);
+        masm.decl(len);
+        masm.jccb(ConditionFlag.Negative, lCarry);
+        masm.decl(len);
+        masm.jccb(ConditionFlag.Negative, lLastIn);
 
         masm.movq(op1, new AMD64Address(in, len, Stride.S4, 0));
         masm.rorq(op1, 32);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -62,9 +62,15 @@ public enum Failure {
     DATA_COUNT_SECTION_REQUIRED(Type.MALFORMED, "data count section required"),
     ILLEGAL_OPCODE(Type.MALFORMED, "illegal opcode"),
     MALFORMED_REFERENCE_TYPE(Type.MALFORMED, "malformed reference type"),
+    MALFORMED_HEAP_TYPE(Type.MALFORMED, "malformed heap type"),
     MALFORMED_IMPORT_KIND(Type.MALFORMED, "malformed import kind"),
     END_OPCODE_EXPECTED(Type.MALFORMED, "END opcode expected"),
     UNEXPECTED_CONTENT_AFTER_LAST_SECTION(Type.MALFORMED, "unexpected content after last section"),
+    MALFORMED_LIMITS_FLAGS(Type.MALFORMED, "malformed limits flags"),
+    MALFORMED_MEMOP_FLAGS(Type.MALFORMED, "malformed memop flags"),
+    MALFORMED_CATCH(Type.MALFORMED, "malformed catch clause"),
+    MALFORMED_TAG_ATTRIBUTE(Type.MALFORMED, "malformed tag attribute"),
+    MALFORMED_CASTOP_FLAGS(Type.MALFORMED, "malformed castop flags"),
     // GraalWasm-specific:
     INVALID_SECTION_ORDER(Type.MALFORMED, "invalid section order"),
     DISABLED_MULTI_VALUE(Type.MALFORMED, "multi-value is not enabled"),
@@ -73,21 +79,25 @@ public enum Failure {
     UNSPECIFIED_INVALID(Type.INVALID, "unspecified"),
     TYPE_MISMATCH(Type.INVALID, "type mismatch"),
     INVALID_RESULT_ARITY(Type.INVALID, "invalid result arity"),
+    NON_EMPTY_TAG_RESULT_TYPE(Type.INVALID, "non-empty tag result type"),
     MULTIPLE_MEMORIES(Type.INVALID, "multiple memories"),
     MULTIPLE_TABLES(Type.INVALID, "multiple tables"),
     LOOP_INPUT(Type.INVALID, "non-empty loop input type"),
     UNKNOWN_LOCAL(Type.INVALID, "unknown local"),
+    UNINITIALIZED_LOCAL(Type.INVALID, "uninitialized local"),
     UNKNOWN_GLOBAL(Type.INVALID, "unknown global"),
     UNKNOWN_MEMORY(Type.INVALID, "unknown memory"),
     UNKNOWN_TABLE(Type.INVALID, "unknown table"),
     UNKNOWN_LABEL(Type.INVALID, "unknown label"),
     UNKNOWN_FUNCTION(Type.INVALID, "unknown function"),
     UNKNOWN_TYPE(Type.INVALID, "unknown type"),
+    SUB_TYPE(Type.INVALID, "sub type"),
+    SUB_TYPE_DOES_NOT_MATCH_SUPER_TYPE(Type.INVALID, "sub type does not match super type"),
     START_FUNCTION_RESULT_VALUE(Type.INVALID, "start function"),
     START_FUNCTION_PARAMS(Type.INVALID, "start function"),
     LIMIT_MINIMUM_GREATER_THAN_MAXIMUM(Type.INVALID, "size minimum must not be greater than maximum"),
     DUPLICATE_EXPORT(Type.INVALID, "duplicate export name"),
-    IMMUTABLE_GLOBAL_WRITE(Type.INVALID, "global is immutable"),
+    IMMUTABLE_GLOBAL_WRITE(Type.INVALID, "immutable global"),
     CONSTANT_EXPRESSION_REQUIRED(Type.INVALID, "constant expression required"),
     LIMIT_EXCEEDED(Type.INVALID, "limit exceeded"),
     MEMORY_SIZE_LIMIT_EXCEEDED(Type.INVALID, "memory size must be at most 65536 pages (4GiB)"),
@@ -100,10 +110,20 @@ public enum Failure {
     UNKNOWN_DATA_SEGMENT(Type.INVALID, "unknown data segment"),
     UNKNOWN_REFERENCE(Type.INVALID, "unknown reference"),
     UNDECLARED_FUNCTION_REFERENCE(Type.INVALID, "undeclared function reference"),
+    UNKNOWN_TAG(Type.INVALID, "unknown tag"),
+    INVALID_FIELD_INDEX(Type.INVALID, "invalid field index"),
+    INVALID_STRUCT_GETTER_SIGNEDNESS(Type.INVALID, "struct.get_s and struct.get_u must be used for fields of packed types"),
+    FIELD_IS_IMMUTABLE(Type.INVALID, "field is immutable"),
+    TOO_MANY_STRUCT_FIELDS(Type.INVALID, "too many struct fields"),
+    ARRAY_TYPE_IS_NOT_NUMERIC_OR_VECTOR(Type.INVALID, "array type is not numeric or vector"),
+    INVALID_ARRAY_GETTER_SIGNEDNESS(Type.INVALID, "array.get_s and array.get_u must be used for arrays of packed types"),
+    ARRAY_IS_IMMUTABLE(Type.INVALID, "array is immutable"),
+    ARRAY_TYPES_DO_NOT_MATCH(Type.INVALID, "array types do not match"),
 
     // GraalWasm-specific:
     MODULE_SIZE_LIMIT_EXCEEDED(Type.INVALID, "module size exceeds limit"),
     TYPE_COUNT_LIMIT_EXCEEDED(Type.INVALID, "type count exceeds limit"),
+    SUB_TYPE_DEPTH_LIMIT_EXCEEDED(Type.INVALID, "sub type depth exceeds limit"),
     FUNCTION_COUNT_LIMIT_EXCEEDED(Type.INVALID, "function count exceeds limit"),
     TABLE_COUNT_LIMIT_EXCEEDED(Type.INVALID, "table count exceeds limit"),
     MEMORY_COUNT_LIMIT_EXCEEDED(Type.INVALID, "memory count exceeds limit"),
@@ -115,6 +135,8 @@ public enum Failure {
     FUNCTION_SIZE_LIMIT_EXCEEDED(Type.INVALID, "function size exceeds limit"),
     PARAMETERS_COUNT_LIMIT_EXCEEDED(Type.INVALID, "parameters count exceeds limit"),
     RESULT_COUNT_LIMIT_EXCEEDED(Type.INVALID, "result values count exceeds limit"),
+    TAG_COUNT_LIMIT_EXCEEDED(Type.INVALID, "tag count exceeds limit"),
+    ARRAY_NEW_FIXED_LIMIT_EXCEEDED(Type.INVALID, "array.new_fixed length exceeds limit"),
 
     // TODO(mbovel): replace UNSPECIFIED_UNLINKABLE usages with appropriate errors.
     UNSPECIFIED_UNLINKABLE(Type.UNLINKABLE, "unspecified"),
@@ -134,12 +156,19 @@ public enum Failure {
     OUT_OF_BOUNDS_MEMORY_ACCESS(Type.TRAP, "out of bounds memory access"),
     UNALIGNED_ATOMIC(Type.TRAP, "unaligned atomic"),
     EXPECTED_SHARED_MEMORY(Type.TRAP, "expected shared memory"),
-    INDIRECT_CALL_TYPE__MISMATCH(Type.TRAP, "indirect call type mismatch"),
+    INDIRECT_CALL_TYPE_MISMATCH(Type.TRAP, "indirect call type mismatch"),
     INVALID_MULTI_VALUE_ARITY(Type.TRAP, "provided multi-value size does not match function type"),
     INVALID_TYPE_IN_MULTI_VALUE(Type.TRAP, "type of value in multi-value does not match the function type"),
+    CAST_FAILURE(Type.TRAP, "cast failure"),
 
-    NULL_REFERENCE(Type.TRAP, "defined element is ref.null"),
+    NULL_REFERENCE(Type.TRAP, "null reference"),
+    NULL_FUNCTION_REFERENCE(Type.TRAP, "null function reference"),
+    NULL_STRUCTURE_REFERENCE(Type.TRAP, "null structure reference"),
+    NULL_ARRAY_REFERENCE(Type.TRAP, "null array reference"),
+    NULL_I31_REFERENCE(Type.TRAP, "null i31 reference"),
     OUT_OF_BOUNDS_TABLE_ACCESS(Type.TRAP, "out of bounds table access"),
+    OUT_OF_BOUNDS_ARRAY_ACCESS(Type.TRAP, "out of bounds array access"),
+    ARRAY_LENGTH_LIMIT_EXCEEDED(Type.TRAP, "array length exceeds limit"),
     // GraalWasm-specific:
     TABLE_INSTANCE_SIZE_LIMIT_EXCEEDED(Type.TRAP, "table instance size exceeds limit"),
     MEMORY_INSTANCE_SIZE_LIMIT_EXCEEDED(Type.TRAP, "memory instance size exceeds limit"),
@@ -147,6 +176,7 @@ public enum Failure {
 
     MEMORY_OVERHEAD_MODE(Type.TRAP, "functions cannot be executed with memory overhead mode enabled"),
     SHARED_MEMORY_WITHOUT_UNSAFE(Type.TRAP, "shared memories are not supported without Unsafe"),
+    DIRECT_BYTE_BUFFER_WITHOUT_UNSAFE(Type.TRAP, "direct ByteBuffer memory access is not supported without Unsafe"),
 
     CALL_STACK_EXHAUSTED(Type.EXHAUSTION, "call stack exhausted"),
     MEMORY_ALLOCATION_FAILED(Type.EXHAUSTION, "could not allocate memory"),
@@ -157,7 +187,9 @@ public enum Failure {
 
     NON_REPRESENTABLE_EXTRA_DATA_VALUE(Type.MALFORMED, "value cannot be represented in extra data"),
 
-    INVALID_LANE_INDEX(Type.INVALID, "invalid lane index");
+    INVALID_LANE_INDEX(Type.INVALID, "invalid lane index"),
+    INVALID_CATCH_CLAUSE_LABEL(Type.INVALID, "invalid catch clause label"),
+    INVALID_RETHROW_LABEL(Type.INVALID, "invalid rethrow label");
 
     public enum Type {
         TRAP("trap"),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,15 +24,35 @@
  */
 package com.oracle.svm.core.graal.code;
 
-import static com.oracle.svm.core.util.VMError.intentionallyUnimplemented;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
 
 import java.lang.reflect.Method;
+import java.util.function.Consumer;
+import java.util.random.RandomGenerator;
+
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.LocationIdentity;
+
+import com.oracle.svm.core.RuntimeRandomness;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
+import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
+import com.oracle.svm.core.graal.nodes.ComputedIndirectCallTargetNode;
+import com.oracle.svm.core.graal.snippets.CFunctionSnippets;
+import com.oracle.svm.core.jni.CallVariant;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.core.nodes.CFunctionPrologueDataNode;
+import com.oracle.svm.core.thread.VMThreads.StatusSupport;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.graal.compiler.core.common.alloc.RegisterAllocationConfig;
 import jdk.graal.compiler.core.target.Backend;
 import jdk.graal.compiler.lir.LIRFrameState;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.nodes.CallTargetNode;
 import jdk.graal.compiler.nodes.IndirectCallTargetNode;
 import jdk.graal.compiler.nodes.LoweredCallTargetNode;
@@ -43,19 +63,6 @@ import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.tiers.SuitesProvider;
 import jdk.graal.compiler.phases.util.Providers;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.LocationIdentity;
-
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
-import com.oracle.svm.core.graal.nodes.ComputedIndirectCallTargetNode;
-import com.oracle.svm.core.graal.snippets.CFunctionSnippets;
-import com.oracle.svm.core.meta.SharedMethod;
-import com.oracle.svm.core.nodes.CFunctionPrologueDataNode;
-import com.oracle.svm.core.thread.VMThreads.StatusSupport;
-import com.oracle.svm.core.util.VMError;
-
 import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.code.RegisterValue;
@@ -70,11 +77,16 @@ public abstract class SubstrateBackend extends Backend {
          * instructions in the compilation.
          */
         PROLOGUE_START(true),
+        PROLOGUE_PUSH_RBP(true),
         PROLOGUE_DECD_RSP(true),
+        PROLOGUE_SET_FRAME_POINTER(true),
         PROLOGUE_SAVED_REGS(true),
         PROLOGUE_END(true),
+        FRAME_POINTER_SPILLED(true),
+        FRAME_POINTER_RELOADED(true),
         EPILOGUE_START(false),
         EPILOGUE_INCD_RSP(true),
+        EPILOGUE_POP_RBP(true),
         EPILOGUE_END(true);
 
         final boolean isMarkAfter;
@@ -149,7 +161,7 @@ public abstract class SubstrateBackend extends Backend {
     }
 
     public CompilationResult newCompilationResult(CompilationIdentifier compilationIdentifier, String name) {
-        return new CompilationResult(compilationIdentifier, name) {
+        return new SharedCompilationResult(compilationIdentifier, name) {
             @Override
             public void close(OptionValues options) {
                 /*
@@ -179,6 +191,21 @@ public abstract class SubstrateBackend extends Backend {
     /** For runtime compilations, emit only indirect calls to avoid additional patching. */
     public static boolean shouldEmitOnlyIndirectCalls() {
         return !SubstrateUtil.HOSTED;
+    }
+
+    public static boolean shouldRandomizeRuntimeCodeOffset(ResolvedJavaMethod method) {
+        return method instanceof SharedRuntimeMethod && SubstrateOptions.MaxRuntimeCodeOffset.getValue() > 0;
+    }
+
+    /**
+     * Insert a random offset before the compiled code and record the location of the actual
+     * prologue start.
+     */
+    public static void randomizeRuntimeCodeOffset(CompilationResultBuilder crb, Consumer<Integer> offsetInserter) {
+        RandomGenerator random = RuntimeRandomness.instance().getRandom();
+        int offset = random.nextInt(SubstrateOptions.MaxRuntimeCodeOffset.getValue());
+        offsetInserter.accept(offset);
+        crb.recordMark(SubstrateMarkId.PROLOGUE_START);
     }
 
     /**
@@ -221,8 +248,11 @@ public abstract class SubstrateBackend extends Backend {
 
     public abstract BasePhase<CoreProviders> newAddressLoweringPhase(CodeCacheProvider codeCache);
 
+    public record InterpreterJNITrampolineData(ResolvedJavaMethod wrapperMethod, CallVariant callVariant) {
+    }
+
     public abstract CompilationResult createJNITrampolineMethod(ResolvedJavaMethod method, CompilationIdentifier identifier,
-                    RegisterValue threadArg, int threadIsolateOffset, RegisterValue methodIdArg, int methodObjEntryPointOffset);
+                    RegisterValue threadArg, int threadIsolateOffset, int threadCodeBaseOffset, RegisterValue methodIdArg, int methodObjEntryPointOffset, InterpreterJNITrampolineData interpreterData);
 
     /**
      * Returns whether the backend can fold the stack overflow check into the method prologue for

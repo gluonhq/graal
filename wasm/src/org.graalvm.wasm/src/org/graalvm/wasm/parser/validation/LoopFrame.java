@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,8 +41,9 @@
 
 package org.graalvm.wasm.parser.validation;
 
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
+import java.util.BitSet;
+
+import org.graalvm.wasm.parser.bytecode.BytecodeFixup;
 import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 
 /**
@@ -51,37 +52,29 @@ import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 class LoopFrame extends ControlFrame {
     private final int labelLocation;
 
-    LoopFrame(byte[] paramTypes, byte[] resultTypes, int initialStackSize, boolean unreachable, int labelLocation) {
-        super(paramTypes, resultTypes, initialStackSize, unreachable);
+    LoopFrame(int[] paramTypes, int[] resultTypes, int initialStackSize, ControlFrame parentFrame, int labelLocation) {
+        super(paramTypes, resultTypes, parentFrame.getSymbolTable(), initialStackSize, (BitSet) parentFrame.initializedLocals.clone(), parentFrame.legacyCatchDepth());
         this.labelLocation = labelLocation;
     }
 
     @Override
-    byte[] labelTypes() {
+    int[] labelTypes() {
         return paramTypes();
     }
 
     @Override
-    void enterElse(ParserState state, RuntimeBytecodeGen bytecode) {
-        throw WasmException.create(Failure.TYPE_MISMATCH, "Expected then branch. Else branch requires preceding then branch.");
+    void exit(ParserState state, RuntimeBytecodeGen bytecode) {
+        registerDelegateContinuationFixups(state, -1);
     }
 
     @Override
-    void exit(RuntimeBytecodeGen bytecode) {
+    void addBranch(RuntimeBytecodeGen bytecode, RuntimeBytecodeGen.BranchOp branchOp, RuntimeBytecodeGen.BranchHint branchHint, int sourceLegacyCatchDepth) {
+        bytecode.addBackwardBranch(labelLocation, branchOp, branchHint);
+        registerBackwardBranch(sourceLegacyCatchDepth);
     }
 
     @Override
-    void addBranch(RuntimeBytecodeGen bytecode) {
-        bytecode.addBranch(labelLocation);
-    }
-
-    @Override
-    void addBranchIf(RuntimeBytecodeGen bytecode) {
-        bytecode.addBranchIf(labelLocation);
-    }
-
-    @Override
-    void addBranchTableItem(RuntimeBytecodeGen bytecode) {
-        bytecode.patchLocation(bytecode.addBranchTableItemLocation(), labelLocation);
+    void addLabelFixup(BytecodeFixup fixup) {
+        fixup.patch(labelLocation);
     }
 }

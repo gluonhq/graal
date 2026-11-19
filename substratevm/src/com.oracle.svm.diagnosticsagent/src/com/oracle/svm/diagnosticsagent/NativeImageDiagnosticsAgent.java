@@ -28,7 +28,16 @@ import static com.oracle.svm.core.jni.JNIObjectHandles.nullHandle;
 import static com.oracle.svm.jvmtiagentbase.Support.check;
 import static com.oracle.svm.jvmtiagentbase.Support.jvmtiFunctions;
 import static com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEvent.JVMTI_EVENT_CLASS_FILE_LOAD_HOOK;
+import static java.lang.classfile.ClassFile.ACC_PUBLIC;
 
+import java.io.Serial;
+import java.lang.classfile.ClassBuilder;
+import java.lang.classfile.ClassElement;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
+import java.lang.classfile.ClassTransform;
+import java.lang.classfile.MethodModel;
+import java.lang.constant.ConstantDescs;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -48,12 +57,12 @@ import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
 import com.oracle.svm.core.jni.headers.JNIEnvironment;
 import com.oracle.svm.core.jni.headers.JNIJavaVM;
 import com.oracle.svm.core.jni.headers.JNIMethodId;
 import com.oracle.svm.core.jni.headers.JNIObjectHandle;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.jvmtiagentbase.AgentIsolate;
 import com.oracle.svm.jvmtiagentbase.JNIHandleSet;
 import com.oracle.svm.jvmtiagentbase.JvmtiAgentBase;
@@ -65,9 +74,6 @@ import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEvent;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEventCallbacks;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEventMode;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiInterface;
-
-import jdk.internal.org.objectweb.asm.ClassReader;
-import jdk.internal.org.objectweb.asm.ClassWriter;
 
 /**
  * JVMTI agent that provides diagnostics information that helps resolve native-image build failures.
@@ -88,6 +94,8 @@ import jdk.internal.org.objectweb.asm.ClassWriter;
  * {@link NativeImageDiagnosticsAgent#maybeInstrumentClassWithClinit(String, byte[])}.
  */
 public class NativeImageDiagnosticsAgent extends JvmtiAgentBase<NativeImageDiagnosticsAgentJNIHandleSet> {
+    // Checkstyle: allow System.err (agent class)
+
     private static final CEntryPointLiteral<CFunctionPointer> ON_CLASS_PREPARE = CEntryPointLiteral.create(NativeImageDiagnosticsAgent.class, "onClassPrepare",
                     JvmtiEnv.class, JNIEnvironment.class, JNIObjectHandle.class, JNIObjectHandle.class);
 
@@ -381,29 +389,59 @@ public class NativeImageDiagnosticsAgent extends JvmtiAgentBase<NativeImageDiagn
         newClassDataLen.write(newClassDataLength);
     }
 
-    static final int ASM8 = 8 << 16;
-    static final int ASM_TARGET_VERSION = ASM8;
-
     private byte[] maybeInstrumentClassWithClinit(String clazzName, byte[] clazzData) {
-        if (clazzName != null && !advisor.shouldTraceClassInitialization(clazzName.replace('/', '.'))) {
-            return null;
-        }
-
         try {
-            ClassReader reader = new ClassReader(clazzData);
-            ClassWriter writer = new ClassWriter(reader, 0);
-            ClinitGenerationVisitor visitor = new ClinitGenerationVisitor(ASM_TARGET_VERSION, writer);
-            reader.accept(visitor, 0);
-
-            if (!visitor.didGeneration()) {
-                return null;
+            TracingAdvisor adv = JvmtiAgentBase.<NativeImageDiagnosticsAgentJNIHandleSet, NativeImageDiagnosticsAgent> singleton().advisor;
+            if (adv.shouldTraceClassInitialization(clazzName.replace("/", "."))) {
+                return instrumentClassWithClinit(clazzData);
             }
-
-            return writer.toByteArray();
+            return null;
         } catch (Throwable e) {
             String targetClazzName = clazzName != null ? clazzName : "<unknown class>";
             System.err.println("[native-image-diagnostics-agent] Failed to instrument class " + targetClazzName + ": ");
             e.printStackTrace(System.err);
+            return null;
+        }
+    }
+
+    /**
+     * Instruments the given class data with a synthetic <clinit> method if missing. Returns null if
+     * no changes are made, otherwise the modified classfile bytes.
+     */
+    public byte[] instrumentClassWithClinit(byte[] classData) {
+        class ClinitAlreadyExistsException extends RuntimeException {
+            @Serial private static final long serialVersionUID = 1L;
+        }
+        try {
+            ClassModel cm = ClassFile.of().parse(classData);
+            return ClassFile.of().transformClass(cm, new ClassTransform() {
+                /**
+                 * Copies over all elements from the original class.
+                 */
+                @Override
+                public void accept(ClassBuilder clb, ClassElement ce) {
+                    if (ce instanceof MethodModel mm && ConstantDescs.CLASS_INIT_NAME.equals((mm.methodName().stringValue()))) {
+                        // already has a <clinit> method
+                        throw new ClinitAlreadyExistsException();
+                    }
+                    clb.with(ce);
+                }
+
+                /**
+                 * Add an empty <clinit> method to the class.
+                 */
+                @Override
+                public void atEnd(ClassBuilder clb) {
+                    clb.withMethodBody(
+                                    ConstantDescs.CLASS_INIT_NAME,
+                                    ConstantDescs.MTD_void,
+                                    ACC_PUBLIC | ClassFile.ACC_STATIC,
+                                    cob -> {
+                                        cob.return_();
+                                    });
+                }
+            });
+        } catch (ClinitAlreadyExistsException e) {
             return null;
         }
     }

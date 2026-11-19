@@ -24,9 +24,9 @@
  */
 package com.oracle.svm.core.jni;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalObject;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalObject;
 
 /**
  * Retains one exception per thread that is pending to be handled in that thread (or none).

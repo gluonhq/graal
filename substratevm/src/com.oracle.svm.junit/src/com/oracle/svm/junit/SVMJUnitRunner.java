@@ -26,9 +26,9 @@ package com.oracle.svm.junit;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
-import java.util.HashSet;
 import java.util.List;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
@@ -45,10 +45,10 @@ import org.junit.runner.notification.Failure;
 import com.oracle.mxtool.junit.MxJUnitRequest;
 import com.oracle.mxtool.junit.MxJUnitWrapper;
 import com.oracle.mxtool.junit.MxJUnitWrapper.MxJUnitConfig;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.LogUtils;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.options.Option;
 import junit.runner.Version;
@@ -119,7 +119,7 @@ public class SVMJUnitRunner {
         system.out().println("JUnit version " + Version.id());
 
         MxJUnitConfig config = new MxJUnitConfig();
-        var testsToRun = new HashSet<String>();
+        var testsToRun = EconomicSet.create();
         int i = 0;
         while (i < args.length) {
             String arg = args[i++];

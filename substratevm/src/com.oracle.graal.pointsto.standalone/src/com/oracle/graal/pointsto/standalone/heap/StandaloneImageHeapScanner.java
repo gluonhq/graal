@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2022, 2022, Alibaba Group Holding Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -26,89 +26,53 @@
 
 package com.oracle.graal.pointsto.standalone.heap;
 
-import java.util.function.Predicate;
-
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.ObjectScanningObserver;
 import com.oracle.graal.pointsto.heap.HostedValuesProvider;
 import com.oracle.graal.pointsto.heap.ImageHeap;
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.heap.ImageHeapScanner;
-import com.oracle.graal.pointsto.heap.value.ValueSupplier;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
-import com.oracle.graal.pointsto.util.AnalysisError;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
-import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.ResolvedJavaField;
 
+/**
+ * Standalone heap scanner that consults the standalone hosted-values availability layer before
+ * snapshotting hosted values.
+ */
 public class StandaloneImageHeapScanner extends ImageHeapScanner {
-    private ClassLoader classLoader;
-    private Predicate<JavaConstant> shouldScanConstant;
-    private Predicate<AnalysisField> shouldScanField;
-
-    public StandaloneImageHeapScanner(BigBang bb, ImageHeap heap, AnalysisMetaAccess aMetaAccess, SnippetReflectionProvider aSnippetReflection, ConstantReflectionProvider aConstantReflection,
-                    ObjectScanningObserver aScanningObserver, ClassLoader classLoader, HostedValuesProvider hostedValuesProvider) {
+    public StandaloneImageHeapScanner(BigBang bb, ImageHeap heap, AnalysisMetaAccess aMetaAccess, SnippetReflectionProvider aSnippetReflection,
+                    ConstantReflectionProvider aConstantReflection, ObjectScanningObserver aScanningObserver,
+                    HostedValuesProvider hostedValuesProvider) {
         super(bb, heap, aMetaAccess, aSnippetReflection, aConstantReflection, aScanningObserver, hostedValuesProvider);
-        this.classLoader = classLoader;
-        shouldScanConstant = constant -> isClassLoaderAllowed(metaAccess.lookupJavaType(constant).getJavaClass().getClassLoader());
-        shouldScanField = field -> isClassLoaderAllowed(field.getDeclaringClass().getJavaClass().getClassLoader());
-    }
-
-    @Override
-    protected Class<?> getClass(String className) {
-        try {
-            return Class.forName(className, false, classLoader);
-        } catch (ClassNotFoundException e) {
-            AnalysisError.shouldNotReachHere(e);
-            return null;
-        }
-    }
-
-    @Override
-    protected ValueSupplier<JavaConstant> readHostedFieldValue(AnalysisField field, JavaConstant receiver) {
-        ValueSupplier<JavaConstant> ret = super.readHostedFieldValue(field, receiver);
-        if (ret.get() == null && field.isStatic()) {
-            ResolvedJavaField wrappedField = field.getWrapped();
-            JavaConstant constant = wrappedField.getConstantValue();
-            if (constant == null) {
-                constant = JavaConstant.defaultForKind(wrappedField.getJavaKind());
-            }
-            return ValueSupplier.eagerValue(constant);
-        } else {
-            return ret;
-        }
-    }
-
-    @Override
-    public void scanEmbeddedRoot(JavaConstant root, BytecodePosition position) {
-        if (shouldScanConstant.test(root)) {
-            super.scanEmbeddedRoot(root, position);
-        }
-    }
-
-    @Override
-    public void onFieldRead(AnalysisField field) {
-        if (shouldScanField.test(field)) {
-            super.onFieldRead(field);
-        }
     }
 
     /**
-     * We only allow scanning analysis target classes which are loaded by platformClassloader(e.g.
-     * the JDK classes) or the classloader dedicated for analysis targets.
+     * Standalone guest reads may temporarily report "value not available yet" by returning a Java
+     * {@code null} reference from guest constant reflection. The generic scanner only asks the heap
+     * scanner for availability, so re-probe through the standalone hosted-values path while a field
+     * is still backed by the hosted guest object. Pure shadow-heap receivers keep the default eager
+     * behavior because their values are already represented by image-heap tasks.
      */
-    private boolean isClassLoaderAllowed(ClassLoader cl) {
-        return ClassLoader.getPlatformClassLoader().equals(cl) || this.classLoader.equals(cl);
+    @Override
+    public boolean isValueAvailable(AnalysisField field, JavaConstant receiver) {
+        JavaConstant hostedReceiver = getHostedReceiver(receiver);
+        if (receiver == null || hostedReceiver != null) {
+            return readHostedFieldValue(field, hostedReceiver).isAvailable();
+        }
+        return super.isValueAvailable(field, receiver);
     }
 
-    public Predicate<JavaConstant> getShouldScanConstant() {
-        return shouldScanConstant;
-    }
-
-    public Predicate<AnalysisField> getShouldScanField() {
-        return shouldScanField;
+    private static JavaConstant getHostedReceiver(JavaConstant receiver) {
+        if (receiver instanceof ImageHeapConstant imageHeapConstant && imageHeapConstant.isBackedByHostedObject()) {
+            return imageHeapConstant.getHostedObject();
+        }
+        if (receiver instanceof ImageHeapConstant) {
+            return null;
+        }
+        return receiver;
     }
 }

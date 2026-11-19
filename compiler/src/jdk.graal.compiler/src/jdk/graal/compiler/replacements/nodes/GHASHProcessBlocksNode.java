@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
  */
 package jdk.graal.compiler.replacements.nodes;
 
+import static jdk.vm.ci.amd64.AMD64.CPUFeature.AVX;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.CLMUL;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSSE3;
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.HAS_SIDE_EFFECT;
@@ -104,16 +105,15 @@ public class GHASHProcessBlocksNode extends MemoryKillStubIntrinsicNode {
 
     @SuppressWarnings("unlikely-arg-type")
     public static boolean isSupported(Architecture arch) {
-        if (arch instanceof AMD64) {
-            return ((AMD64) arch).getFeatures().containsAll(minFeaturesAMD64());
-        } else if (arch instanceof AArch64) {
-            return ((AArch64) arch).getFeatures().containsAll(minFeaturesAARCH64());
-        }
-        return false;
+        return switch (arch) {
+            case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+            case AArch64 aarch64 -> aarch64.getFeatures().containsAll(minFeaturesAARCH64());
+            default -> false;
+        };
     }
 
     @NodeIntrinsic
-    @GenerateStub(name = "ghashProcessBlocks", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+    @GenerateStub(name = "ghashProcessBlocks", minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64", runtimeCPUFeaturesAMD64 = "runtimeCheckedCPUFeaturesAMD64")
     public static native void apply(Pointer state,
                     Pointer hashSubkey,
                     Pointer data,
@@ -132,12 +132,16 @@ public class GHASHProcessBlocksNode extends MemoryKillStubIntrinsicNode {
     }
 
     @Override
-    public boolean canBeEmitted(Architecture arch) {
-        return isSupported(arch);
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return false;
     }
 
     @Override
     public void emitIntrinsic(NodeLIRBuilderTool gen) {
-        gen.getLIRGeneratorTool().emitGHASHProcessBlocks(gen.operand(state), gen.operand(hashSubkey), gen.operand(data), gen.operand(blocks));
+        gen.getLIRGeneratorTool().emitGHASHProcessBlocks(runtimeCheckedCPUFeatures, gen.operand(state), gen.operand(hashSubkey), gen.operand(data), gen.operand(blocks));
+    }
+
+    public static EnumSet<AMD64.CPUFeature> runtimeCheckedCPUFeaturesAMD64() {
+        return EnumSet.of(AVX, CLMUL);
     }
 }

@@ -1,0 +1,152 @@
+/*
+ * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.guest.staging.core.graal;
+
+import org.graalvm.nativeimage.IsolateThread;
+import org.graalvm.nativeimage.c.function.CodePointer;
+import org.graalvm.word.Pointer;
+
+import com.oracle.svm.shared.NeverInline;
+
+/**
+ * Functions that are implemented as compiler intrinsics. For hosted registration, see
+ * {@code SubstrateGraphBuilderPlugins}.
+ */
+public class KnownIntrinsics {
+
+    /**
+     * Returns the value of the heap base.
+     */
+    public static native Pointer heapBase();
+
+    /**
+     * Returns the value of the code base, which is the address which {@code MethodOffset} method
+     * offsets are relative to.
+     */
+    public static native Pointer codeBase();
+
+    /**
+     * Narrow down the range of values to exclude 0 as the possible pointer value.
+     *
+     * @param pointer that we are narrowing to non-null
+     * @return a pointer with stamp non-null
+     */
+    public static native Pointer nonNullPointer(Pointer pointer);
+
+    /**
+     * Returns the value of the native stack pointer.
+     */
+    public static native Pointer readStackPointer();
+
+    /**
+     * Returns the value of the native stack pointer for the physical caller frame.
+     *
+     * The caller of this method must be annotated with {@link NeverInline} to ensure that the
+     * physical caller frame is deterministic.
+     */
+    public static native Pointer readCallerStackPointer();
+
+    /**
+     * Returns the value of the native instruction pointer for the physical caller frame.
+     *
+     * The caller of this method must be annotated with {@link NeverInline} to ensure that the
+     * physical caller frame is deterministic.
+     */
+    public static native CodePointer readReturnAddress();
+
+    /**
+     * Continues execution in the specified caller frame, at the specified instruction pointer. The
+     * result is placed in the register used for object results, simulating the return from a method
+     * with an Object return type.
+     *
+     * Note that this is very dangerous. You have to know what you are doing. The parameters are not
+     * checked for correctness in any way.
+     *
+     * Consider that invoking a method or stub this way can result in a missing return address and
+     * therefore an unwalkable stack when the return address is expected to be pushed by the caller
+     * (such as on AMD64). On other platforms, we set the link register here which the callee will
+     * push on the stack (such as on AArch64).
+     */
+    public static native void farReturn(Object result, Pointer sp, CodePointer ip, boolean fromMethodWithCalleeSavedRegisters);
+
+    /** Intrinsified as {@code PauseNode} by {@code SubstrateGraphBuilderPlugins}. */
+    public static native void pause();
+
+    /**
+     * Intrinsified as {@code WriteCurrentVMThreadNode} by
+     * {@code SubstrateGraphBuilderPlugins}.
+     */
+    public static native void writeCurrentVMThread(IsolateThread thread);
+
+    /**
+     * Intrinsified as {@code CodeSynchronizationNode} by {@code SubstrateGraphBuilderPlugins}.
+     */
+    public static native void synchronizeCode();
+
+    /**
+     * For deoptimization testing only. Performs a deoptimization in a regular method, but is a
+     * no-op in a deoptimization target method.
+     */
+    public static native void testDeoptimize();
+
+    /**
+     * For deoptimization testing only. Folds to <code>true</code> in a deoptimization target method
+     * and to <code>false</code> in a deoptimization source method.
+     */
+    public static native boolean isDeoptimizationTarget();
+
+    /**
+     * Casts the given object to the exact class represented by {@code clazz}. The cast succeeds
+     * only if {@code object == null || object.getClass() == clazz} and thus fails for any subclass.
+     *
+     * @param object the object to be cast
+     * @param clazz the class to check against, must not be null
+     * @return the object after casting
+     * @throws ClassCastException if the object is non-null and not exactly of the given class
+     * @throws NullPointerException if the class argument is null
+     * @see Class#cast(Object)
+     */
+    public static native <T> T castExact(Object object, Class<T> clazz);
+
+    /**
+     * Allocates an instance like {@link jdk.internal.misc.Unsafe#allocateInstance}, but assumes the
+     * caller already performed the class validation that unsafe allocation normally requires. This
+     * intrinsic does not check that {@code hub} is an instance class, is registered for unsafe
+     * allocation using the reflection configuration, was seen as instantiated by the static
+     * analysis, or is already initialized.
+     * <p>
+     * The intrinsic can throw only the allocation failures listed below.
+     *
+     * @throws OutOfMemoryError if the object allocation cannot reserve enough memory
+     * @throws StackOverflowError if the object allocation exhausts the stack
+     */
+    public static native Object unvalidatedAllocateInstance(Class<?> hub);
+
+    /**
+     * Like {@link java.lang.reflect.Array#newInstance(Class, int)} but without the checks that the
+     * array of the desired class is registered for reflection.
+     */
+    public static native Object unvalidatedNewArray(Class<?> componentType, int length) throws NegativeArraySizeException;
+}

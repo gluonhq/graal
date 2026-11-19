@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.hosted.c.util;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.io.BufferedReader;
 import java.io.Closeable;
@@ -32,21 +32,50 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import jdk.graal.compiler.debug.DebugContext;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.c.libc.TemporaryBuildDirectoryProvider;
 
+import jdk.graal.compiler.debug.DebugContext;
+
 public class FileUtils {
+
+    /// Maximum number of attempts to delete a file whose access is temporarily denied.
+    private static final int DELETE_MAX_ATTEMPTS = 20;
+
+    /// Delay between attempts to delete a file, in milliseconds.
+    private static final long DELETE_RETRY_MILLIS = 250L;
+
+    /// Deletes `path`, retrying access denials that may occur while Windows releases an executable
+    /// after process exit or another process temporarily holds the file open. Other I/O failures are
+    /// propagated immediately. Interruption stops the retries and preserves the interrupt status.
+    public static void deleteWithRetry(Path path) throws IOException {
+        for (int attempt = 1; attempt <= DELETE_MAX_ATTEMPTS; attempt++) {
+            try {
+                Files.delete(path);
+                return;
+            } catch (AccessDeniedException ex) {
+                if (attempt == DELETE_MAX_ATTEMPTS) {
+                    throw ex;
+                }
+                try {
+                    Thread.sleep(DELETE_RETRY_MILLIS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting to retry deletion of " + path, interrupted);
+                }
+            }
+        }
+    }
 
     public static void drainInputStream(InputStream source, OutputStream sink) {
         byte[] buffer = new byte[4 * 1024];
@@ -64,34 +93,20 @@ public class FileUtils {
     }
 
     public static List<String> readAllLines(InputStream source) {
-        try {
-            BufferedReader reader = new BufferedReader(new InputStreamReader(source));
-            List<String> result = new ArrayList<>();
-            while (true) {
-                String line = reader.readLine();
-                if (line == null) {
-                    break;
-                }
-                result.add(line);
-            }
-            return result;
-        } catch (IOException ex) {
-            throw shouldNotReachHere(ex);
-        }
+        return new BufferedReader(new InputStreamReader(source)).lines().toList();
     }
 
     public static int executeCommand(String... args) throws IOException, InterruptedException {
         return executeCommand(Arrays.asList(args));
     }
 
-    @SuppressWarnings("try")
     public static int executeCommand(List<String> args) throws IOException, InterruptedException {
         ProcessBuilder command = prepareCommand(args, null).redirectErrorStream(true);
 
         traceCommand(command);
 
         Process process = command.start();
-        try (Closeable ignored = process::destroy) {
+        try (Closeable _ = process::destroy) {
 
             try (InputStream inputStream = process.getInputStream()) {
                 traceCommandOutput(readAllLines(inputStream));

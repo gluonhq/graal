@@ -27,10 +27,10 @@ package com.oracle.svm.core.genscavenge;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.ObjectVisitor;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.guest.staging.core.heap.ObjectVisitor;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.Uninterruptible;
 
 /** A Generation is a collection of one or more Spaces. */
 abstract class Generation {
@@ -41,13 +41,7 @@ abstract class Generation {
         this.name = name;
     }
 
-    /**
-     * Walk the Objects in this Space, passing each to a Visitor.
-     *
-     * @param visitor An ObjectVisitor.
-     * @return True if all visits returned true, false otherwise.
-     */
-    public abstract boolean walkObjects(ObjectVisitor visitor);
+    public abstract void walkObjects(ObjectVisitor visitor);
 
     public String getName() {
         return name;
@@ -55,9 +49,6 @@ abstract class Generation {
 
     /** Print some heap statistics to a log. */
     public abstract void logUsage(Log log);
-
-    /** Print some information about the chunks to the log. */
-    public abstract void logChunks(Log log);
 
     /**
      * Promote an Object to this Generation, typically by copying and leaving a forwarding pointer
@@ -91,15 +82,21 @@ abstract class Generation {
     protected abstract Object promoteUnalignedObject(Object original, UnalignedHeapChunk.UnalignedHeader originalChunk, Space originalSpace);
 
     /**
-     * Promote a HeapChunk from its original space to the appropriate space in this generation if
-     * there is sufficient capacity.
+     * Promote an aligned heap chunk that contains pinned objects from its original space to the
+     * appropriate Space in this generation if there is sufficient capacity.
      *
-     * This turns all the Objects in the chunk from white to grey: the objects are in the target
-     * Space, but have not yet had their interior pointers visited.
+     * At this point, the chunk can contain dead objects and an incorrect remembered set, which is
+     * rectified by {@linkplain SweepAndPromotePinnedChunkVisitor subsequent sweeping}.
      *
      * @return true on success, false if the there was insufficient capacity.
      */
-    protected abstract boolean promotePinnedObject(Object obj, HeapChunk.Header<?> originalChunk, boolean isAligned, Space originalSpace);
+    protected abstract boolean promoteAlignedChunkWithPinnedObjectsBeforeSweeping(AlignedHeapChunk.AlignedHeader chunk, Space originalSpace);
+
+    /**
+     * Visits all aligned chunks in From spaces, and for those that contain pinned objects,
+     * {@linkplain #promoteAlignedChunkWithPinnedObjectsBeforeSweeping promotes} and sweeps them.
+     */
+    protected abstract void promoteAndSweepAlignedChunksWithPinnedObjectsInFromSpaces(SweepAndPromotePinnedChunkVisitor visitor);
 
     void checkSanityBeforeCollection() {
     }

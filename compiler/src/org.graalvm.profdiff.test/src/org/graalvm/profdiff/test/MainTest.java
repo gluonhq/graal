@@ -195,6 +195,35 @@ public class MainTest {
     }
 
     @Test
+    public void compareReplayedOptimizationLogsByCompilationId() throws IOException {
+        OptimizationLogMock optLog1 = new OptimizationLogMock("profdiff_compare_replayed_1");
+        OptimizationLogMock optLog2 = new OptimizationLogMock("profdiff_compare_replayed_2");
+        OptimizationLogFileMock file1 = optLog1.addLogFile();
+        OptimizationLogFileMock file2 = optLog2.addLogFile();
+        file1.addCompilationUnit("foo()", "10");
+        file1.addCompilationUnit("foo()", "20");
+        file2.addCompilationUnit("foo()", "10");
+        file2.addCompilationUnit("foo()", "30");
+        Path logDir1 = optLog1.writeToTempDirectory();
+        Path logDir2 = optLog2.writeToTempDirectory();
+        try {
+            String[] args = {"compare-replayed", logDir1.toAbsolutePath().toString(), logDir2.toAbsolutePath().toString()};
+            Profdiff.main(args);
+        } finally {
+            deleteTree(logDir1);
+            deleteTree(logDir2);
+        }
+        assertNoError();
+        String output = outputStream.toString();
+        assertOutputContains(optLog1.allCompilationIDs());
+        assertOutputContains(optLog2.allCompilationIDs());
+        Assert.assertTrue(output.contains("compilations are paired only when they have the same compilation ID"));
+        Assert.assertFalse(output.contains("compilation fragment"));
+        Assert.assertTrue(output.contains("Compilation unit    10 in experiment 1 vs" + System.lineSeparator() + "    Compilation unit    10 in experiment 2"));
+        Assert.assertFalse(output.contains("Compilation unit    20 in experiment 1 vs"));
+    }
+
+    @Test
     public void compareAOTExperiments() throws IOException {
         ExperimentMock exp1 = createAOTExperiment1("profdiff_aot_1", "profdiff_aot_prof_1");
         ExperimentMock exp2 = createAOTExperiment2("profdiff_aot_2", "profdiff_aot_prof_2");

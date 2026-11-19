@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -53,6 +53,7 @@ public final class ClassSetContents implements JsonConvertible {
         Class,
         Strings,
         Range,
+        BrokenRange,
         POSIXCollationElement,
         POSIXCollationEquivalenceClass
     }
@@ -93,6 +94,16 @@ public final class ClassSetContents implements JsonConvertible {
         return new ClassSetContents(Kind.Range, CodePointSet.create(lo, hi), EconomicSet.create(), false);
     }
 
+    /**
+     * Special case where a regex flavor considers a range to be valid even though the decoded lower
+     * bound is greater than the upper bound. We swap them here in order not to break CodePointSet's
+     * assertions.
+     */
+    public static ClassSetContents createBrokenRange(int lo, int hi) {
+        assert lo > hi;
+        return new ClassSetContents(Kind.BrokenRange, CodePointSet.create(hi, lo), EconomicSet.create(), false);
+    }
+
     public static ClassSetContents createPOSIXCollationElement(int codePoint) {
         return new ClassSetContents(Kind.POSIXCollationElement, CodePointSet.create(codePoint), EconomicSet.create(), false);
     }
@@ -123,9 +134,13 @@ public final class ClassSetContents implements JsonConvertible {
     public ClassSetContents caseFold(CodePointSetAccumulator tmp) {
         EconomicSet<String> foldedStrings = EconomicSet.create(strings.size());
         for (String string : strings) {
-            foldedStrings.add(CaseFoldData.icuSimpleCaseFold(string));
+            foldedStrings.add(CaseFoldData.simpleCaseFold(CaseFoldData.CaseFoldAlgorithm.ECMAScriptUnicode, string));
         }
         return new ClassSetContents(kind, CaseFoldData.simpleCaseFold(codePointSet, tmp), foldedStrings, mayContainStrings);
+    }
+
+    public boolean isEmpty() {
+        return codePointSet.isEmpty() && strings.isEmpty();
     }
 
     public EconomicSet<String> getStrings() {
@@ -146,6 +161,26 @@ public final class ClassSetContents implements JsonConvertible {
 
     public boolean isRange() {
         return kind == Kind.Range;
+    }
+
+    public boolean isBrokenRange() {
+        return kind == Kind.BrokenRange;
+    }
+
+    public boolean isRangeOrBrokenRange() {
+        return isRange() || isBrokenRange();
+    }
+
+    public int getRangeLo() {
+        assert isRange() || isBrokenRange();
+        assert codePointSet.size() == 1;
+        return isBrokenRange() ? codePointSet.getMax() : codePointSet.getMin();
+    }
+
+    public int getRangeHi() {
+        assert isRange() || isBrokenRange();
+        assert codePointSet.size() == 1;
+        return isBrokenRange() ? codePointSet.getMin() : codePointSet.getMax();
     }
 
     public boolean isPosixCollationElement() {

@@ -24,20 +24,16 @@
  */
 package com.oracle.svm.core.jvmstat;
 
-import java.util.Arrays;
-import java.util.List;
 import java.util.zip.ZipFile;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.svm.core.VMInspectionOptions;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.jdk.RuntimeSupport;
-import com.oracle.svm.core.jdk.RuntimeSupportFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 import com.oracle.svm.core.thread.VMOperationListenerSupport;
-import com.oracle.svm.core.thread.VMOperationListenerSupportFeature;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 
 /**
  * The performance data feature (hsperfdata) provides monitoring data that can be access by external
@@ -76,9 +72,10 @@ import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
  */
 @AutomaticallyRegisteredFeature
 public class PerfDataFeature implements InternalFeature {
+
     @Override
-    public List<Class<? extends Feature>> getRequiredFeatures() {
-        return Arrays.asList(VMOperationListenerSupportFeature.class, RuntimeSupportFeature.class);
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
     }
 
     @Override

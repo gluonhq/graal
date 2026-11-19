@@ -24,15 +24,18 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import com.oracle.graal.pointsto.heap.ImageLayerLoader;
-import com.oracle.graal.pointsto.infrastructure.OriginalFieldProvider;
+import static com.oracle.svm.shared.singletons.MultiLayeredImageSingleton.LAYER_NUM_UNINSTALLED;
+
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaField;
 import com.oracle.graal.pointsto.meta.AnalysisField;
-import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.svm.core.StaticFieldsSupport;
-import com.oracle.svm.core.meta.SharedField;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.jvmci.shared.meta.SharedField;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.util.OriginalFieldProvider;
 
+import jdk.graal.compiler.debug.Assertions;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -42,20 +45,26 @@ import jdk.vm.ci.meta.ResolvedJavaField;
  */
 public class HostedField extends HostedElement implements OriginalFieldProvider, SharedField, WrappedJavaField {
 
+    static final int LOC_UNMATERIALIZED_STATIC_CONSTANT = -10;
+
+    public static final HostedField[] EMPTY_ARRAY = new HostedField[0];
+
     public final AnalysisField wrapped;
 
     private final HostedType holder;
     private final HostedType type;
 
     protected int location;
+    private int installedLayerNum;
 
-    static final int LOC_UNMATERIALIZED_STATIC_CONSTANT = -10;
+    private final FieldValueInterceptionSupport fieldValueInterceptionSupport = FieldValueInterceptionSupport.singleton();
 
     public HostedField(AnalysisField wrapped, HostedType holder, HostedType type) {
         this.wrapped = wrapped;
         this.holder = holder;
         this.type = type;
         this.location = LOC_UNINITIALIZED;
+        this.installedLayerNum = LAYER_NUM_UNINSTALLED;
     }
 
     @Override
@@ -63,15 +72,41 @@ public class HostedField extends HostedElement implements OriginalFieldProvider,
         return wrapped;
     }
 
-    protected void setLocation(int location) {
+    public void setLocation(int newLocation, int newInstallLayerNum) {
         assert this.location == LOC_UNINITIALIZED;
-        assert location >= 0;
-        this.location = location;
+        assert newLocation >= 0 || newLocation == LOC_UNMATERIALIZED_STATIC_CONSTANT;
+
+        if (newLocation != LOC_UNMATERIALIZED_STATIC_CONSTANT) {
+            wrapped.checkGuaranteeFolded();
+        }
+        this.location = newLocation;
+
+        setInstalledLayerNum(newInstallLayerNum);
     }
 
-    protected void setUnmaterializedStaticConstant() {
-        assert this.location == LOC_UNINITIALIZED && isStatic();
-        this.location = LOC_UNMATERIALIZED_STATIC_CONSTANT;
+    private void setInstalledLayerNum(int newInstallLayerNum) {
+        assert this.installedLayerNum == LAYER_NUM_UNINSTALLED;
+        assert newInstallLayerNum != LAYER_NUM_UNINSTALLED;
+        if (wrapped.isStatic()) {
+            assert ImageLayerBuildingSupport.buildingImageLayer() ? newInstallLayerNum >= 0 : newInstallLayerNum == MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
+        } else {
+            assert newInstallLayerNum == MultiLayeredImageSingleton.NONSTATIC_FIELD_LAYER_NUMBER;
+        }
+        this.installedLayerNum = newInstallLayerNum;
+    }
+
+    protected void setUnmaterializedStaticConstant(int newInstalledLayerNum) {
+        assert isStatic();
+        if (location == LOC_UNMATERIALIZED_STATIC_CONSTANT) {
+            // already set via prior layer
+            assert installedLayerNum != newInstalledLayerNum;
+            return;
+        }
+        setLocation(LOC_UNMATERIALIZED_STATIC_CONSTANT, newInstalledLayerNum);
+    }
+
+    public boolean isUnmaterialized() {
+        return this.location == LOC_UNMATERIALIZED_STATIC_CONSTANT;
     }
 
     public boolean hasLocation() {
@@ -113,9 +148,13 @@ public class HostedField extends HostedElement implements OriginalFieldProvider,
         return wrapped.isWritten();
     }
 
-    @Override
-    public boolean isValueAvailable() {
-        return FieldValueInterceptionSupport.singleton().isValueAvailable(wrapped);
+    /**
+     * Returns true if the field's value is available at the time of querying. For unknown fields
+     * this depends on the image build stage when the value is computed.
+     */
+    public boolean isValueAvailable(JavaConstant receiver) {
+        assert (receiver == null) == isStatic() : Assertions.errorMessage("The receiver should be null iff this is a static field", this, receiver);
+        return fieldValueInterceptionSupport.isValueAvailable(wrapped, receiver);
     }
 
     @Override
@@ -173,19 +212,19 @@ public class HostedField extends HostedElement implements OriginalFieldProvider,
         return wrapped;
     }
 
-    @Override
-    public boolean isInBaseLayer() {
-        return wrapped.isInBaseLayer();
+    public boolean hasInstalledLayerNum() {
+        return !(installedLayerNum == LAYER_NUM_UNINSTALLED || installedLayerNum == MultiLayeredImageSingleton.NONSTATIC_FIELD_LAYER_NUMBER);
     }
 
     @Override
-    public JavaConstant getStaticFieldBase() {
-        AnalysisUniverse universe = type.wrapped.getUniverse();
-        boolean primitive = getStorageKind().isPrimitive();
-        if (isInBaseLayer()) {
-            ImageLayerLoader imageLayerLoader = universe.getImageLayerLoader();
-            return primitive ? imageLayerLoader.getBaseLayerStaticPrimitiveFields() : imageLayerLoader.getBaseLayerStaticObjectFields();
-        }
-        return universe.getSnippetReflection().forObject(primitive ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields());
+    public int getInstalledLayerNum() {
+        VMError.guarantee(hasInstalledLayerNum(), "Bad installed layer value: %s %s", installedLayerNum, this);
+        return installedLayerNum;
+    }
+
+    @Override
+    public Object getStaticFieldBaseForRuntimeLoadedClass() {
+        // never a runtime loaded class
+        return null;
     }
 }

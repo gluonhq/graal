@@ -43,6 +43,7 @@ import jdk.graal.compiler.lir.LIRInstruction;
 import jdk.graal.compiler.lir.LIRValueUtil;
 import jdk.graal.compiler.lir.ValueConsumer;
 import jdk.graal.compiler.lir.framemap.FrameMap;
+import jdk.graal.compiler.lir.util.BlockWorkList;
 import jdk.graal.compiler.lir.util.ValueSet;
 
 import jdk.vm.ci.code.Register;
@@ -72,7 +73,7 @@ public abstract class LocationMarker<S extends ValueSet<S>> {
 
     void build() {
         BasicBlock<?>[] blocks = lir.getControlFlowGraph().getBlocks();
-        UniqueWorkList worklist = new UniqueWorkList(blocks.length);
+        BlockWorkList worklist = new BlockWorkList(blocks.length);
         for (int i = blocks.length - 1; i >= 0; i--) {
             worklist.add(blocks[i]);
         }
@@ -105,7 +106,7 @@ public abstract class LocationMarker<S extends ValueSet<S>> {
     }
 
     @SuppressWarnings("try")
-    private void processBlock(BasicBlock<?> block, UniqueWorkList worklist) {
+    private void processBlock(BasicBlock<?> block, BlockWorkList worklist) {
         if (updateOutBlock(block)) {
             DebugContext debug = lir.getDebug();
             try (Indent indent = debug.logAndIndent("handle block %s", block)) {
@@ -140,6 +141,8 @@ public abstract class LocationMarker<S extends ValueSet<S>> {
             // kills
 
             op.visitEachOutput(defConsumer);
+            // Model @UseKill once as a kill/clobber while walking the block bottom-up.
+            op.visitEachUseKill(defConsumer);
             op.visitEachTemp(defConsumer);
             if (frameMap != null && op.destroysCallerSavedRegisters()) {
                 for (Register reg : frameMap.getRegisterConfig().getCallerSaveRegisters()) {
@@ -155,6 +158,9 @@ public abstract class LocationMarker<S extends ValueSet<S>> {
             op.forEachState(stateConsumer);
             // gen
             op.visitEachInput(useConsumer);
+            // Model @UseKill as a use because these operands must still be live on instruction
+            // entry even though the op also kills them.
+            op.visitEachUseKill(useConsumer);
         } catch (GraalError e) {
             throw e.addContext("lir instruction", "@" + op.id() + " " + op.getClass().getName() + " " + op);
         }

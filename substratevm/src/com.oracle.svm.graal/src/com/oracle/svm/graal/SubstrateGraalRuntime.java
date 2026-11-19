@@ -30,7 +30,11 @@ import org.graalvm.nativeimage.Platforms;
 import com.oracle.svm.core.graal.GraalConfiguration;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.stack.SubstrateStackIntrospection;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ClassUtil;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.api.runtime.GraalRuntime;
@@ -39,6 +43,7 @@ import jdk.graal.compiler.runtime.RuntimeProvider;
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.code.stack.StackIntrospection;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public class SubstrateGraalRuntime implements GraalRuntime, RuntimeProvider {
 
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -56,7 +61,7 @@ public class SubstrateGraalRuntime implements GraalRuntime, RuntimeProvider {
         if (clazz == RuntimeProvider.class) {
             return (T) this;
         } else if (clazz == SnippetReflectionProvider.class) {
-            RuntimeConfiguration runtimeConfiguration = TruffleRuntimeCompilationSupport.getRuntimeConfig();
+            RuntimeConfiguration runtimeConfiguration = RuntimeCompilationSupport.getRuntimeConfig();
             return (T) runtimeConfiguration.getProviders().getSnippetReflection();
         } else if (clazz == StackIntrospection.class) {
             return (T) SubstrateStackIntrospection.SINGLETON;
@@ -66,13 +71,13 @@ public class SubstrateGraalRuntime implements GraalRuntime, RuntimeProvider {
 
     @Override
     public Backend getHostBackend() {
-        return TruffleRuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod();
+        return RuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod();
     }
 
     @Override
     public <T extends Architecture> Backend getBackend(Class<T> arch) {
-        assert arch.isInstance(TruffleRuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod().getTarget().arch);
-        return TruffleRuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod();
+        assert arch.isInstance(RuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod().getTarget().arch);
+        return RuntimeCompilationSupport.getRuntimeConfig().getBackendForNormalMethod();
     }
 
     @Override

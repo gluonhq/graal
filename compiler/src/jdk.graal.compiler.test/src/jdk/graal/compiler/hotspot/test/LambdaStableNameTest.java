@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,57 +25,60 @@
 
 package jdk.graal.compiler.hotspot.test;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import java.math.BigInteger;
-import java.util.Collections;
+import java.util.function.Function;
 
+import jdk.graal.compiler.core.test.GraalCompilerTest;
+import jdk.graal.compiler.java.StableMethodNameFormatter;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import org.junit.Assert;
 import org.junit.Test;
-import org.objectweb.asm.Type;
 
-import jdk.graal.compiler.api.runtime.GraalJVMCICompiler;
-import jdk.graal.compiler.core.test.TestGraphBuilderPhase;
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.debug.DebugContext.Builder;
-import jdk.graal.compiler.hotspot.meta.HotSpotJITClassInitializationPlugin;
 import jdk.graal.compiler.java.LambdaUtils;
-import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.phases.OptimisticOptimizations;
-import jdk.graal.compiler.phases.util.Providers;
-import jdk.graal.compiler.runtime.RuntimeProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.runtime.JVMCI;
 
-public class LambdaStableNameTest {
-    private String findStableLambdaName(ResolvedJavaType type) {
-        OptionValues options = new OptionValues(OptionValues.newOptionMap());
-        DebugContext debug = new Builder(options, Collections.emptyList()).build();
-        GraalJVMCICompiler compiler = (GraalJVMCICompiler) JVMCI.getRuntime().getCompiler();
-        Providers providers = compiler.getGraalRuntime().getCapability(RuntimeProvider.class).getHostBackend().getProviders();
-        final HotSpotJITClassInitializationPlugin initializationPlugin = new HotSpotJITClassInitializationPlugin();
-        return LambdaUtils.findStableLambdaName(initializationPlugin, providers, type, options, debug, this,
-                        config -> new TestGraphBuilderPhase.Instance(providers, config, OptimisticOptimizations.NONE, null));
-    }
+public class LambdaStableNameTest extends GraalCompilerTest {
 
     @Test
     public void checkStableLamdaNameForRunnableAndAutoCloseable() {
         String s = "a string";
-        Runnable r = s::hashCode;
-        ResolvedJavaType rType = JVMCI.getRuntime().getHostJVMCIBackend().getMetaAccess().lookupJavaType(r.getClass());
+        Runnable r0 = s::hashCode;
+        String r0Name = getLambdaName(r0.getClass());
 
-        String name = findStableLambdaName(rType);
-        assertLambdaName(name);
+        Runnable r1 = s::hashCode;
+        String r1Name = getLambdaName(r1.getClass());
+
+        Assert.assertEquals("The two stable lambda names should the same as they reference the same method and implement the same interface", r0Name, r1Name);
 
         AutoCloseable ac = s::hashCode;
-        ResolvedJavaType acType = JVMCI.getRuntime().getHostJVMCIBackend().getMetaAccess().lookupJavaType(ac.getClass());
-        String acName = findStableLambdaName(acType);
-        assertEquals("Both stable lambda names are the same as they reference the same method", name, acName);
+        String acName = getLambdaName(ac.getClass());
 
-        String myName = Type.getInternalName(getClass());
-        assertEquals("The name known in 24.0 version is computed", "L" + myName + "$$Lambda.0x605511206480068bfd9e0bafd4f79e22;", name);
+        assertNotEquals("The two stable lambda names should not be the same as they reference the same method but implement different interfaces", r0Name, acName);
+
+        String myName = getClass().getName().replace('.', '/');
+        Assert.assertEquals("The name known in 24.0 version is computed", "L" + myName + "$$Lambda.0x59cf38d78b5471f8ea57f1c28b37039c;", r0Name);
+
+        Function<String, Integer> f0 = (str) -> str.hashCode();
+        String f0Name = getLambdaName(f0.getClass());
+
+        interface ValueTransformer<L, R> extends Function<L, R> {
+        }
+
+        ValueTransformer<String, Integer> f1 = (str) -> str.hashCode();
+        String f1Name = getLambdaName(f1.getClass());
+
+        assertNotEquals("The two stable lambda names should not be the same as they reference the same method but implement different interfaces", f0Name, f1Name);
+    }
+
+    private static String getLambdaName(Class<?> clazz) {
+        ResolvedJavaType type = JVMCI.getRuntime().getHostJVMCIBackend().getMetaAccess().lookupJavaType(clazz);
+        String name = LambdaUtils.findStableLambdaName(type);
+        assertLambdaName(name);
+        return name;
     }
 
     private static void assertLambdaName(String name) {
@@ -92,5 +95,15 @@ public class LambdaStableNameTest {
 
         BigInteger aValue = new BigInteger(hash, 16);
         assertNotNull("Hash can be parsed as a hex number: " + hash, aValue);
+    }
+
+    @Test
+    public void testStableMethodNameFormatter() {
+        Runnable runnable = "foo"::hashCode;
+        ResolvedJavaMethod method = getResolvedJavaMethod(runnable.getClass(), "run");
+        StableMethodNameFormatter formatter = new StableMethodNameFormatter();
+        String actualName = formatter.apply(method);
+        String expectedName = getClass().getName() + LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING + "/0x59cf38d78b5471f8ea57f1c28b37039c.run()";
+        Assert.assertEquals(expectedName, actualName);
     }
 }

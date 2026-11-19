@@ -24,17 +24,17 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.EXTREMELY_SLOW_PATH_PROBABILITY;
-import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CORE_GC_CODE;
 
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.genscavenge.GCImpl.ChunkReleaser;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
 
 public abstract class OldGeneration extends Generation {
     OldGeneration(String name) {
@@ -42,17 +42,17 @@ public abstract class OldGeneration extends Generation {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    abstract void beginPromotion(boolean incrementalGc);
+    abstract void beginPromotion(boolean completeCollection);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    abstract void blackenDirtyCardRoots(GreyToBlackObjectVisitor visitor);
+    abstract void blackenDirtyCardRoots(GreyToBlackObjectVisitor visitor, GreyToBlackObjRefVisitor refVisitor);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    abstract boolean scanGreyObjects(boolean incrementalGc);
-
-    abstract void sweepAndCompact(Timers timers, ChunkReleaser chunkReleaser);
+    abstract boolean scanGreyObjects(boolean completeCollection);
 
     abstract void releaseSpaces(ChunkReleaser chunkReleaser);
+
+    abstract void clean(boolean cleanUnusedMemory, boolean cleanFillerObjectMemory);
 
     abstract void swapSpaces();
 
@@ -63,21 +63,28 @@ public abstract class OldGeneration extends Generation {
 
     abstract boolean isInSpace(Pointer ptr);
 
+    abstract boolean printLocationInfo(Log log, Pointer ptr);
+
+    abstract void logChunks(Log log);
+
     abstract boolean verifyRememberedSets();
 
     abstract boolean verifySpaces();
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Tear-down in progress.")
     abstract void tearDown();
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CORE_GC_CODE)
     AlignedHeapChunk.AlignedHeader requestAlignedChunk() {
         assert VMOperation.isGCInProgress() : "Should only be called from the collector.";
         AlignedHeapChunk.AlignedHeader chunk = HeapImpl.getChunkProvider().produceAlignedChunk();
-        if (probability(EXTREMELY_SLOW_PATH_PROBABILITY, chunk.isNull())) {
-            throw VMError.shouldNotReachHere("OldGeneration.requestAlignedChunk: failure to allocate aligned chunk");
-        }
+        assert chunk.isNonNull() : "OldGeneration.requestAlignedChunk: failed to allocate aligned chunk";
         RememberedSet.get().enableRememberedSetForChunk(chunk);
         return chunk;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static int getAge() {
+        return HeapParameters.getMaxSurvivorSpaces() + 1;
     }
 }

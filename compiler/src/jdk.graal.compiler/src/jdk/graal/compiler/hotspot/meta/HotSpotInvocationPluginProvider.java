@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,8 +25,8 @@
 package jdk.graal.compiler.hotspot.meta;
 
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
-import jdk.graal.compiler.nodes.spi.Replacements;
 
+import jdk.graal.compiler.serviceprovider.LibGraalService;
 import jdk.graal.compiler.serviceprovider.ServiceProvider;
 import jdk.vm.ci.code.Architecture;
 
@@ -34,6 +34,7 @@ import jdk.vm.ci.code.Architecture;
  * Allows adding additional invocation plugins to {@link HotSpotGraphBuilderPlugins} via
  * {@link ServiceProvider}.
  */
+@LibGraalService
 public interface HotSpotInvocationPluginProvider {
-    void registerInvocationPlugins(Architecture architecture, InvocationPlugins plugins, Replacements replacements);
+    void registerInvocationPlugins(Architecture architecture, InvocationPlugins plugins);
 }

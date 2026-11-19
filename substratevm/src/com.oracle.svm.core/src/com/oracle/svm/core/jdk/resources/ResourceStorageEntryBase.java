@@ -25,12 +25,10 @@
 
 package com.oracle.svm.core.jdk.resources;
 
-import java.util.List;
-
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 public class ResourceStorageEntryBase {
     public boolean isDirectory() {
@@ -41,12 +39,12 @@ public class ResourceStorageEntryBase {
         throw VMError.shouldNotReachHere("This should only be called on entries with data.");
     }
 
-    public List<byte[]> getData() {
+    public byte[][] getData() {
         throw VMError.shouldNotReachHere("This should only be called on entries with data.");
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public void addData(@SuppressWarnings("unused") byte[] data) {
+    public void addData(@SuppressWarnings("unused") byte[] data, @SuppressWarnings("unused") int rootId) {
         throw VMError.shouldNotReachHere("This should only be called on entries with data.");
     }
 

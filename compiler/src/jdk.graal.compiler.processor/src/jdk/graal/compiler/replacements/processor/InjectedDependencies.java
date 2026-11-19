@@ -24,12 +24,10 @@
  */
 package jdk.graal.compiler.replacements.processor;
 
-import static jdk.graal.compiler.processor.AbstractProcessor.getAnnotationValue;
-
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 
-import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
@@ -91,9 +89,7 @@ public class InjectedDependencies implements Iterable<InjectedDependencies.Depen
 
         @Override
         public String getExpression(AbstractProcessor processor, ExecutableElement inject) {
-            AnnotationMirror nodeIntrinsic = processor.getAnnotation(inject, processor.getType(NodeIntrinsicHandler.NODE_INTRINSIC_CLASS_NAME));
-            boolean nonNull = nodeIntrinsic != null && getAnnotationValue(nodeIntrinsic, "injectedStampIsNonNull", Boolean.class);
-            return String.format("injection.getInjectedStamp(%s.class, %s)", GeneratedPlugin.getErasedType(inject.getReturnType()), nonNull);
+            return String.format("injection.getInjectedStamp(%s.class)", GeneratedPlugin.getErasedType(inject.getReturnType()));
         }
     }
 
@@ -160,7 +156,7 @@ public class InjectedDependencies implements Iterable<InjectedDependencies.Depen
     public InjectedDependencies(boolean useVariables, ExecutableElement intrinsicMethod) {
         this.useVariables = useVariables;
         this.intrinsicMethod = intrinsicMethod;
-        deps = new HashMap<>();
+        deps = new LinkedHashMap<>();
     }
 
     public String use(AbstractProcessor processor, WellKnownDependency wellKnown) {

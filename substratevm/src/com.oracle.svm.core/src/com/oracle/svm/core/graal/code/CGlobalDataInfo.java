@@ -26,26 +26,34 @@ package com.oracle.svm.core.graal.code;
 
 import java.util.function.Supplier;
 
+import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.BuildPhaseProvider.AfterHeapLayout;
-import com.oracle.svm.core.BuildPhaseProvider.AfterHostedUniverse;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.CGlobalDataImpl;
-import com.oracle.svm.core.heap.UnknownPrimitiveField;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterHeapLayout;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterHostedUniverse;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.guest.staging.c.CGlobalDataImpl;
+import com.oracle.svm.shared.util.VMError;
 
+/**
+ * Stores build-specific information about a CGlobal. Static information is stored in
+ * {@link CGlobalDataImpl}. This separation of data is used to facilitate storing
+ * {@link CGlobalDataImpl} within static fields.
+ */
 public final class CGlobalDataInfo {
-    public static final String CGLOBALDATA_BASE_SYMBOL_NAME = "__svm_cglobaldata_base";
-    public static final CGlobalData<Pointer> CGLOBALDATA_RUNTIME_BASE_ADDRESS = CGlobalDataFactory.forSymbol(CGLOBALDATA_BASE_SYMBOL_NAME);
-
     private final CGlobalDataImpl<?> data;
     private final boolean isSymbolReference;
 
+    /**
+     * Denotes whether this CGlobal has been defined as a global in a prior layer. This also implies
+     * in a prior layer that the CGlobal was not a symbol reference.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class) private final boolean definedAsGlobalInPriorLayer;
+
+    /** See CGlobalDataFeature#registerWithGlobalSymbol. */
     @UnknownPrimitiveField(availability = AfterHostedUniverse.class) private boolean isGlobalSymbol;
+    /** See CGlobalDataFeature#registerWithGlobalHiddenSymbol. */
     @UnknownPrimitiveField(availability = AfterHostedUniverse.class) private boolean isHiddenSymbol;
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) private int offset = -1;
     @UnknownPrimitiveField(availability = AfterHeapLayout.class) private int size = -1;
@@ -53,11 +61,16 @@ public final class CGlobalDataInfo {
     /** Cache until writing the image in case the {@link Supplier} is costly or has side-effects. */
     @Platforms(HOSTED_ONLY.class) private byte[] bytes;
 
-    public CGlobalDataInfo(CGlobalDataImpl<?> data) {
+    private final int layerNum;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public CGlobalDataInfo(CGlobalDataImpl<?> data, boolean definedAsGlobalInPriorLayer, int layerNum) {
         assert data != null;
         this.data = data;
-        this.isSymbolReference = (data.bytesSupplier == null && data.sizeSupplier == null);
+        this.isSymbolReference = data.isSymbolReference();
         assert !this.isSymbolReference || data.symbolName != null;
+        this.definedAsGlobalInPriorLayer = definedAsGlobalInPriorLayer;
+        this.layerNum = layerNum;
     }
 
     public CGlobalDataImpl<?> getData() {
@@ -82,7 +95,7 @@ public final class CGlobalDataInfo {
     @SuppressWarnings("hiding")
     public void assignBytes(byte[] bytes) {
         assert this.bytes == null : "already initialized";
-        assert size == -1 || size == bytes.length;
+        VMError.guarantee(size == -1 || size == bytes.length);
         this.bytes = bytes;
     }
 
@@ -96,8 +109,21 @@ public final class CGlobalDataInfo {
         return size;
     }
 
+    public int getLayerNumber() {
+        return layerNum;
+    }
+
     public void makeGlobalSymbol() {
-        VMError.guarantee(!isSymbolReference && data.symbolName != null, "Cannot change the local/global status of a symbol reference");
+        if (isSymbolReference) {
+            /*
+             * Only CGlobals assigned to global data chunks allocated by native image can be defined
+             * as global symbols. If the symbol was defined as a global symbol in a prior layer,
+             * this request is a no-op.
+             */
+            VMError.guarantee(definedAsGlobalInPriorLayer, "Cannot change the local/global status of a symbol reference %s", data.symbolName);
+            return;
+        }
+        VMError.guarantee(data.symbolName != null, "No symbol name associated with data reference");
         isGlobalSymbol = true;
     }
 

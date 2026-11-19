@@ -38,11 +38,13 @@ import jdk.graal.compiler.lir.LIRInstruction.OperandMode;
 import jdk.graal.compiler.lir.StandardOp.LoadConstantOp;
 import jdk.graal.compiler.lir.StandardOp.MoveOp;
 import jdk.graal.compiler.lir.StandardOp.ValueMoveOp;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.vm.ci.code.BytecodeFrame;
 import jdk.vm.ci.meta.Value;
 
 public class LIRInstructionClass<T> extends LIRIntrospection<T> {
 
+    @LibGraalSupport.HostedOnly
     public static <T extends LIRInstruction> LIRInstructionClass<T> create(Class<T> c) {
         return new LIRInstructionClass<>(c);
     }
@@ -51,6 +53,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     private static final Class<LIRFrameState> STATE_CLASS = LIRFrameState.class;
 
     private final Values uses;
+    private final Values useKills;
     private final Values alives;
     private final Values temps;
     private final Values defs;
@@ -60,27 +63,25 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     private final boolean isValueMoveOp;
     private final boolean isLoadConstantOp;
 
-    private String opcodeConstant;
-    private int opcodeIndex;
+    private final String opcodeConstant;
+    private final int opcodeIndex;
 
-    private LIRInstructionClass(Class<T> clazz) {
-        this(clazz, new FieldsScanner.DefaultCalcOffset());
-    }
-
-    public LIRInstructionClass(Class<T> clazz, FieldsScanner.CalcOffset calcOffset) {
+    @LibGraalSupport.HostedOnly
+    public LIRInstructionClass(Class<T> clazz) {
         super(clazz);
         assert INSTRUCTION_CLASS.isAssignableFrom(clazz);
 
-        LIRInstructionFieldsScanner ifs = new LIRInstructionFieldsScanner(calcOffset);
-        ifs.scan(clazz);
+        LIRInstructionFieldsScanner ifs = new LIRInstructionFieldsScanner();
+        ifs.scan(clazz, LIRInstruction.class);
 
         uses = Values.create(ifs.valueAnnotations.get(LIRInstruction.Use.class));
+        useKills = Values.create(ifs.valueAnnotations.get(LIRInstruction.UseKill.class));
         alives = Values.create(ifs.valueAnnotations.get(LIRInstruction.Alive.class));
         temps = Values.create(ifs.valueAnnotations.get(LIRInstruction.Temp.class));
         defs = Values.create(ifs.valueAnnotations.get(LIRInstruction.Def.class));
 
         states = Fields.create(ifs.states);
-        data = Fields.create(ifs.data);
+        data = ifs.createData();
 
         opcodeConstant = ifs.opcodeConstant;
         if (ifs.opcodeField == null) {
@@ -95,6 +96,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     }
 
     @SuppressWarnings("unchecked")
+    @LibGraalSupport.HostedOnly
     public static <T> LIRInstructionClass<T> get(Class<T> clazz) {
         try {
             Field field = clazz.getDeclaredField("TYPE");
@@ -118,10 +120,9 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
          */
         private FieldsScanner.FieldInfo opcodeField;
 
-        LIRInstructionFieldsScanner(FieldsScanner.CalcOffset calc) {
-            super(calc);
-
+        LIRInstructionFieldsScanner() {
             valueAnnotations.put(LIRInstruction.Use.class, new OperandModeAnnotation());
+            valueAnnotations.put(LIRInstruction.UseKill.class, new OperandModeAnnotation());
             valueAnnotations.put(LIRInstruction.Alive.class, new OperandModeAnnotation());
             valueAnnotations.put(LIRInstruction.Temp.class, new OperandModeAnnotation());
             valueAnnotations.put(LIRInstruction.Def.class, new OperandModeAnnotation());
@@ -136,6 +137,8 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
             // from arrays to EnumSet manually.
             if (field.isAnnotationPresent(LIRInstruction.Use.class)) {
                 result.addAll(Arrays.asList(field.getAnnotation(LIRInstruction.Use.class).value()));
+            } else if (field.isAnnotationPresent(LIRInstruction.UseKill.class)) {
+                result.addAll(Arrays.asList(field.getAnnotation(LIRInstruction.UseKill.class).value()));
             } else if (field.isAnnotationPresent(LIRInstruction.Alive.class)) {
                 result.addAll(Arrays.asList(field.getAnnotation(LIRInstruction.Alive.class).value()));
             } else if (field.isAnnotationPresent(LIRInstruction.Temp.class)) {
@@ -148,16 +151,18 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
             return result;
         }
 
-        public void scan(Class<?> clazz) {
-            if (clazz.getAnnotation(Opcode.class) != null) {
-                opcodeConstant = clazz.getAnnotation(Opcode.class).value();
+        @Override
+        public void scan(Class<?> startSubclass, Class<?> endSuperclass) {
+            Opcode opcode = startSubclass.getAnnotation(Opcode.class);
+            if (opcode != null) {
+                opcodeConstant = opcode.value();
             }
             opcodeField = null;
 
-            super.scan(clazz, LIRInstruction.class, false);
+            super.scan(startSubclass, endSuperclass);
 
             if (opcodeConstant == null && opcodeField == null) {
-                opcodeConstant = clazz.getSimpleName();
+                opcodeConstant = startSubclass.getSimpleName();
                 if (opcodeConstant.endsWith("Op")) {
                     opcodeConstant = opcodeConstant.substring(0, opcodeConstant.length() - 2);
                 }
@@ -177,8 +182,8 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
 
             if (field.getAnnotation(Opcode.class) != null) {
                 assert opcodeConstant == null && opcodeField == null : "Can have only one Opcode definition: " + type;
-                assert data.get(data.size() - 1).offset == offset : Assertions.errorMessage(data.get(data.size() - 1).offset, offset);
-                opcodeField = data.get(data.size() - 1);
+                assert data.getLast().offset == offset : Assertions.errorMessage(data.getLast().offset, offset);
+                opcodeField = data.getLast();
             }
         }
     }
@@ -186,7 +191,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     @Override
     public Fields[] getAllFields() {
         assert values == null;
-        return new Fields[]{data, uses, alives, temps, defs, states};
+        return new Fields[]{data, uses, useKills, alives, temps, defs, states};
     }
 
     @Override
@@ -194,6 +199,8 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
         StringBuilder str = new StringBuilder();
         str.append(getClass().getSimpleName()).append(" ").append(getClazz().getSimpleName()).append(" use[");
         uses.appendFields(str);
+        str.append("] useKill[");
+        useKills.appendFields(str);
         str.append("] alive[");
         alives.appendFields(str);
         str.append("] temp[");
@@ -217,7 +224,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     }
 
     final boolean hasOperands() {
-        return uses.getCount() > 0 || alives.getCount() > 0 || temps.getCount() > 0 || defs.getCount() > 0;
+        return uses.getCount() > 0 || useKills.getCount() > 0 || alives.getCount() > 0 || temps.getCount() > 0 || defs.getCount() > 0;
     }
 
     final boolean hasState(LIRInstruction obj) {
@@ -237,6 +244,10 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
         forEach(obj, alives, OperandMode.ALIVE, proc);
     }
 
+    final void forEachUseKill(LIRInstruction obj, InstructionValueProcedure proc) {
+        forEach(obj, useKills, OperandMode.USE_KILL, proc);
+    }
+
     final void forEachTemp(LIRInstruction obj, InstructionValueProcedure proc) {
         forEach(obj, temps, OperandMode.TEMP, proc);
     }
@@ -251,6 +262,10 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
 
     final void visitEachAlive(LIRInstruction obj, InstructionValueConsumer proc) {
         visitEach(obj, alives, OperandMode.ALIVE, proc);
+    }
+
+    final void visitEachUseKill(LIRInstruction obj, InstructionValueConsumer proc) {
+        visitEach(obj, useKills, OperandMode.USE_KILL, proc);
     }
 
     final void visitEachTemp(LIRInstruction obj, InstructionValueConsumer proc) {
@@ -289,15 +304,16 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
     }
 
     final Value forEachRegisterHint(LIRInstruction obj, OperandMode mode, InstructionValueProcedure proc) {
-        Values hints;
         if (mode == OperandMode.USE) {
-            hints = defs;
+            return forEachRegisterHint(obj, defs, proc);
         } else if (mode == OperandMode.DEF) {
-            hints = uses;
+            return forEachRegisterHint(obj, uses, proc);
         } else {
             return null;
         }
+    }
 
+    private static Value forEachRegisterHint(LIRInstruction obj, Values hints, InstructionValueProcedure proc) {
         for (int i = 0; i < hints.getCount(); i++) {
             if (i < hints.getDirectCount()) {
                 Value hintValue = hints.getValue(obj, i);
@@ -307,8 +323,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
                 }
             } else {
                 Value[] hintValues = hints.getValueArray(obj, i);
-                for (int j = 0; j < hintValues.length; j++) {
-                    Value hintValue = hintValues[j];
+                for (Value hintValue : hintValues) {
                     Value result = proc.doValue(obj, hintValue, null, null);
                     if (result != null) {
                         return result;
@@ -324,7 +339,7 @@ public class LIRInstructionClass<T> extends LIRIntrospection<T> {
 
         appendValues(result, obj, "", " = ", "(", ")", true, new String[]{""}, defs);
         result.append(String.valueOf(getOpcode(obj)).toUpperCase(Locale.ROOT));
-        appendValues(result, obj, " ", "", "(", ")", false, new String[]{"", "~"}, uses, alives);
+        appendValues(result, obj, " ", "", "(", ")", false, new String[]{"", "!", "~"}, uses, useKills, alives);
         appendValues(result, obj, " ", "", "{", "}", false, new String[]{""}, temps);
 
         for (int i = 0; i < data.getCount(); i++) {

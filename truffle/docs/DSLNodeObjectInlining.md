@@ -381,7 +381,7 @@ public abstract static class AddAbsNode extends Node {
 _Cached Nodes with Multiple Instances_
 
 For nodes with specializations that may have multiple instances a `@Bind("this") Node node` parameter must be used to access the inline target node.
-This is simliar to the `SumArrayNode` node in the advanced usage example.
+This is similar to the `SumArrayNode` node in the advanced usage example.
 
 ```java
 @ImportStatic(AbstractArray.class)
@@ -428,7 +428,7 @@ For example:
         /* ... */
 
         @ExportMessage
-        final long abs(@Bind("$node") Node node,
+        final long abs(@Bind Node node,
                        @Cached InlinedConditionProfile profile) {
             if (profile.profile(node, this.value >= 0)) {
                 return  this.value;
@@ -468,7 +468,7 @@ In order to support inlining across stable API boundaries, it is recommended to 
 
 As an example, consider the following node:
 
-```
+```java
 @GenerateInline
 @GenerateUncached
 @GeneratePackagePrivate
@@ -486,8 +486,8 @@ public abstract static class APINode extends Node {
         return -v;
     }
 
-    public static APINode inline(@RequiredField(value = StateField.class, bits = 32) InlineContext context) {
-        return APINodeGen.inline(context);
+    public static APINode inline(@RequiredField(value = StateField.class, bits = 32) InlineTarget target) {
+        return APINodeGen.inline(target);
     }
 
     public static APINode create() {
@@ -505,6 +505,10 @@ We specify a manual `inline` method that specifies the required bits for this no
 If the specializations of a node require more bits or more additional fields other than specified, then the annotation processor fails with an error.
 If the node requires fewer bits, then this does not cause any compiler error.
 This allows API to use node inlining across stable API boundaries as long as the reserved field capacity is not exceeded.
+
+Reference-typed required fields participate in the same compatibility contract. For generated inline methods, the DSL now preserves concrete node types for public node fields and node arrays in `@RequiredField(type = ...)`. This means that a generated signature may change incompatibly if a public cached child field changes from one concrete node type to another. Non-public or generated helper node types are still widened to generic `Node.class` or `Node[].class` and are therefore not exposed in generated inline signatures.
+
+If you need a stable inline API, prefer declaring a handwritten `inline(InlineTarget)` method and pin `ReferenceField` requirements to a stable public supertype, for example `Node.class`, instead of relying on the generated concrete node type. This allows the implementation to evolve as long as the reserved state bits and chosen public supertype remain compatible.
 
 A change is compatible if:
 * There was previously no `inline` method for this node before.

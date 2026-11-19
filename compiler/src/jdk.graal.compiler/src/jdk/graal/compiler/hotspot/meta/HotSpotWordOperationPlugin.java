@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ import static org.graalvm.word.LocationIdentity.any;
 
 import org.graalvm.word.LocationIdentity;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.bytecode.BridgeMethodUtils;
 import jdk.graal.compiler.core.common.memory.BarrierType;
@@ -92,27 +93,26 @@ public class HotSpotWordOperationPlugin extends WordOperationPlugin {
             return false;
         }
 
-        HotSpotOperation operation = BridgeMethodUtils.getAnnotation(HotSpotOperation.class, method);
+        AnnotationValue operation = BridgeMethodUtils.getAnnotation(HotSpotOperation.class, method);
         if (operation == null) {
             processWordOperation(b, args, wordTypes.getWordOperation(method, b.getMethod().getDeclaringClass()));
             return true;
         }
-        processHotSpotWordOperation(b, method, args, operation);
+        HotspotOpcode opcode = operation.getEnum("opcode", HotspotOpcode.class);
+        processHotSpotWordOperation(b, method, args, opcode);
         return true;
     }
 
-    protected void processHotSpotWordOperation(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args, HotSpotOperation operation) {
+    protected void processHotSpotWordOperation(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args, HotspotOpcode opcode) {
         JavaKind returnKind = method.getSignature().getReturnKind();
-        switch (operation.opcode()) {
+        switch (opcode) {
             case POINTER_EQ:
             case POINTER_NE:
                 assert args.length == 2 : args;
-                HotspotOpcode opcode = operation.opcode();
                 ValueNode left = args[0];
                 ValueNode right = args[1];
                 assert left.stamp(NodeView.DEFAULT) instanceof MetaspacePointerStamp : left + " " + left.stamp(NodeView.DEFAULT);
                 assert right.stamp(NodeView.DEFAULT) instanceof MetaspacePointerStamp : right + " " + right.stamp(NodeView.DEFAULT);
-                assert opcode == POINTER_EQ || opcode == POINTER_NE : opcode;
 
                 PointerEqualsNode comparison = b.add(new PointerEqualsNode(left, right));
                 ValueNode eqValue = b.add(forBoolean(opcode == POINTER_EQ));
@@ -132,6 +132,11 @@ public class HotSpotWordOperationPlugin extends WordOperationPlugin {
             case FROM_POINTER:
                 assert args.length == 1 : args;
                 b.addPush(returnKind, PointerCastNode.create(StampFactory.forKind(wordKind), args[0]));
+                break;
+
+            case FROM_COMPRESSED_POINTER:
+                assert args.length == 1 : args;
+                b.addPush(returnKind, PointerCastNode.create(StampFactory.forKind(JavaKind.Int), args[0]));
                 break;
 
             case TO_KLASS_POINTER:
@@ -160,7 +165,7 @@ public class HotSpotWordOperationPlugin extends WordOperationPlugin {
                 break;
 
             default:
-                throw GraalError.shouldNotReachHere("unknown operation: " + operation.opcode()); // ExcludeFromJacocoGeneratedReport
+                throw GraalError.shouldNotReachHere("unknown operation: " + opcode); // ExcludeFromJacocoGeneratedReport
         }
     }
 }

@@ -26,6 +26,8 @@ package jdk.graal.compiler.hotspot.replacements;
 
 import static jdk.graal.compiler.replacements.SnippetTemplate.DEFAULT_REPLACER;
 
+import org.graalvm.word.impl.Word;
+
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.api.replacements.Snippet.ConstantParameter;
 import jdk.graal.compiler.core.common.type.StampFactory;
@@ -40,7 +42,6 @@ import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
 import jdk.graal.compiler.replacements.Snippets;
 import jdk.graal.compiler.replacements.nodes.CStringConstant;
 import jdk.graal.compiler.replacements.nodes.LogNode;
-import jdk.graal.compiler.word.Word;
 
 /**
  * Collection of snippets to lower {@link LogNode} with different input edge constellations.
@@ -94,8 +95,8 @@ public class LogSnippets implements Snippets {
             } else if (logNode.getL1() != null) {
                 info = printf1;
             }
-            Arguments args = new Arguments(info, graph.getGuardsStage(), tool.getLoweringStage());
-            args.addConst("message", graph.unique(new ConstantNode(new CStringConstant(logNode.message()), StampFactory.pointer())));
+            Arguments args = new Arguments(info, graph, tool.getLoweringStage());
+            args.add("message", graph.unique(new ConstantNode(new CStringConstant(logNode.message()), StampFactory.pointer())));
             if (logNode.getL1() != null) {
                 args.add("l1", logNode.getL1());
             }

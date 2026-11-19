@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,10 @@
  */
 package com.oracle.svm.core.posix.thread;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
@@ -39,20 +42,19 @@ import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.posix.PosixUtils;
 import com.oracle.svm.core.posix.headers.Errno;
 import com.oracle.svm.core.posix.headers.Pthread;
+import com.oracle.svm.guest.staging.config.SubstrateGuestLibC;
 import com.oracle.svm.core.posix.headers.Pthread.pthread_attr_t;
 import com.oracle.svm.core.posix.headers.Pthread.pthread_cond_t;
 import com.oracle.svm.core.posix.headers.Pthread.pthread_mutex_t;
@@ -62,21 +64,32 @@ import com.oracle.svm.core.posix.headers.Unistd;
 import com.oracle.svm.core.posix.headers.darwin.DarwinPthread;
 import com.oracle.svm.core.posix.headers.linux.LinuxPthread;
 import com.oracle.svm.core.posix.pthread.PthreadConditionUtils;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
 import com.oracle.svm.core.thread.Parker;
 import com.oracle.svm.core.thread.Parker.ParkerFactory;
 import com.oracle.svm.core.thread.PlatformThreads;
-import com.oracle.svm.core.thread.VMThreads.OSThreadHandle;
-import com.oracle.svm.core.util.BasedOnJDKFile;
-import com.oracle.svm.core.util.UnsignedUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.guest.staging.core.thread.OSThreadHandle;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
 import jdk.internal.misc.Unsafe;
 
 @AutomaticallyRegisteredImageSingleton(PlatformThreads.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public final class PosixPlatformThreads extends PlatformThreads {
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     @SuppressFBWarnings(value = "BC", justification = "Cast for @TargetClass")
     private static Target_java_lang_Thread toTarget(Thread thread) {
         return Target_java_lang_Thread.class.cast(thread);
@@ -86,71 +99,100 @@ public final class PosixPlatformThreads extends PlatformThreads {
     PosixPlatformThreads() {
     }
 
+    /** This method must not throw any exceptions. */
     @Override
-    protected boolean doStartThread(Thread thread, long stackSize) {
+    protected IsolateThread doStartThread(Thread thread, long javaStackSize) {
+        assert StackOverflowCheck.singleton().isYellowZoneAvailable();
+
         pthread_attr_t attributes = UnsafeStackValue.get(pthread_attr_t.class);
         if (Pthread.pthread_attr_init(attributes) != 0) {
-            return false;
+            return Word.nullPointer();
         }
         try {
             if (Pthread.pthread_attr_setdetachstate(attributes, Pthread.PTHREAD_CREATE_JOINABLE()) != 0) {
-                return false;
+                return Word.nullPointer();
             }
 
-            UnsignedWord threadStackSize = WordFactory.unsigned(stackSize);
-            /* If there is a chosen stack size, use it as the stack size. */
-            if (threadStackSize.notEqual(WordFactory.zero())) {
-                /* Make sure the chosen stack size is large enough. */
-                threadStackSize = UnsignedUtils.max(threadStackSize, Pthread.PTHREAD_STACK_MIN());
-                /* Make sure the chosen stack size is a multiple of the system page size. */
-                threadStackSize = UnsignedUtils.roundUp(threadStackSize, WordFactory.unsigned(Unistd.getpagesize()));
-
-                if (Pthread.pthread_attr_setstacksize(attributes, threadStackSize) != 0) {
-                    return false;
+            if (javaStackSize != 0L) {
+                UnsignedWord nativeStackSize = computeNativeStackSize(attributes, javaStackSize, true);
+                if (nativeStackSize == UnsignedUtils.MAX_VALUE || Pthread.pthread_attr_setstacksize(attributes, nativeStackSize) != 0) {
+                    return Word.nullPointer();
                 }
             }
 
-            /*
-             * Prevent stack overflow errors so that starting the thread and reverting back to a
-             * safe state (in case of an error) works reliably.
-             */
-            StackOverflowCheck.singleton().makeYellowZoneAvailable();
-            try {
-                return doStartThread0(thread, attributes);
-            } finally {
-                StackOverflowCheck.singleton().protectYellowZone();
-            }
+            return doStartThread0(thread, attributes);
         } finally {
             Pthread.pthread_attr_destroy(attributes);
         }
     }
 
-    /** Starts a thread to the point so that it is executing. */
-    @NeverInline("Workaround for GR-51925 - prevent that reads float from this method into the caller.")
-    private boolean doStartThread0(Thread thread, pthread_attr_t attributes) {
-        ThreadStartData startData = prepareStart(thread, SizeOf.get(ThreadStartData.class));
-        try {
-            Pthread.pthread_tPointer newThread = UnsafeStackValue.get(Pthread.pthread_tPointer.class);
-            if (Pthread.pthread_create(newThread, attributes, threadStartRoutine.getFunctionPointer(), startData) != 0) {
-                undoPrepareStartOnError(thread, startData);
-                return false;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord computeNativeStackSize(pthread_attr_t attributes, long stackSize, boolean isJavaStackSize) {
+        assert stackSize != 0;
+
+        UnsignedWord result = Word.unsigned(stackSize);
+        if (isJavaStackSize) {
+            UnsignedWord includedGuardSize = computeGuardSizeIncludedInStackSize(attributes);
+            if (includedGuardSize == UnsignedUtils.MAX_VALUE) {
+                return UnsignedUtils.MAX_VALUE;
             }
-            return true;
-        } catch (Throwable e) {
-            throw VMError.shouldNotReachHere("No exception must be thrown after creating the thread start data.", e);
+            result = result.add(includedGuardSize);
         }
+        result = UnsignedUtils.max(result, Pthread.PTHREAD_STACK_MIN());
+
+        /* Make sure the native stack size is a multiple of the system page size. */
+        return UnsignedUtils.roundUp(result, Word.unsigned(Unistd.NoTransitions.getpagesize()));
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static UnsignedWord computeGuardSizeIncludedInStackSize(pthread_attr_t attr) {
+        if (Platform.includedIn(Platform.LINUX.class)) {
+            if (SubstrateGuestLibC.isMusl()) {
+                /* pthread_attr_getstack() already excludes the guard size correctly. */
+                return Word.zero();
+            } else if (SubstrateGuestLibC.isGLibC() || SubstrateGuestLibC.isBionic()) {
+                /* pthread_attr_getstack() includes the guard size, so determine and subtract the guard size. */
+                WordPointer guardSizePtr = StackValue.get(WordPointer.class);
+                if (Pthread.pthread_attr_getguardsize(attr, guardSizePtr) != 0) {
+                    return UnsignedUtils.MAX_VALUE;
+                }
+                return guardSizePtr.read();
+            } else {
+                throw VMError.shouldNotReachHere("Unexpected libc implementation");
+            }
+        }
+        /* On other platforms, such as macOS, the guard size is excluded correctly. */
+        return Word.zero();
+    }
+
+    /** Starts a thread to the point so that it is executing. This method must not throw any exceptions. */
+    @NeverInline("Workaround for GR-51925 - prevent that reads float from this method into the caller.")
+    private IsolateThread doStartThread0(Thread thread, pthread_attr_t attributes) {
+        assert StackOverflowCheck.singleton().isYellowZoneAvailable();
+
+        IsolateThread isolateThread = prepareThreadStart(thread);
+        if (isolateThread.isNull()) {
+            return Word.nullPointer();
+        }
+        Pthread.pthread_tPointer newThread = UnsafeStackValue.get(Pthread.pthread_tPointer.class);
+        if (Pthread.pthread_create(newThread, attributes, threadStartEntryPoint.getFunctionPointer(), isolateThread) != 0) {
+            undoPrepareStartOnError(thread, isolateThread);
+            return Word.nullPointer();
+        }
+        return isolateThread;
+    }
+
+    @Uninterruptible(reason = "Thread is not fully set up yet.")
     private static void setPthreadIdentifier(Thread thread, Pthread.pthread_t pthread) {
         toTarget(thread).hasPthreadIdentifier = true;
         toTarget(thread).pthreadIdentifier = pthread;
     }
 
-    static Pthread.pthread_t getPthreadIdentifier(Thread thread) {
+    private static Pthread.pthread_t getPthreadIdentifier(Thread thread) {
         return toTarget(thread).pthreadIdentifier;
     }
 
-    static boolean hasThreadIdentifier(Thread thread) {
+    private static boolean hasThreadIdentifier(Thread thread) {
         return toTarget(thread).hasPthreadIdentifier;
     }
 
@@ -201,45 +243,42 @@ public final class PosixPlatformThreads extends PlatformThreads {
      * isolate.
      */
     @Override
-    protected void beforeThreadRun(Thread thread) {
+    @Uninterruptible(reason = "Thread is not fully set up yet.")
+    protected void afterThreadStart(Thread thread) {
         /* Complete the initialization of the thread, now that it is (nearly) running. */
         setPthreadIdentifier(thread, Pthread.pthread_self());
-        setNativeName(thread, thread.getName());
     }
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public OSThreadHandle startThreadUnmanaged(CFunctionPointer threadRoutine, PointerBase userData, int stackSize) {
+    public OSThreadHandle startThreadUnmanaged(CFunctionPointer threadRoutine, PointerBase userData, long stackSize, boolean isJavaStackSize) {
         pthread_attr_t attributes = StackValue.get(pthread_attr_t.class);
         int status = Pthread.pthread_attr_init_no_transition(attributes);
         if (status != 0) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         try {
             status = Pthread.pthread_attr_setdetachstate_no_transition(attributes, Pthread.PTHREAD_CREATE_JOINABLE());
             if (status != 0) {
-                return WordFactory.nullPointer();
+                return Word.nullPointer();
             }
 
-            UnsignedWord threadStackSize = WordFactory.unsigned(stackSize);
-            /* If there is a chosen stack size, use it as the stack size. */
-            if (threadStackSize.notEqual(WordFactory.zero())) {
-                /* Make sure the chosen stack size is large enough. */
-                threadStackSize = UnsignedUtils.max(threadStackSize, Pthread.PTHREAD_STACK_MIN());
-                /* Make sure the chosen stack size is a multiple of the system page size. */
-                threadStackSize = UnsignedUtils.roundUp(threadStackSize, WordFactory.unsigned(Unistd.NoTransitions.getpagesize()));
+            if (stackSize != 0L) {
+                UnsignedWord nativeStackSize = computeNativeStackSize(attributes, stackSize, isJavaStackSize);
+                if (nativeStackSize == UnsignedUtils.MAX_VALUE) {
+                    return Word.nullPointer();
+                }
 
-                status = Pthread.pthread_attr_setstacksize_no_transition(attributes, threadStackSize);
+                status = Pthread.pthread_attr_setstacksize_no_transition(attributes, nativeStackSize);
                 if (status != 0) {
-                    return WordFactory.nullPointer();
+                    return Word.nullPointer();
                 }
             }
 
             Pthread.pthread_tPointer newThread = StackValue.get(Pthread.pthread_tPointer.class);
-
             status = Pthread.pthread_create_no_transition(newThread, attributes, threadRoutine, userData);
             if (status != 0) {
-                return WordFactory.nullPointer();
+                return Word.nullPointer();
             }
 
             return newThread.read();
@@ -256,10 +295,16 @@ public final class PosixPlatformThreads extends PlatformThreads {
     }
 
     @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean supportsUnmanagedThreadLocal() {
+        return true;
+    }
+
+    @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public ThreadLocalKey createUnmanagedThreadLocal() {
         Pthread.pthread_key_tPointer key = StackValue.get(Pthread.pthread_key_tPointer.class);
-        PosixUtils.checkStatusIs0(Pthread.pthread_key_create(key, WordFactory.nullPointer()), "pthread_key_create(key, keyDestructor): failed.");
+        PosixUtils.checkStatusIs0(Pthread.pthread_key_create(key, Word.nullPointer()), "pthread_key_create(key, keyDestructor): failed.");
         return (ThreadLocalKey) key.read();
     }
 
@@ -326,7 +371,7 @@ final class PosixParker extends Parker {
         relativeCond = (pthread_cond_t) memory.add(mutexSize);
         absoluteCond = (pthread_cond_t) memory.add(mutexSize).add(condSize);
 
-        final Pthread.pthread_mutexattr_t mutexAttr = WordFactory.nullPointer();
+        final Pthread.pthread_mutexattr_t mutexAttr = Word.nullPointer();
         PosixUtils.checkStatusIs0(Pthread.pthread_mutex_init(mutex, mutexAttr), "mutex initialization");
         PosixUtils.checkStatusIs0(PthreadConditionUtils.initConditionWithRelativeTime(relativeCond), "relative-time condition variable initialization");
         PosixUtils.checkStatusIs0(PthreadConditionUtils.initConditionWithAbsoluteTime(absoluteCond), "absolute-time condition variable initialization");
@@ -354,7 +399,7 @@ final class PosixParker extends Parker {
         }
     }
 
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/os/posix/os_posix.cpp#L1662-L1738")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23+10/src/hotspot/os/posix/os_posix.cpp#L1662-L1738")
     private void park0(boolean isAbsolute, long time) {
         int status = Pthread.pthread_mutex_trylock_no_transition(mutex);
         if (status == Errno.EBUSY()) {
@@ -378,7 +423,7 @@ final class PosixParker extends Parker {
                     }
                     assert status == 0 || status == Errno.ETIMEDOUT();
                 } finally {
-                    currentCond = WordFactory.nullPointer();
+                    currentCond = Word.nullPointer();
                 }
             }
             event = 0;
@@ -393,7 +438,7 @@ final class PosixParker extends Parker {
     }
 
     @Override
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/os/posix/os_posix.cpp#L1740-L1763")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23+10/src/hotspot/os/posix/os_posix.cpp#L1740-L1763")
     protected void unpark() {
         StackOverflowCheck.singleton().makeYellowZoneAvailable();
         try {
@@ -429,19 +474,20 @@ final class PosixParker extends Parker {
         /* The conditions and the mutex are allocated with a single malloc. */
         int status = Pthread.pthread_cond_destroy(relativeCond);
         assert status == 0;
-        relativeCond = WordFactory.nullPointer();
+        relativeCond = Word.nullPointer();
 
         status = Pthread.pthread_cond_destroy(absoluteCond);
         assert status == 0;
-        absoluteCond = WordFactory.nullPointer();
+        absoluteCond = Word.nullPointer();
 
         status = Pthread.pthread_mutex_destroy(mutex);
         assert status == 0;
         NativeMemory.free(mutex);
-        mutex = WordFactory.nullPointer();
+        mutex = Word.nullPointer();
     }
 }
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 @AutomaticallyRegisteredImageSingleton(ParkerFactory.class)
 class PosixParkerFactory implements Parker.ParkerFactory {
     @Override

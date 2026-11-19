@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -172,6 +172,10 @@ public class CodeTreeBuilder {
         return createBuilder().type(s).build();
     }
 
+    public static CodeTree singleVariable(VariableElement s) {
+        return createBuilder().variable(s).build();
+    }
+
     private CodeTreeBuilder push(CodeTreeKind kind) {
         return push(new BuilderCodeTree(currentElement, kind, null, null), kind == NEW_LINE);
     }
@@ -263,6 +267,10 @@ public class CodeTreeBuilder {
         return startCall((CodeTree) null, callSite);
     }
 
+    public CodeTreeBuilder startCall(VariableElement receiver, String callSite) {
+        return startCall(receiver.getSimpleName().toString(), callSite);
+    }
+
     public CodeTreeBuilder startCall(String receiver, ExecutableElement method) {
         if (receiver == null && method.getModifiers().contains(Modifier.STATIC)) {
             return startStaticCall(method.getEnclosingElement().asType(), method.getSimpleName().toString());
@@ -281,14 +289,14 @@ public class CodeTreeBuilder {
 
     public CodeTreeBuilder startCall(CodeTree receiver, String callSite) {
         if (receiver == null) {
-            return startGroup().string(callSite).startParanthesesCommaGroup().endAfter();
+            return startGroup().string(callSite).startParenthesesCommaGroup().endAfter();
         } else {
-            return startGroup().tree(receiver).string(".").string(callSite).startParanthesesCommaGroup().endAfter();
+            return startGroup().tree(receiver).string(".").string(callSite).startParenthesesCommaGroup().endAfter();
         }
     }
 
     public CodeTreeBuilder startStaticCall(TypeMirror type, String methodName) {
-        return startGroup().push(CodeTreeKind.STATIC_METHOD_REFERENCE, type, methodName).startParanthesesCommaGroup().endAfter();
+        return startGroup().push(CodeTreeKind.STATIC_METHOD_REFERENCE, type, methodName).startParenthesesCommaGroup().endAfter();
     }
 
     public CodeTreeBuilder startStaticCall(ExecutableElement method) {
@@ -339,7 +347,7 @@ public class CodeTreeBuilder {
         return this;
     }
 
-    private CodeTreeBuilder startParanthesesCommaGroup() {
+    private CodeTreeBuilder startParenthesesCommaGroup() {
         startGroup();
         string("(").startCommaGroup();
         registerCallBack(new EndCallback() {
@@ -375,7 +383,7 @@ public class CodeTreeBuilder {
         return this;
     }
 
-    public CodeTreeBuilder startParantheses() {
+    public CodeTreeBuilder startParentheses() {
         startGroup();
         string("(").startGroup();
         registerCallBack(new EndCallback() {
@@ -452,7 +460,7 @@ public class CodeTreeBuilder {
     }
 
     public CodeTreeBuilder startWhile() {
-        return startGroup().string("while ").startParanthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
+        return startGroup().string("while ").startParenthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
     }
 
     public CodeTreeBuilder startDoBlock() {
@@ -461,15 +469,15 @@ public class CodeTreeBuilder {
 
     public CodeTreeBuilder startDoWhile() {
         clearLast(CodeTreeKind.NEW_LINE);
-        return startStatement().string(" while ").startParanthesesCommaGroup().endAfter().startGroup().endAfter();
+        return startStatement().string(" while ").startParenthesesCommaGroup().endAfter().startGroup().endAfter();
     }
 
     public CodeTreeBuilder startIf() {
-        return startGroup().string("if ").startParanthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
+        return startGroup().string("if ").startParenthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
     }
 
     public CodeTreeBuilder startFor() {
-        return startGroup().string("for ").startParantheses().endAndWhitespaceAfter().startGroup().endAfter();
+        return startGroup().string("for ").startParentheses().endAndWhitespaceAfter().startGroup().endAfter();
     }
 
     public boolean startIf(boolean elseIf) {
@@ -483,7 +491,15 @@ public class CodeTreeBuilder {
 
     public CodeTreeBuilder startElseIf() {
         clearLast(CodeTreeKind.NEW_LINE);
-        return startGroup().string(" else if ").startParanthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
+        return startGroup().string(" else if ").startParenthesesCommaGroup().endAndWhitespaceAfter().startGroup().endAfter();
+    }
+
+    public CodeTreeBuilder startElseBlock(boolean elseIf) {
+        if (elseIf) {
+            return startElseBlock();
+        } else {
+            return startGroup();
+        }
     }
 
     public CodeTreeBuilder startElseBlock() {
@@ -530,7 +546,7 @@ public class CodeTreeBuilder {
     }
 
     public CodeTreeBuilder startSwitch() {
-        return startGroup().string("switch ").startParantheses().endAndWhitespaceAfter();
+        return startGroup().string("switch ").startParentheses().endAndWhitespaceAfter();
     }
 
     public CodeTreeBuilder startReturn() {
@@ -576,12 +592,37 @@ public class CodeTreeBuilder {
         return string("// ").string(text).newLine();
     }
 
-    public CodeTreeBuilder startNew(TypeMirror uninializedNodeClass) {
-        return startGroup().string("new ").type(uninializedNodeClass).startParanthesesCommaGroup().endAfter();
+    public CodeTreeBuilder lineCommentf(String text, Object... args) {
+        return lineComment(String.format(text, args));
+    }
+
+    public CodeTreeBuilder startComment() {
+        string("/*");
+        startGroup();
+        registerCallBack(new EndCallback() {
+
+            public void beforeEnd() {
+                string("*/");
+
+            }
+
+            public void afterEnd() {
+            }
+        });
+
+        return this;
+    }
+
+    public CodeTreeBuilder startNew(TypeMirror uninitializedNodeClass) {
+        return startGroup().string("new ").type(uninitializedNodeClass).startParenthesesCommaGroup().endAfter();
     }
 
     public CodeTreeBuilder startNew(String typeName) {
-        return startGroup().string("new ").string(typeName).startParanthesesCommaGroup().endAfter();
+        return startGroup().string("new ").string(typeName).startParenthesesCommaGroup().endAfter();
+    }
+
+    public CodeTreeBuilder startNew(CodeTree typeTree) {
+        return startGroup().string("new ").tree(typeTree).startParenthesesCommaGroup().endAfter();
     }
 
     public CodeTreeBuilder startIndention() {
@@ -640,7 +681,7 @@ public class CodeTreeBuilder {
     }
 
     public CodeTreeBuilder startSynchronized(CodeTree object) {
-        return string("synchronized").startParantheses().tree(object).end().startBlock();
+        return string("synchronized").startParentheses().tree(object).end().startBlock();
     }
 
     private void registerCallBack(EndCallback callback) {
@@ -662,6 +703,23 @@ public class CodeTreeBuilder {
 
     public CodeTreeBuilder declaration(TypeMirror type, String name, String init) {
         return declaration(type, name, singleString(init));
+    }
+
+    public CodeTreeBuilder startDeclaration(TypeMirror type, String name) {
+        if (ElementUtils.isVoid(type)) {
+            startStatement();
+        } else {
+            startStatement();
+            type(type);
+            string(" ");
+            string(name);
+            string(" = ");
+        }
+        return this;
+    }
+
+    public CodeTreeBuilder declaration(TypeMirror type, String name) {
+        return declaration(type, name, (CodeTree) null);
     }
 
     public CodeTreeBuilder declarationDefault(TypeMirror type, String name) {
@@ -769,6 +827,10 @@ public class CodeTreeBuilder {
         return this;
     }
 
+    public CodeTreeBuilder cast(TypeMirror type, String content) {
+        return cast(type, CodeTreeBuilder.singleString(content));
+    }
+
     public CodeTreeBuilder cast(TypeMirror type, CodeTree content) {
         if (ElementUtils.isVoid(type)) {
             tree(content);
@@ -779,7 +841,7 @@ public class CodeTreeBuilder {
     }
 
     public CodeTreeBuilder startSuperCall() {
-        return string("super").startParanthesesCommaGroup();
+        return string("super").startParenthesesCommaGroup();
     }
 
     public CodeTreeBuilder returnFalse() {
@@ -807,6 +869,14 @@ public class CodeTreeBuilder {
 
     public CodeTreeBuilder instanceOf(CodeTree var, TypeMirror type) {
         return tree(var).string(" instanceof ").type(type);
+    }
+
+    public CodeTreeBuilder instanceOf(String var, TypeMirror type) {
+        return string(var).string(" instanceof ").type(type);
+    }
+
+    public CodeTreeBuilder instanceOf(String var, TypeMirror type, String binding) {
+        return string(var).string(" instanceof ").type(type).string(" " + binding);
     }
 
     public CodeTreeBuilder instanceOf(TypeMirror type) {
@@ -957,6 +1027,7 @@ public class CodeTreeBuilder {
                     }
                     break;
                 case TYPE:
+                case TYPE_LITERAL:
                     write(ElementUtils.getSimpleName(e.getType()));
                     break;
                 case STATIC_METHOD_REFERENCE:
@@ -1011,6 +1082,25 @@ public class CodeTreeBuilder {
         return startStatement().field(receiver, field).string(" = ");
     }
 
+    public CodeTreeBuilder startAssign(String variableName) {
+        return startStatement().string(variableName).string(" = ");
+    }
+
+    public CodeTreeBuilder startAssign(VariableElement variable) {
+        return startAssign(variable.getSimpleName().toString());
+    }
+
+    public CodeTreeBuilder variable(VariableElement variable) {
+        return string(variable.getSimpleName().toString());
+    }
+
+    public CodeTreeBuilder variables(List<? extends VariableElement> variables) {
+        for (VariableElement variable : variables) {
+            variable(variable);
+        }
+        return this;
+    }
+
     public CodeTreeBuilder field(String receiver, VariableElement field) {
         if (receiver == null && field.getModifiers().contains(Modifier.STATIC)) {
             return staticReference(field);
@@ -1024,6 +1114,13 @@ public class CodeTreeBuilder {
             return string("(byte) ", String.valueOf(index));
         }
         return null;
+    }
+
+    public CodeTreeBuilder lines(List<String> lines) {
+        for (String line : lines) {
+            string(line).newLine();
+        }
+        return this;
     }
 
 }

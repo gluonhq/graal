@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -70,6 +70,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
@@ -159,6 +160,98 @@ public class MultiThreadedLanguageTest extends AbstractThreadedPolyglotTest {
         } catch (ClassCastException e) {
         } catch (IllegalArgumentException e) {
         } catch (NullPointerException e) {
+        }
+    }
+
+    private static String threadDescriptionPattern(Thread thread) {
+        // The first '#' introduces the thread ID; do not match IDs in names or prefixes of other IDs.
+        return "[^#]*#" + thread.threadId() + "(?![0-9]).*";
+    }
+
+    private static void assertThreadAccessError(String message, Thread requestingThread, Thread activeThread) {
+        String pattern = Pattern.quote("Multi threaded access requested by thread ") + threadDescriptionPattern(requestingThread) +
+                        Pattern.quote(" but is not allowed for language(s) " + MultiThreadedLanguage.ID + ".");
+        if (activeThread != null) {
+            pattern += Pattern.quote(" Thread ") + threadDescriptionPattern(activeThread) + Pattern.quote(" was already active.");
+        }
+        assertTrue(message, message.matches(pattern));
+    }
+
+    @Test
+    public void testSingleThreadedAccessErrorIncludesActiveThread() throws Exception {
+        MultiThreadedLanguage.isThreadAccessAllowed = (req) -> req.singleThreaded;
+        ExecutorService executor = createExecutor(1, vthreads);
+        for (boolean seenThread : new boolean[]{false, true}) {
+            try (Context context = Context.create(MultiThreadedLanguage.ID)) {
+                context.initialize(MultiThreadedLanguage.ID);
+                if (seenThread) {
+                    executor.submit(() -> {
+                        context.enter();
+                        context.leave();
+                    }).get(10, TimeUnit.SECONDS);
+                }
+                Thread activeThread = Thread.currentThread();
+                context.enter();
+                try {
+                    executor.submit(() -> {
+                        Thread.currentThread().setName("requesting-thread");
+                        AbstractPolyglotTest.assertFails(() -> {
+                            context.enter();
+                            context.leave();
+                        }, IllegalStateException.class, (e) -> {
+                            assertThreadAccessError(e.getMessage(), Thread.currentThread(), activeThread);
+                        });
+                    }).get(10, TimeUnit.SECONDS);
+                } finally {
+                    context.leave();
+                }
+                executor.submit(() -> {
+                    context.enter();
+                    context.leave();
+                }).get(10, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    public void testMultiThreadedAccessErrorWithoutTransition() throws Exception {
+        ExecutorService executor = createExecutor(1, vthreads);
+        try (Context context = Context.create(MultiThreadedLanguage.ID)) {
+            // Transition before initializing the language that will deny multithreaded access.
+            context.enter();
+            try {
+                executor.submit(() -> {
+                    context.enter();
+                    context.leave();
+                }).get(10, TimeUnit.SECONDS);
+            } finally {
+                context.leave();
+            }
+
+            AtomicReference<Thread> deniedThread = new AtomicReference<>();
+            Function<ThreadRequest, Boolean> denyMultiThreadedAccess = (req) -> {
+                if (!req.singleThreaded) {
+                    deniedThread.set(req.thread);
+                }
+                return req.singleThreaded;
+            };
+            MultiThreadedLanguage.isThreadAccessAllowed = denyMultiThreadedAccess;
+            AbstractPolyglotTest.assertFails(() -> context.initialize(MultiThreadedLanguage.ID), IllegalStateException.class, (e) -> {
+                assertThreadAccessError(e.getMessage(), deniedThread.get(), null);
+            });
+
+            MultiThreadedLanguage.isThreadAccessAllowed = (req) -> true;
+            context.initialize(MultiThreadedLanguage.ID);
+            MultiThreadedLanguage.isThreadAccessAllowed = denyMultiThreadedAccess;
+            // A previously unseen thread is rejected without another multithreading transition.
+            createExecutor(1, vthreads).submit(() -> {
+                AbstractPolyglotTest.assertFails(() -> {
+                    context.enter();
+                    context.leave();
+                }, IllegalStateException.class, (e) -> {
+                    assertThreadAccessError(e.getMessage(), deniedThread.get(), null);
+                });
+            }).get(10, TimeUnit.SECONDS);
         }
     }
 
@@ -677,13 +770,17 @@ public class MultiThreadedLanguageTest extends AbstractThreadedPolyglotTest {
     @Test
     public void testMultiThreadedAccessExceptionThrownToCreator() throws Throwable {
         try (Context context = Context.newBuilder(MultiThreadedLanguage.ID).allowCreateThread(true).build()) {
+            AtomicReference<Thread> deniedThread = new AtomicReference<>();
             MultiThreadedLanguage.isThreadAccessAllowed = (req) -> {
+                if (!req.singleThreaded) {
+                    deniedThread.set(req.thread);
+                }
                 return req.singleThreaded;
             };
             eval(context, (env) -> {
                 AbstractPolyglotTest.assertFails(() -> env.newTruffleThreadBuilder(() -> {
                 }).virtual(vthreads).build(), IllegalStateException.class, (ise) -> {
-                    assertTrue(ise.getMessage().contains("Multi threaded access requested by thread"));
+                    assertThreadAccessError(ise.getMessage(), deniedThread.get(), null);
                 });
                 return null;
             });
@@ -699,8 +796,8 @@ public class MultiThreadedLanguageTest extends AbstractThreadedPolyglotTest {
     volatile AtomicInteger initializeCount;
     volatile AtomicInteger disposeCount;
     volatile AtomicInteger initializeMultiThreadingCount;
-    volatile AtomicReference<ThreadRequest> lastInitializeRequest;
-    volatile AtomicReference<ThreadRequest> lastDisposeRequest;
+    final AtomicReference<ThreadRequest> lastInitializeRequest = new AtomicReference<>();
+    final AtomicReference<ThreadRequest> lastDisposeRequest = new AtomicReference<>();
     private final Map<Object, Set<Thread>> initializedThreadsPerContext = Collections.synchronizedMap(new HashMap<>());
 
     @Before
@@ -743,22 +840,34 @@ public class MultiThreadedLanguageTest extends AbstractThreadedPolyglotTest {
         initializeCount = new AtomicInteger(0);
         disposeCount = new AtomicInteger(0);
         initializeMultiThreadingCount = new AtomicInteger(0);
-        lastInitializeRequest = new AtomicReference<>(null);
-        lastDisposeRequest = new AtomicReference<>(null);
+        lastInitializeRequest.set(null);
+        lastDisposeRequest.set(null);
         initializedThreadsPerContext.clear();
     }
 
     @After
     public void teardown() {
-        threads.clear();
-        for (ExecutorService executor : executors) {
-            assertTrue(executor.shutdownNow().isEmpty());
-        }
-        executors.clear();
-        for (Entry<Object, Set<Thread>> entry : initializedThreadsPerContext.entrySet()) {
-            if (!entry.getValue().isEmpty()) {
-                throw new AssertionError("Threads initialized but not disposed for context " + entry.getKey() + ": " + entry.getValue());
+        try {
+            threads.clear();
+            for (ExecutorService executor : executors) {
+                assertTrue(executor.shutdownNow().isEmpty());
             }
+            executors.clear();
+            for (Entry<Object, Set<Thread>> entry : initializedThreadsPerContext.entrySet()) {
+                if (!entry.getValue().isEmpty()) {
+                    throw new AssertionError("Threads initialized but not disposed for context " + entry.getKey() + ": " + entry.getValue());
+                }
+            }
+        } finally {
+            initializedThreadsPerContext.clear();
+            lastInitializeRequest.set(null);
+            lastDisposeRequest.set(null);
+            MultiThreadedLanguage.initializeThread = null;
+            MultiThreadedLanguage.disposeThread = null;
+            MultiThreadedLanguage.initializeMultiThreading = null;
+            MultiThreadedLanguage.finalizeContext = null;
+            MultiThreadedLanguage.isThreadAccessAllowed = null;
+            MultiThreadedLanguage.langContext = null;
         }
     }
 

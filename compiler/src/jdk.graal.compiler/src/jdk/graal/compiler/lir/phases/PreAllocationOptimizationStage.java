@@ -25,6 +25,7 @@
 package jdk.graal.compiler.lir.phases;
 
 import jdk.graal.compiler.lir.alloc.SaveCalleeSaveRegisters;
+import jdk.graal.compiler.lir.alloc.UseKillMoveInjectionPhase;
 import jdk.graal.compiler.lir.constopt.ConstantLoadOptimization;
 import jdk.graal.compiler.options.OptionValues;
 
@@ -34,6 +35,7 @@ public class PreAllocationOptimizationStage extends LIRPhaseSuite<PreAllocationO
         if (ConstantLoadOptimization.Options.LIROptConstantLoadOptimization.getValue(options)) {
             appendPhase(new ConstantLoadOptimization());
         }
+        appendPhase(new UseKillMoveInjectionPhase());
         appendPhase(new SaveCalleeSaveRegisters());
     }
 }

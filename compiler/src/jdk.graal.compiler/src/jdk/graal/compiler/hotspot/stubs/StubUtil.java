@@ -33,6 +33,8 @@ import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.List;
 
+import org.graalvm.word.LocationIdentity;
+
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.api.replacements.Fold.InjectedParameter;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
@@ -43,9 +45,7 @@ import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor;
 import jdk.graal.compiler.hotspot.nodes.StubForeignCallNode;
 import jdk.graal.compiler.hotspot.nodes.VMErrorNode;
 import jdk.graal.compiler.hotspot.replacements.Log;
-import jdk.graal.compiler.word.Word;
-import org.graalvm.word.LocationIdentity;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 //JaCoCo Exclude
 
@@ -159,7 +159,7 @@ public class StubUtil {
      * Analyzes a given value and prints information about it to the log stream.
      */
     public static void decipher(long value) {
-        vmMessageC(VM_MESSAGE_C, false, WordFactory.zero(), value, 0L, 0L);
+        vmMessageC(VM_MESSAGE_C, false, Word.zero(), value, 0L, 0L);
     }
 
     /**

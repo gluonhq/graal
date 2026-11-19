@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,23 +33,22 @@ import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.charset.CharsetDecoder;
-import java.security.AccessControlContext;
 import java.util.concurrent.ForkJoinPool;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.impl.InternalPlatform;
-import org.graalvm.nativeimage.impl.RuntimeClassInitializationSupport;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
-import com.oracle.svm.core.StaticFieldsSupport;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 
 import jdk.internal.misc.Unsafe;
 
@@ -59,6 +58,7 @@ import jdk.internal.misc.Unsafe;
  */
 
 @TargetClass(java.nio.charset.CharsetEncoder.class)
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-24+23/src/java.base/share/classes/java/nio/charset/Charset-X-Coder.java.template")
 final class Target_java_nio_charset_CharsetEncoder {
     @Alias @RecomputeFieldValue(kind = Reset) //
     private WeakReference<CharsetDecoder> cachedDecoder;
@@ -78,7 +78,12 @@ final class Target_java_util_concurrent_atomic_AtomicReferenceFieldUpdater_Atomi
     /** field value type */
     @Alias private Class<?> vclass;
 
-    // simplified version of the original constructor
+    /*
+     * The field-updater substitutions predate this change and are kept because SVM recomputes
+     * updater offsets for image-heap instances. Runtime-created updaters still run these
+     * constructors, so keep their access checks aligned with the JDK while preserving the existing
+     * Substrate offset handling.
+     */
     @SuppressWarnings("unused")
     @Substitute
     Target_java_util_concurrent_atomic_AtomicReferenceFieldUpdater_AtomicReferenceFieldUpdaterImpl(
@@ -90,6 +95,7 @@ final class Target_java_util_concurrent_atomic_AtomicReferenceFieldUpdater_Atomi
             field = tclass.getDeclaredField(fieldName);
 
             modifiers = field.getModifiers();
+            jdk.internal.reflect.Reflection.ensureMemberAccess(caller, tclass, null, modifiers);
             fieldClass = field.getType();
         } catch (Exception ex) {
             throw new RuntimeException(ex);
@@ -104,8 +110,7 @@ final class Target_java_util_concurrent_atomic_AtomicReferenceFieldUpdater_Atomi
         if (!Modifier.isVolatile(modifiers))
             throw new IllegalArgumentException("Must be volatile type");
 
-        // access checks are disabled
-        this.cclass = tclass;
+        this.cclass = AtomicFieldUpdaterAccessCheck.getAccessCheckClass(tclass, caller, modifiers);
         this.tclass = tclass;
         this.vclass = vclass;
         this.offset = Unsafe.getUnsafe().objectFieldOffset(field);
@@ -122,7 +127,7 @@ final class Target_java_util_concurrent_atomic_AtomicIntegerFieldUpdater_AtomicI
     /** class holding the field */
     @Alias private Class<?> tclass;
 
-    // simplified version of the original constructor
+    /* See AtomicReferenceFieldUpdater substitution above. */
     @SuppressWarnings("unused")
     @Substitute
     Target_java_util_concurrent_atomic_AtomicIntegerFieldUpdater_AtomicIntegerFieldUpdaterImpl(final Class<?> tclass,
@@ -132,6 +137,7 @@ final class Target_java_util_concurrent_atomic_AtomicIntegerFieldUpdater_AtomicI
         try {
             field = tclass.getDeclaredField(fieldName);
             modifiers = field.getModifiers();
+            jdk.internal.reflect.Reflection.ensureMemberAccess(caller, tclass, null, modifiers);
         } catch (Exception ex) {
             throw new RuntimeException(ex);
         }
@@ -142,8 +148,7 @@ final class Target_java_util_concurrent_atomic_AtomicIntegerFieldUpdater_AtomicI
         if (!Modifier.isVolatile(modifiers))
             throw new IllegalArgumentException("Must be volatile type");
 
-        // access checks are disabled
-        this.cclass = tclass;
+        this.cclass = AtomicFieldUpdaterAccessCheck.getAccessCheckClass(tclass, caller, modifiers);
         this.tclass = tclass;
         this.offset = Unsafe.getUnsafe().objectFieldOffset(field);
     }
@@ -159,7 +164,7 @@ final class Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_CASUpdater
     /** class holding the field */
     @Alias private Class<?> tclass;
 
-    // simplified version of the original constructor
+    /* See AtomicReferenceFieldUpdater substitution above. */
     @SuppressWarnings("unused")
     @Substitute
     Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_CASUpdater(final Class<?> tclass,
@@ -169,6 +174,7 @@ final class Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_CASUpdater
         try {
             field = tclass.getDeclaredField(fieldName);
             modifiers = field.getModifiers();
+            jdk.internal.reflect.Reflection.ensureMemberAccess(caller, tclass, null, modifiers);
         } catch (Exception ex) {
             throw new RuntimeException(ex);
         }
@@ -179,48 +185,25 @@ final class Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_CASUpdater
         if (!Modifier.isVolatile(modifiers))
             throw new IllegalArgumentException("Must be volatile type");
 
-        // access checks are disabled
-        this.cclass = tclass;
+        this.cclass = AtomicFieldUpdaterAccessCheck.getAccessCheckClass(tclass, caller, modifiers);
         this.tclass = tclass;
         this.offset = Unsafe.getUnsafe().objectFieldOffset(field);
     }
 
 }
 
-@TargetClass(className = "java.util.concurrent.atomic.AtomicLongFieldUpdater$LockedUpdater", onlyWith = JDK21OrEarlier.class)
-final class Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_LockedUpdater {
-    @Alias @RecomputeFieldValue(kind = AtomicFieldUpdaterOffset) //
-    private long offset;
+final class AtomicFieldUpdaterAccessCheck {
+    /*
+     * Keep the JDK access-check class selection for field updaters whose offsets are recomputed in
+     * the image. This code is part of the native image runtime, not hosted state construction, so it
+     * intentionally uses java.lang.Class rather than JVMCI metadata.
+     */
+    static Class<?> getAccessCheckClass(Class<?> tclass, Class<?> caller, int modifiers) {
+        return Modifier.isProtected(modifiers) && tclass.isAssignableFrom(caller) && !isSamePackage(tclass, caller) ? caller : tclass;
+    }
 
-    /** the same as tclass, used for checks */
-    @Alias private Class<?> cclass;
-    /** class holding the field */
-    @Alias private Class<?> tclass;
-
-    // simplified version of the original constructor
-    @SuppressWarnings("unused")
-    @Substitute
-    Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_LockedUpdater(final Class<?> tclass,
-                    final String fieldName, final Class<?> caller) {
-        Field field = null;
-        int modifiers = 0;
-        try {
-            field = tclass.getDeclaredField(fieldName);
-            modifiers = field.getModifiers();
-        } catch (Exception ex) {
-            throw new RuntimeException(ex);
-        }
-
-        if (field.getType() != long.class)
-            throw new IllegalArgumentException("Must be long type");
-
-        if (!Modifier.isVolatile(modifiers))
-            throw new IllegalArgumentException("Must be volatile type");
-
-        // access checks are disabled
-        this.cclass = tclass;
-        this.tclass = tclass;
-        this.offset = Unsafe.getUnsafe().objectFieldOffset(field);
+    private static boolean isSamePackage(Class<?> firstClass, Class<?> secondClass) {
+        return firstClass.getClassLoader() == secondClass.getClassLoader() && firstClass.getPackageName().equals(secondClass.getPackageName());
     }
 }
 
@@ -229,7 +212,7 @@ final class Target_java_util_concurrent_atomic_AtomicLongFieldUpdater_LockedUpda
 class InnocuousForkJoinWorkerThreadFeature implements InternalFeature {
     @Override
     public void duringSetup(DuringSetupAccess access) {
-        ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtRunTime(access.findClassByName("java.util.concurrent.ForkJoinWorkerThread$InnocuousForkJoinWorkerThread"),
+        JVMCIRuntimeClassInitializationSupport.singleton().initializeAtRunTime(GuestAccess.get().lookupType("java.util.concurrent.ForkJoinWorkerThread$InnocuousForkJoinWorkerThread"),
                         "innocuousThreadGroup must be initialized at run time");
     }
 }
@@ -259,20 +242,11 @@ final class Target_java_util_concurrent_ForkJoinPool {
     }
 
     @Alias //
-    private static Unsafe U;
-
-    @Alias //
-    private static long POOLIDS;
-
-    @Substitute
-    private static int getAndAddPoolIds(int x) {
-        // Original method wrongly uses ForkJoinPool.class instead of calling U.staticFieldBase()
-        return U.getAndAddInt(StaticFieldsSupport.getStaticPrimitiveFields(), POOLIDS, x);
-    }
-
-    @Alias //
     Target_java_util_concurrent_ForkJoinPool(byte forCommonPoolOnly) {
     }
+
+    @Alias //
+    public static native ForkJoinPool asyncCommonPool();
 }
 
 /**
@@ -309,15 +283,6 @@ class ForkJoinPoolCommonAccessor {
         }
         return result;
     }
-}
-
-@TargetClass(value = java.util.concurrent.ForkJoinPool.class, innerClass = "DefaultForkJoinWorkerThreadFactory", onlyWith = JDKLatest.class)
-@SuppressWarnings("removal")
-final class Target_java_util_concurrent_ForkJoinPool_DefaultForkJoinWorkerThreadFactory {
-    @Alias @RecomputeFieldValue(kind = Reset) //
-    static AccessControlContext regularACC;
-    @Alias @RecomputeFieldValue(kind = Reset) //
-    static AccessControlContext commonACC;
 }
 
 /** Dummy class to have a class with the file's name. */

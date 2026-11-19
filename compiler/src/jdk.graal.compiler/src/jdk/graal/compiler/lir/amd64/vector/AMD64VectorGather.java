@@ -64,15 +64,13 @@ public class AMD64VectorGather {
         public static final LIRInstructionClass<VexVectorGatherOp> TYPE = LIRInstructionClass.create(VexVectorGatherOp.class);
 
         @Opcode private final AMD64Assembler.VexGatherOp opcode;
-        // both used and killed, must be a fixed register
-        @Use({OperandFlag.REG}) protected AllocatableValue mask;
-        @Temp({OperandFlag.REG}) protected AllocatableValue maskTemp;
+        // both used and killed
+        @UseKill({OperandFlag.REG}) protected AllocatableValue mask;
 
         public VexVectorGatherOp(AMD64Assembler.VexGatherOp opcode, AVXKind.AVXSize size, AllocatableValue result, AllocatableValue base, AllocatableValue index, AllocatableValue mask) {
             super(TYPE, size, result, base, index);
             this.opcode = opcode;
             this.mask = mask;
-            this.maskTemp = mask;
         }
 
         @Override
@@ -91,15 +89,13 @@ public class AMD64VectorGather {
         public static final LIRInstructionClass<EvexVectorGatherOp> TYPE = LIRInstructionClass.create(EvexVectorGatherOp.class);
 
         @Opcode private final AMD64Assembler.EvexGatherOp opcode;
-        // both used and killed, must be a fixed register
-        @Use({OperandFlag.REG}) protected AllocatableValue mask;
-        @Temp({OperandFlag.REG}) protected AllocatableValue maskTemp;
+        // both used and killed
+        @UseKill({OperandFlag.REG}) protected AllocatableValue mask;
 
         public EvexVectorGatherOp(AMD64Assembler.EvexGatherOp opcode, AVXKind.AVXSize size, AllocatableValue result, AllocatableValue base, AllocatableValue index, AllocatableValue mask) {
             super(TYPE, size, result, base, index);
             this.opcode = opcode;
             this.mask = mask;
-            this.maskTemp = mask;
         }
 
         @Override

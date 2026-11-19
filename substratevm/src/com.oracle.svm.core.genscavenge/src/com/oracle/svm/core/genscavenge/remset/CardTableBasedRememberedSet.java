@@ -24,18 +24,20 @@
  */
 package com.oracle.svm.core.genscavenge.remset;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CORE_GC_CODE;
+
 import java.util.List;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.AlwaysInline;
 import com.oracle.svm.core.genscavenge.AlignedHeapChunk.AlignedHeader;
 import com.oracle.svm.core.genscavenge.GCImpl;
-import com.oracle.svm.core.genscavenge.GreyToBlackObjectVisitor;
 import com.oracle.svm.core.genscavenge.HeapChunk;
 import com.oracle.svm.core.genscavenge.HeapImpl;
 import com.oracle.svm.core.genscavenge.HeapParameters;
@@ -43,10 +45,28 @@ import com.oracle.svm.core.genscavenge.ObjectHeaderImpl;
 import com.oracle.svm.core.genscavenge.Space;
 import com.oracle.svm.core.genscavenge.UnalignedHeapChunk.UnalignedHeader;
 import com.oracle.svm.core.genscavenge.graal.SubstrateCardTableBarrierSet;
-import com.oracle.svm.core.heap.ObjectHeader;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.ObjectHeader;
+import com.oracle.svm.core.heap.PodReferenceMapDecoder;
+import com.oracle.svm.core.heap.StoredContinuation;
+import com.oracle.svm.core.heap.UninterruptibleObjectReferenceVisitor;
+import com.oracle.svm.core.heap.UninterruptibleObjectVisitor;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.guest.staging.hub.HubType;
 import com.oracle.svm.core.image.ImageHeapObject;
-import com.oracle.svm.core.util.HostedByteBufferPointer;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.guest.staging.util.HostedByteBufferPointer;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.nodes.gc.BarrierSet;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -55,6 +75,7 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  * A card table based remembered set where the {@link CardTable} and the {@link FirstObjectTable}
  * are placed in the individual {@link HeapChunk}s.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class CardTableBasedRememberedSet implements RememberedSet {
     @Platforms(Platform.HOSTED_ONLY.class)
     public CardTableBasedRememberedSet() {
@@ -72,8 +93,33 @@ public class CardTableBasedRememberedSet implements RememberedSet {
     }
 
     @Override
-    public UnsignedWord getHeaderSizeOfUnalignedChunk() {
-        return UnalignedChunkRememberedSet.getHeaderSize();
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public UnsignedWord getHeaderSizeOfUnalignedChunk(UnsignedWord objectSize) {
+        return UnalignedChunkRememberedSet.getHeaderSize(objectSize);
+    }
+
+    @Override
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void setObjectStartOffsetOfUnalignedChunk(HostedByteBufferPointer chunk, UnsignedWord objectStartOffset) {
+        UnalignedChunkRememberedSet.setObjectStartOffset(chunk, objectStartOffset);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void setObjectStartOffsetOfUnalignedChunk(UnalignedHeader chunk, UnsignedWord objectStartOffset) {
+        UnalignedChunkRememberedSet.setObjectStartOffset(chunk, objectStartOffset);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public UnsignedWord getObjectStartOffsetOfUnalignedChunk(UnalignedHeader chunk) {
+        return UnalignedChunkRememberedSet.getObjectStartOffset(chunk);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public UnsignedWord getOffsetForObjectInUnalignedChunk(Pointer objPtr) {
+        return UnalignedChunkRememberedSet.getOffsetForObject(objPtr);
     }
 
     @Override
@@ -84,118 +130,211 @@ public class CardTableBasedRememberedSet implements RememberedSet {
 
     @Override
     @Platforms(Platform.HOSTED_ONLY.class)
-    public void enableRememberedSetForUnalignedChunk(HostedByteBufferPointer chunk) {
-        UnalignedChunkRememberedSet.enableRememberedSet(chunk);
+    public void enableRememberedSetForUnalignedChunk(HostedByteBufferPointer chunk, UnsignedWord objectSize) {
+        UnalignedChunkRememberedSet.enableRememberedSet(chunk, objectSize);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void enableRememberedSetForChunk(AlignedHeader chunk) {
         AlignedChunkRememberedSet.enableRememberedSet(chunk);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void enableRememberedSetForChunk(UnalignedHeader chunk) {
         UnalignedChunkRememberedSet.enableRememberedSet(chunk);
     }
 
     @Override
     @AlwaysInline("GC performance")
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void enableRememberedSetForObject(AlignedHeader chunk, Object obj) {
-        AlignedChunkRememberedSet.enableRememberedSetForObject(chunk, obj);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void enableRememberedSetForObject(AlignedHeader chunk, Object obj, UnsignedWord objSize) {
+        AlignedChunkRememberedSet.enableRememberedSetForObject(chunk, obj, objSize);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void clearRememberedSet(AlignedHeader chunk) {
         AlignedChunkRememberedSet.clearRememberedSet(chunk);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void clearRememberedSet(UnalignedHeader chunk) {
         UnalignedChunkRememberedSet.clearRememberedSet(chunk);
     }
 
     @Override
     @AlwaysInline("GC performance")
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public boolean hasRememberedSet(UnsignedWord header) {
+        if (!GraalDirectives.inIntrinsic()) { // too expensive and not necessary in write barriers
+            assert !ObjectHeaderImpl.isMarkedHeader(header) : "use hasRememberedSetInGC";
+        }
         return ObjectHeaderImpl.hasRememberedSet(header);
     }
 
     @Override
     @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void dirtyCardForAlignedObject(Object object, boolean verifyOnly) {
         AlignedChunkRememberedSet.dirtyCardForObject(object, verifyOnly);
     }
 
     @Override
     @AlwaysInline("GC performance")
-    public void dirtyCardForUnalignedObject(Object object, boolean verifyOnly) {
-        UnalignedChunkRememberedSet.dirtyCardForObject(object, verifyOnly);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void dirtyCardForUnalignedObject(Object object, Pointer address, boolean verifyOnly) {
+        UnalignedChunkRememberedSet.dirtyCardForObject(object, address, verifyOnly);
     }
 
     @Override
     @AlwaysInline("GC performance")
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void dirtyCardIfNecessary(Object holderObject, Object object) {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void dirtyCardRangeForUnalignedObject(Object object, Pointer startAddress, Pointer endAddress) {
+        UnalignedChunkRememberedSet.dirtyCardRangeForObject(object, startAddress, endAddress);
+    }
+
+    @Override
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void dirtyCardIfNecessaryInGC(Object holderObject, Object object, Pointer objRef) {
         if (holderObject == null || object == null) {
             return;
         }
-        // We dirty the cards of ...
-        if (HeapParameters.getMaxSurvivorSpaces() != 0 && !GCImpl.getGCImpl().isCompleteCollection() && HeapImpl.getHeapImpl().getYoungGeneration().contains(object)) {
-            /*
-             * ...references from the old generation to the young generation, unless there cannot be
-             * any such references if we do not use survivor spaces, or if we do but are doing a
-             * complete collection: in both cases, all objects are promoted to the old generation.
-             * (We avoid an extra old generation check and might remark a few image heap cards, too)
-             */
-        } else if (HeapImpl.usesImageHeapCardMarking() && GCImpl.getGCImpl().isCompleteCollection() && HeapImpl.getHeapImpl().isInImageHeap(holderObject)) {
-            // ...references from the image heap to the runtime heap, but we clean and remark those
-            // only during complete collections.
-            assert !HeapImpl.getHeapImpl().isInImageHeap(object) : "should never be called for references to image heap objects";
-        } else {
-            return;
-        }
 
-        UnsignedWord objectHeader = ObjectHeader.readHeaderFromObject(holderObject);
-        if (hasRememberedSet(objectHeader)) {
+        assert !HeapImpl.getHeapImpl().isInImageHeap(object) : "should never be called for references to image heap objects";
+
+        if (cardNeedsDirtyingInGC(holderObject, object)) {
             if (ObjectHeaderImpl.isAlignedObject(holderObject)) {
                 AlignedChunkRememberedSet.dirtyCardForObject(holderObject, false);
             } else {
-                assert ObjectHeaderImpl.isUnalignedObject(holderObject) : "sanity";
-                UnalignedChunkRememberedSet.dirtyCardForObject(holderObject, false);
+                assert ObjectHeaderImpl.isUnalignedObject(holderObject);
+                /* Stored continuations use imprecise card marking, so their scanner checks at the start of the object. */
+                Pointer address = holderObject instanceof StoredContinuation ? Word.objectToUntrackedPointer(holderObject) : objRef;
+                UnalignedChunkRememberedSet.dirtyCardForObject(holderObject, address, false);
             }
         }
     }
 
-    @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void walkDirtyObjects(AlignedHeader chunk, GreyToBlackObjectVisitor visitor, boolean clean) {
-        AlignedChunkRememberedSet.walkDirtyObjects(chunk, visitor, clean);
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean cardNeedsDirtyingInGC(Object holderObject, Object object) {
+        assert holderObject != null && object != null;
+
+        if (GCImpl.getGCImpl().isCompleteCollection()) {
+            /*
+             * After a full GC, the young generation is empty. So, there would be nothing to do.
+             * However, we want to keep track of all the references that the image heap or metaspace
+             * have to the runtime heap (regardless of the runtime heap generation). We clean and
+             * remark those only during complete collections.
+             */
+            return HeapImpl.usesImageHeapCardMarking() && HeapImpl.getHeapImpl().isInImageHeap(holderObject) ||
+                            Metaspace.singleton().isInAddressSpace(holderObject);
+        }
+
+        /*
+         * If we don't have any survivor spaces, then there is nothing to do because the young
+         * generation will be empty after a young GC.
+         */
+        if (HeapParameters.getMaxSurvivorSpaces() == 0) {
+            return false;
+        }
+
+        /*
+         * Dirty the card table for references from the image heap, metaspace, or old generation to
+         * the young generation.
+         */
+        if (!isInYoungGenerationInGC(object)) {
+            return false;
+        }
+        return hasRememberedSetInGC(holderObject);
+    }
+
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean isInYoungGenerationInGC(Object object) {
+        Space space = HeapChunk.getSpace(HeapChunk.getEnclosingHeapChunk(object));
+        if (!HeapImpl.usesImageHeapCardMarking()) {
+            return space.isYoungSpace();
+        }
+        /* If the object has no remembered set (bit), it must be in the young generation. */
+        UnsignedWord header = Heap.getHeap().getObjectHeader().readHeaderFromObject(object);
+        if (ObjectHeaderImpl.isMarkedHeader(header)) {
+            /* Cannot tell from a marked object header, so we need to access the chunk's Space. */
+            return space.isYoungSpace();
+        }
+        boolean young = !ObjectHeaderImpl.hasRememberedSet(header);
+        assert young == space.isYoungSpace();
+        return young;
+    }
+
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean hasRememberedSetInGC(Object holderObject) {
+        UnsignedWord holderHeader = Heap.getHeap().getObjectHeader().readHeaderFromObject(holderObject);
+        if (ObjectHeaderImpl.isMarkedHeader(holderHeader)) {
+            /* Cannot tell from a marked object header, so we need to access the chunk's Space. */
+            Space space = HeapChunk.getSpace(HeapChunk.getEnclosingHeapChunk(holderObject));
+            boolean isInImageHeap = (space == null);
+            assert !isInImageHeap : "image heap objects should never be marked";
+            /* All objects outside of the young generation (or image heap) have a remembered set. */
+            return !space.isYoungSpace();
+        }
+        return ObjectHeaderImpl.hasRememberedSet(holderHeader);
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void walkDirtyObjects(UnalignedHeader chunk, GreyToBlackObjectVisitor visitor, boolean clean) {
-        UnalignedChunkRememberedSet.walkDirtyObjects(chunk, visitor, clean);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void dirtyAllReferencesIfNecessary(Object obj) {
+        ObjectHeader oh = Heap.getHeap().getObjectHeader();
+        Word header = oh.readHeaderFromObject(obj);
+        if (RememberedSet.get().hasRememberedSet(header) && mayContainReferences(obj)) {
+            dirtyAllReferencesOf(obj);
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean mayContainReferences(Object obj) {
+        DynamicHub hub = DynamicHubIntrinsics.readHub(obj);
+        int hubType = hub.getHubType();
+        return switch (hubType) {
+            case HubType.INSTANCE -> !DynamicHubUtils.hasEmptyReferenceMap(hub);
+            case HubType.POD_INSTANCE -> !DynamicHubUtils.hasEmptyReferenceMap(hub) || !PodReferenceMapDecoder.hasEmptyReferenceMap(obj);
+            case HubType.REFERENCE_INSTANCE, HubType.STORED_CONTINUATION_INSTANCE -> true;
+            case HubType.PRIMITIVE_ARRAY -> false;
+            case HubType.OBJECT_ARRAY -> ((Object[]) obj).length > 0;
+            default -> throw VMError.shouldNotReachHere("Unexpected hub type.");
+        };
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void dirtyAllReferencesOf(Object obj) {
+        if (ObjectHeaderImpl.isAlignedObject(obj)) {
+            AlignedChunkRememberedSet.dirtyAllReferencesOf(obj);
+        } else {
+            assert ObjectHeaderImpl.isUnalignedObject(obj);
+            UnalignedChunkRememberedSet.dirtyAllReferencesOf(obj);
+        }
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void walkDirtyObjects(Space space, GreyToBlackObjectVisitor visitor, boolean clean) {
-        AlignedHeader aChunk = space.getFirstAlignedHeapChunk();
+    @Uninterruptible(reason = CORE_GC_CODE)
+    public void walkDirtyObjects(AlignedHeader firstAlignedChunk, UnalignedHeader firstUnalignedChunk, UnalignedHeader lastUnalignedChunk, UninterruptibleObjectVisitor visitor,
+                    UninterruptibleObjectReferenceVisitor refVisitor, boolean clean) {
+        AlignedHeader aChunk = firstAlignedChunk;
         while (aChunk.isNonNull()) {
-            walkDirtyObjects(aChunk, visitor, clean);
+            AlignedChunkRememberedSet.walkDirtyObjects(aChunk, visitor, clean);
             aChunk = HeapChunk.getNext(aChunk);
         }
 
-        UnalignedHeader uChunk = space.getFirstUnalignedHeapChunk();
+        UnalignedHeader uChunk = firstUnalignedChunk;
         while (uChunk.isNonNull()) {
-            walkDirtyObjects(uChunk, visitor, clean);
+            UnalignedChunkRememberedSet.walkDirtyObjects(uChunk, refVisitor, clean);
+            if (uChunk.equal(lastUnalignedChunk)) {
+                break;
+            }
             uChunk = HeapChunk.getNext(uChunk);
         }
     }
@@ -213,7 +352,7 @@ public class CardTableBasedRememberedSet implements RememberedSet {
 
     @Override
     public boolean verify(UnalignedHeader firstUnalignedHeapChunk) {
-        return verify(firstUnalignedHeapChunk, WordFactory.nullPointer());
+        return verify(firstUnalignedHeapChunk, Word.nullPointer());
     }
 
     @Override
@@ -228,5 +367,15 @@ public class CardTableBasedRememberedSet implements RememberedSet {
             uChunk = HeapChunk.getNext(uChunk);
         }
         return success;
+    }
+
+    @Override
+    public boolean usePreciseCardMarking(Object obj) {
+        if (ObjectHeaderImpl.isAlignedObject(obj)) {
+            return AlignedChunkRememberedSet.usePreciseCardMarking();
+        } else {
+            assert ObjectHeaderImpl.isUnalignedObject(obj);
+            return UnalignedChunkRememberedSet.usePreciseCardMarking(obj);
+        }
     }
 }

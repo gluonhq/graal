@@ -1,25 +1,42 @@
 Non-standard options help:
 
-    --exclude-config      exclude configuration for a comma-separated pair of classpath/modulepath
+    Argument files whose first line is '# native-image: value-continuations' support
+    option-value continuations: an option ending in '=...' joins subsequent values
+    with commas until a blank line, another option ending in '=...', or end of file.
+    Comment-only lines do not end a continuation.
+    A '# native-image:' directive must start the first line; unknown settings are errors.
+
+    --exclude-config      exclude configuration for a space-separated pair of classpath/modulepath
                           pattern and resource pattern. For example:
-                          '--exclude-config foo.jar,META-INF\/native-image\/.*.properties'
+                          '--exclude-config foo.jar META-INF\/native-image\/.*.properties'
                           ignores all .properties files in 'META-INF/native-image' in all
                           JARs named 'foo.jar'.
+  ||--exclude-config||exclude configuration for a space-separated pair of classpath/modulepath pattern and resource pattern.|String||false|
+  ||> For example: '--exclude-config foo.jar META-INF\/native-image\/.*.properties' ignores all .properties files in 'META-INF/native-image' in all JARs named 'foo.jar'.|
     --expert-options      lists image build options for experts
+  ||--expert-options||lists image build options for experts|Flag||false|
     --expert-options-all  lists all image build options for experts (use at your own risk).
                           Options marked with [Extra help available] contain help that can be
                           shown with --expert-options-detail
+  ||--expert-options-all||lists all image build options for experts (use at your own risk).|Flag||false|
+  ||> Options marked with [Extra help available] contain help that can be shown with --expert-options-detail.|
     --expert-options-detail
                           displays all available help for a comma-separated list of option names.
                           Pass * to show extra help for all options that contain it.
+  ||--expert-options-detail||displays all available help for a comma-separated list of option names.|String||false|
+  ||> Pass * to show extra help for all options that contain it.|
 
     --configurations-path <search path of option-configuration directories>
                           A %pathsep% separated list of directories to be treated as
                           option-configuration directories.
+  ||--configurations-path| <search path of option-configuration directories>|A %pathsep% separated list of directories to be treated as option-configuration directories.|Path||false|
     --debug-attach[=<port or host:port (* can be used as host meaning bind to all interfaces)>]
                           attach to debugger during image building (default port is 8000)
+  ||--debug-attach|[=<port or host:port (* can be used as host meaning bind to all interfaces)>]|attach to debugger during image building (default port is 8000)|String||false|
     --diagnostics-mode    Enables logging of image-build information to a diagnostics folder.
+  ||--diagnostics-mode||Enables logging of image-build information to a diagnostics folder.|Flag||false|
     --dry-run             output the command line that would be used for building
+  ||--dry-run||output the command line that would be used for building|Flag||false|
 
     --bundle-create[=new-bundle.nib][,dry-run][,container[=<container-tool>][,dockerfile=<Dockerfile>]]
                           in addition to image building, create a Native Image bundle file (*.nib
@@ -34,6 +51,9 @@ Non-standard options help:
                             one or the other as '=<container-tool>' forces the use of a specific tool.
                           * 'dockerfile=<Dockerfile>': Use a user provided 'Dockerfile' instead of the default based on
                             Oracle Linux 8 base images for GraalVM (see https://github.com/graalvm/container)
+||--bundle-create|[=new-bundle.nib][,dry-run][,container[=<container-tool>][,dockerfile=<Dockerfile>]]|in addition to image building, create a Native Image bundle file (*.nib file) that allows rebuilding of that image again at a later point.|String||false|
+||> If a bundle-file gets passed, the bundle will be created with the given name; otherwise, the bundle-file name is derived from the image name.|
+||> Bundle options can be extended with ',dry-run' and ',container'; 'dockerfile=<Dockerfile>' uses a user-provided Dockerfile.|
     --bundle-apply=some-bundle.nib[,dry-run][,container[=<container-tool>][,dockerfile=<Dockerfile>]]
                           an image will be built from the given bundle file with the exact same
                           arguments and files that have been passed to native-image originally
@@ -44,12 +64,17 @@ Non-standard options help:
                           > native-image --bundle-apply=app.nib --bundle-create=app_dbg.nib -g
                           creates a new bundle app_dbg.nib based on the given app.nib bundle.
                           Both bundles are the same except the new one also uses the -g option.
+||--bundle-apply|=some-bundle.nib[,dry-run][,container[=<container-tool>][,dockerfile=<Dockerfile>]]|build an image from the given bundle file using the original arguments and files.|String||false|
+||> If --bundle-create is passed after --bundle-apply, a new bundle is written with the applied plus additional arguments.|
 
     -E<env-var-key>[=<env-var-value>]
                           allow native-image to access the given environment variable during
                           image build. If the optional <env-var-value> is not given, the value
                           of the environment variable will be taken from the environment
                           native-image was invoked from.
+  ||-E|<env-var-key>[=<env-var-value>]|allow native-image to access the given environment variable during image build.|String||false|
+  ||> If <env-var-value> is omitted, the value is taken from the environment native-image was invoked from.|
 
     -V<key>=<value>       provide values for placeholders in native-image.properties files
+  ||-V|<key>=<value>|provide values for placeholders in native-image.properties files|String||false|
 

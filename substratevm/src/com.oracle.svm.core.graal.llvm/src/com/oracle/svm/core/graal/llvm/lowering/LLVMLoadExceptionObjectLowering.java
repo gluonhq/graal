@@ -24,18 +24,16 @@
  */
 package com.oracle.svm.core.graal.llvm.lowering;
 
-import jdk.graal.compiler.core.common.type.StampFactory;
+import com.oracle.svm.core.graal.nodes.ReadExceptionObjectNode;
+import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
+
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.java.LoadExceptionObjectNode;
 import jdk.graal.compiler.nodes.spi.LoweringTool;
-
-import com.oracle.svm.core.graal.nodes.ReadExceptionObjectNode;
-import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
-import com.oracle.svm.core.nodes.CFunctionEpilogueNode;
-import com.oracle.svm.core.thread.VMThreads;
 
 public class LLVMLoadExceptionObjectLowering implements NodeLoweringProvider<LoadExceptionObjectNode> {
 
@@ -46,21 +44,16 @@ public class LLVMLoadExceptionObjectLowering implements NodeLoweringProvider<Loa
 
         StructuredGraph graph = node.graph();
         GraalError.guarantee(graph.getGuardsStage().areFrameStatesAtDeopts(), "Should be after FSA %s", node);
-        FixedWithNextNode readRegNode = graph.add(new ReadExceptionObjectNode(StampFactory.objectNonNull()));
+        FixedWithNextNode readRegNode = graph.add(new ReadExceptionObjectNode(node.stamp(NodeView.DEFAULT)));
         graph.replaceFixedWithFixed(node, readRegNode);
 
         /*
-         * When libunwind has found an exception handler, it jumps directly to it from native code.
-         * We therefore need the CFunctionEpilogueNode to restore the Java state before we handle
-         * the exception.
+         * The LLVM exception unwinder calls into libunwind without a Java-to-native thread status
+         * transition. When libunwind installs the handler context, execution continues here with
+         * Java state already restored. Calls with a JavaFrameAnchor perform their own thread
+         * status transition and must not have exception edges.
          */
-        CFunctionEpilogueNode cFunctionEpilogueNode = new CFunctionEpilogueNode(VMThreads.StatusSupport.STATUS_IN_NATIVE);
-        graph.add(cFunctionEpilogueNode);
-        graph.addAfterFixed(readRegNode, cFunctionEpilogueNode);
         GraalError.guarantee(exceptionState.rethrowException() && exceptionState.stackSize() == 1 && exceptionState.stackAt(0) == readRegNode,
-                        "Unexpected state for node %s: %s", cFunctionEpilogueNode, exceptionState);
-        cFunctionEpilogueNode.setStateBefore(exceptionState);
-        cFunctionEpilogueNode.setStateAfter(exceptionState);
-        cFunctionEpilogueNode.lower(tool);
+                        "Unexpected state for node %s: %s", readRegNode, exceptionState);
     }
 }

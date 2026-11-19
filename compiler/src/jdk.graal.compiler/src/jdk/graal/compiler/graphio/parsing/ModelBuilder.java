@@ -40,15 +40,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import jdk.graal.compiler.graphio.parsing.BinaryReader.EnumValue;
 import jdk.graal.compiler.graphio.parsing.BinaryReader.Method;
@@ -87,20 +85,22 @@ public class ModelBuilder implements Builder {
         final int from;
         final int to;
         final char num;
+        final int listIndex;
         final String label;
         final String type;
         final boolean input;
 
         EdgeInfo(int from, int to) {
-            this(from, to, (char) 0, null, null, false);
+            this(from, to, (char) 0, -1, null, null, false);
         }
 
-        EdgeInfo(int from, int to, char num, String label, String type, boolean input) {
+        EdgeInfo(int from, int to, char num, int listIndex, String label, String type, boolean input) {
             this.from = from;
             this.to = to;
             this.label = label;
             this.type = type;
             this.num = num;
+            this.listIndex = listIndex;
             this.input = input;
         }
 
@@ -112,6 +112,10 @@ public class ModelBuilder implements Builder {
             return to;
         }
 
+        public int getListIndex() {
+            return listIndex;
+        }
+
         @Override
         public boolean equals(Object other) {
             if (other == null) {
@@ -121,16 +125,17 @@ public class ModelBuilder implements Builder {
                 return false;
             }
             EdgeInfo otherEdge = (EdgeInfo) other;
-            return from == otherEdge.from && to == otherEdge.to && num == otherEdge.num && input == otherEdge.input && Objects.equals(label, otherEdge.label) && Objects.equals(type, otherEdge.type);
+            return from == otherEdge.from && to == otherEdge.to && num == otherEdge.num && listIndex == otherEdge.listIndex && input == otherEdge.input && Objects.equals(label, otherEdge.label) &&
+                            Objects.equals(type, otherEdge.type);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(from, to, label);
+            return Objects.hash(from, to, listIndex, label);
         }
     }
 
-    private static class ErrorMessages {
+    private static final class ErrorMessages {
         public static String edgeStartNodeNotExists(String label, int node) {
             return String.format("Start node for edge %s does not exist: %d", label, node);
         }
@@ -174,7 +179,7 @@ public class ModelBuilder implements Builder {
     /**
      * Content digests for individual graph types.
      */
-    private Map<String, byte[]> lastDigests = new HashMap<>();
+    private Map<String, byte[]> lastDigests = new LinkedHashMap<>();
 
     private final Deque<Object> stack = new ArrayDeque<>();
 
@@ -325,7 +330,7 @@ public class ModelBuilder implements Builder {
         pushContext();
         if (currentNode != null) {
             // nested graph -> no duplicates should be recorded or checked.
-            lastDigests = new HashMap<>();
+            lastDigests = new LinkedHashMap<>();
         }
         currentGraph = g;
         entity = g;
@@ -335,10 +340,9 @@ public class ModelBuilder implements Builder {
     }
 
     protected void connectModifiedProperties(FolderElement g) {
-        if (!(g instanceof Properties.MutableOwner)) {
+        if (!(g instanceof Properties.MutableOwner<?> mu)) {
             return;
         }
-        Properties.MutableOwner<?> mu = (Properties.MutableOwner<?>) g;
         GraphDocument doc = g.getOwner();
         if (doc != null) {
             Properties props = doc.getModifiedProperties(g);
@@ -357,8 +361,8 @@ public class ModelBuilder implements Builder {
         for (int i = 0; i < args.length; ++i) {
             if (args[i] instanceof BinaryReader.Klass) {
                 String className = args[i].toString();
-                String s = className.substring(className.lastIndexOf(".") + 1); // strip the package
-                                                                                // name
+                // strip the package name
+                String s = className.substring(className.lastIndexOf(".") + 1);
                 int innerClassPos = s.indexOf('$');
                 if (innerClassPos > 0) {
                     /* Remove inner class name. */
@@ -512,7 +516,7 @@ public class ModelBuilder implements Builder {
         entity = group;
         this.folder = group;
         if (startNew) {
-            lastDigests = new HashMap<>();
+            lastDigests = new LinkedHashMap<>();
         }
         return group;
     }
@@ -649,12 +653,20 @@ public class ModelBuilder implements Builder {
         popContext();
     }
 
-    static final Set<String> SYSTEM_PROPERTIES = new HashSet<>(Arrays.asList(
+    static final Set<String> SYSTEM_PROPERTIES = Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
                     PROPNAME_HAS_PREDECESSOR,
                     PROPNAME_NAME,
                     PROPNAME_CLASS,
                     PROPNAME_ID,
-                    PROPNAME_IDX, PROPNAME_BLOCK));
+                    PROPNAME_IDX, PROPNAME_BLOCK)));
+
+    private static boolean isSystemProperty(String key) {
+        return switch (key) {
+            case PROPNAME_HAS_PREDECESSOR, PROPNAME_NAME, PROPNAME_CLASS, PROPNAME_ID, PROPNAME_IDX, PROPNAME_BLOCK ->
+                true;
+            default -> false;
+        };
+    }
 
     @Override
     public void setGroupName(String name, String shortName) {
@@ -678,7 +690,7 @@ public class ModelBuilder implements Builder {
     @Override
     public void setNodeName(NodeClass nodeClass) {
         assert currentNode != null;
-        getProperties().setProperty(PROPNAME_NAME, createName(nodeClass, nodeEdges, nodeClass.nameTemplate));
+        getProperties().setProperty(PROPNAME_NAME, createName(nodeClass, nodeEdges));
         getProperties().setProperty(PROPNAME_CLASS, nodeClass.className);
         switch (nodeClass.className) {
             case "BeginNode":
@@ -690,39 +702,41 @@ public class ModelBuilder implements Builder {
         }
     }
 
-    static final Pattern TEMPLATE_PATTERN = Pattern.compile("\\{([pi])#([a-zA-Z0-9$_]+)(/([lms]))?}");
-
-    private String createName(NodeClass nodeClass, List<EdgeInfo> edges, String template) {
-        if (template.isEmpty()) {
+    private String createName(NodeClass nodeClass, List<EdgeInfo> edges) {
+        if (nodeClass.nameTemplate.isEmpty()) {
             return nodeClass.toShortString();
         }
-        Matcher m = TEMPLATE_PATTERN.matcher(template);
-        StringBuilder sb = new StringBuilder();
+
+        StringBuilder sb = new StringBuilder(nodeClass.nameTemplate.length());
         Properties p = getProperties();
-        while (m.find()) {
-            String name = m.group(2);
-            String type = m.group(1);
-            String result;
+        List<TemplateParser.TemplatePart> templateParts = nodeClass.getTemplateParts();
+        for (TemplateParser.TemplatePart template : templateParts) {
+            if (!template.isReplacement) {
+                sb.append(template.value);
+                continue;
+            }
+            String name = template.name;
+            String type = template.type;
             switch (type) {
                 case "i":
-                    StringBuilder inputString = new StringBuilder();
+                    boolean first = true;
                     for (EdgeInfo edge : edges) {
                         if (edge.label.startsWith(name) && (name.length() == edge.label.length() || edge.label.charAt(name.length()) == '[')) {
-                            if (inputString.length() > 0) {
-                                inputString.append(", ");
+                            if (!first) {
+                                sb.append(", ");
                             }
-                            inputString.append(edge.from);
+                            first = false;
+                            sb.append(edge.from);
                         }
                     }
-                    result = inputString.toString();
                     break;
                 case "p":
                     Object prop = p.get(name);
-                    String length = m.group(4);
+                    String length = template.length;
+                    String result;
                     if (prop == null) {
                         result = "?";
-                    } else if (length != null && prop instanceof LengthToString) {
-                        LengthToString lengthProp = (LengthToString) prop;
+                    } else if (length != null && prop instanceof LengthToString lengthProp) {
                         switch (length) {
                             case "s":
                                 result = lengthProp.toString(Length.S);
@@ -730,36 +744,21 @@ public class ModelBuilder implements Builder {
                             case "m":
                                 result = lengthProp.toString(Length.M);
                                 break;
-                            default:
                             case "l":
+                            default:
                                 result = lengthProp.toString(Length.L);
                                 break;
                         }
                     } else {
                         result = prop.toString();
                     }
+                    sb.append(result);
                     break;
                 default:
-                    result = "#?#";
+                    sb.append("#?#");
                     break;
             }
-
-            // Escape '\' and '$' to not interfere with the regular expression.
-            StringBuilder newResult = new StringBuilder();
-            for (int i = 0; i < result.length(); ++i) {
-                char c = result.charAt(i);
-                if (c == '\\') {
-                    newResult.append("\\\\");
-                } else if (c == '$') {
-                    newResult.append("\\$");
-                } else {
-                    newResult.append(c);
-                }
-            }
-            result = newResult.toString();
-            m.appendReplacement(sb, result);
         }
-        m.appendTail(sb);
         return sb.toString();
     }
 
@@ -770,19 +769,26 @@ public class ModelBuilder implements Builder {
         assert currentNode != null;
         String k = key;
         if (!(value instanceof InputGraph)) {
-            if (SYSTEM_PROPERTIES.contains(key)) {
+            if (isSystemProperty(key)) {
                 k = NOT_DATA + k;
             }
             setProperty(k, value);
         }
     }
 
+    protected static String inputEdgeType(Port p) {
+        EnumValue type = ((TypedPort) p).type;
+        return type == null ? null : type.toString(Length.S);
+    }
+
     @Override
     public void inputEdge(Port p, int from, int to, char num, int index) {
         assert currentNode != null;
-        String label = (p.isList && index >= 0) ? p.name + "[" + index + "]" : p.name;
-        EnumValue type = ((TypedPort) p).type;
-        EdgeInfo ei = new EdgeInfo(from, to, num, label, type == null ? null : type.toString(Length.S), true);
+        // Ignore null edges
+        if (from < 0) {
+            return;
+        }
+        EdgeInfo ei = new EdgeInfo(from, to, num, index, p.name, inputEdgeType(p), true);
         inputEdges.add(ei);
         nodeEdges.add(ei);
     }
@@ -790,14 +796,17 @@ public class ModelBuilder implements Builder {
     @Override
     public void successorEdge(Port p, int from, int to, char num, int index) {
         assert currentNode != null;
-        String label = (p.isList && index >= 0) ? p.name + "[" + index + "]" : p.name;
-        EdgeInfo ei = new EdgeInfo(to, from, num, label, InputEdge.SUCCESSOR_EDGE_TYPE, false);
+        // Ignore null edges
+        if (from < 0) {
+            return;
+        }
+        EdgeInfo ei = new EdgeInfo(to, from, num, index, p.name, InputEdge.SUCCESSOR_EDGE_TYPE, false);
         successorEdges.add(ei);
         nodeEdges.add(ei);
     }
 
-    protected InputEdge immutableEdge(char fromIndex, char toIndex, int from, int to, String label, String type) {
-        return InputEdge.createImmutable(fromIndex, toIndex, from, to, label, type);
+    protected InputEdge immutableEdge(char fromIndex, char toIndex, int from, int to, int listIndex, String label, String type) {
+        return InputEdge.createImmutable(fromIndex, toIndex, from, to, listIndex, label, type);
     }
 
     @Override
@@ -806,7 +815,7 @@ public class ModelBuilder implements Builder {
         InputGraph graph = currentGraph;
         assert (inputEdges != null && successorEdges != null) || (graph.getNodes().isEmpty());
 
-        Set<InputNode> nodesWithSuccessor = new HashSet<>();
+        Set<InputNode> nodesWithSuccessor = new LinkedHashSet<>();
         for (EdgeInfo e : successorEdges) {
             assert !e.input;
             char fromIndex = e.num;
@@ -818,13 +827,13 @@ public class ModelBuilder implements Builder {
             if (currentGraph.getNode(e.to) == null) {
                 reportLoadingError(ErrorMessages.edgeEndNodeNotExists(e.label, e.to));
             }
-            graph.addEdge(immutableEdge(fromIndex, toIndex, e.from, e.to, e.label, e.type));
+            graph.addEdge(immutableEdge(fromIndex, toIndex, e.from, e.to, e.listIndex, e.label, e.type));
         }
         for (EdgeInfo e : inputEdges) {
             assert e.input;
             char fromIndex = (char) (nodesWithSuccessor.contains(graph.getNode(e.from)) ? 1 : 0);
             char toIndex = e.num;
-            graph.addEdge(immutableEdge(fromIndex, toIndex, e.from, e.to, e.label, e.type));
+            graph.addEdge(immutableEdge(fromIndex, toIndex, e.from, e.to, e.listIndex, e.label, e.type));
         }
     }
 

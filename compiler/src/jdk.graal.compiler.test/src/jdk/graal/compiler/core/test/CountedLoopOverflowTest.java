@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,18 +24,18 @@
  */
 package jdk.graal.compiler.core.test;
 
-import java.util.Collections;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.Formatter;
 import java.util.Map;
 
+import org.junit.Test;
+
 import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.OptimisticOptimizations;
-import org.junit.Test;
-
+import jdk.graal.compiler.util.CollectionsUtil;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ProfilingInfo;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -84,6 +84,48 @@ public class CountedLoopOverflowTest extends GraalCompilerTest {
         }
     }
 
+    public static int snippetUnsignedNegativeBound(int step) {
+        int i = 0;
+        int sum = 0;
+        int count = 0;
+        while (Integer.compareUnsigned(i, -100) < 0 && count < 1000) {
+            sum += i;
+            i += step;
+            count++;
+        }
+        return sum;
+    }
+
+    public static int snippetUnsignedNegativeBoundDown(int step) {
+        int i = 0;
+        int sum = 0;
+        int count = 999;
+        while (Integer.compareUnsigned(i, -100) < 0 && count >= 0) {
+            sum += i;
+            i += step;
+            count--;
+        }
+        return sum;
+    }
+
+    @Test
+    public void testUnsignedNegativeBound() {
+        // Mature the unsigned exit profile so the parser replaces its untaken branch with a deopt.
+        for (int i = 0; i < 5000; i++) {
+            snippetUnsignedNegativeBound(5);
+            snippetUnsignedNegativeBoundDown(5);
+        }
+        test("snippetUnsignedNegativeBound", 5);
+        test("snippetUnsignedNegativeBoundDown", 5);
+
+        // The unsigned check first fails on the final header visit: 1000 * step wraps to -96.
+        int step = 219043332;
+        ResolvedJavaMethod method = getResolvedJavaMethod("snippetUnsignedNegativeBound");
+        int deoptsBefore = method.getProfilingInfo().getDeoptimizationCount(DeoptimizationReason.UnreachedCode);
+        assertEquals(new Result((int) (step * 999L * 1000 / 2), null), executeActual(method, null, step));
+        assertTrue(method.getProfilingInfo().getDeoptimizationCount(DeoptimizationReason.UnreachedCode) > deoptsBefore);
+    }
+
     @Override
     protected OptimisticOptimizations getOptimisticOptimizations() {
         return OptimisticOptimizations.ALL;
@@ -121,7 +163,7 @@ public class CountedLoopOverflowTest extends GraalCompilerTest {
         // first should deopt with a failed speculation, second not
         Map<DeoptimizationReason, Integer> deoptCountsBefore = getDeoptCounts(method);
         try {
-            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, Collections.emptySet(), null);
+            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, CollectionsUtil.setOf(), null);
             deoptCountsBefore = getDeoptCounts(method);
             executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, EnumSet.allOf(DeoptimizationReason.class), null);
         } catch (Throwable t) {
@@ -142,7 +184,7 @@ public class CountedLoopOverflowTest extends GraalCompilerTest {
         // first should deopt with a failed speculation, second not
         Map<DeoptimizationReason, Integer> deoptCountsBefore = getDeoptCounts(method);
         try {
-            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, Collections.emptySet(), null);
+            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, CollectionsUtil.setOf(), null);
             deoptCountsBefore = getDeoptCounts(method);
             executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, EnumSet.allOf(DeoptimizationReason.class), null);
         } catch (Throwable t) {
@@ -163,7 +205,7 @@ public class CountedLoopOverflowTest extends GraalCompilerTest {
         // first should deopt with a failed speculation, second not
         Map<DeoptimizationReason, Integer> deoptCountsBefore = getDeoptCounts(method);
         try {
-            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, Collections.emptySet(), null);
+            executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, CollectionsUtil.setOf(), null);
             deoptCountsBefore = getDeoptCounts(method);
             executeActualCheckDeopt(new OptionValues(getInitialOptions(), GraalOptions.LoopPeeling, false, GraalOptions.FullUnroll, false), method, EnumSet.allOf(DeoptimizationReason.class), null);
         } catch (Throwable t) {

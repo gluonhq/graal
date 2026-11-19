@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,18 +24,20 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
+import static jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandSize.DWORD;
 import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.vm.ci.code.ValueUtil.isRegister;
 import static jdk.vm.ci.code.ValueUtil.isStackSlot;
-import static jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandSize.DWORD;
 
 import jdk.graal.compiler.asm.amd64.AMD64Address;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64BinaryArithmetic;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64MIOp;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64MROp;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64RMOp;
+import jdk.graal.compiler.asm.amd64.AMD64Assembler.VexRMOp;
 import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandSize;
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
+import jdk.graal.compiler.asm.amd64.AVXKind;
 import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstruction;
@@ -43,7 +45,6 @@ import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.StandardOp;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
-
 import jdk.vm.ci.code.site.DataSectionReference;
 import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.Constant;
@@ -68,6 +69,38 @@ public class AMD64BinaryConsumer {
         @LIRInstruction.Use({LIRInstruction.OperandFlag.REG, LIRInstruction.OperandFlag.STACK}) protected AllocatableValue y;
 
         public Op(AMD64RMOp opcode, OperandSize size, AllocatableValue x, AllocatableValue y) {
+            super(TYPE);
+            this.opcode = opcode;
+            this.size = size;
+
+            this.x = x;
+            this.y = y;
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
+            if (isRegister(y)) {
+                opcode.emit(masm, size, asRegister(x), asRegister(y));
+            } else {
+                assert isStackSlot(y);
+                opcode.emit(masm, size, asRegister(x), (AMD64Address) crb.asAddress(y));
+            }
+        }
+    }
+
+    /**
+     * Instruction that has two {@link AllocatableValue} operands.
+     */
+    public static class AvxOp extends AMD64LIRInstruction {
+        public static final LIRInstructionClass<AvxOp> TYPE = LIRInstructionClass.create(AvxOp.class);
+
+        @Opcode private final VexRMOp opcode;
+        private final AVXKind.AVXSize size;
+
+        @LIRInstruction.Use({LIRInstruction.OperandFlag.REG}) protected AllocatableValue x;
+        @LIRInstruction.Use({LIRInstruction.OperandFlag.REG, LIRInstruction.OperandFlag.STACK}) protected AllocatableValue y;
+
+        public AvxOp(VexRMOp opcode, AVXKind.AVXSize size, AllocatableValue x, AllocatableValue y) {
             super(TYPE);
             this.opcode = opcode;
             this.size = size;
@@ -119,10 +152,10 @@ public class AMD64BinaryConsumer {
         @Override
         public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
             if (isRegister(x)) {
-                opcode.emit(masm, size, asRegister(x), y, shouldAnnotate());
+                masm.emitAMD64MIOp(opcode, size, asRegister(x), y, shouldAnnotate());
             } else {
                 assert isStackSlot(x);
-                opcode.emit(masm, size, (AMD64Address) crb.asAddress(x), y, shouldAnnotate());
+                masm.emitAMD64MIOp(opcode, size, (AMD64Address) crb.asAddress(x), y, shouldAnnotate());
             }
         }
 
@@ -228,7 +261,51 @@ public class AMD64BinaryConsumer {
             if (state != null) {
                 crb.recordImplicitException(masm.position(), state);
             }
-            opcode.emit(masm, size, asRegister(x), y.toAddress());
+            opcode.emit(masm, size, asRegister(x), y.toAddress(masm));
+        }
+
+        @Override
+        public boolean makeNullCheckFor(Value value, LIRFrameState nullCheckState, int implicitNullCheckLimit) {
+            if (state == null && y.isValidImplicitNullCheckFor(value, implicitNullCheckLimit)) {
+                state = nullCheckState;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Instruction that has an {@link AllocatableValue} as first input and a
+     * {@link AMD64AddressValue memory} operand as second input.
+     */
+    public static class MemoryAvxOp extends AMD64LIRInstruction implements StandardOp.ImplicitNullCheck {
+        public static final LIRInstructionClass<MemoryAvxOp> TYPE = LIRInstructionClass.create(MemoryAvxOp.class);
+
+        @Opcode private final VexRMOp opcode;
+        private final AVXKind.AVXSize size;
+
+        @LIRInstruction.Use({LIRInstruction.OperandFlag.REG}) protected AllocatableValue x;
+        @LIRInstruction.Use({LIRInstruction.OperandFlag.COMPOSITE}) protected AMD64AddressValue y;
+
+        @LIRInstruction.State protected LIRFrameState state;
+
+        public MemoryAvxOp(VexRMOp opcode, AVXKind.AVXSize size, AllocatableValue x, AMD64AddressValue y, LIRFrameState state) {
+            super(TYPE);
+            this.opcode = opcode;
+            this.size = size;
+
+            this.x = x;
+            this.y = y;
+
+            this.state = state;
+        }
+
+        @Override
+        public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
+            if (state != null) {
+                crb.recordImplicitException(masm.position(), state);
+            }
+            opcode.emit(masm, size, asRegister(x), y.toAddress(masm));
         }
 
         @Override
@@ -272,7 +349,7 @@ public class AMD64BinaryConsumer {
             if (state != null) {
                 crb.recordImplicitException(masm.position(), state);
             }
-            opcode.emit(masm, size, x.toAddress(), asRegister(y));
+            opcode.emit(masm, size, x.toAddress(masm), asRegister(y));
         }
 
         @Override
@@ -324,7 +401,7 @@ public class AMD64BinaryConsumer {
             if (state != null) {
                 crb.recordImplicitException(masm.position(), state);
             }
-            opcode.emit(masm, size, x.toAddress(), y, shouldAnnotate());
+            masm.emitAMD64MIOp(opcode, size, x.toAddress(masm), y, shouldAnnotate());
         }
 
         protected boolean shouldAnnotate() {

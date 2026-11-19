@@ -28,8 +28,6 @@ import static com.oracle.graal.pointsto.reports.ReportUtils.CHILD;
 import static com.oracle.graal.pointsto.reports.ReportUtils.CONNECTING_INDENT;
 import static com.oracle.graal.pointsto.reports.ReportUtils.EMPTY_INDENT;
 import static com.oracle.graal.pointsto.reports.ReportUtils.LAST_CHILD;
-import static com.oracle.graal.pointsto.reports.ReportUtils.invokeInfoComparator;
-import static com.oracle.graal.pointsto.reports.ReportUtils.methodComparator;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -42,6 +40,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -57,6 +56,7 @@ import java.util.stream.Stream;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.AnalysisUniverse;
 import com.oracle.graal.pointsto.meta.InvokeInfo;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.util.AnalysisError;
@@ -64,11 +64,13 @@ import com.oracle.graal.pointsto.util.AnalysisError;
 import jdk.graal.compiler.java.LambdaUtils;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.JavaKind;
+import org.graalvm.collections.EconomicSet;
 
 public final class CallTreePrinter {
 
     public static final Pattern CAMEL_CASE_PATTERN = Pattern.compile(
                     "\\b[a-zA-Z]|[A-Z]|\\.");
+    public static final String METHOD_FORMAT = "%H.%n(%P):%R";
 
     public static void print(BigBang bb, String reportsPath, String reportName) {
         CallTreePrinter printer = new CallTreePrinter(bb);
@@ -107,7 +109,8 @@ public final class CallTreePrinter {
 
         @Override
         public String format() {
-            return methodNode.method.format(METHOD_FORMAT) + " id-ref=" + methodNode.id;
+            var hostVM = methodNode.method.getUniverse().hostVM();
+            return hostVM.loaderName(methodNode.method.getDeclaringClass()) + ':' + methodNode.method.format(METHOD_FORMAT) + " id-ref=" + methodNode.id;
         }
 
     }
@@ -137,7 +140,7 @@ public final class CallTreePrinter {
 
         @Override
         public String format() {
-            return method.format(METHOD_FORMAT) + " id=" + id;
+            return method.getUniverse().hostVM().loaderName(method.getDeclaringClass()) + ':' + method.format(METHOD_FORMAT) + " id=" + id;
         }
     }
 
@@ -182,20 +185,9 @@ public final class CallTreePrinter {
 
     public void buildCallTree() {
         /* Add all the roots to the tree. */
-        List<AnalysisMethod> roots = new ArrayList<>();
-        for (AnalysisMethod m : bb.getUniverse().getMethods()) {
-            if (m.isDirectRootMethod() && m.isSimplyImplementationInvoked()) {
-                roots.add(m);
-            }
-            if (m.isVirtualRootMethod()) {
-                for (AnalysisMethod impl : m.collectMethodImplementations(false)) {
-                    AnalysisError.guarantee(impl.isImplementationInvoked());
-                    roots.add(impl);
-                }
-            }
-        }
+        List<AnalysisMethod> roots = AnalysisUniverse.getCallTreeRoots(bb.getUniverse());
 
-        roots.sort(methodComparator);
+        roots.sort(ReportUtils.methodComparator());
         for (AnalysisMethod m : roots) {
             methodToNode.put(m, new MethodNode(m, true));
         }
@@ -221,7 +213,7 @@ public final class CallTreePrinter {
              * In order to have deterministic order of invokes we sort them by position and names.
              * In case of Lambda names we avoid the non-deterministic hash part while sorting.
              */
-            invokeInfos.sort(invokeInfoComparator);
+            invokeInfos.sort(ReportUtils.invokeInfoComparator());
 
             for (var invokeInfo : invokeInfos) {
                 processInvoke(invokeInfo, node, workList);
@@ -235,7 +227,7 @@ public final class CallTreePrinter {
         InvokeNode invokeNode = new InvokeNode(invokeInfo.getTargetMethod(), invokeInfo.isDirectInvoke(), sourceReference(invokeInfo.getPosition()));
         callerNode.addInvoke(invokeNode);
 
-        invokeInfo.getAllCallees().stream().sorted(methodComparator).forEach(callee -> {
+        invokeInfo.getAllCallees().stream().sorted(ReportUtils.methodComparator()).forEach(callee -> {
             if (methodToNode.containsKey(callee)) {
                 MethodNodeReference calleeNode = new MethodNodeReference(methodToNode.get(callee));
                 invokeNode.addCallee(calleeNode);
@@ -268,8 +260,6 @@ public final class CallTreePrinter {
         }
         return sourceReference.toArray(new SourceReference[sourceReference.size()]);
     }
-
-    private static final String METHOD_FORMAT = "%H.%n(%P):%R";
 
     private void printMethods(PrintWriter out) {
         out.println("VM Entry Points");
@@ -317,7 +307,7 @@ public final class CallTreePrinter {
     private void printUsedMethods(PrintWriter out) {
         List<String> methodsList = new ArrayList<>();
         for (AnalysisMethod method : methodToNode.keySet()) {
-            methodsList.add(method.format("%H.%n(%p):%r"));
+            methodsList.add(method.getUniverse().hostVM().loaderName(method.getDeclaringClass()) + ':' + method.format(METHOD_FORMAT));
         }
         methodsList.sort(null);
         for (String name : methodsList) {
@@ -334,9 +324,9 @@ public final class CallTreePrinter {
     }
 
     public Set<String> classesSet(boolean packageNameOnly) {
-        Set<String> classSet = new HashSet<>();
-        for (AnalysisMethod method : methodToNode.keySet()) {
-            String name = method.getDeclaringClass().toJavaName(true);
+        Set<String> classSet = new HashSet<>(); // noEconomicSet(temp)
+        for (AnalysisType type : usedAnalysisTypes()) {
+            String name = type.toJavaName(true);
             if (packageNameOnly) {
                 name = packagePrefix(name);
                 if (LambdaUtils.isLambdaClassName(name)) {
@@ -344,7 +334,16 @@ public final class CallTreePrinter {
                     name = packagePrefix(name);
                 }
             }
-            classSet.add(name);
+
+            classSet.add(type.getUniverse().hostVM().loaderName(type) + ':' + name);
+        }
+        return classSet;
+    }
+
+    public Iterable<AnalysisType> usedAnalysisTypes() {
+        EconomicSet<AnalysisType> classSet = EconomicSet.create();
+        for (AnalysisMethod method : methodToNode.keySet()) {
+            classSet.add(method.getDeclaringClass());
         }
         return classSet;
     }
@@ -358,18 +357,16 @@ public final class CallTreePrinter {
     }
 
     private static void printCsvFiles(Map<AnalysisMethod, MethodNode> methodToNode, String reportsPath, String reportName) {
-        Set<MethodNode> nodes = new HashSet<>();
-
-        List<MethodNode> entrypoints = methodToNode.values().stream().filter(n -> n.isEntryPoint).toList();
-        for (MethodNode entrypoint : entrypoints) {
-            walkNodes(entrypoint, nodes, methodToNode);
-        }
-
         String msgPrefix = "call tree csv file for ";
         String timeStamp = ReportUtils.getTimeStampString();
-        toCsvFile(msgPrefix + "methods", reportsPath, "call_tree_methods", reportName, timeStamp, writer -> printMethodNodes(methodToNode.values(), writer));
+        /*
+         * We print invokes first, because when traversing the invokes new method nodes (for call
+         * targets that were not visited before, e.g. abstract methods) may be created, which we
+         * want to print in call_tree_methods as well.
+         */
         toCsvFile(msgPrefix + "invokes", reportsPath, "call_tree_invokes", reportName, timeStamp, writer -> printInvokeNodes(methodToNode, writer));
         toCsvFile(msgPrefix + "targets", reportsPath, "call_tree_targets", reportName, timeStamp, writer -> printCallTargets(methodToNode, writer));
+        toCsvFile(msgPrefix + "methods", reportsPath, "call_tree_methods", reportName, timeStamp, writer -> printMethodNodes(methodToNode.values(), writer));
     }
 
     private static void toCsvFile(String description, String reportsPath, String prefix, String reportName, String timeStamp, Consumer<PrintWriter> reporter) {
@@ -402,12 +399,20 @@ public final class CallTreePrinter {
 
     private static void printInvokeNodes(Map<AnalysisMethod, MethodNode> methodToNode, PrintWriter writer) {
         writer.println(convertToCSV("Id", "MethodId", "BytecodeIndexes", "TargetId", "IsDirect"));
+        /*
+         * Methods that act as call targets, but are not reachable (e.g. abstract methods), will not
+         * have a MethodNode allocated yet. We store them in a separate map, because methodToNode
+         * cannot be modified while we iterate over it.
+         */
+        var callTargets = new HashMap<AnalysisMethod, MethodNode>();
         methodToNode.values().stream()
                         .flatMap(node -> node.invokes.stream()
-                                        .filter(invoke -> !invoke.callees.isEmpty())
-                                        .map(invoke -> invokeNodeInfo(methodToNode, node, invoke)))
+                                        .map(invoke -> invokeNodeInfo(methodToNode, node, invoke, callTargets)))
                         .map(CallTreePrinter::convertToCSV)
                         .forEach(writer::println);
+        for (var entry : callTargets.entrySet()) {
+            methodToNode.putIfAbsent(entry.getKey(), entry.getValue());
+        }
     }
 
     private static void printCallTargets(Map<AnalysisMethod, MethodNode> methodToNode, PrintWriter writer) {
@@ -422,49 +427,36 @@ public final class CallTreePrinter {
     }
 
     private static List<String> methodNodeInfo(MethodNode method) {
-        return resolvedJavaMethodInfo(method.id, method.method);
+        var parameters = method.method.getSignature().getParameterCount(false) > 0
+                        ? method.method.format("%P").replace(",", "")
+                        : "empty";
+        return Arrays.asList(
+                        Integer.toString(method.id),
+                        method.method.getName(),
+                        method.method.getDeclaringClass().toJavaName(true),
+                        parameters,
+                        method.method.getSignature().getReturnType().toJavaName(true),
+                        display(method.method),
+                        flags(method.method),
+                        String.valueOf(method.isEntryPoint));
     }
 
-    private static List<String> invokeNodeInfo(Map<AnalysisMethod, MethodNode> methodToNode, MethodNode method, InvokeNode invoke) {
+    private static List<String> invokeNodeInfo(Map<AnalysisMethod, MethodNode> methodToNode, MethodNode method, InvokeNode invoke, HashMap<AnalysisMethod, MethodNode> callTargets) {
+        MethodNode targetMethod = methodToNode.get(invoke.targetMethod);
+        if (targetMethod == null) {
+            targetMethod = callTargets.computeIfAbsent(invoke.targetMethod, MethodNode::new);
+        }
         return Arrays.asList(
                         String.valueOf(invoke.id),
                         String.valueOf(method.id),
                         showBytecodeIndexes(bytecodeIndexes(invoke)),
-                        String.valueOf(methodToNode.get(invoke.targetMethod).id),
+                        String.valueOf(targetMethod.id),
                         String.valueOf(invoke.isDirectInvoke));
     }
 
     private static List<String> callTargetInfo(InvokeNode invoke, Node callee) {
         MethodNode node = callee instanceof MethodNodeReference ref ? ref.methodNode : ((MethodNode) callee);
         return Arrays.asList(String.valueOf(invoke.id), String.valueOf(node.id));
-    }
-
-    private static void walkNodes(MethodNode methodNode, Set<MethodNode> nodes, Map<AnalysisMethod, MethodNode> methodToNode) {
-        for (InvokeNode invoke : methodNode.invokes) {
-            methodToNode.computeIfAbsent(invoke.targetMethod, MethodNode::new);
-            if (invoke.isDirectInvoke) {
-                if (invoke.callees.size() > 0) {
-                    Node calleeNode = invoke.callees.get(0);
-                    addNode(calleeNode, nodes);
-                    if (calleeNode instanceof MethodNode) {
-                        walkNodes((MethodNode) calleeNode, nodes, methodToNode);
-                    }
-                }
-            } else {
-                for (Node calleeNode : invoke.callees) {
-                    if (calleeNode instanceof MethodNode) {
-                        walkNodes((MethodNode) calleeNode, nodes, methodToNode);
-                    }
-                }
-            }
-        }
-    }
-
-    private static void addNode(Node calleeNode, Set<MethodNode> nodes) {
-        MethodNode methodNode = calleeNode instanceof MethodNode
-                        ? (MethodNode) calleeNode
-                        : ((MethodNodeReference) calleeNode).methodNode;
-        nodes.add(methodNode);
     }
 
     private static List<Integer> bytecodeIndexes(InvokeNode node) {
@@ -477,28 +469,6 @@ public final class CallTreePrinter {
         return bytecodeIndexes.stream()
                         .map(String::valueOf)
                         .collect(Collectors.joining("->"));
-    }
-
-    private static List<String> resolvedJavaMethodInfo(Integer id, AnalysisMethod method) {
-        // TODO method parameter types are opaque, but could in the future be split out and link
-        // together
-        // e.g. each method could BELONG to a type, and a method could have PARAMETER relationships
-        // with N types
-        // see https://neo4j.com/developer/guide-import-csv/#_converting_data_values_with_load_csv
-        // for examples
-        final String parameters = method.getSignature().getParameterCount(false) > 0
-                        ? method.format("%P").replace(",", "")
-                        : "empty";
-
-        return Arrays.asList(
-                        id == null ? null : Integer.toString(id),
-                        method.getName(),
-                        method.getDeclaringClass().toJavaName(true),
-                        parameters,
-                        method.getSignature().getReturnType().toJavaName(true),
-                        display(method),
-                        flags(method),
-                        String.valueOf(method.isEntryPoint()));
     }
 
     private static String display(AnalysisMethod method) {

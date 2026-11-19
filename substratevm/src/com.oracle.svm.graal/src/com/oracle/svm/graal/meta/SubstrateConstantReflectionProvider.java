@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,49 +24,124 @@
  */
 package com.oracle.svm.graal.meta;
 
-import org.graalvm.nativeimage.CurrentIsolate;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.SignedWord;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereAtRuntime;
 
-import com.oracle.svm.core.Isolates;
+import java.lang.reflect.Array;
+import java.util.Objects;
+
+import org.graalvm.word.SignedWord;
+import org.graalvm.word.impl.Word;
+
 import com.oracle.svm.core.StaticFieldsSupport;
-import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.RecomputeFieldValue;
-import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
-import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.graal.meta.SharedConstantReflectionProvider;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.meta.ObjectConstantEquality;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.NumUtil;
-import jdk.graal.compiler.word.Word;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MemoryAccessProvider;
 import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class SubstrateConstantReflectionProvider extends SharedConstantReflectionProvider {
     private final MetaAccessProvider metaAccess;
 
-    @Platforms(Platform.HOSTED_ONLY.class)
     public SubstrateConstantReflectionProvider(SubstrateMetaAccess metaAccess) {
         this.metaAccess = metaAccess;
+        assert SubstrateUtil.HOSTED || SubstrateOptions.useRistretto();
     }
 
     @Override
-    public Integer identityHashCode(JavaConstant constant) {
-        if (constant == null || constant.getJavaKind() != JavaKind.Object) {
+    public boolean canRepresentAsImageHeapOffset(JavaConstant constant) {
+        return getImageHeapOffset(constant) != 0;
+    }
+
+    @Override
+    public Boolean constantEquals(Constant x, Constant y) {
+        if (x == y) {
+            return true;
+        } else if (x instanceof SubstrateObjectConstant) {
+            return y instanceof SubstrateObjectConstant && ObjectConstantEquality.get().test((SubstrateObjectConstant) x, (SubstrateObjectConstant) y);
+        } else {
+            return x.equals(y);
+        }
+    }
+
+    @Override
+    public Integer readArrayLength(JavaConstant array) {
+        if (array.getJavaKind() != JavaKind.Object || array.isNull() || !SubstrateObjectConstant.asObject(array).getClass().isArray()) {
             return null;
-        } else if (constant.isNull()) {
+        }
+        return Array.getLength(SubstrateObjectConstant.asObject(array));
+    }
+
+    @Override
+    public JavaConstant readArrayElement(JavaConstant array, int index) {
+        if (array.getJavaKind() != JavaKind.Object || array.isNull()) {
+            return null;
+        }
+
+        Object a = SubstrateObjectConstant.asObject(array);
+
+        if (!a.getClass().isArray() || index < 0 || index >= Array.getLength(a)) {
+            return null;
+        }
+
+        if (a instanceof Object[]) {
+            Object element = ((Object[]) a)[index];
+            return SubstrateObjectConstant.forObject(element);
+        } else {
+            return JavaConstant.forBoxedPrimitive(Array.get(a, index));
+        }
+    }
+
+    @Override
+    public JavaConstant unboxPrimitive(JavaConstant source) {
+        if (!source.getJavaKind().isObject()) {
+            return null;
+        }
+        return JavaConstant.forBoxedPrimitive(SubstrateObjectConstant.asObject(source));
+    }
+
+    @Override
+    public JavaConstant forString(String value) {
+        return SubstrateObjectConstant.forObject(value);
+    }
+
+    @Override
+    public MethodHandleAccessProvider getMethodHandleAccess() {
+        throw shouldNotReachHereAtRuntime(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public int identityHashCode(JavaConstant constant) {
+        JavaKind kind = Objects.requireNonNull(constant).getJavaKind();
+        if (kind != JavaKind.Object) {
+            throw new IllegalArgumentException("Constant has unexpected kind " + kind + ": " + constant);
+        }
+        if (constant.isNull()) {
             /* System.identityHashCode is specified to return 0 when passed null. */
             return 0;
         }
-        return ((SubstrateObjectConstant) constant).getIdentityHashCode();
+        if (constant instanceof SubstrateObjectConstant sConstant) {
+            return sConstant.getIdentityHashCode();
+        }
+        throw new IllegalArgumentException("Constant has unexpected type " + constant.getClass() + ": " + constant);
+    }
+
+    @Override
+    public int makeIdentityHashCode(JavaConstant constant, int requestedValue) {
+        throw VMError.unsupportedFeature("Injecting identity hash code not supported at Native Image runtime");
     }
 
     @Override
@@ -95,53 +170,21 @@ public class SubstrateConstantReflectionProvider extends SharedConstantReflectio
         return readFieldValue((SubstrateField) field, receiver);
     }
 
-    protected boolean canBoxPrimitive(JavaConstant source) {
-        boolean result = source.getJavaKind().isPrimitive() && isCachedPrimitive(source);
-        assert !result || source.asBoxedPrimitive() == source.asBoxedPrimitive() : "value must be cached";
-        return result;
-    }
-
-    /**
-     * Check if the constant is a boxed value that is guaranteed to be cached by the platform.
-     * Otherwise the generated code might be the only reference to the boxed value and since object
-     * references from code are weak this can cause invalidation problems.
-     */
-    private static boolean isCachedPrimitive(JavaConstant source) {
-        switch (source.getJavaKind()) {
-            case Boolean:
-                return true;
-            case Char:
-                return source.asInt() <= 127;
-            case Byte:
-            case Short:
-                return source.asInt() >= -128 && source.asInt() <= 127;
-            case Int:
-                return source.asInt() >= -128 && source.asInt() <= Target_java_lang_Integer_IntegerCache.high;
-            case Long:
-                return source.asLong() >= -128 && source.asLong() <= 127;
-            case Float:
-            case Double:
-                return false;
-            default:
-                throw new IllegalArgumentException("Unexpected kind " + source.getJavaKind());
-        }
-    }
-
     public static JavaConstant readFieldValue(SubstrateField field, JavaConstant receiver) {
         if (field.constantValue != null) {
             return field.constantValue;
         }
-        int location = field.location;
+        int location = field.getLocation();
         if (location < 0) {
             return null;
         }
         JavaKind kind = field.getStorageKind();
         Object baseObject;
         if (field.isStatic()) {
-            if (kind == JavaKind.Object) {
-                baseObject = StaticFieldsSupport.getStaticObjectFields();
+            if (kind.isObject()) {
+                baseObject = StaticFieldsSupport.getStaticObjectFieldsAtRuntime(field.getInstalledLayerNum());
             } else {
-                baseObject = StaticFieldsSupport.getStaticPrimitiveFields();
+                baseObject = StaticFieldsSupport.getStaticPrimitiveFieldsAtRuntime(field.getInstalledLayerNum());
             }
         } else {
             if (receiver == null || !field.getDeclaringClass().isInstance(receiver)) {
@@ -161,10 +204,10 @@ public class SubstrateConstantReflectionProvider extends SharedConstantReflectio
          * static fields the offsets are into the known data arrays that hold the fields. So we can
          * use read methods that do not perform further checks.
          */
-        if (kind == JavaKind.Object) {
+        if (kind.isObject()) {
             result = SubstrateMemoryAccessProviderImpl.readObjectUnchecked(baseObject, location, false, isVolatile);
         } else {
-            result = SubstrateMemoryAccessProviderImpl.readPrimitiveUnchecked(kind, baseObject, location, kind.getByteCount() * 8, isVolatile);
+            result = SubstrateMemoryAccessProviderImpl.readPrimitiveUnchecked(kind, baseObject, location, kind.getByteCount(), isVolatile);
         }
         return result;
     }
@@ -188,17 +231,11 @@ public class SubstrateConstantReflectionProvider extends SharedConstantReflectio
          * into yet another auxiliary image and the object offsets change.
          */
         if (Heap.getHeap().isInPrimaryImageHeap(object)) {
-            SignedWord base = (SignedWord) Isolates.getHeapBase(CurrentIsolate.getIsolate());
-            SignedWord offset = Word.objectToUntrackedPointer(object).subtract(base);
+            SignedWord base = (SignedWord) KnownIntrinsics.heapBase();
+            SignedWord offset = Word.objectToUntrackedWord(object).subtract(base);
             return NumUtil.safeToInt(offset.rawValue());
         } else {
             return 0;
         }
     }
-}
-
-@TargetClass(className = "java.lang.Integer$IntegerCache")
-final class Target_java_lang_Integer_IntegerCache {
-    @Alias @RecomputeFieldValue(kind = Kind.None, isFinal = true) //
-    static int high;
 }

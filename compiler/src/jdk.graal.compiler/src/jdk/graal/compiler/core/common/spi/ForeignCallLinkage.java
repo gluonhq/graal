@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 package jdk.graal.compiler.core.common.spi;
 
 import jdk.vm.ci.code.CallingConvention;
+import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.meta.InvokeTarget;
 import jdk.vm.ci.meta.Value;
 
@@ -50,7 +51,7 @@ public interface ForeignCallLinkage extends InvokeTarget {
      * the code cache or -1 when not applicable. Intended for determining the required size of
      * address/offset fields.
      */
-    long getMaxCallTargetOffset();
+    long getMaxCallTargetOffset(CodeCacheProvider codeCache);
 
     ForeignCallDescriptor getDescriptor();
 
@@ -58,6 +59,15 @@ public interface ForeignCallLinkage extends InvokeTarget {
      * Gets the values used/killed by this foreign call.
      */
     Value[] getTemporaries();
+
+    /**
+     * Gets additional values returned by this foreign call, beyond those specified in the
+     * {@linkplain ForeignCallDescriptor descriptor}. The default implementation returns an empty
+     * array, indicating that there are no additional return values.
+     */
+    default Value[] getAdditionalReturns() {
+        return Value.NO_VALUES;
+    }
 
     /**
      * Determines if the foreign call target destroys all registers.

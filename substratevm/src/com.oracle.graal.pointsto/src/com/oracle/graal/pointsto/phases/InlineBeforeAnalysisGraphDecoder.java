@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,7 +38,6 @@ import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.graal.pointsto.phases.InlineBeforeAnalysisPolicy.AbstractPolicyScope;
 
-import jdk.graal.compiler.bytecode.BytecodeProvider;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeSourcePosition;
@@ -57,11 +56,9 @@ import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
 import jdk.graal.compiler.nodes.graphbuilderconf.InlineInvokePlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.LoopExplosionPlugin;
-import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.replacements.PEGraphDecoder;
 import jdk.graal.compiler.replacements.nodes.MethodHandleWithExceptionNode;
-import jdk.graal.compiler.replacements.nodes.ResolvedMethodHandleCallTargetNode;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
@@ -70,6 +67,7 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
 
         public final AbstractPolicyScope policyScope;
 
+        private final AnalysisMethod rootMethod;
         private boolean inliningAborted;
 
         /*
@@ -78,12 +76,13 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
          */
         private final EconomicSet<EncodedGraph> encodedGraphs;
 
-        InlineBeforeAnalysisMethodScope(StructuredGraph targetGraph, PEMethodScope caller, LoopScope callerLoopScope, EncodedGraph encodedGraph, AnalysisMethod method,
+        InlineBeforeAnalysisMethodScope(StructuredGraph targetGraph, PEMethodScope caller, EncodedGraph encodedGraph, AnalysisMethod method,
                         InvokeData invokeData, int inliningDepth, ValueNode[] arguments) {
-            super(targetGraph, caller, callerLoopScope, encodedGraph, method, invokeData, inliningDepth, arguments);
+            super(targetGraph, caller, encodedGraph, method, invokeData, inliningDepth, arguments);
 
             if (caller == null) {
                 /* The root method that we are decoding, i.e., inlining into. */
+                rootMethod = method;
                 policyScope = policy.createRootScope();
                 if (graph.getDebug().isLogEnabled()) {
                     graph.getDebug().logv("  ".repeat(inliningDepth) + "createRootScope for " + method.format("%H.%n(%p)") + ": " + policyScope);
@@ -93,7 +92,9 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
                 for (int i = 0; i < arguments.length; i++) {
                     constArgsWithReceiver[i] = arguments[i].isConstant();
                 }
-                policyScope = policy.openCalleeScope(cast(caller).policyScope, (AnalysisMethod) caller.method, method);
+                InlineBeforeAnalysisMethodScope callerScope = cast(caller);
+                rootMethod = callerScope.rootMethod;
+                policyScope = policy.openCalleeScope(callerScope.policyScope, (AnalysisMethod) caller.method, method);
                 if (graph.getDebug().isLogEnabled()) {
                     graph.getDebug().logv("  ".repeat(inliningDepth) + "openCalleeScope for " + method.format("%H.%n(%p)") + ": " + policyScope);
                 }
@@ -123,8 +124,9 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
         public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod m, ValueNode[] args) {
             AnalysisMethod method = (AnalysisMethod) m;
 
-            AbstractPolicyScope policyScope = cast(((PENonAppendGraphBuilderContext) b).methodScope).policyScope;
-            if (policy.shouldInlineInvoke(b, policyScope, method, args)) {
+            InlineBeforeAnalysisMethodScope methodScope = cast(((PENonAppendGraphBuilderContext) b).methodScope);
+            AbstractPolicyScope policyScope = methodScope.policyScope;
+            if (policy.shouldInlineInvoke(b, policyScope, methodScope.rootMethod, method, args)) {
                 return policy.createInvokeInfo(method);
             } else {
                 return InlineInfo.DO_NOT_INLINE_WITH_EXCEPTION;
@@ -139,7 +141,7 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
         super(AnalysisParsedGraph.HOST_ARCHITECTURE, graph, providers, loopExplosionPlugin,
                         providers.getGraphBuilderPlugins().getInvocationPlugins(),
                         new InlineInvokePlugin[]{new InlineBeforeAnalysisInlineInvokePlugin(policy)},
-                        null, policy.nodePlugins, null, null,
+                        null, policy.nodePlugins, null,
                         new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), policy.needsExplicitExceptions(), false);
         this.bb = bb;
         this.policy = policy;
@@ -147,6 +149,11 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
         if (graph.getDebug().isLogEnabled()) {
             graph.getDebug().logv("InlineBeforeAnalysis: decoding " + graph.method().format("%H.%n(%p)"));
         }
+    }
+
+    @Override
+    protected boolean supportsOOMEExceptionEdgeRepair(ResolvedJavaMethod method, PEMethodScope caller, InvokeData invokeData) {
+        return policy.needsExplicitExceptions();
     }
 
     @Override
@@ -170,13 +177,13 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
     }
 
     @Override
-    protected PEMethodScope createMethodScope(StructuredGraph targetGraph, PEMethodScope caller, LoopScope callerLoopScope, EncodedGraph encodedGraph, ResolvedJavaMethod method, InvokeData invokeData,
+    protected PEMethodScope createMethodScope(StructuredGraph targetGraph, PEMethodScope caller, EncodedGraph encodedGraph, ResolvedJavaMethod method, InvokeData invokeData,
                     int inliningDepth, ValueNode[] arguments) {
-        return new InlineBeforeAnalysisMethodScope(targetGraph, caller, callerLoopScope, encodedGraph, (AnalysisMethod) method, invokeData, inliningDepth, arguments);
+        return new InlineBeforeAnalysisMethodScope(targetGraph, caller, encodedGraph, (AnalysisMethod) method, invokeData, inliningDepth, arguments);
     }
 
     @Override
-    protected EncodedGraph lookupEncodedGraph(ResolvedJavaMethod method, BytecodeProvider intrinsicBytecodeProvider) {
+    protected EncodedGraph lookupEncodedGraph(ResolvedJavaMethod method) {
         AnalysisMethod aMethod = (AnalysisMethod) method;
         return aMethod.ensureGraphParsed(bb).getEncodedGraph();
     }
@@ -284,13 +291,7 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
                         invokableData.nextOrderId, invokableData.exceptionOrderId, invokableData.exceptionStateOrderId, invokableData.exceptionNextOrderId);
 
         CallTargetNode callTarget;
-        if (invoke.callTarget() instanceof ResolvedMethodHandleCallTargetNode t) {
-            // This special CallTargetNode lowers itself back to the original target (e.g. linkTo*)
-            // if the invocation hasn't been inlined, which we don't want for Native Image.
-            callTarget = new MethodCallTargetNode(t.invokeKind(), t.targetMethod(), t.arguments().toArray(ValueNode.EMPTY_ARRAY), t.returnStamp(), t.getTypeProfile());
-        } else {
-            callTarget = (CallTargetNode) invoke.callTarget().copyWithInputs(false);
-        }
+        callTarget = (CallTargetNode) invoke.callTarget().copyWithInputs(false);
         // handleInvoke() expects that CallTargetNode is not eagerly added to the graph
         invoke.callTarget().replaceAtUsagesAndDelete(null);
         invokeData.callTarget = callTarget;
@@ -310,7 +311,7 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
     protected void finishInlining(MethodScope is) {
         InlineBeforeAnalysisMethodScope inlineScope = cast(is);
         InlineBeforeAnalysisMethodScope callerScope = cast(inlineScope.caller);
-        LoopScope callerLoopScope = inlineScope.callerLoopScope;
+        LoopScope callerLoopScope = inlineScope.caller.currentLoopScope;
         InvokeData invokeData = inlineScope.invokeData;
 
         if (inlineScope.inliningAborted) {
@@ -331,7 +332,7 @@ public class InlineBeforeAnalysisGraphDecoder extends PEGraphDecoder {
                 assert lookupNode(callerLoopScope, invokeData.exceptionOrderId) == inlineScope.exceptionPlaceholderNode : inlineScope;
                 registerNode(callerLoopScope, invokeData.exceptionOrderId, null, true, true);
                 ValueNode exceptionReplacement = makeStubNode(callerScope, callerLoopScope, invokeData.exceptionOrderId);
-                inlineScope.exceptionPlaceholderNode.replaceAtUsagesAndDelete(exceptionReplacement);
+                inlineScope.exceptionPlaceholderNode.replaceAtUsagesAndDeleteWithoutCheckingInvariants(exceptionReplacement);
             }
 
             handleNonInlinedInvoke(callerScope, callerLoopScope, invokeData);

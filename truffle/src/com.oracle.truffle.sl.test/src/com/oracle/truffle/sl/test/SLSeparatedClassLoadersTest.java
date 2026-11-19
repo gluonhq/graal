@@ -45,9 +45,13 @@ import static org.junit.Assert.assertNotNull;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.security.ProtectionDomain;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 import org.graalvm.polyglot.Engine;
+import org.graalvm.word.WordFactory;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -66,11 +70,28 @@ public class SLSeparatedClassLoadersTest {
 
     @Test
     public void sdkAndTruffleLanguageAPIAndSLInSeparateClassLoaders() throws Exception {
-        final ProtectionDomain sdkDomain = Engine.class.getProtectionDomain();
-        Assume.assumeNotNull(sdkDomain);
-        Assume.assumeNotNull(sdkDomain.getCodeSource());
-        URL sdkURL = sdkDomain.getCodeSource().getLocation();
-        Assume.assumeNotNull(sdkURL);
+        final ProtectionDomain polyglotDomain = Engine.class.getProtectionDomain();
+        Assume.assumeNotNull(polyglotDomain);
+        Assume.assumeNotNull(polyglotDomain.getCodeSource());
+        URL polyglotURL = polyglotDomain.getCodeSource().getLocation();
+        Assume.assumeNotNull(polyglotURL);
+
+        URL collectionsURL = Class.forName("org.graalvm.collections.EconomicMap").getProtectionDomain().getCodeSource().getLocation();
+        Assume.assumeNotNull(collectionsURL);
+
+        URL wordURL = WordFactory.class.getProtectionDomain().getCodeSource().getLocation();
+        Assume.assumeNotNull(wordURL);
+
+        URL nativeURL = Class.forName("org.graalvm.nativeimage.ImageInfo").getProtectionDomain().getCodeSource().getLocation();
+        Assume.assumeNotNull(nativeURL);
+
+        // Optional NativeBridge distribution
+        URL nativeBridgeURL;
+        try {
+            nativeBridgeURL = Class.forName("org.graalvm.nativebridge.ForeignObject").getProtectionDomain().getCodeSource().getLocation();
+        } catch (ClassNotFoundException e) {
+            nativeBridgeURL = null;
+        }
 
         URL truffleURL = Truffle.class.getProtectionDomain().getCodeSource().getLocation();
         Assume.assumeNotNull(truffleURL);
@@ -79,8 +100,12 @@ public class SLSeparatedClassLoadersTest {
         Assume.assumeNotNull(slURL);
 
         ClassLoader parent = Engine.class.getClassLoader().getParent();
-
-        URLClassLoader sdkLoader = new URLClassLoader(new URL[]{sdkURL}, parent);
+        List<URL> classpath = new ArrayList<>();
+        Collections.addAll(classpath, collectionsURL, wordURL, nativeURL, polyglotURL);
+        if (nativeBridgeURL != null) {
+            classpath.add(nativeBridgeURL);
+        }
+        URLClassLoader sdkLoader = new URLClassLoader(classpath.toArray(new URL[0]), parent);
         boolean sdkLoaderLoadsTruffleLanguage;
         try {
             Class.forName("com.oracle.truffle.api.TruffleLanguage", false, sdkLoader);
@@ -94,8 +119,10 @@ public class SLSeparatedClassLoadersTest {
         Thread.currentThread().setContextClassLoader(slLoader);
 
         Class<?> engineClass = sdkLoader.loadClass(Engine.class.getName());
-        Object engine = engineClass.getMethod("create").invoke(null);
-        assertNotNull("Engine has been created", engine);
+        Class<?> builderClass = sdkLoader.loadClass(Engine.Builder.class.getName());
+        Object builder = engineClass.getMethod("newBuilder").invoke(null);
+        builderClass.getMethod("useSystemProperties", boolean.class).invoke(builder, false);
+        Object engine = builderClass.getMethod("build").invoke(builder);
 
         Map<?, ?> languages = (Map<?, ?>) engineClass.getMethod("getLanguages").invoke(engine);
         Object lang = languages.get("sl");

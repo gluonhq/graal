@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,18 +28,18 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryPoolMXBean;
 import java.lang.management.MemoryType;
 import java.lang.management.MemoryUsage;
-import java.util.List;
 
 import javax.management.ObjectName;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.core.jdk.management.VMManagementBean;
 import com.oracle.svm.core.heap.AbstractMXBean;
 
 import sun.management.Util;
 
-public abstract class CodeCachePoolMXBean extends AbstractMXBean implements MemoryPoolMXBean {
+public abstract class CodeCachePoolMXBean extends AbstractMXBean implements MemoryPoolMXBean, VMManagementBean {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     CodeCachePoolMXBean() {
@@ -136,11 +136,7 @@ public abstract class CodeCachePoolMXBean extends AbstractMXBean implements Memo
         return Util.newObjectName(ManagementFactory.MEMORY_POOL_MXBEAN_DOMAIN_TYPE, getName());
     }
 
-    public static List<MemoryPoolMXBean> getMemoryPools() {
-        return List.of(new CodeAndDataPool(), new NativeMetadataPool());
-    }
-
-    static final class CodeAndDataPool extends CodeCachePoolMXBean {
+    public static final class CodeAndDataPool extends CodeCachePoolMXBean {
         @Override
         protected long getCurrentSize() {
             RuntimeCodeInfoMemory.SizeCounters counters = RuntimeCodeInfoMemory.singleton().getSizeCounters();
@@ -164,7 +160,7 @@ public abstract class CodeCachePoolMXBean extends AbstractMXBean implements Memo
         }
     }
 
-    static final class NativeMetadataPool extends CodeCachePoolMXBean {
+    public static final class NativeMetadataPool extends CodeCachePoolMXBean {
         @Override
         protected long getCurrentSize() {
             RuntimeCodeInfoMemory.SizeCounters counters = RuntimeCodeInfoMemory.singleton().getSizeCounters();

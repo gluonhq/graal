@@ -28,19 +28,26 @@ import static com.oracle.svm.core.posix.headers.darwin.DarwinTime.NoTransitions.
 import static com.oracle.svm.core.posix.headers.darwin.DarwinTime.NoTransitions.mach_timebase_info;
 
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.StackValue;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.posix.PosixUtils;
 import com.oracle.svm.core.posix.headers.darwin.DarwinTime;
-import com.oracle.svm.core.util.BasedOnJDKFile;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.util.JVMCIReflectionUtil;
 
 import jdk.internal.misc.Unsafe;
 
@@ -62,6 +69,7 @@ final class Target_java_lang_System_Darwin {
 
 /** Additional static-like fields for {@link Target_java_lang_System_Darwin}. */
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 final class DarwinTimeUtil {
     private static final Unsafe U = Unsafe.getUnsafe();
     private static final long INITIALIZED_OFFSET = U.objectFieldOffset(DarwinTimeUtil.class, "initialized");
@@ -79,7 +87,7 @@ final class DarwinTimeUtil {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/os/bsd/os_bsd.cpp#L799-L821")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23+10/src/hotspot/os/bsd/os_bsd.cpp#L799-L821")
     long nanoTime() {
         if (!U.getBooleanAcquire(this, INITIALIZED_OFFSET)) {
             /* Can be called by multiple threads but they should all query the same data. */
@@ -115,6 +123,40 @@ final class DarwinTimeUtil {
          */
         return (prev == obsv) ? now : obsv;
     }
+}
+
+/**
+ * Native functions don't exist on Darwin because this whole class is used, and should exist, only
+ * on Linux. See <code>java.util.prefs.Preferences#factory</code>.
+ */
+@TargetClass(className = "java.util.prefs.FileSystemPreferences", onlyWith = IsJavaUtilPrefsPresent.class)
+final class Target_java_util_prefs_FileSystemPreferences {
+    @Delete
+    private static native int[] lockFile0(String fileName, int permission, boolean shared);
+
+    @Delete
+    private static native int unlockFile0(int lockHandle);
+
+    @Delete
+    private static native int chmod(String fileName, int permission);
+}
+
+final class IsJavaUtilPrefsPresent implements BooleanSupplier {
+    @Override
+    public boolean getAsBoolean() {
+        var prefsMod = JVMCIReflectionUtil.bootModuleLayer().findModule("java.prefs");
+        return prefsMod.isPresent();
+    }
+}
+
+/**
+ * Not used in native image and has linker errors with XCode 13. Can be removed in the future when
+ * XCode 14 becomes omnipresent.
+ */
+@TargetClass(className = "sun.util.locale.provider.HostLocaleProviderAdapterImpl")
+final class Target_sun_util_locale_provider_HostLocaleProviderAdapterImpl {
+    @Delete
+    private static native String getDefaultLocale(int cat);
 }
 
 /** Dummy class to have a class with the file's name. */

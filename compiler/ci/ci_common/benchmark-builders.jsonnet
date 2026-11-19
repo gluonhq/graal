@@ -3,56 +3,79 @@
   local utils = (import '../../../ci/ci_common/common-utils.libsonnet'),
   local bc = (import '../../../ci/ci_common/bench-common.libsonnet'),
   local cc = (import 'compiler-common.libsonnet'),
+  local config = (import '../../../ci/repo-configuration.libsonnet'),
   local bench = (import 'benchmark-suites.libsonnet'),
+  local pr_bench_settings = (import '../../../ci/ci_common/pr-bench-settings.libsonnet'),
   local hw = bc.bench_hw,
 
   # GR-49532 TODO add 'throughput' metric and 'top-tier-throughput' secondary_metrics
-  local PR_bench_libgraal = {unicorn_pull_request_benchmarking:: {name: 'libgraal', metrics: ['time', 'throughput'], secondary_metrics: ['max-rss', 'top-tier-throughput']}},
+  local PR_bench_libgraal = {unicorn_pull_request_benchmarking:: {name: 'libgraal', metrics: ['time', 'throughput'], secondary_metrics: ['binary-size', 'max-rss', 'top-tier-throughput'], baseline_benchmarking: true}},
+  local PR_bench_crema_awfy = {unicorn_pull_request_benchmarking:: pr_bench_settings.crema_awfy_pr_bench},
+  local PR_bench_libgraal_gate = c.tier3 + {
+    # A single representative DaCapo workload keeps this below an hour while
+    # still exercising the LibGraal PR-bench execution path.
+    job_prefix:: "gate-compiler-smoke",
+    should_upload_results:: false,
+    targets: ['tier3'],
+    run: [
+      self.benchmark_cmd + ['dacapo:pmd', '--'] + self.extra_vm_args,
+    ],
+    timelimit: '0:45:00',
+  },
 
   local main_builds = std.flattenArrays([
     [
-    c.daily + c.opt_post_merge + hw.e3 + jdk + cc.libgraal + bench.dacapo + PR_bench_libgraal,
-    c.daily + c.opt_post_merge + hw.e3 + jdk + cc.libgraal + bench.scala_dacapo + PR_bench_libgraal,
-    c.daily + c.opt_post_merge + hw.e3 + jdk + cc.libgraal + bench.renaissance + PR_bench_libgraal,
-    c.daily + c.opt_post_merge + hw.e3 + jdk + cc.libgraal + bench.specjvm2008 + PR_bench_libgraal,
-    c.on_demand                + hw.e3 + jdk + cc.libgraal + bench.dacapo_size_variants,
-    c.on_demand                + hw.e3 + jdk + cc.libgraal + bench.scala_dacapo_size_variants,
-    c.monthly                  + hw.e3 + jdk + cc.libgraal + bench.specjbb2015,
-    c.daily + c.opt_post_merge + hw.e3 + jdk + cc.libgraal + bench.awfy + PR_bench_libgraal,
-    c.daily                    + hw.e3 + jdk + cc.libgraal + bench.microservice_benchmarks,
-    c.weekly                   + hw.e3 + jdk + cc.libgraal + bench.micros_graal_whitebox,
-    c.weekly                   + hw.e3 + jdk + cc.libgraal + bench.micros_graal_dist,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.dacapo + PR_bench_libgraal,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.scala_dacapo + PR_bench_libgraal,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.renaissance + PR_bench_libgraal,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.barista + PR_bench_libgraal,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.specjvm2008 + PR_bench_libgraal,
+    c.monthly                  + hw.x52 + jdk + cc.libgraal + bench.specjbb2015,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + cc.libgraal + bench.awfy + PR_bench_libgraal,
+    c.weekly                   + hw.x52 + jdk + cc.libgraal + bench.micros_graal_whitebox,
+    c.weekly                   + hw.x52 + jdk + cc.libgraal + bench.micros_graal_dist,
+    ]
+  for jdk in cc.product_jdks
+  ]),
+
+  local gate_builds = std.flattenArrays([
+    [
+    c.linux_amd64 + jdk + cc.libgraal + bench.dacapo + PR_bench_libgraal_gate,
     ]
   for jdk in cc.product_jdks
   ]),
 
   local profiling_builds = std.flattenArrays([
     [
-    c.monthly + hw.e3 + jdk + cc.libgraal + suite + cc.enable_profiling   + { job_prefix:: "bench-compiler-profiling" },
-    c.monthly + hw.e3 + jdk + cc.libgraal + suite + cc.footprint_tracking + { job_prefix:: "bench-compiler-footprint" }
+    c.on_demand + hw.x52 + jdk + cc.libgraal + suite + cc.enable_profiling     + { job_prefix:: "bench-compiler-profiling" },
+    c.on_demand + hw.x52 + jdk + cc.libgraal + suite + cc.footprint_tracking   + { job_prefix:: "bench-compiler-footprint" },
+    c.monthly + hw.x52_root + jdk + cc.libgraal + suite + cc.energy_tracking   + { job_prefix:: "bench-compiler-energy" }
     ]
   for jdk in cc.product_jdks
   for suite in bench.groups.main_suites
   ]),
 
-  local weekly_amd64_forks_builds = std.flattenArrays([
+  local weekly_amd64_forks_builds = std.flattenArrays(std.flattenArrays([
+    [
+    bc.generate_fork_builds(c.weekly  + hw.x52  + jdk + cc.libgraal + suite, subdir='compiler'),
     bc.generate_fork_builds(c.weekly  + hw.e3  + jdk + cc.libgraal + suite, subdir='compiler')
+    ]
   for jdk in cc.product_jdks
   for suite in bench.groups.weekly_forks_suites
-  ]),
+  ])),
 
   local weekly_aarch64_forks_builds = std.flattenArrays([
-    bc.generate_fork_builds(c.weekly + hw.a12c + jdk + cc.libgraal + suite, subdir='compiler')
+    bc.generate_fork_builds(c.weekly + hw.hr350a_or_osprey(suite.suite) + jdk + cc.libgraal + suite, subdir='compiler')
   for jdk in cc.product_jdks
   for suite in bench.groups.weekly_forks_suites
   ]),
 
   local aarch64_builds = [
-    c.daily + hw.a12c + jdk + cc.libgraal + suite,
+    c.daily + hw.hr350a_or_osprey(suite.suite) + jdk + cc.libgraal + suite,
   for jdk in cc.product_jdks
   for suite in bench.groups.main_suites
   ] + [
-    c.monthly + hw.a12c + jdk + cc.libgraal + bench.specjbb2015,
+    c.monthly + hw.hr350a_or_osprey(bench.specjbb2015.suite) + jdk + cc.libgraal + bench.specjbb2015,
   for jdk in cc.product_jdks
   ],
 
@@ -64,7 +87,7 @@
   ],
 
   local zgc_builds = [
-    c.weekly + hw.e3 + jdk + cc.libgraal + cc.zgc_mode + suite,
+    c.weekly + hw.x52 + jdk + cc.libgraal + cc.zgc_mode + suite,
   for jdk in cc.product_jdks
   for suite in bench.groups.main_suites + [bench.specjbb2015]
   ],
@@ -76,7 +99,53 @@
   for suite in bench.groups.main_suites
   ],
 
-  local all_builds = main_builds + weekly_amd64_forks_builds + weekly_aarch64_forks_builds + profiling_builds + avx_builds + zgc_builds + zgc_avx_builds + aarch64_builds,
+  local shenandoah_builds = [
+    c.weekly + hw.x52 + jdk + cc.libgraal + cc.shenandoah_mode + suite,
+  for jdk in cc.product_jdks
+  for suite in bench.groups.main_suites + [bench.specjbb2015]
+  ],
+
+  local metrics_suites = [bench.dacapo, bench.scala_dacapo, bench.renaissance, bench.specjvm2008],
+
+  local metrics_builds = std.flattenArrays([
+    [
+    c.weekly + hw.x52 + jdk + cc.libgraal + suite + bench.timing,
+    c.weekly + hw.x52 + jdk + cc.libgraal + suite + bench.mem_use,
+    ],
+  for jdk in cc.product_jdks
+  for suite in metrics_suites
+  ]),
+
+  local crema_builds = std.flattenArrays([
+    [
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy_template(capture_crema_libjvm_size=true, iterations=1000) + cc.crema + PR_bench_crema_awfy,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy_template(capture_crema_libjvm_size=true, iterations=1000) + cc.crema_preserve_java_base + PR_bench_crema_awfy,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy + cc.crema_xint + PR_bench_crema_awfy,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy + cc.crema_xint_with_profiles + PR_bench_crema_awfy,
+    ] + (if config.graalvm_edition == "ee" then [
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy_template(capture_crema_libjvm_size=true, iterations=1000) + cc.crema_pgo + PR_bench_crema_awfy,
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy + cc.crema_xint_pgo + PR_bench_crema_awfy,
+    ] else []) + [
+    c.daily + c.opt_post_merge + hw.x52 + jdk + bench.awfy + cc.crema_no_profiling + PR_bench_crema_awfy,
+    ]
+  for jdk in cc.product_jdks
+  ]),
+
+  // Required PR gate for the same AWFY configuration that preserves java.base bytecodes.
+  // This is functional coverage, not a performance measurement: run the same workload on an
+  // ordinary gate host and do not register it as a PR benchmark or upload benchmark results.
+  local crema_preserve_java_base_gate_builds = [
+    c.gate + c.linux_amd64 + jdk + bench.awfy_template(capture_crema_libjvm_size=true) + cc.crema_preserve_java_base + {
+      job_prefix:: "ristretto-gate",
+      should_upload_results:: false,
+      // TODO GR-79973
+      extra_vm_args+: if config.graalvm_edition == "ce" then ["-XX:-JITUseOnStackReplacement"] else [],
+    },
+  for jdk in cc.product_jdks
+  ],
+
+  local all_builds = gate_builds + main_builds + weekly_amd64_forks_builds + weekly_aarch64_forks_builds + profiling_builds + avx_builds + zgc_builds + zgc_avx_builds +
+                     shenandoah_builds + aarch64_builds + metrics_builds + crema_builds + crema_preserve_java_base_gate_builds,
   local filtered_builds = [b for b in all_builds if b.is_jdk_supported(b.jdk_version) && b.is_arch_supported(b.arch)],
   // adds a "defined_in" field to all builds mentioning the location of this current file
   builds:: utils.add_defined_in(filtered_builds, std.thisFile),

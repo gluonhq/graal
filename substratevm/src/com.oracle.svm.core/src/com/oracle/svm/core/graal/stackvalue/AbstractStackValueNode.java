@@ -28,8 +28,8 @@ import static jdk.graal.compiler.nodeinfo.InputType.Memory;
 
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
 import com.oracle.svm.core.graal.stackvalue.StackValueNode.StackSlotIdentity;
 
 import jdk.graal.compiler.graph.IterableNodeType;
@@ -52,7 +52,7 @@ public abstract class AbstractStackValueNode extends AbstractStateSplit implemen
     protected final boolean checkVirtualThread;
 
     protected AbstractStackValueNode(NodeClass<? extends AbstractStackValueNode> type, int alignmentInBytes, StackSlotIdentity slotIdentity, boolean checkVirtualThread) {
-        super(type, FrameAccess.getWordStamp());
+        super(type, SubstrateTarget.getWordStamp());
         this.alignmentInBytes = alignmentInBytes;
         this.slotIdentity = slotIdentity;
         this.checkVirtualThread = checkVirtualThread;
@@ -88,11 +88,16 @@ public abstract class AbstractStackValueNode extends AbstractStateSplit implemen
          * around in a caller, but these are difficult to ensure across multiple callers and
          * callees.
          */
-        return disallowVirtualThread && !Uninterruptible.Utils.isUninterruptible(method);
+        return disallowVirtualThread && !UninterruptibleAnnotationUtils.isUninterruptible(method);
     }
 
     protected static StackSlotIdentity createStackSlotIdentity(ResolvedJavaMethod method, int bci) {
         String name = method.asStackTraceElement(bci).toString();
         return new StackSlotIdentity(name, false);
+    }
+
+    protected static StackSlotIdentity createSharedStackSlotIdentity(ResolvedJavaMethod method, int bci) {
+        String name = method.asStackTraceElement(bci).toString();
+        return new StackSlotIdentity(name, true);
     }
 }

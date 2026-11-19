@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -385,8 +385,23 @@ public class LIRKind extends ValueKind<LIRKind> {
     }
 
     /**
-     * Check whether this value is derived from a reference in a non-linear way. If this returns
-     * {@code true}, this value must not be live at safepoints.
+     * Gets the location of object references in the value. If the value is a vector type, each bit
+     * represents one component of the vector.
+     */
+    protected int getReferenceMask() {
+        return referenceMask;
+    }
+
+    /**
+     * Gets a bitmask with bits set to 1 indicating which references in {@link #referenceMask} are
+     * compressed.
+     */
+    protected int getReferenceCompressionMask() {
+        return referenceCompressionMask;
+    }
+
+    /**
+     * Checks whether this value is derived from a reference in a way the GC can not track.
      */
     public boolean isUnknownReference() {
         return referenceMask == UNKNOWN_REFERENCE;

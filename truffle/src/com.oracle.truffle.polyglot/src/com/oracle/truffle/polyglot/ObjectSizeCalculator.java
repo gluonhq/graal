@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,6 @@
  */
 package com.oracle.truffle.polyglot;
 
-import java.lang.ref.Reference;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.util.ArrayDeque;
@@ -72,6 +71,7 @@ import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.dsl.NodeFactory;
 import com.oracle.truffle.api.impl.DefaultTruffleRuntime;
 import com.oracle.truffle.api.instrumentation.AllocationReporter;
+import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.ExecutionEventListener;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.io.TruffleProcessBuilder;
@@ -188,8 +188,8 @@ final class ObjectSizeCalculator {
 
     /**
      * Given an object, returns the allocated size, in bytes, of the object and all other objects
-     * reachable from it within {@link ObjectSizeCalculator#isContextHeapBoundary(Object) context
-     * heap boundary}.
+     * reachable from it within {@link ObjectSizeCalculator#isContextHeapBoundary(APIAccess, Object)
+     * context heap boundary}.
      *
      * @param obj the object; cannot be null.
      * @param stopAtBytes when calculated size exceeds stopAtBytes, calculation stops and returns
@@ -285,7 +285,7 @@ final class ObjectSizeCalculator {
         }
     }
 
-    private static void increaseByArraySize(CalculationState calculationState, ArrayMemoryLayout layout, int length) {
+    private static void increaseByArraySize(CalculationState calculationState, ArrayMemoryLayout layout, long length) {
         increaseSize(calculationState, roundToObjectAlignment(layout.baseOffset + length * layout.indexScale, getObjectAlignment()));
     }
 
@@ -297,7 +297,6 @@ final class ObjectSizeCalculator {
         }
         if (obj instanceof PolyglotContextConfig ||
                         obj instanceof TruffleLanguageProvider ||
-                        obj instanceof TruffleLanguage.Provider ||
                         obj instanceof ExecutionEventListener ||
                         obj instanceof ClassValue ||
                         obj instanceof PolyglotWrapper ||
@@ -351,6 +350,8 @@ final class ObjectSizeCalculator {
 
                         (obj instanceof ContextLocal) ||
                         (obj instanceof ContextThreadLocal) ||
+
+                        (obj instanceof EventBinding<?>) ||
                         /*
                          * For safety, copy the asserts here in case asserts are disabled.
                          */
@@ -506,13 +507,11 @@ final class ObjectSizeCalculator {
         // Padded fields + header size
         private final long objectSize;
         private final int[] fieldOffsets;
-        private final boolean isReference;
         private final Class<?> clazz;
 
         ObjectClassInfo(Class<?> clazz) {
             this.fieldOffsets = EngineAccessor.RUNTIME.getFieldOffsets(clazz, false, true);
             this.objectSize = EngineAccessor.RUNTIME.getBaseInstanceSize(clazz);
-            this.isReference = Reference.class.isAssignableFrom(clazz);
             this.clazz = clazz;
         }
 
@@ -524,21 +523,6 @@ final class ObjectSizeCalculator {
         @Override
         public ForcedStop visit(CalculationState calculationState, Object obj) {
             assert clazz == obj.getClass();
-            if (isReference) {
-                Object nextObj = null;
-                try {
-                    nextObj = ((Reference<?>) obj).get();
-                } catch (Exception t) {
-                    /*
-                     * The lookup might throw an exception .e.g UnsupportedOperationException for
-                     * phantom references.
-                     */
-                }
-                ForcedStop stop = enqueueOrStop(calculationState, nextObj);
-                if (stop != ForcedStop.NONE) {
-                    return stop;
-                }
-            }
             for (int fieldOffset : fieldOffsets) {
                 Object nextObj = UNSAFE.getObject(obj, fieldOffset);
                 ForcedStop stop = enqueueOrStop(calculationState, nextObj);

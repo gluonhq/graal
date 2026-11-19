@@ -32,25 +32,27 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.nodes.DirectCallNode;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
-import com.oracle.truffle.espresso.descriptors.Signatures;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.descriptors.SignatureSymbols;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.impl.Field;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.impl.Method;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.nodes.quick.invoke.InvokeDynamicCallSiteNode;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.MethodHandleIntrinsics;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.meta.SignaturePolymorphicIntrinsic;
 
 /**
  * Performs the actual job of an invocation:
- * <li>Obtain the trailing MemberName from the arguments, and extract its payload.
- * <li>Perform method lookup if needed on the given receiver.
- * <li>Execute the payload on the given arguments, stripped from the given MemberName
- *
+ * <ul>
+ * <li>Obtain the trailing MemberName from the arguments, and extract its payload.</li>
+ * <li>Perform method lookup if needed on the given receiver.</li>
+ * <li>Execute the payload on the given arguments, stripped from the given MemberName</li>
+ * </ul>
  * Note that there is a small overhead, as the method invoked is usually the actual payload (in
  * opposition to the other MH nodes, who usually either calls the type checkers, or performs type
  * checks on erased primitives), whose signature is not sub-workd erased. Unfortunately, the
@@ -66,11 +68,11 @@ public abstract class MHLinkToNode extends MethodHandleIntrinsicNode {
 
     static final int INLINE_CACHE_SIZE_LIMIT = 5;
 
-    MHLinkToNode(Method method, MethodHandleIntrinsics.PolySigIntrinsics id) {
+    MHLinkToNode(Method method, SignaturePolymorphicIntrinsic id) {
         super(method);
-        this.argCount = Signatures.parameterCount(method.getParsedSignature());
-        this.hiddenVmtarget = method.getMeta().HIDDEN_VMTARGET;
-        this.hasReceiver = id != MethodHandleIntrinsics.PolySigIntrinsics.LinkToStatic;
+        this.argCount = SignatureSymbols.parameterCount(method.getParsedSignature());
+        this.hiddenVmtarget = method.getMeta().java_lang_invoke_MemberName_0vmTarget;
+        this.hasReceiver = id != SignaturePolymorphicIntrinsic.LinkToStatic;
         this.linker = findLinker(id);
         assert method.isStatic();
     }
@@ -79,7 +81,7 @@ public abstract class MHLinkToNode extends MethodHandleIntrinsicNode {
     public Object call(Object[] args) {
         assert (getMethod().isStatic());
         Method.MethodVersion resolutionSeed = getTarget(args);
-        Object[] basicArgs = unbasic(args, resolutionSeed.getMethod().getParsedSignature(), 0, argCount - 1, hasReceiver);
+        Object[] basicArgs = unbasic(args, resolutionSeed.getMethod().getParsedSignature(), argCount - 1, hasReceiver);
         // method might have been redefined or removed by redefinition
         if (!resolutionSeed.getRedefineAssumption().isValid()) {
             if (resolutionSeed.getMethod().isRemovedByRedefinition()) {
@@ -116,54 +118,44 @@ public abstract class MHLinkToNode extends MethodHandleIntrinsicNode {
     }
 
     @ExplodeLoop
-    static Object[] unbasic(Object[] args, Symbol<Type>[] targetSig, int from, int length, boolean inclReceiver) {
+    static Object[] unbasic(Object[] args, Symbol<Type>[] targetSig, int length, boolean inclReceiver) {
         Object[] res = new Object[length];
         int start = 0;
         if (inclReceiver) {
-            res[start++] = args[from];
+            res[start++] = args[0];
         }
         for (int i = start; i < length; i++) {
-            Symbol<Type> t = Signatures.parameterType(targetSig, i - start);
-            res[i] = InvokeDynamicCallSiteNode.unbasic(args[i + from], t);
+            Symbol<Type> t = SignatureSymbols.parameterType(targetSig, i - start);
+            res[i] = InvokeDynamicCallSiteNode.unbasic(args[i], t);
         }
         return res;
     }
 
     // Tranform sub-words to int
     public static Object rebasic(Object obj, JavaKind rKind) {
-        switch (rKind) {
-            case Boolean:
-                return ((boolean) obj) ? 1 : 0;
-            case Byte:
-                return (int) ((byte) obj);
-            case Char:
-                return (int) ((char) obj);
-            case Short:
-                return (int) ((short) obj);
-            default:
-                return obj;
-        }
+        return switch (rKind) {
+            case Boolean -> ((boolean) obj) ? 1 : 0;
+            case Byte -> (int) ((byte) obj);
+            case Char -> (int) ((char) obj);
+            case Short -> (int) ((short) obj);
+            default -> obj;
+        };
     }
 
-    private static Linker findLinker(MethodHandleIntrinsics.PolySigIntrinsics id) {
-        switch (id) {
-            case LinkToVirtual:
-                return virtualLinker;
-            case LinkToStatic:
-                return staticLinker;
-            case LinkToSpecial:
-                return specialLinker;
-            case LinkToInterface:
-                return interfaceLinker;
-            default:
-                throw EspressoError.shouldNotReachHere("unrecognized linkTo intrinsic: " + id);
-        }
+    private static Linker findLinker(SignaturePolymorphicIntrinsic id) {
+        return switch (id) {
+            case LinkToVirtual -> virtualLinker;
+            case LinkToStatic -> staticLinker;
+            case LinkToSpecial -> specialLinker;
+            case LinkToInterface -> interfaceLinker;
+            default -> throw EspressoError.shouldNotReachHere("unrecognized linkTo intrinsic: " + id);
+        };
     }
 
     private Method.MethodVersion getTarget(Object[] args) {
         assert args.length >= 1;
         StaticObject memberName = (StaticObject) args[args.length - 1];
-        assert (memberName.getKlass().getType() == Symbol.Type.java_lang_invoke_MemberName);
+        assert (memberName.getKlass().getType() == Types.java_lang_invoke_MemberName);
         return ((Method) hiddenVmtarget.getHiddenObject(memberName)).getMethodVersion();
     }
 }

@@ -136,7 +136,7 @@ gu -L install /path/to/sl-component.jar
 A language built with Truffle can be AOT compiled using [Native Image](../reference-manual/native-image/README.md).
 Running `mvn package` in the SimpleLanguage directory also builds a `slnative` executable in the `native` directory.
 This executable is the full SimpleLanguage implementation as a single native application, and has no need for GraalVM in order to execute SimpleLanguage code.
-Besides this, a big advantage of using the native executable when compared to running on GraalVM is the greatly faster startup time as shown bellow:
+Besides this, a big advantage of using the native executable when compared to running on GraalVM is the greatly faster startup time as shown below:
 ```shell
 time ./sl language/tests/HelloWorld.sl
 == running on org.graalvm.polyglot.Engine@2db0f6b2
@@ -227,7 +227,7 @@ Apply the `--upgrade-module-path` option together with `-Dgraalvm.locatorDisable
 A sample POM using `--upgrade-module-path` to export Language API packages can be found in the [Simple Language POM.xml](https://github.com/graalvm/simplelanguage/blob/master/language/pom.xml#L58) file.
 
 > Note: Disabling the locator effectively removes all installed languages from the module path as the locator also creates the class loader for the languages.
-To still use the builtin languages add them to the module-path by pointing the module-path to all needed language homes (for example, `$GRAALVM/languages/js`).
+To still use the built-in languages, add them to the module path by updating the module path to include the paths of all the languages you need (for example, `$GRAALVM/languages/js`).
 
 ### Other JVM Implementations
 

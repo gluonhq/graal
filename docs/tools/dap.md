@@ -17,6 +17,11 @@ The usage of Debug Adapter Protocol is similar to the existing [Chrome DevTools 
 * `--dap.WaitAttached`: do not execute any source code until debugger client is attached. The default is false.
 * `--dap=<[[host:]port]>`: start the debugger on a different port than default (`<host>:4711`).
 
+The DAP server supports successive debugger connections to the same polyglot engine, with one active session at a time.
+Disconnecting an attached debugger leaves the application running and releases the session's breakpoints and debugger state.
+Another debugger can attach without restarting the application or replacing its engine.
+The `--dap.Suspend` and `--dap.WaitAttached` options apply to startup, not to subsequent sessions.
+
 Then you need a DAP client to connect to the open DAP port. VS Code will be used as an example.
 
 1&#46; Save this Node.js application in a file named _App.js_:
@@ -75,9 +80,6 @@ code .
 ```
 
 8&#46; Start debugging (F5).
-
-The other approach is to use VS Code with the GraalVM extension installed.
-Follow the steps described in [Node.js and JavaScript Debugging](https://marketplace.visualstudio.com/items?itemName=oracle-labs-graalvm.graalvm#javascript-and-node.js-debugging), and launch the application being debugged directly from VS Code.
 When debugging a guest language application from VS Code, a user can choose a protocol to use by setting the protocol attribute in the corresponding debug configuration to either `chromeDevTools` or `debugAdapter`.
 To connect to the open DAP port in this scenario, the content of the _launch.json_ should be:
 
@@ -98,3 +100,64 @@ To connect to the open DAP port in this scenario, the content of the _launch.jso
 ```
 
 The advantage of using Debug Adapter Protocol over Chrome Dev Tools is that (1) it is 'native' to Visual Studio Code (VS Code), meaning it does not require any intermediate translation, and (2) that it supports multithreading, which can be particularly useful to debug, for example, a Ruby application.
+
+## Configure Source Path Mappings
+
+Use source path mappings when the debugger client and the GraalVM runtime access the same sources through different paths.
+You can configure mappings in either a `launch` or an `attach` configuration.
+
+The `pathMappings` property accepts the debugpy array syntax.
+Each entry maps a client-local `localRoot` to a `remoteRoot` used by the runtime:
+
+```json
+{
+    "request": "launch",
+    "pathMappings": [
+        {
+            "localRoot": "${workspaceFolder}/src",
+            "remoteRoot": "/opt/application/src"
+        }
+    ]
+}
+```
+
+The Xdebug object syntax maps each runtime root key to a client-local root value:
+
+```json
+{
+    "request": "attach",
+    "pathMappings": {
+        "/opt/application/src": "${workspaceFolder}/src",
+        "/opt/libraries": "${workspaceFolder}/libraries"
+    }
+}
+```
+
+For a single direct mapping, set `localRoot` and `remoteRoot` at the top level:
+
+```json
+{
+    "request": "attach",
+    "localRoot": "${workspaceFolder}",
+    "remoteRoot": "/opt/application"
+}
+```
+
+The server translates client-local paths to runtime paths for path-based breakpoint, breakpoint-location, and source requests.
+It translates runtime paths to client-local paths in loaded-source events, loaded-source responses, and stack traces.
+Trailing path separators do not affect matching.
+Windows drive-letter roots (such as `C:\work`) and Universal Naming Convention (UNC) roots (such as `\\server\share` or `//server/share`) match without regard to case.
+For these roots, `/` and `\` are interchangeable separators.
+The server recognizes Windows syntax independently on each side of a mapping, regardless of its own operating system.
+Other roots remain case-sensitive.
+A root matches either the complete path or a whole directory prefix, so `/opt/app` does not match `/opt/application`.
+When multiple roots match, the longest root takes precedence.
+You can combine `pathMappings` with the top-level `localRoot` and `remoteRoot` pair.
+If matching roots have the same length, the top-level pair takes precedence.
+Paths that do not match a configured root remain unchanged.
+When path mappings are configured, a source receives a `sourceReference` only if its runtime path does not match a mapped remote root.
+A source that matches a mapping is returned with the mapped client path, even when the runtime cannot verify its readability.
+This also applies to sources cached before the `launch` or `attach` request supplies mappings.
+
+> Note: Paths for sources with a positive `sourceReference` remain unchanged.
+> The client must retrieve these sources with a DAP `source` request that specifies the source reference.

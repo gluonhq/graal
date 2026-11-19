@@ -26,17 +26,16 @@ package com.oracle.svm.hosted.methodhandles;
 
 import static com.oracle.svm.hosted.methodhandles.InjectedInvokerRenamingSubstitutionProcessor.INJECTED_INVOKER_CLASS_NAME_SUBSTRING;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.BaseLayerType;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.hosted.FeatureImpl.AfterAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * @see InjectedInvokerRenamingSubstitutionProcessor
@@ -67,7 +66,7 @@ final class StableInjectedInvokerNameFeature implements InternalFeature {
         }
 
         /* Injected invoker names should be unique. */
-        Set<String> injectedInvokerNames = new HashSet<>();
+        EconomicSet<String> injectedInvokerNames = EconomicSet.create();
         types.stream()
                         .map(AnalysisType::getName)
                         .filter(x -> x.contains(INJECTED_INVOKER_CLASS_NAME_SUBSTRING))

@@ -30,12 +30,15 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.List;
 
+import org.junit.AssumptionViolatedException;
 import org.junit.Test;
 
-import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.genscavenge.HeapParameters;
+import com.oracle.svm.core.genscavenge.TlabOptionCache;
 import com.oracle.svm.core.jfr.JfrEvent;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 import jdk.jfr.Recording;
 import jdk.jfr.consumer.RecordedClass;
@@ -47,6 +50,16 @@ public class TestObjectAllocationInNewTLABEvent extends JfrRecordingTest {
 
     @Test
     public void test() throws Throwable {
+        /* GR-26848: Adapt this test for G1 once it supports JFR TLAB allocation events. */
+        if (SubstrateOptions.useG1GC()) {
+            /*
+             * Throw explicitly so image analysis cannot reach the Serial GC TlabOptionCache
+             * accesses below. An assumeFalse call does not guarantee that analysis excludes this
+             * code, which requires a singleton that is absent in G1 images.
+             */
+            throw new AssumptionViolatedException("This test requires Serial GC TLAB allocation events.");
+        }
+
         String[] events = new String[]{JfrEvent.ObjectAllocationInNewTLAB.getName()};
         Recording recording = startRecording(events);
 
@@ -95,10 +108,13 @@ public class TestObjectAllocationInNewTLABEvent extends JfrRecordingTest {
                 } else if (className.equals(byte[].class.getName())) {
                     foundBigByteArray = true;
                 }
-            } else if (allocationSize >= K && tlabSize == alignedHeapChunkSize && className.equals(byte[].class.getName())) {
+                checkTopStackFrame(event, "slowPathNewArrayLikeObjectWithoutAllocation0");
+            } else if (allocationSize >= K && tlabSize >= TlabOptionCache.getMinTlabSize() && tlabSize <= alignedHeapChunkSize && className.equals(byte[].class.getName())) {
                 foundSmallByteArray = true;
-            } else if (tlabSize == alignedHeapChunkSize && className.equals(Helper.class.getName())) {
+                checkTopStackFrame(event, "slowPathNewArrayLikeObjectWithoutAllocation0");
+            } else if (tlabSize >= TlabOptionCache.getMinTlabSize() && tlabSize <= alignedHeapChunkSize && className.equals(Helper.class.getName())) {
                 foundInstance = true;
+                checkTopStackFrame(event, "slowPathNewInstanceWithoutAllocation0");
             }
         }
 
@@ -127,6 +143,6 @@ public class TestObjectAllocationInNewTLABEvent extends JfrRecordingTest {
      * This class is only needed to provide a unique name in the event's "objectClass" field that we
      * check.
      */
-    private static class Helper {
+    private static final class Helper {
     }
 }

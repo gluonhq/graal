@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +24,15 @@
  */
 package com.oracle.svm.truffle.api;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.graalvm.collections.EconomicMap;
-import jdk.graal.compiler.bytecode.BytecodeProvider;
+
+import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
+import com.oracle.svm.graal.RuntimeCompilationSupport;
+
 import jdk.graal.compiler.graph.SourceLanguagePositionProvider;
 import jdk.graal.compiler.nodes.EncodedGraph;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -40,10 +43,6 @@ import jdk.graal.compiler.nodes.graphbuilderconf.NodePlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.ParameterPlugin;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.replacements.PEGraphDecoder;
-
-import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
-import com.oracle.svm.graal.TruffleRuntimeCompilationSupport;
-
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -52,15 +51,15 @@ public class SubstratePEGraphDecoder extends PEGraphDecoder {
     private final EconomicMap<ResolvedJavaMethod, EncodedGraph> graphCache = EconomicMap.create();
 
     public SubstratePEGraphDecoder(Architecture architecture, StructuredGraph graph, CoreProviders providers, LoopExplosionPlugin loopExplosionPlugin, InvocationPlugins invocationPlugins,
-                    InlineInvokePlugin[] inlineInvokePlugins, ParameterPlugin parameterPlugin, NodePlugin[] nodePlugins, ResolvedJavaMethod peRootForInlining,
+                    InlineInvokePlugin[] inlineInvokePlugins, ParameterPlugin parameterPlugin, NodePlugin[] nodePlugins,
                     SourceLanguagePositionProvider sourceLanguagePosition, ConcurrentHashMap<SpecialCallTargetCacheKey, Object> specialCallTargetCache,
                     ConcurrentHashMap<ResolvedJavaMethod, Object> invocationPluginsCache) {
         super(architecture, graph, providers, loopExplosionPlugin, invocationPlugins, inlineInvokePlugins, parameterPlugin, nodePlugins,
-                        peRootForInlining, sourceLanguagePosition, specialCallTargetCache, invocationPluginsCache, false, false);
+                        sourceLanguagePosition, specialCallTargetCache, invocationPluginsCache, false, false);
     }
 
     @Override
-    protected EncodedGraph lookupEncodedGraph(ResolvedJavaMethod method, BytecodeProvider intrinsicBytecodeProvider) {
+    protected EncodedGraph lookupEncodedGraph(ResolvedJavaMethod method) {
         /*
          * The EncodedGraph instance also serves as a cache for some information during decoding,
          * e.g., the start offsets of encoded nodes. So it is beneficial to have a cache of the
@@ -74,7 +73,7 @@ public class SubstratePEGraphDecoder extends PEGraphDecoder {
     }
 
     private EncodedGraph createGraph(ResolvedJavaMethod method, boolean trackNodeSourcePosition) {
-        EncodedGraph result = TruffleRuntimeCompilationSupport.encodedGraph((SharedRuntimeMethod) method, trackNodeSourcePosition);
+        EncodedGraph result = RuntimeCompilationSupport.encodedGraph((SharedRuntimeMethod) method, trackNodeSourcePosition);
         if (result == null) {
             throw shouldNotReachHere("Graph not available for runtime compilation: " + method.format("%H.%n(%p)"));
         }

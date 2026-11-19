@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -59,6 +59,7 @@ import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeBitMap;
 import jdk.graal.compiler.nodes.AbstractBeginNode;
 import jdk.graal.compiler.nodes.ControlSplitNode;
+import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.LoopBeginNode;
 import jdk.graal.compiler.nodes.ProfileData;
@@ -74,6 +75,9 @@ import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.loop.phases.LoopInversionPhase;
+import jdk.graal.compiler.vector.phases.LoopVectorizationAnalysis;
+import jdk.graal.compiler.vector.phases.VectorLoopUtility;
 
 public class DefaultLoopPolicies implements LoopPolicies {
 
@@ -82,14 +86,14 @@ public class DefaultLoopPolicies implements LoopPolicies {
         @Option(help = "Maximum loop unswitching code size increase in nodes.", type = OptionType.Debug)
         public static final OptionKey<Integer> LoopUnswitchMaxIncrease = new OptionKey<>(2000);
         @Option(help = "Number of nodes allowed for a loop unswitching regardless of the loop frequency.", type = OptionType.Debug)
-        public static final OptionKey<Integer> LoopUnswitchTrivial = new OptionKey<>(20);
+        public static final OptionKey<Integer> LoopUnswitchTrivial = new OptionKey<>(40);
         @Option(help = "Specifies the number of nodes allowed for a loop unswitching per loop frequency. The number of nodes allowed for an unswitching is proportional to the relative frequency of the loop by this value.", type = OptionType.Debug)
-        public static final OptionKey<Double> LoopUnswitchFrequencyBoost = new OptionKey<>(20.0);
+        public static final OptionKey<Double> LoopUnswitchFrequencyBoost = new OptionKey<>(40.0);
         @Option(help = "Minimum value for the frequency factor of an invariant.", type = OptionType.Debug)
         public static final OptionKey<Double> LoopUnswitchFrequencyMinFactor = new OptionKey<>(0.05);
-        @Option(help = "Maximun value for the frequency factor of an invariant.", type = OptionType.Debug)
+        @Option(help = "Maximum value for the frequency factor of an invariant.", type = OptionType.Debug)
         public static final OptionKey<Double> LoopUnswitchFrequencyMaxFactor = new OptionKey<>(0.95);
-        @Option(help = "Lower bound for the minimun frequency of an invariant condition to be unswitched.", type = OptionType.Debug)
+        @Option(help = "Lower bound for the minimum frequency of an invariant condition to be unswitched.", type = OptionType.Debug)
         public static final OptionKey<Double> LoopUnswitchMinSplitFrequency = new OptionKey<>(1.0);
         @Option(help = "Default frequency for loops with unknown local frequency.", type = OptionType.Debug)
         public static final OptionKey<Double> DefaultLoopFrequency = new OptionKey<>(100.0);
@@ -105,7 +109,44 @@ public class DefaultLoopPolicies implements LoopPolicies {
         @Option(help = "", type = OptionType.Debug) public static final OptionKey<Integer> ExactPartialUnrollMaxNodes = new OptionKey<>(200);
 
         @Option(help = "", type = OptionType.Debug) public static final OptionKey<Integer> UnrollMaxIterations = new OptionKey<>(16);
+        @Option(help = "Allow inversion of vectorizable loops.", type = OptionType.Debug) public static final OptionKey<Boolean> InvertVectorizableLoops = new OptionKey<>(false);
+        @Option(help = "Allow inversion of loops with multiple backedges.", type = OptionType.Debug) public static final OptionKey<Boolean> InvertMultiEndLoops = new OptionKey<>(false);
+        @Option(help = "Allow inversion of non-leaf loops.", type = OptionType.Debug) public static final OptionKey<Boolean> InvertNonLeafLoops = new OptionKey<>(false);
         // @formatter:on
+    }
+
+    @Override
+    public boolean shouldInvert(Loop loop, IfNode controlSplit, CoreProviders providers) {
+        if (!LoopInversionPhase.canInvert(loop)) {
+            return false;
+        }
+        if (!loop.loopBegin().isNonCountedStripMinedInner()) {
+            if (!Options.InvertMultiEndLoops.getValue(controlSplit.getOptions())) {
+                /*
+                 * Loop inversion and multi-end loops: Inverting multi-end loops can cause
+                 * performance slowdowns. This can happen because inverting such loops requires to
+                 * merge the loop ends. If a loop has a very short fast-path inside the loop before
+                 * inversion, the merging of loop ends after inversion can result in the fast path
+                 * now needing to perform an additional jump (to the merge before jumping to the
+                 * header again). This can create performance slowdowns.
+                 */
+                if (loop.loopBegin().getLoopEndCount() > 1) {
+                    return false;
+                }
+            }
+        }
+        if (loop.loopBegin().isPreLoop() || loop.loopBegin().isPostLoop()) {
+            // Do not invert pre or post loops
+            return false;
+        }
+        if (!Options.InvertNonLeafLoops.getValue(controlSplit.getOptions()) && !loop.getCFGLoop().getChildren().isEmpty()) {
+            return false;
+        }
+        if (!Options.InvertVectorizableLoops.getValue(controlSplit.getOptions()) && VectorLoopUtility.Options.RespectVectorization.getValue(controlSplit.getOptions()) &&
+                        LoopVectorizationAnalysis.detectVectorizableLoop(loop, true, providers) != null) {
+            return false;
+        }
+        return true;
     }
 
     @Override
@@ -131,7 +172,7 @@ public class DefaultLoopPolicies implements LoopPolicies {
             }
         }
 
-        if (loop.loop().getChildren().size() > 0) {
+        if (loop.getCFGLoop().getChildren().size() > 0) {
             // This loop has child loops. Loop peeling could explode graph size.
             return false;
         }
@@ -216,6 +257,7 @@ public class DefaultLoopPolicies implements LoopPolicies {
         size -= 2; // remove the counted if and its non-exit begin
         size -= loop.loopBegin().loopEnds().count();
         GraalError.guarantee(size >= 0, "Wrong size");
+        int countedDescendantCloneFactor = loop.loopBegin().getCountedDescendantCloneFactor();
         /* @formatter:off
          * The check below should not throw ArithmeticException because:
          * maxTrips is guaranteed to be >= 1 by the check above
@@ -225,12 +267,26 @@ public class DefaultLoopPolicies implements LoopPolicies {
          * @formatter:on
          */
         UnsignedLong estimated = maxTrips.minus(1).times(size);
+        if (countedDescendantCloneFactor > 1) {
+            /*
+             * Ancestor unrolling may already have cloned this loop's body. Charge the same
+             * maxNodes budget for that prior duplication so oversized descendant loops stop being
+             * considered for another full unroll.
+             */
+            try {
+                estimated = estimated.times(countedDescendantCloneFactor);
+            } catch (ArithmeticException e) {
+                debug.log(DebugContext.INFO_LEVEL, "Loop %s not fully unrolled, because counted descendant clone factor %d makes the size increase too large", loop, countedDescendantCloneFactor);
+                return FullUnrollability.TOO_LARGE;
+            }
+        }
         if (estimated.isLessOrEqualTo(maxNodes)) {
             // check whether we're allowed to unroll this loop
-            debug.log(DebugContext.INFO_LEVEL, "Loop %s should be fully unrolled: estimated=%s, max=%d", loop, estimated, maxNodes);
+            debug.log(DebugContext.INFO_LEVEL, "Loop %s should be fully unrolled: estimated=%s, max=%d, countedDescendantCloneFactor=%d", loop, estimated, maxNodes, countedDescendantCloneFactor);
             return FullUnrollability.SHOULD_FULL_UNROLL;
         } else {
-            debug.log(DebugContext.INFO_LEVEL, "Loop %s not fully unrolled, because size increase is too large: estimated=%s, max=%d", loop, estimated, maxNodes);
+            debug.log(DebugContext.INFO_LEVEL, "Loop %s not fully unrolled, because size increase is too large: estimated=%s, max=%d, countedDescendantCloneFactor=%d", loop, estimated, maxNodes,
+                            countedDescendantCloneFactor);
             return FullUnrollability.TOO_LARGE;
         }
     }
@@ -369,7 +425,7 @@ public class DefaultLoopPolicies implements LoopPolicies {
      * invariant is used 750 times.
      */
     private static double splitLocalLoopFrequency(Loop loop, List<ControlSplitNode> controlSplits) {
-        int loopDepth = loop.loop().getDepth();
+        int loopDepth = loop.getCFGLoop().getDepth();
         double loopLocalFrequency = loop.localLoopFrequency();
         ControlFlowGraph cfg = loop.loopsData().getCFG();
         double loopRelativeFrequency = cfg.blockFor(loop.loopBegin()).getRelativeFrequency();
@@ -408,7 +464,7 @@ public class DefaultLoopPolicies implements LoopPolicies {
             maxDiff = min(maxDiff, LoopUnswitchMaxIncrease.getValue(options));
             return min(maxDiff, remainingGraphSpace);
         } catch (ArithmeticException e) {
-            return remainingGraphSpace;
+            return min(LoopUnswitchMaxIncrease.getValue(options), remainingGraphSpace);
         }
     }
 
@@ -556,7 +612,7 @@ public class DefaultLoopPolicies implements LoopPolicies {
              * This is the idea behind the following heuristic. {@link factor} is 0 for control
              * split with success probabilities close to 1 or 0 and 1 for evenly distributed splits.
              *
-             * The initial value of {@link factor} is computed such that if all the successor
+             * The normalization of {@link factor} is computed such that if all the successor
              * probabilities are equals (i.e. 1 / successorCount) then its final value is 1 and the
              * its inverted and capped value is close to 0 meaning that the invariant can have any
              * frequency and it will be unswitched. On the other hand when one of the successor
@@ -565,8 +621,8 @@ public class DefaultLoopPolicies implements LoopPolicies {
              * must be executed often.
              *
              * Let's consider the following program with a probability of 0.1 for the null check.
-             * The initial value of factor is 2^(2*1) = 4 and its final value is 4 * 0.9 * 0.1 =
-             * 0.36. Then its inverted and capped value is 1 - 0.36 = 0.64 meaning that for this
+             * The factor is 2^(2*1) * 0.9 * 0.1 = 0.36. Then its inverted and capped value is
+             * 1 - 0.36 = 0.64 meaning that for this
              * invariant to be unswitched it must be used during more that 64% of the loop's
              * iterations.
              *
@@ -579,13 +635,16 @@ public class DefaultLoopPolicies implements LoopPolicies {
              *  }
              * </pre>
              */
-            double factor = Math.pow(split.get(0).getSuccessorCount(), split.get(0).getSuccessorCount() * split.size());
+            double factor;
             if (isTrusted) {
+                // Accumulate in log space to avoid overflowing the normalization n^(n * k).
+                double logFactor = 0.0;
                 for (ControlSplitNode s : split) {
                     for (double p : s.successorProbabilities()) {
-                        factor *= p;
+                        logFactor += Math.log(p * s.getSuccessorCount());
                     }
                 }
+                factor = Math.exp(logFactor);
                 assert ProfileData.isApproximatelyInRange(factor, 0.0, 1.0) : "factor should be between 0 and 1, but is : " + factor;
             } else {
                 debug.log("control split %s has an untrusted profile source", split);

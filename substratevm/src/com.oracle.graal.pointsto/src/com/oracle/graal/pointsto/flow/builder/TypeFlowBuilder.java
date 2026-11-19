@@ -24,17 +24,19 @@
  */
 package com.oracle.graal.pointsto.flow.builder;
 
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.List;
 import java.util.function.Supplier;
 
-import jdk.graal.compiler.phases.common.LazyValue;
-
 import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.flow.AlwaysEnabledPredicateFlow;
+import com.oracle.graal.pointsto.flow.PredicateMergeFlow;
 import com.oracle.graal.pointsto.flow.PrimitiveFlow;
 import com.oracle.graal.pointsto.flow.TypeFlow;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.typestate.PointsToStats;
+
+import jdk.graal.compiler.phases.common.LazyValue;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * The type flow builder is a node in the type flow builder graph. The {@link #useDependencies} and
@@ -46,9 +48,10 @@ import com.oracle.graal.pointsto.typestate.PointsToStats;
  */
 public final class TypeFlowBuilder<T extends TypeFlow<?>> {
 
-    public static <U extends TypeFlow<?>> TypeFlowBuilder<U> create(PointsToAnalysis bb, Object source, Class<U> clazz, Supplier<U> supplier) {
-        TypeFlowBuilder<U> builder = new TypeFlowBuilder<>(source, clazz, new LazyValue<>(supplier));
-        assert checkForPrimitiveFlows(bb, clazz) : "Primitive flow encountered without -H:+TrackPrimitiveValues: " + clazz;
+    public static <U extends TypeFlow<?>> TypeFlowBuilder<U> create(PointsToAnalysis bb, PointsToAnalysisMethod method, Object predicate, Object source, Class<U> clazz, Supplier<U> supplier) {
+        TypeFlowBuilder<U> builder = new TypeFlowBuilder<>(source, predicate, clazz, new LazyValue<>(supplier));
+        assert checkForPrimitiveFlows(bb, clazz) : "Primitive flow encountered without -H:+TrackPrimitiveValues: " + clazz + " in method " + method.getQualifiedName();
+        assert checkPredicate(bb, clazz, predicate) : "Null or invalid predicate " + predicate + "  encountered with -H:+UsePredicates: " + clazz + " in method " + method.getQualifiedName();
         PointsToStats.registerTypeFlowBuilder(bb, builder);
         return builder;
     }
@@ -61,25 +64,52 @@ public final class TypeFlowBuilder<T extends TypeFlow<?>> {
         return bb.trackPrimitiveValues() || !PrimitiveFlow.class.isAssignableFrom(clazz);
     }
 
+    /**
+     * A sanity check. If predicates are enabled, the predicate object should be: a) null for
+     * AlwaysEnabledPredicateFlow, b) List of TypeFlowBuilders for PredicateMergeFlow, c)
+     * TypeFlowBuilder otherwise.
+     */
+    private static boolean checkPredicate(PointsToAnalysis bb, Class<?> clazz, Object predicate) {
+        if (!bb.usePredicates()) {
+            assert predicate == null : "Predicates are disabled: " + predicate;
+            return true;
+        }
+        if (clazz == AlwaysEnabledPredicateFlow.class) {
+            return predicate == null;
+        }
+        if (clazz == PredicateMergeFlow.class) {
+            return predicate instanceof List<?>;
+        }
+        return predicate instanceof TypeFlowBuilder<?>;
+    }
+
     private final Object source;
 
     private final Class<T> flowClass;
     private final LazyValue<T> lazyTypeFlowCreator;
     /** Input dependency, i.e., builders that have this builder as an use. */
-    private final Set<TypeFlowBuilder<?>> useDependencies;
+    private final EconomicSet<TypeFlowBuilder<?>> useDependencies;
     /** Input dependency, i.e., builders that have this builder as an observer. */
-    private final Set<TypeFlowBuilder<?>> observerDependencies;
+    private final EconomicSet<TypeFlowBuilder<?>> observerDependencies;
     private boolean buildingAnActualParameter;
     private boolean isMaterialized;
 
-    private TypeFlowBuilder(Object source, Class<T> flowClass, LazyValue<T> creator) {
+    /**
+     * Predicate dependency. Most often, it will be a single type flow builder, apart from
+     * PredicateMergeFlow, which has a list of type flow builders as predicates (one for each input
+     * branch), or AlwaysEnabledPredicateFlow, which has no predicate.
+     */
+    private final Object predicate;
+
+    private TypeFlowBuilder(Object source, Object predicate, Class<T> flowClass, LazyValue<T> creator) {
         this.flowClass = flowClass;
         this.source = source;
         this.lazyTypeFlowCreator = creator;
-        this.useDependencies = new HashSet<>();
-        this.observerDependencies = new HashSet<>();
+        this.useDependencies = EconomicSet.create();
+        this.observerDependencies = EconomicSet.create();
         this.buildingAnActualParameter = false;
         this.isMaterialized = false;
+        this.predicate = predicate;
     }
 
     public void markAsBuildingAnActualParameter() {
@@ -106,7 +136,7 @@ public final class TypeFlowBuilder<T extends TypeFlow<?>> {
         this.useDependencies.add(dependency);
     }
 
-    Collection<TypeFlowBuilder<?>> getUseDependencies() {
+    Iterable<TypeFlowBuilder<?>> getUseDependencies() {
         return useDependencies;
     }
 
@@ -114,8 +144,12 @@ public final class TypeFlowBuilder<T extends TypeFlow<?>> {
         this.observerDependencies.add(dependency);
     }
 
-    Collection<TypeFlowBuilder<?>> getObserverDependencies() {
+    Iterable<TypeFlowBuilder<?>> getObserverDependencies() {
         return observerDependencies;
+    }
+
+    public Object getPredicate() {
+        return predicate;
     }
 
     public T get() {

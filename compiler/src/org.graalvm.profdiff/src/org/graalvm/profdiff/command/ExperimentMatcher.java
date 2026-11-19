@@ -28,6 +28,7 @@ import org.graalvm.profdiff.core.CompilationUnit;
 import org.graalvm.profdiff.core.OptimizationContextTree;
 import org.graalvm.profdiff.core.OptimizationContextTreeNode;
 import org.graalvm.profdiff.core.TreeNode;
+import org.graalvm.profdiff.core.Writer;
 import org.graalvm.profdiff.core.inlining.InliningTree;
 import org.graalvm.profdiff.core.inlining.InliningTreeNode;
 import org.graalvm.profdiff.core.optimization.OptimizationTree;
@@ -45,7 +46,6 @@ import org.graalvm.profdiff.diff.OptimizationContextTreeWriterVisitor;
 import org.graalvm.profdiff.diff.OptimizationTreeEditPolicy;
 import org.graalvm.profdiff.diff.TreeMatcher;
 import org.graalvm.profdiff.parser.ExperimentParserError;
-import org.graalvm.profdiff.core.Writer;
 
 /**
  * Matches and compares the methods and compilations of two experiments, writing the results
@@ -112,17 +112,7 @@ public class ExperimentMatcher {
             writer.increaseIndent();
             if (writer.getOptionValues().shouldDiffCompilations()) {
                 for (CompilationUnitPair compilationUnitPair : methodPair.getHotCompilationUnitPairsByDescendingPeriod()) {
-                    compilationUnitPair.writeHeaders(writer);
-                    writer.increaseIndent();
-                    CompilationUnit.TreePair treePair1 = compilationUnitPair.getCompilationUnit1().loadTrees();
-                    CompilationUnit.TreePair treePair2 = compilationUnitPair.getCompilationUnit2().loadTrees();
-                    if (writer.getOptionValues().isOptimizationContextTreeEnabled()) {
-                        createOptimizationContextTreeAndMatch(treePair1, treePair2);
-                    } else {
-                        matchInliningTrees(treePair1.getInliningTree(), treePair2.getInliningTree());
-                        matchOptimizationTrees(treePair1.getOptimizationTree(), treePair2.getOptimizationTree());
-                    }
-                    writer.decreaseIndent();
+                    matchCompilationUnitPair(compilationUnitPair);
                 }
             } else {
                 for (CompilationUnit compilationUnit : methodPair.getMethod1().getHotCompilationUnits()) {
@@ -134,6 +124,43 @@ public class ExperimentMatcher {
             }
             writer.decreaseIndent();
         }
+    }
+
+    /**
+     * Matches and compares compilation units with the same compilation ID across both experiments.
+     *
+     * @param experimentPair the pair of experiments to be matched
+     * @throws ExperimentParserError failed to load the trees of a matched compilation pair
+     */
+    public void matchCompilationUnitsById(ExperimentPair experimentPair) throws ExperimentParserError {
+        boolean first = true;
+        for (MethodPair methodPair : experimentPair.getMethodPairs(false)) {
+            if (first) {
+                first = false;
+            } else {
+                writer.writeln();
+            }
+            methodPair.writeHeaderAndCompilationList(writer);
+            writer.increaseIndent();
+            for (CompilationUnitPair compilationUnitPair : methodPair.getCompilationUnitPairsBySameCompilationId()) {
+                matchCompilationUnitPair(compilationUnitPair);
+            }
+            writer.decreaseIndent();
+        }
+    }
+
+    private void matchCompilationUnitPair(CompilationUnitPair compilationUnitPair) throws ExperimentParserError {
+        compilationUnitPair.writeHeaders(writer);
+        writer.increaseIndent();
+        CompilationUnit.TreePair treePair1 = compilationUnitPair.getCompilationUnit1().loadTrees();
+        CompilationUnit.TreePair treePair2 = compilationUnitPair.getCompilationUnit2().loadTrees();
+        if (writer.getOptionValues().isOptimizationContextTreeEnabled()) {
+            createOptimizationContextTreeAndMatch(treePair1, treePair2);
+        } else {
+            matchInliningTrees(treePair1.getInliningTree(), treePair2.getInliningTree());
+            matchOptimizationTrees(treePair1.getOptimizationTree(), treePair2.getOptimizationTree());
+        }
+        writer.decreaseIndent();
     }
 
     /**

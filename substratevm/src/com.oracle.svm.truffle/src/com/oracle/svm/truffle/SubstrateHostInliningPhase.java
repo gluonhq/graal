@@ -24,19 +24,24 @@
  */
 package com.oracle.svm.truffle;
 
-import jdk.graal.compiler.core.common.CompilationIdentifier;
-import jdk.graal.compiler.nodes.StructuredGraph;
-import jdk.graal.compiler.phases.common.CanonicalizerPhase;
-import jdk.graal.compiler.phases.tiers.HighTierContext;
-import jdk.graal.compiler.truffle.host.TruffleHostEnvironment;
-import jdk.graal.compiler.truffle.host.HostInliningPhase;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.svm.hosted.BytecodeHandlerFeature;
+import com.oracle.svm.hosted.SubstrateBytecodeHandlerStub;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.truffle.api.HostCompilerDirectives.BytecodeInterpreterSwitch;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
+import jdk.graal.compiler.nodes.GraphDecoder.DecodeContext;
+import jdk.graal.compiler.nodes.Invoke;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.phases.common.CanonicalizerPhase;
+import jdk.graal.compiler.phases.tiers.HighTierContext;
+import jdk.graal.compiler.truffle.host.HostInliningPhase;
+import jdk.graal.compiler.truffle.host.TruffleHostEnvironment;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -48,16 +53,23 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 @Platforms(Platform.HOSTED_ONLY.class)
 public final class SubstrateHostInliningPhase extends HostInliningPhase {
 
+    private final BytecodeHandlerFeature bytecodeHandlerFeature = ImageSingletons.lookup(BytecodeHandlerFeature.class);
     private final TruffleFeature truffleFeature = ImageSingletons.lookup(TruffleFeature.class);
 
     SubstrateHostInliningPhase(CanonicalizerPhase canonicalizer) {
-        super(canonicalizer, -1.0d); // -1.0 effectively disables frequency based inlining by
-                                     // default.
+        // -1.0 effectively disables frequency based inlining by default.
+        super(canonicalizer, -1.0d);
     }
 
     @Override
-    protected StructuredGraph parseGraph(HighTierContext context, StructuredGraph graph, ResolvedJavaMethod method) {
-        return ((HostedMethod) method).compilationInfo.createGraph(graph.getDebug(), graph.getOptions(), CompilationIdentifier.INVALID_COMPILATION_ID, true);
+    protected StructuredGraph parseGraph(HighTierContext context, StructuredGraph graph, ResolvedJavaMethod method, Invoke invoke) {
+        DecodeContext decodeContext = invoke.isInOOMETry() ? DecodeContext.OOME_EXCEPTION_EDGES : DecodeContext.DEFAULT;
+        return ((HostedMethod) method).compilationInfo.createGraph(graph.getDebug(), graph.getOptions(), CompilationIdentifier.INVALID_COMPILATION_ID, true, decodeContext);
+    }
+
+    @Override
+    protected boolean isBytecodeInterpreterHandlerStub(TruffleHostEnvironment env, ResolvedJavaMethod targetMethod) {
+        return bytecodeHandlerFeature.isBytecodeHandler(translateMethod(targetMethod));
     }
 
     /**
@@ -73,8 +85,12 @@ public final class SubstrateHostInliningPhase extends HostInliningPhase {
             return false;
         } else if (super.isEnabledFor(env, method)) {
             return true;
-        } else if (truffleFeature.runtimeCompiledMethods.contains(translateMethod(method)) &&
-                        isTruffleBoundary(env, method) == null) {
+        }
+
+        AnalysisMethod translatedMethod = translateMethod(method);
+        if (truffleFeature.runtimeCompiledMethods.contains(translatedMethod) && isTruffleBoundary(env, method) == null) {
+            return true;
+        } else if (translatedMethod.wrapped instanceof SubstrateBytecodeHandlerStub) {
             return true;
         }
         return false;
@@ -94,7 +110,7 @@ public final class SubstrateHostInliningPhase extends HostInliningPhase {
     }
 
     @Override
-    protected ResolvedJavaMethod translateMethod(ResolvedJavaMethod method) {
+    protected AnalysisMethod translateMethod(ResolvedJavaMethod method) {
         return ((HostedMethod) method).getWrapped();
     }
 }

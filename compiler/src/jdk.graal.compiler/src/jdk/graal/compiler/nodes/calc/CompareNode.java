@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -146,6 +146,10 @@ public abstract class CompareNode extends BinaryOpLogicNode implements Canonical
                     boolean supported = isConstantConversionSupported(convertX, view, smallestCompareWidth);
                     if (supported && convertX.getValue().stamp(view) instanceof IntegerStamp) {
                         supported = convertX.getClass() == convertY.getClass();
+                        if (supported && convertX instanceof FloatConvertNode floatConvertX) {
+                            // Matching node classes are not sufficient when conversion signedness differs.
+                            supported = floatConvertX.getFloatConvert() == ((FloatConvertNode) convertY).getFloatConvert();
+                        }
                     }
 
                     if (supported) {
@@ -391,47 +395,54 @@ public abstract class CompareNode extends BinaryOpLogicNode implements Canonical
         }
     }
 
-    public boolean implies(LogicNode otherLogicNode, boolean thisNegated) {
-        boolean otherNegated = false;
-        LogicNode otherLogic = otherLogicNode;
-        while (otherLogic instanceof LogicNegationNode) {
-            otherLogic = ((LogicNegationNode) otherLogic).getValue();
-            otherNegated = !otherNegated;
+    @Override
+    public TriState implies(boolean thisNegated, LogicNode other) {
+        if (other instanceof CompareNode compare) {
+            TriState result = impliesCompare(compare, thisNegated);
+            if (result.isKnown()) {
+                return result;
+            }
         }
-        if (otherLogic instanceof CompareNode) {
-            CompareNode otherCompare = (CompareNode) otherLogic;
-            return implies(otherCompare, otherNegated, thisNegated);
-        } else {
-            return false;
-        }
+        return super.implies(thisNegated, other);
     }
 
-    public boolean implies(CompareNode otherCompare, boolean otherNegated, boolean thisNegated) {
+    private TriState impliesCompare(CompareNode otherCompare, boolean thisNegated) {
         CanonicalCondition otherCondition = otherCompare.condition();
         ValueNode otherX = otherCompare.getX();
         ValueNode otherY = otherCompare.getY();
-        if (condition() == otherCondition && sameValue(getX(), otherX) && sameValue(getY(), otherY) && thisNegated == otherNegated) {
-            return true;
+        /*
+         * True when both comparisons have equivalent inputs in the same order, e.g.,
+         * `this: Pi(a) == b` and `otherCompare: a == b`.
+         */
+        boolean sameInputs = sameValue(getX(), otherX) && sameValue(getY(), otherY);
+        /*
+         * True when both comparisons have equivalent inputs in reverse order, e.g.,
+         * `this: Pi(a) == b` and `otherCompare: b == a`.
+         */
+        boolean swappedInputs = sameValue(getX(), otherY) && sameValue(getY(), otherX);
+        if (condition() == otherCondition && unorderedIsTrue == otherCompare.unorderedIsTrue() &&
+                        (sameInputs || (swappedInputs && getNodeClass().isCommutative()))) {
+            return TriState.get(!thisNegated);
         }
-        if ((sameValue(getX(), otherX) && sameValue(getY(), otherY)) || (sameValue(getX(), otherY) && sameValue(getY(), otherX))) {
+        if (sameInputs || swappedInputs) {
             if (condition() == CanonicalCondition.EQ && (otherCondition == CanonicalCondition.LT || otherCondition == CanonicalCondition.BT)) {
-                if (!thisNegated && otherNegated) {
+                if (!thisNegated) {
                     // a == b => !(a < b)
-                    return true;
+                    return TriState.FALSE;
                 }
             }
             if (otherCondition == CanonicalCondition.EQ && (condition() == CanonicalCondition.LT || condition() == CanonicalCondition.BT)) {
-                if (thisNegated && !otherNegated) {
+                if (!thisNegated) {
                     // a < b => a != b
-                    return true;
+                    return TriState.FALSE;
                 }
             }
         }
-        if (condition() == otherCondition && sameValue(getX(), otherY) && sameValue(getY(), otherX)) {
+        if (condition() == otherCondition && swappedInputs) {
             if ((condition() == CanonicalCondition.LT || condition() == CanonicalCondition.BT) && getY().stamp(NodeView.DEFAULT) instanceof IntegerStamp) {
-                if (!thisNegated && otherNegated) {
+                if (!thisNegated) {
                     // a < b => !(b < a)
-                    return true;
+                    return TriState.FALSE;
                 }
             }
         }
@@ -441,25 +452,28 @@ public abstract class CompareNode extends BinaryOpLogicNode implements Canonical
             long otherYLong = otherY.asJavaConstant().asLong();
             if (condition() == CanonicalCondition.EQ && !thisNegated) {
                 if (otherCondition == CanonicalCondition.EQ) {
-                    if (thisYLong != otherYLong && otherNegated) {
+                    if (thisYLong != otherYLong) {
                         // a == c1 & c1 != c2 => a != c2
-                        return true;
+                        return TriState.FALSE;
                     }
                 } else if (otherCondition == CanonicalCondition.LT) {
-                    if (!otherNegated && thisYLong < otherYLong) {
+                    if (thisYLong < otherYLong) {
                         // a == c1 & c1 < c2 => a < c2
-                        return true;
-                    } else if (otherNegated && otherYLong < thisYLong) {
+                        return TriState.TRUE;
+                    } else if (otherYLong < thisYLong) {
                         // a == c1 & c2 < c1 => !(a < c2)
-                        return true;
+                        return TriState.FALSE;
                     }
                 }
             }
         }
-        return false;
+        return TriState.UNKNOWN;
     }
 
-    private static boolean sameValue(ValueNode v1, ValueNode v2) {
+    /**
+     * Checks whether the values are identical, equal constants, or Pi aliases of the same value.
+     */
+    protected static boolean sameValue(ValueNode v1, ValueNode v2) {
         if (v1 == v2) {
             return true;
         }

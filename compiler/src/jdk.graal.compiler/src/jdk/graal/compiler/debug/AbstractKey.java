@@ -24,6 +24,8 @@
  */
 package jdk.graal.compiler.debug;
 
+import jdk.graal.compiler.util.ObjectCopier;
+
 /**
  * A name and index for a metric value.
  */
@@ -33,7 +35,9 @@ abstract class AbstractKey implements MetricKey {
     private final Object nameArg1;
     private final Object nameArg2;
 
+    @ObjectCopier.Transformed(transformer = AbstractKeyNameTransformer.class) //
     private String name;
+    @ObjectCopier.Transformed(transformer = AbstractKeyIndexTransformer.class) //
     private int index;
     private String doc;
 
@@ -100,5 +104,28 @@ abstract class AbstractKey implements MetricKey {
     @Override
     public String toString() {
         return getName() + "@" + index;
+    }
+
+    public static class AbstractKeyNameTransformer implements ObjectCopier.Transformer {
+        @Override
+        public Object encodeValue(ObjectCopier.Encoder encoder, Object receiver, Object value) {
+            AbstractKey key = (AbstractKey) receiver;
+            /*
+             * The name needs to be cached before we persist the graph to avoid modifying its values
+             * during the encoding.
+             */
+            return key.getName();
+        }
+    }
+
+    public static class AbstractKeyIndexTransformer implements ObjectCopier.Transformer {
+        @Override
+        public Object encodeValue(ObjectCopier.Encoder encoder, Object receiver, Object value) {
+            /*
+             * The index needs to be reset to be correctly registered in the KeyRegistry of
+             * extension layers.
+             */
+            return -1;
+        }
     }
 }

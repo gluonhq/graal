@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,7 +42,6 @@ package com.oracle.truffle.sl.nodes.local;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.NeverDefault;
 import com.oracle.truffle.api.dsl.Cached.Exclusive;
@@ -63,6 +62,7 @@ import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.api.strings.TruffleString;
 import com.oracle.truffle.sl.SLLanguage;
+import com.oracle.truffle.sl.nodes.SLAstRootNode;
 import com.oracle.truffle.sl.nodes.SLExpressionNode;
 import com.oracle.truffle.sl.nodes.SLRootNode;
 import com.oracle.truffle.sl.nodes.controlflow.SLBlockNode;
@@ -79,7 +79,7 @@ import com.oracle.truffle.sl.runtime.SLStrings;
 public abstract class SLScopedNode extends Node {
 
     /**
-     * Index to the the {@link SLBlockNode#getDeclaredLocalVariables() block's variables} that
+     * Index to the {@link SLBlockNode#getDeclaredLocalVariables() block's variables} that
      * determine variables belonging into this scope (excluding parent scopes) on node enter. The
      * scope variables are in the interval &lt;0, visibleVariablesIndexOnEnter).
      */
@@ -119,7 +119,7 @@ public abstract class SLScopedNode extends Node {
         if (blockNode instanceof SLBlockNode) {
             return new VariablesObject(frame, cachedNode, nodeEnter, (SLBlockNode) blockNode);
         } else {
-            return new ArgumentsObject(frame, (SLRootNode) blockNode);
+            return new ArgumentsObject(frame, (SLAstRootNode) blockNode);
         }
     }
 
@@ -182,7 +182,7 @@ public abstract class SLScopedNode extends Node {
     }
 
     /**
-     * Set the index to the the {@link SLBlockNode#getDeclaredLocalVariables() block's variables}
+     * Set the index to the {@link SLBlockNode#getDeclaredLocalVariables() block's variables}
      * that determine variables belonging into this scope (excluding parent scopes) on node enter.
      */
     public final void setVisibleVariablesIndexOnEnter(int index) {
@@ -224,12 +224,12 @@ public abstract class SLScopedNode extends Node {
         static int LIMIT = 3;
 
         private final Frame frame;
-        protected final SLRootNode root;
+        protected final SLAstRootNode root;
 
         /**
          * The arguments depend on the current frame and root node.
          */
-        ArgumentsObject(Frame frame, SLRootNode root) {
+        ArgumentsObject(Frame frame, SLAstRootNode root) {
             this.frame = frame;
             this.root = root;
         }
@@ -256,14 +256,14 @@ public abstract class SLScopedNode extends Node {
          */
         @ExportMessage
         @SuppressWarnings("static-method")
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
         @SuppressWarnings("static-method")
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return SLLanguage.class;
+        String getLanguageId() {
+            return SLLanguage.ID;
         }
 
         /**
@@ -528,14 +528,14 @@ public abstract class SLScopedNode extends Node {
          */
         @ExportMessage
         @SuppressWarnings("static-method")
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
         @SuppressWarnings("static-method")
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return SLLanguage.class;
+        String getLanguageId() {
+            return SLLanguage.ID;
         }
 
         /**

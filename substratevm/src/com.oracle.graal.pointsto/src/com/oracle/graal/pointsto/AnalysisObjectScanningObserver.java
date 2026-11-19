@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,6 +30,7 @@ import com.oracle.graal.pointsto.flow.FieldTypeFlow;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 import jdk.vm.ci.meta.JavaConstant;
@@ -44,19 +45,20 @@ public class AnalysisObjectScanningObserver implements ObjectScanningObserver {
 
     @Override
     public boolean forRelocatedPointerFieldValue(JavaConstant receiver, AnalysisField field, JavaConstant fieldValue, ScanReason reason) {
-        if (!field.isWritten()) {
-            return field.registerAsWritten(reason);
-        }
+        var changed = false;
         if (fieldValue.isNonNull()) {
-            FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(field, receiver);
-            return fieldTypeFlow.addState(getAnalysis(), TypeState.anyPrimitiveState());
+            FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(((PointsToAnalysisField) field), receiver);
+            changed = fieldTypeFlow.addState(getAnalysis(), TypeState.anyPrimitiveState());
         }
-        return false;
+        if (!field.isWritten()) {
+            changed |= field.registerAsWritten(reason);
+        }
+        return changed;
     }
 
     @Override
     public boolean forNullFieldValue(JavaConstant receiver, AnalysisField field, ScanReason reason) {
-        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(field, receiver);
+        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(((PointsToAnalysisField) field), receiver);
         if (!fieldTypeFlow.getState().canBeNull()) {
             /* Signal that the field can contain null. */
             return fieldTypeFlow.addState(getAnalysis(), TypeState.forNull());
@@ -70,7 +72,7 @@ public class AnalysisObjectScanningObserver implements ObjectScanningObserver {
         AnalysisType fieldType = analysis.getMetaAccess().lookupJavaType(fieldValue);
 
         /* Add the constant value object to the field's type flow. */
-        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(field, receiver);
+        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(((PointsToAnalysisField) field), receiver);
         /* Add the new constant to the field's flow state. */
         return fieldTypeFlow.addState(analysis, bb.analysisPolicy().constantTypeState(analysis, fieldValue, fieldType));
     }
@@ -80,15 +82,15 @@ public class AnalysisObjectScanningObserver implements ObjectScanningObserver {
         PointsToAnalysis analysis = getAnalysis();
 
         /* Add the constant value object to the field's type flow. */
-        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(field, receiver);
+        FieldTypeFlow fieldTypeFlow = getFieldTypeFlow(((PointsToAnalysisField) field), receiver);
         /* Add the new constant to the field's flow state. */
-        return fieldTypeFlow.addState(analysis, TypeState.forPrimitiveConstant(fieldValue.asLong()));
+        return fieldTypeFlow.addState(analysis, TypeState.forPrimitiveConstant(analysis, fieldValue.asLong()));
     }
 
     /**
      * Get the field type flow give a receiver.
      */
-    private FieldTypeFlow getFieldTypeFlow(AnalysisField field, JavaConstant receiver) {
+    private FieldTypeFlow getFieldTypeFlow(PointsToAnalysisField field, JavaConstant receiver) {
         /* The field type flow is used to track the constant field value. */
         if (field.isStatic()) {
             /* If the field is static it comes from the originalRoots. */

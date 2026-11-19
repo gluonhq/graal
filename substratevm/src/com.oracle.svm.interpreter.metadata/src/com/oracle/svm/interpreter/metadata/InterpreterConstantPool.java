@@ -1,0 +1,881 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.interpreter.metadata;
+
+import static com.oracle.svm.interpreter.metadata.Bytecodes.INVOKEDYNAMIC;
+import static jdk.graal.compiler.api.directives.GraalDirectives.FASTPATH_PROBABILITY;
+import static jdk.graal.compiler.api.directives.GraalDirectives.SLOWPATH_PROBABILITY;
+
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Function;
+
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.crema.CremaSupport;
+import com.oracle.svm.core.hub.registry.SymbolsSupport;
+import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.guest.staging.reflect.target.Target_java_lang_reflect_AccessibleObject;
+import com.oracle.svm.espresso.classfile.ConstantPool;
+import com.oracle.svm.espresso.classfile.ParserConstantPool;
+import com.oracle.svm.espresso.classfile.descriptors.ByteSequence;
+import com.oracle.svm.espresso.classfile.descriptors.Name;
+import com.oracle.svm.espresso.classfile.descriptors.Symbol;
+import com.oracle.svm.espresso.classfile.descriptors.Type;
+import com.oracle.svm.espresso.classfile.descriptors.TypeSymbols;
+import com.oracle.svm.espresso.shared.resolver.CallKind;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.interpreter.metadata.serialization.VisibleForSerialization;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterAnalysis;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.internal.misc.Unsafe;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.JavaField;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaMethod;
+import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.Signature;
+import jdk.vm.ci.meta.UnresolvedJavaField;
+import jdk.vm.ci.meta.UnresolvedJavaMethod;
+import jdk.vm.ci.meta.UnresolvedJavaType;
+
+/**
+ * JVMCI's {@link jdk.vm.ci.meta.ConstantPool} is not designed to be used in a performance-sensitive
+ * bytecode interpreter, so a Espresso-like CP implementation is used instead for performance.
+ * <p>
+ * AOT types use pre-resolved entries. Runtime-loaded types resolve their entries through
+ * the runtime constant-pool subclass.
+ */
+public class InterpreterConstantPool extends ConstantPool implements jdk.vm.ci.meta.ConstantPool {
+    private static final Unsafe UNSAFE = Unsafe.getUnsafe();
+
+    protected static final Object NULL_DYNAMIC_CONSTANT_SENTINEL = new Object();
+
+    final InterpreterResolvedObjectType holder;
+    final ParserConstantPool parserConstantPool;
+
+    // Assigned after analysis.
+    @UnknownObjectField(availability = AfterAnalysis.class, types = Object[].class) protected Object[] cachedEntries;
+
+    // TODO move to crema once GR-71517 is resolved
+    private volatile jdk.vm.ci.meta.ConstantPool ristrettoConstantPool;
+    private static final AtomicReferenceFieldUpdater<InterpreterConstantPool, jdk.vm.ci.meta.ConstantPool> RISTRETTO_CONSTANT_POOL_UPDATER = AtomicReferenceFieldUpdater
+                    .newUpdater(InterpreterConstantPool.class, jdk.vm.ci.meta.ConstantPool.class, "ristrettoConstantPool");
+
+    /**
+     * Returns the backing cache array, not a copy. Runtime resolution updates this same array.
+     * Numeric constants use {@link InterpreterConstantPoolPrimitiveEntry}; strings are stored directly.
+     */
+    public Object[] rawCachedEntries() {
+        return cachedEntries;
+    }
+
+    /** Returns the backing raw constant-pool words for verified interpreter frame accesses. */
+    public int[] rawEntries() {
+        return entries;
+    }
+
+    Object objAt(int cpi) {
+        if (cpi == 0) {
+            // 0 implies unknown (!= unresolved) e.g. unknown class, field, method ...
+            // In this case it's not possible to even provide a name or symbolic representation for
+            // what's missing.
+            // Index 0 must be handled by the resolution methods e.g. resolveType, resolveMethod ...
+            // where an appropriate error should be thrown.
+            throw VMError.shouldNotReachHere("Cannot resolve CP entry 0");
+        }
+        return cachedEntries[cpi];
+    }
+
+    protected InterpreterConstantPool(InterpreterResolvedObjectType holder, ParserConstantPool parserConstantPool, Object[] cachedEntries) {
+        super(parserConstantPool);
+        this.holder = MetadataUtil.requireNonNull(holder);
+        this.parserConstantPool = parserConstantPool;
+        this.cachedEntries = MetadataUtil.requireNonNull(cachedEntries);
+    }
+
+    protected InterpreterConstantPool(InterpreterResolvedObjectType holder, ParserConstantPool parserConstantPool) {
+        this(holder, parserConstantPool, new Object[parserConstantPool.length()]);
+    }
+
+    @VisibleForSerialization
+    public static InterpreterConstantPool create(InterpreterResolvedObjectType holder, ParserConstantPool parserConstantPool, Object[] cachedEntries) {
+        return new InterpreterConstantPool(holder, parserConstantPool, cachedEntries);
+    }
+
+    public jdk.vm.ci.meta.ConstantPool getRistrettoConstantPool(Function<InterpreterConstantPool, jdk.vm.ci.meta.ConstantPool> ristrettoConstantPoolSupplier) {
+        if (this.ristrettoConstantPool != null) {
+            return this.ristrettoConstantPool;
+        }
+        /*
+         * We allow concurrent allocation of a ristretto constant pool per interpreter constant
+         * pool. Eventually however we CAS on the pointer in the interpreter representation, if
+         * another thread was faster return its constant pool.
+         */
+        return getOrSetRistrettoConstantPool(ristrettoConstantPoolSupplier.apply(this));
+    }
+
+    private jdk.vm.ci.meta.ConstantPool getOrSetRistrettoConstantPool(jdk.vm.ci.meta.ConstantPool newRistrettoConstantPool) {
+        if (RISTRETTO_CONSTANT_POOL_UPDATER.compareAndSet(this, null, newRistrettoConstantPool)) {
+            return newRistrettoConstantPool;
+        }
+        var cp = this.ristrettoConstantPool;
+        assert cp != null : "If CAS for null fails must have written a constant pool already";
+        return cp;
+    }
+
+    @Override
+    public int length() {
+        return cachedEntries.length;
+    }
+
+    @Override
+    public JavaField lookupField(int cpi, ResolvedJavaMethod method, int opcode) {
+        return (JavaField) objAt(cpi);
+    }
+
+    @Override
+    public JavaMethod lookupMethod(int cpi, int opcode) {
+        Object entry = objAt(cpi);
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            return linkedInvokeCacheEntry.resolvedMethod;
+        }
+        return (JavaMethod) entry;
+    }
+
+    @Override
+    public JavaMethod lookupMethod(int cpi, int opcode, ResolvedJavaMethod caller) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public List<BootstrapMethodInvocation> lookupBootstrapMethodInvocations(boolean invokeDynamic) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public JavaType lookupType(int cpi, int opcode) {
+        return (JavaType) objAt(cpi);
+    }
+
+    @Override
+    public Object lookupConstant(int cpi) {
+        return lookupConstant(cpi, true);
+    }
+
+    @Override
+    public Object lookupConstant(int cpi, boolean resolve) {
+        final Tag tag = tagAt(cpi);
+        return switch (tag) {
+            case INTEGER -> JavaConstant.forInt(this.intAt(cpi));
+            case FLOAT -> JavaConstant.forFloat(this.floatAt(cpi));
+            case LONG -> JavaConstant.forLong(this.longAt(cpi));
+            case DOUBLE -> JavaConstant.forDouble(this.doubleAt(cpi));
+            case STRING -> SubstrateObjectConstant.forObject(resolvedAt(cpi, holder));
+            case CLASS -> objAt(cpi);
+            case INVOKEDYNAMIC -> {
+                /*
+                 * Hosted ldc object constants use the internal INVOKEDYNAMIC tag. For image-heap
+                 * object constants, BuildTimeConstantPool.ldcConstant calls weakObjectConstant,
+                 * which calls ConstantPoolBuilder.appendCachedAppendix to store this tag.
+                 * Hydration rewrites the ldc operand to that synthetic pool entry. JVMCI graph
+                 * parsing requires its non-opaque referent. Actual invokedynamic bytecodes use
+                 * lookupMethod and lookupAppendix instead.
+                 */
+                VMError.guarantee(SubstrateOptions.useRistretto(), "Hosted object constants must only be exposed to JVMCI graph parsing by Ristretto");
+                JavaConstant entry = (JavaConstant) objAt(cpi);
+                if (entry instanceof ReferenceConstant<?> referenceConstant) {
+                    if (referenceConstant.isOpaque()) {
+                        throw VMError.shouldNotReachHere("Cannot expose opaque image heap constant to JVMCI graph parsing");
+                    }
+                    yield SubstrateObjectConstant.forObject(referenceConstant.getReferent());
+                }
+                yield entry;
+            }
+            case METHODHANDLE, METHODTYPE -> {
+                /*
+                 * A non-resolving JVMCI lookup reports a cold entry as null. Do not wrap the cache
+                 * miss as the object constant representing Java null.
+                 */
+                Object ret = queryConstantPool(cpi, resolve);
+                if (ret == null) {
+                    yield null;
+                }
+                yield SubstrateObjectConstant.forObject(ret);
+            }
+            case DYNAMIC -> {
+                if (!resolve) {
+                    /*
+                     * Only a successfully published dynamic value is visible to a non-resolving
+                     * lookup. A cold entry and StickyConstantError both remain interpreter-owned
+                     * linkage state.
+                     */
+                    Object cachedEntry = objAt(cpi);
+                    if (cachedEntry == null || cachedEntry instanceof StickyConstantError) {
+                        yield null;
+                    }
+                }
+                Object ret = resolvedDynamicConstantAt(cpi, getHolder());
+                yield switch (CremaTypeAccess.symbolToJvmciKind(dynamicType(cpi))) {
+                    case Boolean -> JavaConstant.forBoolean((Boolean) ret);
+                    case Byte -> JavaConstant.forByte((Byte) ret);
+                    case Short -> JavaConstant.forShort((Short) ret);
+                    case Char -> JavaConstant.forChar((Character) ret);
+                    case Int -> JavaConstant.forInt((Integer) ret);
+                    case Float -> JavaConstant.forFloat((Float) ret);
+                    case Long -> JavaConstant.forLong((Long) ret);
+                    case Double -> JavaConstant.forDouble((Double) ret);
+                    case Object -> SubstrateObjectConstant.forObject(ret);
+                    default -> throw VMError.shouldNotReachHere("Unexpected dynamic constant type " + dynamicType(cpi));
+                };
+            }
+            default -> throw VMError.shouldNotReachHere("Unknown tag " + tag);
+        };
+    }
+
+    private Object queryConstantPool(int cpi, boolean resolve) {
+        if (resolve) {
+            return resolvedAt(cpi, holder);
+        } else {
+            return objAt(cpi);
+        }
+    }
+
+    @Override
+    public JavaConstant lookupAppendix(int cpi, int opcode) {
+        assert opcode == INVOKEDYNAMIC;
+        JavaConstant appendix = (JavaConstant) objAt(cpi);
+        /*
+         * Image-heap constants store invokedynamic appendices as ReferenceConstant wrappers while
+         * preserving AOT bytecodes. Runtime graph parsing expects the actual object constant, so
+         * expose only non-opaque referents.
+         */
+        if (appendix instanceof ReferenceConstant<?> referenceConstant) {
+            if (referenceConstant.isOpaque()) {
+                throw VMError.shouldNotReachHere("Cannot expose opaque image heap appendix to JVMCI graph parsing");
+            }
+            return SubstrateObjectConstant.forObject(referenceConstant.getReferent());
+        }
+        return appendix;
+    }
+
+    @VisibleForSerialization
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public Object[] getCachedEntries() {
+        Object[] result = cachedEntries;
+        for (int i = 0; i < cachedEntries.length; i++) {
+            if (cachedEntries[i] instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+                if (result == cachedEntries) {
+                    result = cachedEntries.clone();
+                }
+                result[i] = linkedInvokeCacheEntry.resolvedMethod;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns a cached entry without resolution.
+     */
+    public Object peekCachedEntry(int cpi) {
+        return cachedEntries[cpi];
+    }
+
+    /**
+     * Returns the method currently published for {@code cpi} without resolving or linking it.
+     *
+     * A linked-invoke wrapper retains the original resolved method so that sites which share a
+     * member reference but have different invoke opcodes can retain independent linkage metadata.
+     * Consumers that only need stable method metadata must look through that wrapper rather than
+     * attempting to decode the intentionally incomplete symbolic member reference.
+     */
+    public JavaMethod peekCachedMethod(int cpi) {
+        Object entry = peekCachedEntry(cpi);
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            entry = linkedInvokeCacheEntry.resolvedMethod;
+        }
+        return entry instanceof JavaMethod method ? method : null;
+    }
+
+    /** Returns whether this retained member reference keeps a symbolic name-and-type payload. */
+    public boolean hasSymbolicMemberNameAndType(int cpi) {
+        return memberNameAndTypeIndex(cpi) != 0;
+    }
+
+    public InterpreterResolvedObjectType getHolder() {
+        return holder;
+    }
+
+    @Override
+    public final RuntimeException classFormatError(String message) {
+        throw new ClassFormatError(message);
+    }
+
+    // region Unimplemented methods
+
+    @Override
+    public void loadReferencedType(int cpi, int opcode) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public JavaType lookupReferencedType(int cpi, int opcode) {
+        int declaringClassCPI = -1;
+        switch (opcode) {
+            case Bytecodes.CHECKCAST:
+            case Bytecodes.INSTANCEOF:
+            case Bytecodes.NEW:
+            case Bytecodes.ANEWARRAY:
+            case Bytecodes.MULTIANEWARRAY:
+            case Bytecodes.LDC:
+            case Bytecodes.LDC_W:
+            case Bytecodes.LDC2_W:
+                declaringClassCPI = cpi;
+                break;
+            case Bytecodes.GETSTATIC:
+            case Bytecodes.PUTSTATIC:
+            case Bytecodes.GETFIELD:
+            case Bytecodes.PUTFIELD:
+            case Bytecodes.INVOKEVIRTUAL:
+            case Bytecodes.INVOKESPECIAL:
+            case Bytecodes.INVOKESTATIC:
+            case Bytecodes.INVOKEINTERFACE:
+                declaringClassCPI = memberClassIndex(cpi);
+                if (declaringClassCPI == 0) {
+                    return cachedMemberDeclaringClass(cpi);
+                }
+                break;
+            default:
+                throw VMError.shouldNotReachHere("Unexpected opcode: " + opcode); // ExcludeFromJacocoGeneratedReport
+        }
+        return findClassAt(declaringClassCPI);
+    }
+
+    private JavaType cachedMemberDeclaringClass(int cpi) {
+        Object entry = peekCachedEntry(cpi);
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            entry = linkedInvokeCacheEntry.resolvedMethod;
+        }
+        if (entry instanceof JavaMethod method) {
+            return method.getDeclaringClass();
+        }
+        if (entry instanceof JavaField field) {
+            return field.getDeclaringClass();
+        }
+        throw VMError.shouldNotReachHere("Missing cached member at constant pool index " + cpi); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public String lookupUtf8(int cpi) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public Signature lookupSignature(int cpi) {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    // endregion Unimplemented methods
+
+    @Override
+    public ParserConstantPool getParserConstantPool() {
+        return parserConstantPool;
+    }
+
+    @Override
+    public int methodHandleMemberIndex(int cpi) {
+        return super.methodHandleMemberIndex(cpi);
+    }
+
+    protected Object resolve(int cpi, @SuppressWarnings("unused") InterpreterResolvedObjectType accessingClass) {
+        assert cpi != 0; // guaranteed by the caller
+
+        Object entry = cachedEntries[cpi]; // CPI bounds check
+        if (isUnresolved(entry)) {
+            throw new UnsupportedResolutionException();
+        }
+
+        return entry;
+    }
+
+    public Object resolvedAt(int cpi, InterpreterResolvedObjectType accessingClass) {
+        return resolvedAt(cpi, accessingClass, true);
+    }
+
+    public Object resolvedAt(int cpi, InterpreterResolvedObjectType accessingClass, boolean allowStickyFailure) {
+        Object entry = cachedEntries[cpi];
+        if (isUnresolved(entry)) {
+            entry = forceResolveAt(cpi, accessingClass, allowStickyFailure);
+        }
+        return entry;
+    }
+
+    private Object forceResolveAt(int cpi, InterpreterResolvedObjectType accessingClass, boolean allowStickyFailure) {
+        Object entry = cachedEntries[cpi];
+        if (isUnresolved(entry)) {
+            Object resolved = resolve(cpi, accessingClass);
+            if (!allowStickyFailure && resolved instanceof StickyConstantError) {
+                return resolved;
+            }
+            Object witness = UNSAFE.compareAndExchangeReference(cachedEntries, Unsafe.ARRAY_OBJECT_BASE_OFFSET + (long) cpi * Unsafe.ARRAY_OBJECT_INDEX_SCALE, entry, resolved);
+            if (witness != entry) {
+                return witness;
+            }
+            return resolved;
+        }
+        return entry;
+    }
+
+    /**
+     * Looks for already-linked invoke metadata for {@code cpi}/{@code opcode}. Returns
+     * {@code null} when this CPI has not been linked yet, or when it was linked only for another
+     * invoke opcode.
+     */
+    public LinkedInvoke peekLinkedInvoke(int cpi, int opcode) {
+        assert isInvokeOpcode(opcode) : Bytecodes.nameOf(opcode);
+        Object entry = cachedEntries[cpi];
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            return linkedInvokeCacheEntry.get(opcode);
+        }
+        return null;
+    }
+
+    /** Returns opcode-specific linkage from an entry already loaded by the interpreter frame. */
+    public static LinkedInvoke peekLinkedInvoke(Object entry, int opcode) {
+        assert isInvokeOpcode(opcode) : Bytecodes.nameOf(opcode);
+        // Keep the null probability explicit when the instanceof is lowered to a hub check.
+        if (GraalDirectives.injectBranchProbability(SLOWPATH_PROBABILITY, entry == null)) {
+            return null;
+        }
+        if (GraalDirectives.injectBranchProbability(FASTPATH_PROBABILITY, entry instanceof LinkedInvokeCacheEntry)) {
+            return ((LinkedInvokeCacheEntry) entry).get(opcode);
+        }
+        return null;
+    }
+
+    public Object peekInvokeAppendix(int cpi, int opcode) {
+        assert isInvokeOpcode(opcode) : Bytecodes.nameOf(opcode);
+        Object entry = cachedEntries[cpi];
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            LinkedInvoke linkedInvoke = linkedInvokeCacheEntry.get(opcode);
+            if (linkedInvoke != null) {
+                return linkedInvoke.appendix;
+            }
+            entry = linkedInvokeCacheEntry.resolvedMethod;
+        }
+        if (entry instanceof InterpreterResolvedInvokeGenericJavaMethod invokeGenericMethod) {
+            return invokeGenericMethod.getAppendix();
+        }
+        return null;
+    }
+
+    public LinkedInvoke cacheLinkedInvoke(int cpi, int opcode, LinkedInvoke linkedInvoke) {
+        assert isInvokeOpcode(opcode) : Bytecodes.nameOf(opcode);
+        LinkedInvokeCacheEntry linkedInvokeCacheEntry = getOrCreateLinkedInvokeCacheEntry(cpi);
+        return linkedInvokeCacheEntry.set(opcode, linkedInvoke);
+    }
+
+    private LinkedInvokeCacheEntry getOrCreateLinkedInvokeCacheEntry(int cpi) {
+        Object entry = resolvedAt(cpi, holder);
+        if (entry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            return linkedInvokeCacheEntry;
+        }
+        /*
+         * Invoke linkage is an opportunistic cache. The CP wrapper is deliberately published
+         * without synchronization: a race can temporarily lose another thread's LinkedInvoke
+         * metadata, but invoke bytecodes are not quickened and therefore never depend on the cache
+         * entry being present. A later execution that misses the cache can relink the site and
+         * publish another entry. If invoke bytecodes were patched to require this metadata, wrapper
+         * publication would need synchronization/ordering so quickened bytecodes could not observe
+         * missing metadata.
+         */
+        InterpreterResolvedJavaMethod resolvedMethod = (InterpreterResolvedJavaMethod) entry;
+        LinkedInvokeCacheEntry linkedInvokeCacheEntry = new LinkedInvokeCacheEntry(resolvedMethod);
+        cachedEntries[cpi] = linkedInvokeCacheEntry;
+        return linkedInvokeCacheEntry;
+    }
+
+    /** Tests whether a cached entry still requires constant-pool resolution. */
+    public static boolean isUnresolved(Object entry) {
+        return entry == null || entry instanceof UnresolvedJavaType || entry instanceof UnresolvedJavaMethod || entry instanceof UnresolvedJavaField;
+    }
+
+    private static boolean isInvokeOpcode(int opcode) {
+        return switch (opcode) {
+            case Bytecodes.INVOKEVIRTUAL, Bytecodes.INVOKESPECIAL, Bytecodes.INVOKESTATIC, Bytecodes.INVOKEINTERFACE -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Cached invoke linkage together with the handler-ready call shape. {@link #argumentKinds}
+     * contains one {@link JavaKind#getBasicType() basic type} per Java argument, including the
+     * receiver at index zero when {@link #hasReceiver} is true, and {@link #returnKind} uses the
+     * same encoding.
+     */
+    public static final class LinkedInvoke {
+        public static final byte NO_TYPE_CHECK = 0;
+        public static final byte COMBINED_INTERFACE_LOOKUP = 1;
+        public static final byte SYMBOLIC_TYPE_CHECK = 2;
+
+        public final InterpreterResolvedJavaType symbolicHolder;
+        public final InterpreterResolvedJavaMethod seedMethod;
+        public final CallKind callKind;
+        public final Object appendix;
+        public final byte[] argumentKinds;
+        public final byte returnKind;
+        public final short argumentCount;
+        public final boolean hasReceiver;
+        /**
+         * Receiver validation for this invoke opcode: omitted, combined with hashed interface
+         * dispatch, or performed separately against the required receiver type.
+         */
+        private final byte receiverCheckKind;
+
+        public LinkedInvoke(InterpreterResolvedJavaType symbolicHolder, InterpreterResolvedJavaMethod seedMethod, CallKind callKind, Object appendix, boolean requiresInterfaceReceiverCheck,
+                        int opcode) {
+            this.symbolicHolder = symbolicHolder;
+            this.seedMethod = seedMethod;
+            this.callKind = callKind;
+            this.appendix = appendix;
+            InterpreterUnresolvedSignature signature = seedMethod.getSignature();
+            this.returnKind = (byte) signature.getReturnKind().getBasicType();
+            this.hasReceiver = !seedMethod.isStatic();
+            byte checkKind = switch (opcode) {
+                case Bytecodes.INVOKESTATIC, Bytecodes.INVOKEVIRTUAL -> NO_TYPE_CHECK;
+                case Bytecodes.INVOKEINTERFACE -> SYMBOLIC_TYPE_CHECK;
+                default -> requiresInterfaceReceiverCheck ? SYMBOLIC_TYPE_CHECK : NO_TYPE_CHECK;
+            };
+            /*
+             * An inherited method may dispatch through a superinterface. Its table entry cannot
+             * establish membership in the symbolic subinterface, so retain both checks there.
+             * This caches only the linkage shape, not a receiver class or resolved target.
+             */
+            if (opcode == Bytecodes.INVOKEINTERFACE && SubstrateOptions.useInterfaceHashing()) {
+                assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+                if (callKind == CallKind.ITABLE_LOOKUP && seedMethod.hasDispatchIndex() && symbolicHolder.equals(seedMethod.getDeclaringClass())) {
+                    int interfaceID = symbolicHolder.getHub().getInterfaceID();
+                    assert interfaceID > 0;
+                    if (interfaceID <= SubstrateOptions.interfaceHashingMaxId()) {
+                        checkKind = COMBINED_INTERFACE_LOOKUP;
+                    }
+                }
+            }
+            this.receiverCheckKind = checkKind;
+
+            int count = signature.getParameterCount(hasReceiver);
+            assert count <= 256;
+            this.argumentCount = (short) count;
+            this.argumentKinds = new byte[count];
+            int argumentIndex = 0;
+            if (hasReceiver) {
+                argumentKinds[argumentIndex++] = (byte) JavaKind.Object.getBasicType();
+            }
+            for (int parameterIndex = 0; parameterIndex < signature.getParameterCount(false); parameterIndex++) {
+                argumentKinds[argumentIndex++] = (byte) signature.getParameterKind(parameterIndex).getBasicType();
+            }
+        }
+
+        public boolean hasReceiver(int opcode) {
+            return switch (opcode) {
+                case Bytecodes.INVOKESTATIC -> false;
+                case Bytecodes.INVOKEINTERFACE -> true;
+                default -> hasReceiver;
+            };
+        }
+
+        public Object getAppendix(int opcode) {
+            return switch (opcode) {
+                case Bytecodes.INVOKESTATIC, Bytecodes.INVOKEINTERFACE -> null;
+                default -> appendix;
+            };
+        }
+
+        public byte getReceiverCheckKind(int opcode) {
+            return switch (opcode) {
+                case Bytecodes.INVOKESTATIC, Bytecodes.INVOKEVIRTUAL -> NO_TYPE_CHECK;
+                default -> receiverCheckKind;
+            };
+        }
+    }
+
+    protected static final class LinkedInvokeCacheEntry {
+        final InterpreterResolvedJavaMethod resolvedMethod;
+        /*
+         * A classfile can reuse the same CONSTANT_Methodref for different invoke bytecodes. For
+         * example, generated bytecode may use the same Base.m:()V CPI for both
+         * invokespecial Base.m:()V and invokevirtual Base.m:()V. The symbolic CP resolution is then
+         * the same, but Crema's linked call-site metadata is opcode-specific: the symbolic holder,
+         * resolved seed method, call kind, and appendix can differ by invoke kind. Keep one slot per
+         * invoke opcode so all metadata remains attached to the shared CPI wrapper.
+         */
+        private LinkedInvoke virtualInvoke;
+        private LinkedInvoke specialInvoke;
+        private LinkedInvoke staticInvoke;
+        private LinkedInvoke interfaceInvoke;
+
+        LinkedInvokeCacheEntry(InterpreterResolvedJavaMethod resolvedMethod) {
+            this.resolvedMethod = MetadataUtil.requireNonNull(resolvedMethod);
+        }
+
+        LinkedInvoke get(int opcode) {
+            return switch (opcode) {
+                case Bytecodes.INVOKEVIRTUAL -> virtualInvoke;
+                case Bytecodes.INVOKESPECIAL -> specialInvoke;
+                case Bytecodes.INVOKESTATIC -> staticInvoke;
+                case Bytecodes.INVOKEINTERFACE -> interfaceInvoke;
+                default -> throw new IllegalArgumentException("Not an invoke opcode: " + opcode);
+            };
+        }
+
+        LinkedInvoke set(int opcode, LinkedInvoke linkedInvoke) {
+            assert isInvokeOpcode(opcode) : Bytecodes.nameOf(opcode);
+            LinkedInvoke existing = get(opcode);
+            if (existing != null) {
+                return existing;
+            }
+            return switch (opcode) {
+                case Bytecodes.INVOKEVIRTUAL -> virtualInvoke = linkedInvoke;
+                case Bytecodes.INVOKESPECIAL -> specialInvoke = linkedInvoke;
+                case Bytecodes.INVOKESTATIC -> staticInvoke = linkedInvoke;
+                case Bytecodes.INVOKEINTERFACE -> interfaceInvoke = linkedInvoke;
+                default -> throw new IllegalArgumentException("Not an invoke opcode: " + opcode);
+            };
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    protected static <T extends Throwable> RuntimeException uncheckedThrow(Throwable t) throws T {
+        throw (T) t;
+    }
+
+    public InterpreterResolvedJavaField resolvedFieldAt(InterpreterResolvedObjectType accessingKlass, int cpi) {
+        Object resolvedEntry = resolvedAt(cpi, accessingKlass);
+        assert resolvedEntry != null;
+        return (InterpreterResolvedJavaField) resolvedEntry;
+    }
+
+    public InterpreterResolvedJavaMethod resolvedMethodAt(InterpreterResolvedObjectType accessingKlass, int cpi) {
+        Object resolvedEntry = resolvedAt(cpi, accessingKlass);
+        assert resolvedEntry != null;
+        if (resolvedEntry instanceof LinkedInvokeCacheEntry linkedInvokeCacheEntry) {
+            return linkedInvokeCacheEntry.resolvedMethod;
+        }
+        return (InterpreterResolvedJavaMethod) resolvedEntry;
+    }
+
+    public InterpreterResolvedObjectType resolvedTypeAt(InterpreterResolvedObjectType accessingKlass, int cpi) {
+        return resolvedTypeAt(accessingKlass, cpi, true);
+    }
+
+    public InterpreterResolvedObjectType resolvedTypeAt(InterpreterResolvedObjectType accessingKlass, int cpi, boolean allowStickyFailures) {
+        Object resolvedEntry = resolvedAt(cpi, accessingKlass, allowStickyFailures);
+        assert resolvedEntry != null;
+        if (resolvedEntry instanceof StickyConstantError savedError) {
+            throw savedError.throwOnAccess();
+        }
+        return (InterpreterResolvedObjectType) resolvedEntry;
+    }
+
+    public String resolveStringAt(int cpi) {
+        Object resolvedEntry = resolvedAt(cpi, null);
+        if (resolvedEntry instanceof ReferenceConstant<?> referenceConstant) {
+            resolvedEntry = referenceConstant.getReferent();
+        }
+        assert resolvedEntry != null;
+        return (String) resolvedEntry;
+    }
+
+    public MethodHandle resolvedMethodHandleAt(int cpi, InterpreterResolvedObjectType accessingClass) {
+        Object resolvedEntry = resolvedAt(cpi, accessingClass);
+        assert resolvedEntry != null;
+        return (MethodHandle) resolvedEntry;
+    }
+
+    public MethodType resolvedMethodTypeAt(char cpi, InterpreterResolvedObjectType accessingClass) {
+        Object resolvedEntry = resolvedAt(cpi, accessingClass);
+        assert resolvedEntry != null;
+        return (MethodType) resolvedEntry;
+    }
+
+    /**
+     * This is stored in the constant pool when a "sticky" failure happens while resolving a DYNAMIC
+     * or CLASS entry. It is used to throw the correct exception on subsequent accesses to that
+     * entry.
+     */
+    public static final class StickyConstantError {
+        private final LinkageError originalException;
+        private Constructor<? extends LinkageError> cachedConstructor;
+
+        public StickyConstantError(LinkageError originalException) {
+            this.originalException = originalException;
+        }
+
+        /**
+         * Throws an exception when a failed DYNAMIC or CLASS entry is accessed again. It tries to create a
+         * fresh exception to give an accurate stack trace.
+         */
+        LinkageError throwOnAccess() {
+            if (originalException.getClass().getClassLoader() == null) {
+                /*
+                 * Create a fresh exception for boot class loader exceptions. We avoid doing this
+                 * for other exception types because we don't control their constructor, getMessage,
+                 * and getCause implementations. See JDK-8349141.
+                 */
+                String message = originalException.getMessage();
+                var constructor = getConstructor();
+                if (constructor != null) {
+                    try {
+                        LinkageError error = constructor.newInstance(message);
+                        Throwable cause = originalException.getCause();
+                        if (cause != null) {
+                            error.initCause(cause);
+                        }
+                        throw error;
+                    } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
+                        VMError.shouldNotReachHere(e);
+                    }
+                }
+            }
+            throw originalException;
+        }
+
+        private Constructor<? extends LinkageError> getConstructor() {
+            if (cachedConstructor == null) {
+                Class<? extends LinkageError> exceptionType = originalException.getClass();
+                try {
+                    cachedConstructor = exceptionType.getConstructor(String.class);
+                } catch (NoSuchMethodException e) {
+                    /*
+                     * The only boot classes known to miss the String constructor are native image's
+                     * Missing*RegistrationError.
+                     */
+                    assert exceptionType.getName().startsWith("Missing") && exceptionType.getName().endsWith("RegistrationError");
+                    return null;
+                }
+                /*
+                 * We don't need any access checks for this constructor. It's safe to mutate this
+                 * instance since reflection returned a fresh copy that we own.
+                 */
+                SubstrateUtil.cast(cachedConstructor, Target_java_lang_reflect_AccessibleObject.class).override = true;
+            }
+            return cachedConstructor;
+        }
+    }
+
+    public Object resolvedDynamicConstantAt(int cpi, InterpreterResolvedObjectType accessingClass) {
+        Object resolvedEntry = resolvedAt(cpi, accessingClass);
+        if (resolvedEntry instanceof StickyConstantError savedError) {
+            throw savedError.throwOnAccess();
+        }
+        if (resolvedEntry == NULL_DYNAMIC_CONSTANT_SENTINEL) {
+            return null;
+        }
+        return resolvedEntry;
+    }
+
+    @Override
+    public int intAt(int index) {
+        checkTag(index, CONSTANT_Integer);
+        Object entry = cachedEntries[index];
+        assert entry == null || entry instanceof InterpreterConstantPoolPrimitiveEntry;
+        if (entry instanceof InterpreterConstantPoolPrimitiveEntry primitiveConstant) {
+            assert primitiveConstant.tag() == CONSTANT_Integer;
+            return primitiveConstant.asInt();
+        }
+        return super.intAt(index);
+    }
+
+    @Override
+    public float floatAt(int index) {
+        checkTag(index, CONSTANT_Float);
+        Object entry = cachedEntries[index];
+        assert entry == null || entry instanceof InterpreterConstantPoolPrimitiveEntry;
+        if (entry instanceof InterpreterConstantPoolPrimitiveEntry primitiveConstant) {
+            assert primitiveConstant.tag() == CONSTANT_Float;
+            return primitiveConstant.asFloat();
+        }
+        return super.floatAt(index);
+    }
+
+    @Override
+    public double doubleAt(int index) {
+        checkTag(index, CONSTANT_Double);
+        Object entry = cachedEntries[index];
+        assert entry == null || entry instanceof InterpreterConstantPoolPrimitiveEntry;
+        if (entry instanceof InterpreterConstantPoolPrimitiveEntry primitiveConstant) {
+            assert primitiveConstant.tag() == CONSTANT_Double;
+            return primitiveConstant.asDouble();
+        }
+        return super.doubleAt(index);
+    }
+
+    @Override
+    public long longAt(int index) {
+        checkTag(index, CONSTANT_Long);
+        Object entry = cachedEntries[index];
+        assert entry == null || entry instanceof InterpreterConstantPoolPrimitiveEntry;
+        if (entry instanceof InterpreterConstantPoolPrimitiveEntry primitiveConstant) {
+            assert primitiveConstant.tag() == CONSTANT_Long;
+            return primitiveConstant.asLong();
+        }
+        return super.longAt(index);
+    }
+
+    /** Returns hydrated type metadata without loading; uncached entries require runtime loading. */
+    public JavaType findClassAt(int cpi) {
+        if (peekCachedEntry(cpi) instanceof JavaType type) {
+            return type;
+        }
+        if (!RuntimeClassLoading.isSupported()) {
+            throw VMError.intentionallyUnimplemented();
+        }
+        Symbol<Name> nameSymbol = className(cpi);
+        ByteSequence typeBytes = TypeSymbols.nameToType(nameSymbol);
+        Symbol<Type> typeSymbol = SymbolsSupport.getTypes().lookupValidType(typeBytes);
+        if (typeSymbol == null) {
+            return null;
+        }
+        Class<?> cls = CremaSupport.singleton().findLoadedClass(typeSymbol, getHolder());
+        if (cls == null) {
+            return UnresolvedJavaType.create(typeBytes.toString());
+        } else {
+            return DynamicHubUtils.getInterpreterType(DynamicHub.fromClass(cls));
+        }
+    }
+}

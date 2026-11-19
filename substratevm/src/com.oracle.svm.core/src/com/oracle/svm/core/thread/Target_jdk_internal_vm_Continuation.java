@@ -28,7 +28,7 @@ import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Inject;
@@ -38,8 +38,8 @@ import com.oracle.svm.core.heap.StoredContinuation;
 import com.oracle.svm.core.snippets.ImplicitExceptions;
 import com.oracle.svm.core.stack.JavaFrameAnchor;
 import com.oracle.svm.core.stack.JavaFrameAnchors;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.util.VMError;
 
 @TargetClass(className = "jdk.internal.vm.Continuation")
 public final class Target_jdk_internal_vm_Continuation {
@@ -92,8 +92,7 @@ public final class Target_jdk_internal_vm_Continuation {
     @Substitute
     @NeverInline("access stack pointer")
     private static int isPinned0(Target_jdk_internal_vm_ContinuationScope scope) {
-        Target_java_lang_Thread carrier = JavaThreads.toTarget(Target_java_lang_Thread.currentCarrierThread());
-        Target_jdk_internal_vm_Continuation cont = carrier.cont;
+        Target_jdk_internal_vm_Continuation cont = ContinuationInternals.getContinuationFromCarrier();
         if (cont != null) {
             while (true) {
                 if (cont.pinCount != 0) {
@@ -126,6 +125,11 @@ public final class Target_jdk_internal_vm_Continuation {
     @Substitute
     static void enterSpecial(Target_jdk_internal_vm_Continuation c, @SuppressWarnings("unused") boolean isContinue, boolean isVirtualThread) {
         assert isVirtualThread;
+        if (!ContinuationSupport.isSupported()) {
+            // We should always fail earlier in the Continuation class initializer.
+            // This is only to make the code below and its callees unreachable.
+            throw VMError.shouldNotReachHereAtRuntime();
+        }
 
         int stateBefore = StackOverflowCheck.singleton().getState();
         VMError.guarantee(!StackOverflowCheck.singleton().isYellowZoneAvailable());
@@ -148,8 +152,13 @@ public final class Target_jdk_internal_vm_Continuation {
 
     @Substitute
     private static int doYield() {
-        Target_java_lang_Thread carrier = JavaThreads.toTarget(Target_java_lang_Thread.currentCarrierThread());
-        Target_jdk_internal_vm_Continuation cont = carrier.cont;
+        if (!ContinuationSupport.isSupported()) {
+            // We should always fail earlier in the Continuation class initializer.
+            // This is only to make the code below and its callees unreachable.
+            throw VMError.shouldNotReachHereAtRuntime();
+        }
+
+        Target_jdk_internal_vm_Continuation cont = ContinuationInternals.getContinuationFromCarrier();
         int pinnedReason = isPinned0(cont.getScope());
         if (pinnedReason != 0) {
             return pinnedReason;
@@ -181,23 +190,23 @@ public final class Target_jdk_internal_vm_Continuation {
 
     @Substitute
     public static void pin() {
-        Target_java_lang_Thread carrier = JavaThreads.toTarget(Target_java_lang_Thread.currentCarrierThread());
-        if (carrier.cont != null) {
-            if (carrier.cont.pinCount + 1 == 0) { // unsigned arithmetic
+        Target_jdk_internal_vm_Continuation cont = ContinuationInternals.getContinuationFromCarrier();
+        if (cont != null) {
+            if (cont.pinCount + 1 == 0) { // unsigned arithmetic
                 throw new IllegalStateException("Pin overflow");
             }
-            carrier.cont.pinCount++;
+            cont.pinCount++;
         }
     }
 
     @Substitute
     public static void unpin() {
-        Target_java_lang_Thread carrier = JavaThreads.toTarget(Target_java_lang_Thread.currentCarrierThread());
-        if (carrier.cont != null) {
-            if (carrier.cont.pinCount == 0) {
+        Target_jdk_internal_vm_Continuation cont = ContinuationInternals.getContinuationFromCarrier();
+        if (cont != null) {
+            if (cont.pinCount == 0) {
                 throw new IllegalStateException("Pin underflow");
             }
-            carrier.cont.pinCount--;
+            cont.pinCount--;
         }
     }
 
@@ -215,6 +224,10 @@ public final class Target_jdk_internal_vm_Continuation {
 }
 
 @TargetClass(className = "jdk.internal.vm.StackChunk")
-@Delete
+@Substitute
 final class Target_jdk_internal_vm_StackChunk {
+    @Substitute
+    static void init() {
+        // Called from Continuation initializer.
+    }
 }

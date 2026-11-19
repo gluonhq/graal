@@ -40,8 +40,42 @@
  */
 package com.oracle.truffle.espresso.polyglot.collections;
 
+import java.util.Iterator;
 import java.util.Set;
 
 public class EspressoForeignSet<T> extends EspressoForeignCollection<T> implements Set<T> {
 
+    // Borrowed from java.util.AbstractSet
+    @Override
+    public int hashCode() {
+        int h = 0;
+        Iterator<T> i = iterator();
+        while (i.hasNext()) {
+            T obj = i.next();
+            if (obj != null) {
+                h += obj.hashCode();
+            }
+        }
+        return h;
+    }
+
+    // Borrowed from java.util.AbstractSet
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) {
+            return true;
+        }
+        if (!(o instanceof Set)) {
+            return false;
+        }
+        Set<?> otherSet = (Set<?>) o;
+        if (size() != otherSet.size()) {
+            return false;
+        }
+        try {
+            return containsAll(otherSet);
+        } catch (ClassCastException | NullPointerException unused) {
+            return false;
+        }
+    }
 }

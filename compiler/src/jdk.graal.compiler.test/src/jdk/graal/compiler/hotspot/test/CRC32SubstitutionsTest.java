@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2007, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +24,24 @@
  */
 package jdk.graal.compiler.hotspot.test;
 
+import static jdk.vm.ci.amd64.AMD64.CPUFeature.CLMUL;
+import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSE2;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
+
 import java.io.DataInputStream;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.util.EnumSet;
 import java.util.zip.CRC32;
 
 import jdk.graal.compiler.core.test.GraalCompilerTest;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.calc.XorNode;
+import jdk.graal.compiler.replacements.nodes.CRC32TableNode;
+import jdk.graal.compiler.replacements.nodes.CRC32UpdateBytesNode;
+import jdk.vm.ci.amd64.AMD64;
 import org.junit.Test;
 
 /**
@@ -37,6 +49,34 @@ import org.junit.Test;
  */
 @SuppressWarnings("javadoc")
 public class CRC32SubstitutionsTest extends GraalCompilerTest {
+
+    private void assumeCRC32UpdateBytesIntrinsicSupported() {
+        assumeTrue("CRC32 update bytes intrinsic is not supported by target architecture",
+                        CRC32UpdateBytesNode.isSupported(getTarget().arch));
+    }
+
+    public static long updateSingleByte(int b) {
+        CRC32 crc = new CRC32();
+        crc.update(b);
+        return crc.getValue();
+    }
+
+    @Test
+    public void testUpdateSingleByteExecution() {
+        for (int i = 0; i < 10_000; i++) {
+            updateSingleByte(i);
+        }
+        assertTrue(updateSingleByte(1) >= 0);
+    }
+
+    public static long updateDirectByteBuffer(byte[] input) {
+        CRC32 crc = new CRC32();
+        ByteBuffer direct = ByteBuffer.allocateDirect(input.length);
+        direct.put(input);
+        direct.flip();
+        crc.update(direct);
+        return crc.getValue();
+    }
 
     public static long update(byte[] input) {
         CRC32 crc = new CRC32();
@@ -63,6 +103,40 @@ public class CRC32SubstitutionsTest extends GraalCompilerTest {
         int off = 0;
         int len = buf.length;
         test("updateBytes", buf, off, len);
+    }
+
+    @Test
+    public void testUpdateBytesUsesCRC32StubNode() {
+        assumeCRC32UpdateBytesIntrinsicSupported();
+        StructuredGraph graph = getFinalGraph(getResolvedJavaMethod("updateBytes"));
+        assertTrue(graph.getNodes().filter(CRC32UpdateBytesNode.class).isNotEmpty());
+
+        byte[] buf = new byte[1024];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = (byte) i;
+        }
+        test("updateBytes", buf, 7, buf.length - 19);
+    }
+
+    @Test
+    public void testUpdateIntrinsicOwnershipPath() {
+        StructuredGraph graph = getFinalGraph(getResolvedJavaMethod("updateSingleByte"));
+        assertTrue(graph.getNodes().filter(CRC32TableNode.class).isNotEmpty());
+        assertTrue(graph.getNodes().filter(XorNode.class).isNotEmpty());
+        assertTrue(graph.getNodes().filter(CRC32UpdateBytesNode.class).isEmpty());
+    }
+
+    @Test
+    public void testUpdateBytesIntrinsicOwnershipPath() {
+        assumeCRC32UpdateBytesIntrinsicSupported();
+        StructuredGraph graph = getFinalGraph(getResolvedJavaMethod("updateBytes"));
+        assertTrue(graph.getNodes().filter(CRC32UpdateBytesNode.class).isNotEmpty());
+    }
+
+    @Test
+    public void testAMD64RequiresCLMUL() {
+        assertFalse(CRC32UpdateBytesNode.isSupported(new AMD64(EnumSet.of(SSE2))));
+        assertTrue(CRC32UpdateBytesNode.isSupported(new AMD64(EnumSet.of(SSE2, CLMUL))));
     }
 
     @Test

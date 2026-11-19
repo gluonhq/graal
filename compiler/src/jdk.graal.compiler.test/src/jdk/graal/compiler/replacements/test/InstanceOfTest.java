@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +24,16 @@
  */
 package jdk.graal.compiler.replacements.test;
 
+import java.io.Serializable;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
+import org.junit.Test;
+
+import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.ReturnNode;
@@ -37,8 +41,7 @@ import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.StructuredGraph.AllowAssumptions;
 import jdk.graal.compiler.nodes.java.InstanceOfNode;
 import jdk.graal.compiler.phases.common.AbstractInliningPhase;
-import org.junit.Test;
-
+import jdk.graal.compiler.util.EconomicHashMap;
 import jdk.vm.ci.code.site.Call;
 import jdk.vm.ci.code.site.Mark;
 import jdk.vm.ci.code.site.Site;
@@ -124,7 +127,7 @@ public class InstanceOfTest extends TypeCheckTest {
 
     @Test
     public void test5() {
-        Map<?, ?> map = new HashMap<>();
+        Map<?, ?> map = new EconomicHashMap<>();
         test("isMap", profile(), map);
         test("isMap", profile(HashMap.class), map);
         test("isMap", profile(TreeMap.class, HashMap.class), map);
@@ -137,7 +140,7 @@ public class InstanceOfTest extends TypeCheckTest {
 
     @Test
     public void test6() {
-        Map<?, ?> map = new HashMap<>();
+        Map<?, ?> map = new EconomicHashMap<>();
         test("isMapInt", profile(), map);
         test("isMapInt", profile(HashMap.class), map);
         test("isMapInt", profile(TreeMap.class, HashMap.class), map);
@@ -363,6 +366,32 @@ public class InstanceOfTest extends TypeCheckTest {
         return o instanceof D[];
     }
 
+    /// Tests the interfaces retained when different primitive array types merge.
+    @Test
+    public void testMergedArrayInterfaces() {
+        test("mergedArrayIsCloneable", true);
+        test("mergedArrayIsCloneable", false);
+        test("mergedArrayIsSerializable", true);
+        test("mergedArrayIsSerializable", false);
+    }
+
+    /// Checks `Cloneable` after merging arrays without a common array superclass.
+    public static boolean mergedArrayIsCloneable(boolean chooseIntArray) {
+        Object array;
+        if (chooseIntArray) {
+            array = new int[1];
+        } else {
+            array = new long[1];
+        }
+        return array instanceof Cloneable;
+    }
+
+    /// Checks `Serializable` after merging arrays without a common array superclass.
+    public static boolean mergedArrayIsSerializable(boolean chooseIntArray) {
+        Object array = chooseIntArray ? new int[1] : new long[1];
+        return array instanceof Serializable;
+    }
+
     @Test
     public void testArray() {
         Object aArray = new A[10];
@@ -439,18 +468,22 @@ public class InstanceOfTest extends TypeCheckTest {
         test("conditionalInstantiation", 1);
     }
 
+    @SuppressWarnings("cast")
     public boolean exactlyObject(Thread thread) {
         return thread != null && ((Object) thread).getClass() == Object.class;
     }
 
+    @SuppressWarnings("cast")
     public boolean exactlyObjectArray(Thread[] threads) {
         return threads != null && ((Object[]) threads).getClass() == Object[].class;
     }
 
+    @SuppressWarnings("cast")
     public boolean exactlyString(Thread thread) {
         return thread != null && ((Object) thread).getClass() == String.class;
     }
 
+    @SuppressWarnings("cast")
     public boolean exactlyStringArray(Thread[] threads) {
         return threads != null && ((Object[]) threads).getClass() == String[].class;
     }
@@ -484,10 +517,9 @@ public class InstanceOfTest extends TypeCheckTest {
         assertDeepEquals(value, ret.result().asJavaConstant().asBoxedPrimitive());
     }
 
-    @SuppressWarnings("try")
     protected StructuredGraph buildGraph(final String snippet) {
         DebugContext debug = getDebugContext();
-        try (DebugContext.Scope s = debug.scope("InstanceOfTest", getMetaAccess().lookupJavaMethod(getMethod(snippet)))) {
+        try (DebugContext.Scope _ = debug.scope("InstanceOfTest", getMetaAccess().lookupJavaMethod(getMethod(snippet)))) {
             StructuredGraph graph = parseEager(snippet, AllowAssumptions.YES, debug);
             compile(graph.method(), graph);
             debug.dump(DebugContext.BASIC_LEVEL, graph, snippet);
@@ -537,5 +569,18 @@ public class InstanceOfTest extends TypeCheckTest {
     }
 
     static class Depth14 extends Depth12 {
+    }
+
+    public static int iof(Object o) {
+        if (o instanceof Object[]) {
+            return 0;
+        }
+        GraalDirectives.sideEffect(2);
+        return 1;
+    }
+
+    @Test
+    public void testInstanceOfArray() {
+        test("iof", new Object());
     }
 }

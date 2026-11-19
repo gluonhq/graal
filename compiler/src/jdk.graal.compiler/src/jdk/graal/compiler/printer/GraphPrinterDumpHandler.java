@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@ package jdk.graal.compiler.printer;
 
 import static jdk.graal.compiler.debug.DebugConfig.asJavaMethod;
 import static jdk.graal.compiler.debug.DebugOptions.PrintUnmodifiedGraphs;
+import static jdk.graal.compiler.debug.PathUtilities.getDateString;
 
 import java.io.IOException;
 import java.nio.channels.ClosedByInterruptException;
@@ -33,12 +34,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 
 import jdk.graal.compiler.core.common.CompilationIdentifier;
+import jdk.graal.compiler.core.common.util.CompilationAlarm;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.DebugDumpHandler;
 import jdk.graal.compiler.debug.DebugDumpScope;
@@ -51,10 +52,9 @@ import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.contract.NodeCostUtil;
 import jdk.graal.compiler.serviceprovider.GraalServices;
-
+import jdk.graal.compiler.util.EconomicHashMap;
 import jdk.vm.ci.meta.JavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
-import jdk.vm.ci.services.Services;
 
 //JaCoCo Exclude
 
@@ -92,7 +92,7 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
         this.printerSupplier = printerSupplier;
         /* Add the JVM and Java arguments to the graph properties to help identify it. */
         this.jvmArguments = jvmArguments();
-        this.sunJavaCommand = Services.getSavedProperty("sun.java.command");
+        this.sunJavaCommand = GraalServices.getSavedProperty("sun.java.command");
     }
 
     private static String jvmArguments() {
@@ -145,6 +145,8 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
                 // If the graph to be dumped is with an invalid compilation id, it is likely derived
                 // from inlining.
                 if (compilationID != CompilationIdentifier.INVALID_COMPILATION_ID) {
+                    // Keep derived graphs in the diagnostic scope of their root compilation.
+                    compilationID = compilationID.getRootCompilationIdentifier();
                     if (previousCompilationID != CompilationIdentifier.INVALID_COMPILATION_ID && !compilationID.equals(previousCompilationID)) {
                         // Compilation ID does not match, close existing scopes.
                         for (int inlineDepth = previousInlineContext.size() - 1; inlineDepth >= 0; --inlineDepth) {
@@ -157,7 +159,7 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
             }
 
             if (!inlineContext.equals(previousInlineContext)) {
-                Map<Object, Object> properties = new HashMap<>();
+                Map<Object, Object> properties = new EconomicHashMap<>();
                 properties.put("graph", graph.toString());
                 addCompilationId(properties, graph);
                 // Check for method scopes that must be closed since the previous dump.
@@ -187,7 +189,7 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
             String currentScopeName = debug.getCurrentScopeName();
             try (DebugContext.Scope s = debug.sandbox("PrintingGraph", null)) {
                 // Finally, output the graph.
-                Map<Object, Object> properties = new HashMap<>();
+                Map<Object, Object> properties = new EconomicHashMap<>();
                 properties.put("scope", currentScopeName);
                 graph.getDebugProperties(properties);
                 if (graph instanceof StructuredGraph) {
@@ -200,6 +202,14 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
                     }
                     properties.put("StageFlags", structuredGraph.getGraphState().getStageFlags());
                     properties.put("speculationLog", structuredGraph.getSpeculationLog() != null ? structuredGraph.getSpeculationLog().toString() : "null");
+
+                    CompilationAlarm currentAlarm = CompilationAlarm.current();
+                    if (currentAlarm.isEnabled()) {
+                        properties.put("elapsedCompilationAlarm", currentAlarm.elapsed());
+                        if (currentAlarm.elapsedPhaseTreeAsString() != null) {
+                            properties.put("elapsedPhaseTimes", currentAlarm.elapsedPhaseTreeAsString().toString());
+                        }
+                    }
                 }
                 if (PrintUnmodifiedGraphs.getValue(options) || lastGraph != graph || lastModCount != graph.getEdgeModificationCount()) {
                     printer.print(debug, graph, properties, nextDumpId(), format, arguments);
@@ -333,13 +343,14 @@ public final class GraphPrinterDumpHandler implements DebugDumpHandler {
             if (inlineDepth == 0) {
                 /* Include some VM specific properties at the root. */
                 if (props == null) {
-                    props = new HashMap<>();
+                    props = new EconomicHashMap<>();
                 }
                 props.put("jvmArguments", jvmArguments);
                 if (sunJavaCommand != null) {
                     props.put("sun.java.command", sunJavaCommand);
                 }
-                props.put("date", new Date().toString());
+                Date date = new Date(GraalServices.getGlobalTimeStamp());
+                props.put("date", getDateString(date));
             }
             printer.beginGroup(debug, name, name, debug.contextLookup(ResolvedJavaMethod.class), -1, props);
         } catch (IOException e) {

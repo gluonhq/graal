@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2023, 2023, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,19 +26,21 @@
 
 package com.oracle.svm.core.jfr.oldobject;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.collections.UninterruptibleLinkedList;
 import com.oracle.svm.core.collections.UninterruptiblePriorityQueue;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.jfr.JfrEvent;
+import com.oracle.svm.core.jfr.JfrThreadRepository;
 import com.oracle.svm.core.jfr.JfrTicks;
 import com.oracle.svm.core.jfr.SubstrateJVM;
 import com.oracle.svm.core.jfr.events.OldObjectSampleEvent;
+import com.oracle.svm.core.jfr.traceid.JfrEpoch;
 import com.oracle.svm.core.thread.JavaThreads;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * A sampler that tracks old objects that are potential memory leaks.
@@ -64,7 +66,7 @@ final class JfrOldObjectSampler {
         }
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "Must not safepoint while holding the object profiler lock.")
     boolean sample(Object obj, UnsignedWord allocatedSize, int arrayLength) {
         totalAllocated = totalAllocated.add(allocatedSize);
         UnsignedWord span = totalAllocated.subtract(totalInQueue);
@@ -89,11 +91,11 @@ final class JfrOldObjectSampler {
             }
         }
 
-        store(obj, allocatedSize, arrayLength);
+        store(obj, span, allocatedSize, arrayLength);
         return true;
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "Must be atomic with regard to garbage collection.")
     private int scavenge() {
         int numDead = 0;
         JfrOldObject cur = getOldestObject();
@@ -120,9 +122,12 @@ final class JfrOldObjectSampler {
             next.increaseSpan(sample.getSpan());
             queue.add(next);
         } else {
-            /* No remaining elements, we can't redistribute the weight. */
+            /*
+             * No younger element, we can't redistribute the weight. The next sample should absorb
+             * the extra span.
+             */
             totalInQueue = totalInQueue.subtract(sample.getSpan());
-            assert totalInQueue.equal(0);
+            assert totalInQueue.aboveOrEqual(0);
         }
         queue.remove(sample);
         release(sample);
@@ -141,21 +146,27 @@ final class JfrOldObjectSampler {
         sample.reset();
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
-    private void store(Object obj, UnsignedWord allocatedSize, int arrayLength) {
+    @Uninterruptible(reason = "Must not safepoint while holding the object profiler lock.")
+    private void store(Object obj, UnsignedWord span, UnsignedWord allocatedSize, int arrayLength) {
         Thread thread = JavaThreads.getCurrentThreadOrNull();
         long threadId = thread == null ? 0L : JavaThreads.getThreadId(thread);
-        long stackTraceId = thread == null ? 0L : SubstrateJVM.get().getStackTraceId(JfrEvent.OldObjectSample, 0);
+        String vthreadName = null;
+        long vthreadEpochId = JfrEpoch.NO_EPOCH_ID;
+        if (JavaThreads.isVirtual(thread)) {
+            vthreadName = thread.getName();
+            vthreadEpochId = JfrThreadRepository.getVThreadEpochId(thread);
+        }
+        long stackTraceId = thread == null ? 0L : SubstrateJVM.get().getStackTraceId(JfrEvent.OldObjectSample);
         UnsignedWord heapUsedAfterLastGC = Heap.getHeap().getUsedMemoryAfterLastGC();
 
         JfrOldObject sample = (JfrOldObject) freeList.pop();
-        sample.initialize(obj, allocatedSize, threadId, stackTraceId, heapUsedAfterLastGC, arrayLength);
+        sample.initialize(obj, span, allocatedSize, threadId, vthreadName, vthreadEpochId, stackTraceId, heapUsedAfterLastGC, arrayLength);
         queue.add(sample);
         usedList.append(sample);
-        totalInQueue.add(allocatedSize);
+        totalInQueue = totalInQueue.add(span);
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "Must not safepoint while holding the object profiler lock.")
     void emit(long cutoff, @SuppressWarnings("unused") boolean emitAll, @SuppressWarnings("unused") boolean skipBFS) {
         /* We don't support paths-to-gc-roots yet. */
         if (cutoff <= 0) {
@@ -163,7 +174,7 @@ final class JfrOldObjectSampler {
         }
     }
 
-    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @Uninterruptible(reason = "Must not safepoint while holding the object profiler lock.")
     private void emitUnchained() {
         long startTicks = JfrTicks.elapsedTicks();
 
@@ -175,11 +186,13 @@ final class JfrOldObjectSampler {
                 UnsignedWord objectSize = cur.getObjectSize();
                 long allocationTicks = cur.getAllocationTicks();
                 long threadId = cur.getThreadId();
+                String vthreadName = cur.getVthreadName();
+                long vthreadEpochId = cur.getVthreadEpochId();
                 long stackTraceId = cur.getStackTraceId();
                 UnsignedWord heapUsedAfterLastGC = cur.getHeapUsedAfterLastGC();
                 int arrayLength = cur.getArrayLength();
 
-                OldObjectSampleEvent.emit(startTicks, objectId, objectSize, allocationTicks, threadId, stackTraceId, heapUsedAfterLastGC, arrayLength);
+                OldObjectSampleEvent.emit(startTicks, objectId, objectSize, allocationTicks, threadId, vthreadName, vthreadEpochId, stackTraceId, heapUsedAfterLastGC, arrayLength);
             }
 
             cur = (JfrOldObject) cur.getNext();

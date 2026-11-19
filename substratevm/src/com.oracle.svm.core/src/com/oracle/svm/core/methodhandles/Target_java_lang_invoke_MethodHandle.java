@@ -24,7 +24,8 @@
  */
 package com.oracle.svm.core.methodhandles;
 
-import static com.oracle.svm.core.util.VMError.unsupportedFeature;
+import static com.oracle.svm.core.annotate.TargetElement.CONSTRUCTOR_NAME;
+import static com.oracle.svm.shared.util.VMError.unsupportedFeature;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
@@ -37,24 +38,30 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
 
-import com.oracle.svm.core.LinkToNativeSupport;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.ForeignSupport;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.RuntimeClassLoading.NoRuntimeClassLoading;
+import com.oracle.svm.core.hub.crema.CremaSupport;
 import com.oracle.svm.core.invoke.MethodHandleUtils;
 import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
 import com.oracle.svm.core.reflect.SubstrateAccessor;
 import com.oracle.svm.core.reflect.SubstrateConstructorAccessor;
 import com.oracle.svm.core.reflect.SubstrateMethodAccessor;
-import com.oracle.svm.core.reflect.target.Target_java_lang_reflect_Constructor;
-import com.oracle.svm.core.reflect.target.Target_java_lang_reflect_Field;
-import com.oracle.svm.core.reflect.target.Target_java_lang_reflect_Method;
-import com.oracle.svm.core.reflect.target.Target_jdk_internal_reflect_MethodAccessor;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.reflect.target.Target_java_lang_reflect_Constructor;
+import com.oracle.svm.guest.staging.reflect.target.Target_java_lang_reflect_Field;
+import com.oracle.svm.guest.staging.reflect.target.Target_java_lang_reflect_Method;
+import com.oracle.svm.guest.staging.reflect.target.Target_jdk_internal_reflect_ConstructorAccessor;
+import com.oracle.svm.guest.staging.reflect.target.Target_jdk_internal_reflect_MethodAccessor;
+import com.oracle.svm.guest.staging.jdk.InternalVMMethod;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.internal.reflect.FieldAccessor;
 import sun.invoke.util.ValueConversions;
@@ -79,9 +86,19 @@ final class Target_java_lang_invoke_MethodHandle {
     @Alias
     native Target_java_lang_invoke_LambdaForm internalForm();
 
+    @Alias
+    native boolean isInvokeSpecial();
+
+    @Alias
+    native Class<?> internalCallerClass();
+
     /* All MethodHandle.invoke* methods funnel through here. */
     @Substitute(polymorphicSignature = true)
     Object invokeBasic(Object... args) throws Throwable {
+        if (RuntimeClassLoading.isSupported()) {
+            Target_java_lang_invoke_MemberName vmentry = MethodHandleInterpreterUtils.extractVMEntry(this);
+            return CremaSupport.singleton().invokeBasic(vmentry, this, args);
+        }
         Target_java_lang_invoke_MemberName memberName = internalMemberName();
         Object ret;
         if (memberName != null) {
@@ -99,7 +116,8 @@ final class Target_java_lang_invoke_MethodHandle {
                 var delegating = SubstrateUtil.cast(this, Target_java_lang_invoke_DelegatingMethodHandle.class);
                 return delegating.getTarget().invokeBasic(args);
             }
-            ret = Util_java_lang_invoke_MethodHandle.invokeInternal(memberName, type, args);
+            Class<?> callerClass = delegates ? internalCallerClass() : null;
+            ret = Util_java_lang_invoke_MethodHandle.invokeInternal(memberName, type, callerClass, args);
         } else {
             /* Interpretation mode */
             Target_java_lang_invoke_LambdaForm form = internalForm();
@@ -124,34 +142,47 @@ final class Target_java_lang_invoke_MethodHandle {
 
     @Substitute(polymorphicSignature = true)
     static Object linkToVirtual(Object... args) throws Throwable {
+        if (RuntimeClassLoading.isSupported()) {
+            return CremaSupport.singleton().linkToVirtual(args);
+        }
         return Util_java_lang_invoke_MethodHandle.linkTo(args);
     }
 
     @Substitute(polymorphicSignature = true)
     static Object linkToStatic(Object... args) throws Throwable {
+        if (RuntimeClassLoading.isSupported()) {
+            return CremaSupport.singleton().linkToStatic(args);
+        }
         return Util_java_lang_invoke_MethodHandle.linkTo(args);
     }
 
     @Substitute(polymorphicSignature = true)
     static Object linkToInterface(Object... args) throws Throwable {
+        if (RuntimeClassLoading.isSupported()) {
+            return CremaSupport.singleton().linkToInterface(args);
+        }
         return Util_java_lang_invoke_MethodHandle.linkTo(args);
     }
 
     @Substitute(polymorphicSignature = true)
     static Object linkToSpecial(Object... args) throws Throwable {
+        if (RuntimeClassLoading.isSupported()) {
+            return CremaSupport.singleton().linkToSpecial(args);
+        }
         return Util_java_lang_invoke_MethodHandle.linkTo(args);
     }
 
     @Substitute(polymorphicSignature = true)
     static Object linkToNative(Object... args) throws Throwable {
-        if (LinkToNativeSupport.isAvailable()) {
-            return LinkToNativeSupport.singleton().linkToNative(args);
+        if (ForeignSupport.isAvailable()) {
+            return ForeignSupport.singleton().linkToNative(args);
         } else {
             throw unsupportedFeature("The foreign downcalls feature is not available. Please make sure that preview features are enabled with '--enable-preview'.");
         }
     }
 
     @Substitute
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class)
     void maybeCustomize() {
         /*
          * JDK 8 update 60 added an additional customization possibility for method handles. For all
@@ -160,18 +191,25 @@ final class Target_java_lang_invoke_MethodHandle {
     }
 
     @Delete
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class)
     native void customize();
 }
 
+@InternalVMMethod
 final class Util_java_lang_invoke_MethodHandle {
     static Object linkTo(Object... args) throws Throwable {
         assert args.length > 0;
         Target_java_lang_invoke_MemberName memberName = (Target_java_lang_invoke_MemberName) args[args.length - 1];
         MethodType methodType = memberName.getInvocationType();
-        return MethodHandleUtils.cast(invokeInternal(memberName, methodType, Arrays.copyOf(args, args.length - 1)), methodType.returnType());
+        return MethodHandleUtils.cast(invokeInternal(memberName, methodType, null, Arrays.copyOf(args, args.length - 1)), methodType.returnType());
     }
 
-    static Object invokeInternal(Target_java_lang_invoke_MemberName memberName, MethodType methodType, Object... args) throws Throwable {
+    static Object invokeInternal(Target_java_lang_invoke_MemberName memberName, MethodType methodType, Class<?> callerClass, Object... args) throws Throwable {
+        /*
+         * This is never reached in the "crema" case since invokeBasic & linkTo* are instead
+         * redirected to CremaSupport.
+         */
+        assert !RuntimeClassLoading.isSupported();
         /*
          * The method handle may have been resolved at build time. If that is the case, the
          * SVM-specific information needed to perform the invoke is not stored in the handle yet, so
@@ -201,6 +239,7 @@ final class Util_java_lang_invoke_MethodHandle {
                 return field.get(null);
             } else if (refKind == Target_java_lang_invoke_MethodHandleNatives_Constants.REF_putField) {
                 checkArgs(args, 2, "putField");
+                convertArgs(args, methodType);
                 Object receiver = args[0];
                 Object value = args[1];
                 FieldAccessor field = asField(memberName, false);
@@ -208,6 +247,7 @@ final class Util_java_lang_invoke_MethodHandle {
                 return null;
             } else if (refKind == Target_java_lang_invoke_MethodHandleNatives_Constants.REF_putStatic) {
                 checkArgs(args, 1, "putStatic");
+                convertArgs(args, methodType);
                 Object value = args[0];
                 FieldAccessor field = asField(memberName, true);
                 field.set(null, value);
@@ -218,11 +258,11 @@ final class Util_java_lang_invoke_MethodHandle {
                 Object receiver = args[0];
                 Object[] invokeArgs = Arrays.copyOfRange(args, 1, args.length);
                 SubstrateMethodAccessor method = asMethod(memberName, false);
-                return method.invoke(receiver, invokeArgs);
+                return method.methodHandleInvoke(receiver, invokeArgs, callerClass);
             } else if (refKind == Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeStatic) {
                 convertArgs(args, methodType);
                 SubstrateMethodAccessor method = asMethod(memberName, true);
-                return method.invoke(null, args);
+                return method.methodHandleInvoke(null, args, callerClass);
             } else if (refKind == Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeSpecial) {
                 convertArgs(args, methodType);
                 Object receiver = args[0];
@@ -233,12 +273,12 @@ final class Util_java_lang_invoke_MethodHandle {
                  * constructor).
                  */
                 SubstrateAccessor accessor = getAccessor(memberName);
-                Object returnValue = accessor.invokeSpecial(receiver, invokeArgs);
+                Object returnValue = accessor.methodHandleInvokeSpecial(receiver, invokeArgs);
                 return methodType.returnType() == void.class ? null : returnValue;
             } else if (refKind == Target_java_lang_invoke_MethodHandleNatives_Constants.REF_newInvokeSpecial) {
                 convertArgs(args, methodType);
                 SubstrateConstructorAccessor constructor = asConstructor(memberName);
-                return constructor.newInstance(args);
+                return constructor.methodHandleNewInstance(args);
             } else {
                 throw VMError.shouldNotReachHere("Unknown method handle reference kind: " + refKind);
             }
@@ -280,13 +320,20 @@ final class Util_java_lang_invoke_MethodHandle {
         return getConstructorAccessor(constructor);
     }
 
+    @SuppressWarnings("DataFlowIssue")
     private static SubstrateConstructorAccessor getConstructorAccessor(Constructor<?> constructor) {
-        return SubstrateUtil.cast(SubstrateUtil.cast(constructor, Target_java_lang_reflect_Constructor.class).acquireConstructorAccessor(), SubstrateConstructorAccessor.class);
+        Target_java_lang_reflect_Constructor internalConstructor = SubstrateUtil.cast(constructor, Target_java_lang_reflect_Constructor.class);
+        Target_jdk_internal_reflect_ConstructorAccessor constructorAccessor = internalConstructor.constructorAccessor;
+        var result = constructorAccessor == null ? internalConstructor.acquireConstructorAccessor() : constructorAccessor;
+        return SubstrateUtil.cast(result, SubstrateConstructorAccessor.class);
     }
 
     private static <T extends AccessibleObject & Member> void checkMember(T member, boolean isStatic) {
-        VMError.guarantee(Modifier.isStatic(member.getModifiers()) == isStatic,
-                        "Cannot perform %s operation on a %s member".formatted(isStatic ? "static" : "non-static", isStatic ? "non-static" : "static"));
+        if (Modifier.isStatic(member.getModifiers()) != isStatic) {
+            throw VMError.shouldNotReachHere("Cannot perform " +
+                            (isStatic ? "static" : "non-static") + " operation on a " +
+                            (isStatic ? "non-static" : "static") + " member");
+        }
     }
 
     private static SubstrateAccessor getAccessor(Target_java_lang_invoke_MemberName memberName) {
@@ -295,7 +342,10 @@ final class Util_java_lang_invoke_MethodHandle {
     }
 
     private static void checkArgs(Object[] args, int expectedLength, String methodName) {
-        VMError.guarantee((expectedLength == 0 && args == null) || args.length == expectedLength, "%s requires exactly %d arguments".formatted(methodName, expectedLength));
+        if ((expectedLength == 0 && args == null) || args.length == expectedLength) {
+            return;
+        }
+        throw VMError.shouldNotReachHere(methodName + " requires exactly " + expectedLength + " arguments");
     }
 
     private static void convertArgs(Object[] args, MethodType methodType) throws Throwable {
@@ -340,4 +390,11 @@ final class Target_java_lang_invoke_MethodHandleImpl {
 
 @TargetClass(className = "java.lang.invoke.MethodHandleImpl", innerClass = "ArrayAccessor")
 final class Target_java_lang_invoke_MethodHandleImpl_ArrayAccessor {
+}
+
+@TargetClass(className = "java.lang.invoke.MethodHandleImpl", innerClass = "WrappedMember")
+final class Target_java_lang_invoke_MethodHandleImpl_WrappedMember {
+    @Alias
+    @TargetElement(name = CONSTRUCTOR_NAME)
+    native void constructor(MethodHandle target, MethodType type, Target_java_lang_invoke_MemberName member, boolean isInvokeSpecial, Class<?> callerClass);
 }

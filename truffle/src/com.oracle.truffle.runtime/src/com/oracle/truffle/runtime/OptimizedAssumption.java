@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -374,7 +374,7 @@ public final class OptimizedAssumption extends AbstractAssumption implements For
      */
     static class Lazy {
         /*
-         * We use an Object instead of a String here to avoid accidently handing out the always
+         * We use an Object instead of a String here to avoid accidentally handing out the always
          * valid string object in getName().
          */
         static final Object ALWAYS_VALID_NAME = new Object() {

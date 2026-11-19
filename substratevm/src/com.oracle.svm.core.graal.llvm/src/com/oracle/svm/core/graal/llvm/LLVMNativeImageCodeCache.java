@@ -24,13 +24,15 @@
  */
 package com.oracle.svm.core.graal.llvm;
 
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmAddTextSectionSymbols;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCleanupRISCVAttributes;
 import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCleanupStackMaps;
 import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCompile;
 import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmLink;
 import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmOptimize;
 import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.nativeLink;
-import static com.oracle.svm.core.util.VMError.shouldNotReachHereUnexpectedInput;
 import static com.oracle.svm.hosted.image.NativeImage.RWDATA_CGLOBALS_PARTITION_OFFSET;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereUnexpectedInput;
 
 import java.io.FileOutputStream;
 import java.io.FileWriter;
@@ -52,12 +54,13 @@ import org.graalvm.nativeimage.Platforms;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.util.Timer.StopTimer;
 import com.oracle.graal.pointsto.util.TimerCollection;
+import com.oracle.objectfile.LayoutDecisionMap;
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.objectfile.ObjectFile.Element;
 import com.oracle.objectfile.SectionName;
-import com.oracle.svm.core.c.CGlobalDataImpl;
+import com.oracle.svm.core.Isolates;
+import com.oracle.svm.core.graal.code.CGlobalDataDirectReference;
 import com.oracle.svm.core.graal.code.CGlobalDataInfo;
-import com.oracle.svm.core.graal.code.CGlobalDataReference;
 import com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.BatchExecutor;
 import com.oracle.svm.core.graal.llvm.objectfile.LLVMObjectFile;
 import com.oracle.svm.core.graal.llvm.util.LLVMObjectFileReader;
@@ -65,13 +68,16 @@ import com.oracle.svm.core.graal.llvm.util.LLVMObjectFileReader.LLVMTextSectionI
 import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
 import com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo;
 import com.oracle.svm.core.heap.SubstrateReferenceMap;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicInteger;
+import com.oracle.svm.guest.staging.c.CGlobalDataImpl;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicInteger;
 import com.oracle.svm.hosted.NativeImageOptions;
+import com.oracle.svm.hosted.image.NativeImage;
 import com.oracle.svm.hosted.image.NativeImage.NativeTextSectionImpl;
 import com.oracle.svm.hosted.image.NativeImageCodeCache;
 import com.oracle.svm.hosted.image.NativeImageHeap;
 import com.oracle.svm.hosted.image.RelocatableBuffer;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.core.common.NumUtil;
@@ -107,7 +113,12 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
     @Override
     public int getCodeCacheSize() {
-        return 0;
+        return getCodeAreaSize();
+    }
+
+    @Override
+    public boolean definesTextSectionBoundarySymbols() {
+        return false;
     }
 
     @Override
@@ -139,7 +150,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
     private void writeBitcode(BatchExecutor executor) {
         methodIndex = new HostedMethod[getOrderedCompilations().size()];
         AtomicInteger num = new AtomicInteger(-1);
-        executor.forEach(getOrderedCompilations(), pair -> (debugContext) -> {
+        executor.forEach(getOrderedCompilations(), pair -> _ -> {
             int id = num.incrementAndGet();
             methodIndex[id] = pair.getLeft();
 
@@ -167,7 +178,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
             /* Avoid empty batches with small batch sizes */
             numBatches -= (numBatches * batchSize - methodIndex.length) / batchSize;
 
-            executor.forEach(numBatches, batchId -> (debugContext) -> {
+            executor.forEach(numBatches, batchId -> _ -> {
                 List<String> batchInputs = IntStream.range(getBatchStart(batchId), getBatchEnd(batchId)).mapToObj(this::getBitcodeFilename)
                                 .collect(Collectors.toList());
                 llvmLink(debug, getBatchBitcodeFilename(batchId), batchInputs, basePath, this::getFunctionName);
@@ -180,7 +191,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
     private void compileBitcodeBatches(BatchExecutor executor, DebugContext debug, int numBatches) {
         stackMapDumper.startDumpingFunctions();
 
-        executor.forEach(numBatches, batchId -> (debugContext) -> {
+        executor.forEach(numBatches, batchId -> _ -> {
             llvmOptimize(debug, getBatchOptimizedFilename(batchId), getBatchBitcodeFilename(batchId), basePath, this::getFunctionName);
             llvmCompile(debug, getBatchCompiledFilename(batchId), getBatchOptimizedFilename(batchId), basePath, this::getFunctionName);
 
@@ -195,24 +206,34 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
         LLVMTextSectionInfo textSectionInfo = objectFileReader.parseCode(getLinkedPath());
 
-        executor.forEach(getOrderedCompilations(), pair -> (debugContext) -> {
+        List<Pair<HostedMethod, CompilationResult>> orderedCompilations = getOrderedCompilations();
+        executor.forEach(orderedCompilations, pair -> _ -> {
             HostedMethod method = pair.getLeft();
-            int offset = textSectionInfo.getOffset(method.getUniqueShortName());
-            int nextFunctionStartOffset = textSectionInfo.getNextOffset(offset);
+            method.setCodeAddressOffset(textSectionInfo.getOffset(method.getUniqueShortName()));
+        });
+        orderedCompilations.sort(Comparator.comparingInt(o -> o.getLeft().getCodeAddressOffset()));
+
+        executor.forEach(orderedCompilations.size(), i -> _ -> {
+            var pair = orderedCompilations.get(i);
+            HostedMethod method = pair.getLeft();
+            CompilationResult compilation = pair.getRight();
+            int offset = method.getCodeAddressOffset();
+            HostedMethod nextMethod = i + 1 == orderedCompilations.size() ? null : orderedCompilations.get(i + 1).getLeft();
+            int nextFunctionStartOffset = nextMethod == null ? NumUtil.safeToInt(textSectionInfo.getCodeSize()) : nextMethod.getCodeAddressOffset();
+            VMError.guarantee(offset < nextFunctionStartOffset, "Methods %s and %s have the same offset: %d", method, nextMethod == null ? "end of section" : nextMethod, offset);
             int functionSize = nextFunctionStartOffset - offset;
 
-            CompilationResult compilation = pair.getRight();
             compilation.setTargetCode(null, functionSize);
-            method.setCodeAddressOffset(offset);
         });
 
-        getOrderedCompilations().sort(Comparator.comparingInt(o -> o.getLeft().getCodeAddressOffset()));
         stackMapDumper.dumpOffsets(textSectionInfo);
         stackMapDumper.close();
 
         llvmCleanupStackMaps(debug, getLinkedFilename(), basePath);
         long codeAreaSize = textSectionInfo.getCodeSize();
         assert codeAreaSize <= Integer.MAX_VALUE;
+        llvmCleanupRISCVAttributes(debug, getLinkedFilename(), basePath);
+        llvmAddTextSectionSymbols(debug, getLinkedFilename(), NativeImage.getTextSectionStartSymbol(), NativeImage.getTextSectionEndSymbol(), codeAreaSize, basePath);
         setCodeAreaSize((int) textSectionInfo.getCodeSize());
     }
 
@@ -279,26 +300,34 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
                     throw shouldNotReachHereUnexpectedInput(type);
             }
         }
-        return function + " (" + basePath.resolve(fileName).toString() + ")";
+        return function + " (" + basePath.resolve(fileName) + ")";
     }
 
     @Override
-    public void patchMethods(DebugContext debug, RelocatableBuffer relocs, ObjectFile objectFile) {
+    public void patchAndWriteCode(DebugContext debug, RelocatableBuffer buffer, ObjectFile objectFile, boolean releaseCodeEmissionState) {
+        patchMethods(objectFile);
+        /* Code is written at link stage; only the relocation metadata is emitted here. */
+        if (releaseCodeEmissionState) {
+            clearCodeEmissionState(getOrderedCompilations());
+        }
+    }
+
+    private void patchMethods(ObjectFile objectFile) {
         Element rodataSection = objectFile.elementForName(SectionName.RODATA.getFormatDependentName(objectFile.getFormat()));
-        Element dataSection = objectFile.elementForName(SectionName.DATA.getFormatDependentName(objectFile.getFormat()));
+        Element rwdataSection = objectFile.elementForName(SectionName.DATA.getFormatDependentName(objectFile.getFormat()));
         for (Pair<HostedMethod, CompilationResult> pair : getOrderedCompilations()) {
             CompilationResult result = pair.getRight();
             for (DataPatch dataPatch : result.getDataPatches()) {
-                if (dataPatch.reference instanceof CGlobalDataReference) {
-                    CGlobalDataInfo info = ((CGlobalDataReference) dataPatch.reference).getDataInfo();
+                if (dataPatch.reference instanceof CGlobalDataDirectReference ref) {
+                    CGlobalDataInfo info = ref.getDataInfo();
                     CGlobalDataImpl<?> data = info.getData();
-                    if (info.isSymbolReference() && objectFile.getOrCreateSymbolTable().getSymbol(data.symbolName) == null) {
-                        objectFile.createUndefinedSymbol(data.symbolName, 0, true);
+                    if (info.isSymbolReference() && !isImageHeapSymbol(data.symbolName) && objectFile.getOrCreateSymbolTable().getSymbol(data.symbolName) == null) {
+                        objectFile.createUndefinedSymbol(data.symbolName, true);
                     }
 
                     String symbolName = (String) dataPatch.note;
                     if (data.symbolName == null && objectFile.getOrCreateSymbolTable().getSymbol(symbolName) == null) {
-                        objectFile.createDefinedSymbol(symbolName, dataSection, info.getOffset() + RWDATA_CGLOBALS_PARTITION_OFFSET, 0, false, true);
+                        objectFile.createDefinedSymbol(symbolName, rwdataSection, info.getOffset() + RWDATA_CGLOBALS_PARTITION_OFFSET, 0, false, true, true);
                     }
                 } else if (dataPatch.reference instanceof DataSectionReference) {
                     DataSectionReference reference = (DataSectionReference) dataPatch.reference;
@@ -307,29 +336,55 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
                     String symbolName = (String) dataPatch.note;
                     if (objectFile.getOrCreateSymbolTable().getSymbol(symbolName) == null) {
-                        objectFile.createDefinedSymbol(symbolName, rodataSection, offset, 0, false, true);
+                        objectFile.createDefinedSymbol(symbolName, rodataSection, offset, 0, false, true, true);
                     }
                 }
             }
         }
     }
 
+    private static boolean isImageHeapSymbol(String symbolName) {
+        return symbolName.equals(Isolates.IMAGE_HEAP_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_RELOCATABLE_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_RELOCATABLE_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_A_RELOCATABLE_POINTER_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_PATCHED_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_PATCHED_END_SYMBOL_NAME);
+    }
+
     @Override
     public NativeTextSectionImpl getTextSectionImpl(RelocatableBuffer buffer, ObjectFile objectFile, NativeImageCodeCache codeCache) {
         return new NativeTextSectionImpl(buffer, objectFile, codeCache) {
             @Override
-            protected void defineMethodSymbol(String name, boolean global, Element section, HostedMethod method, CompilationResult result) {
-                ObjectFile.Symbol symbol = objectFile.createUndefinedSymbol(name, 0, true);
+            protected void defineMethodSymbol(String name, boolean global, boolean exported, Element section, HostedMethod method, CompilationResult result) {
+                ObjectFile.Symbol symbol = objectFile.createUndefinedSymbol(name, true);
                 if (global) {
                     globalSymbols.add(symbol);
                 }
             }
-        };
-    }
 
-    @Override
-    public void writeCode(RelocatableBuffer buffer) {
-        /* Do nothing, code is written at link stage */
+            /*
+             * The real text content is linked from llvm.o. Keep this section present while building
+             * the image object, but do not emit a second zero-filled text section into that object.
+             */
+            @Override
+            public int getOrDecideSize(Map<Element, LayoutDecisionMap> alreadyDecided, int sizeHint) {
+                return 0;
+            }
+
+            @Override
+            public byte[] getOrDecideContent(Map<Element, LayoutDecisionMap> alreadyDecided, byte[] contentHint) {
+                return new byte[0];
+            }
+
+            @Override
+            public int getMemSize(Map<Element, LayoutDecisionMap> alreadyDecided) {
+                return 0;
+            }
+        };
     }
 
     @Override
@@ -374,7 +429,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
         void close();
     }
 
-    private class EnabledStackMapDumper implements StackMapDumper {
+    private final class EnabledStackMapDumper implements StackMapDumper {
         private final FileWriter stackMapDump;
 
         {
@@ -385,19 +440,25 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
             }
         }
 
-        private ThreadLocal<StringBuilder> functionDump = new ThreadLocal<>();
+        private final ThreadLocal<StringBuilder> functionDump = new ThreadLocal<>();
 
         @Override
         public void dumpOffsets(LLVMTextSectionInfo textSectionInfo) {
             dump("\nOffsets\n=======\n");
-            getOrderedCompilations().forEach((pair) -> {
+            List<Pair<HostedMethod, CompilationResult>> orderedCompilations = getOrderedCompilations();
+            for (int i = 0; i < orderedCompilations.size(); ++i) {
+                var pair = orderedCompilations.get(i);
                 int startOffset = pair.getLeft().getCodeAddressOffset();
                 CompilationResult compilationResult = pair.getRight();
-                assert startOffset + compilationResult.getTargetCodeSize() == textSectionInfo.getNextOffset(startOffset) : compilationResult.getName();
+                assert i == 0 || checkPreviousFunctionEnd(orderedCompilations.get(i - 1), startOffset) : orderedCompilations.get(i - 1).getRight().getName();
 
                 String methodName = textSectionInfo.getSymbol(startOffset);
                 dump("[" + startOffset + "] " + methodName + " (" + compilationResult.getTargetCodeSize() + ")\n");
-            });
+            }
+        }
+
+        private static boolean checkPreviousFunctionEnd(Pair<HostedMethod, CompilationResult> previousPair, int startOffset) {
+            return previousPair.getLeft().getCodeAddressOffset() + previousPair.getRight().getTargetCodeSize() == startOffset;
         }
 
         @Override
@@ -454,7 +515,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
         }
     }
 
-    private static class DisabledStackMapDumper implements StackMapDumper {
+    private static final class DisabledStackMapDumper implements StackMapDumper {
         @Override
         public void dumpOffsets(LLVMTextSectionInfo textSectionInfo) {
         }

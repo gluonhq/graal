@@ -24,6 +24,7 @@
  */
 package jdk.graal.compiler.hotspot;
 
+import static jdk.graal.compiler.options.LibGraalSupport.LIBGRAAL_SETTING_PROPERTY_PREFIX;
 import static jdk.vm.ci.common.InitTimer.timer;
 
 import java.util.ArrayList;
@@ -33,12 +34,14 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import org.graalvm.collections.EconomicMap;
+
 import jdk.graal.compiler.core.Instrumentation;
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
 import jdk.graal.compiler.core.common.util.PhasePlan;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.debug.TTY;
 import jdk.graal.compiler.options.EnumOptionKey;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionStability;
@@ -47,17 +50,17 @@ import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.tiers.CompilerConfiguration;
 import jdk.graal.compiler.serviceprovider.GlobalAtomicLong;
 import jdk.graal.compiler.serviceprovider.GraalServices;
-
+import jdk.graal.compiler.serviceprovider.LibGraalService;
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.common.InitTimer;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
-import jdk.vm.ci.services.Services;
 
 /**
  * A factory that creates the {@link CompilerConfiguration} the compiler will use. Each factory must
  * have a unique {@link #name} and {@link #autoSelectionPriority}. The latter imposes a total
  * ordering between factories for the purpose of auto-selecting the factory to use.
  */
+@LibGraalService
 public abstract class CompilerConfigurationFactory implements Comparable<CompilerConfigurationFactory> {
 
     public enum ShowConfigurationLevel {
@@ -90,7 +93,7 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
 
     /**
      * The priority of this factory. This must be unique across all factory instances and is used
-     * when selecting a factory when {@link Options#CompilerConfiguration} is omitted
+     * when selecting a factory.
      */
     private final int autoSelectionPriority;
 
@@ -101,7 +104,8 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
      *            {@link Options#CompilerConfiguration} option
      * @param info a higher level description of the configuration used for
      *            {@link ShowConfigurationLevel#info}
-     * @param autoSelectionPriority
+     * @param autoSelectionPriority a priority which must be unique across all factory instances and
+     *            is used to select a factory
      */
     protected CompilerConfigurationFactory(String name, String info, int autoSelectionPriority) {
         this.name = name;
@@ -135,14 +139,14 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
 
     public static class DefaultBackendMap implements BackendMap {
 
-        private final EconomicMap<Class<? extends Architecture>, HotSpotBackendFactory> backends = EconomicMap.create();
+        private final EconomicMap<String, HotSpotBackendFactory> backends = EconomicMap.create();
 
         @SuppressWarnings("try")
         public DefaultBackendMap(String backendName) {
             try (InitTimer t = timer("HotSpotBackendFactory.register")) {
                 for (HotSpotBackendFactory backend : GraalServices.load(HotSpotBackendFactory.class)) {
                     if (backend.getName().equals(backendName)) {
-                        Class<? extends Architecture> arch = backend.getArchitecture();
+                        String arch = backend.getArchitecture();
                         if (arch != null) {
                             HotSpotBackendFactory oldEntry = backends.put(arch, backend);
                             assert oldEntry == null || oldEntry == backend : "duplicate Graal backend";
@@ -154,7 +158,7 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
 
         @Override
         public final HotSpotBackendFactory getBackendFactory(Architecture arch) {
-            return backends.get(arch.getClass());
+            return backends.get(arch.getName());
         }
     }
 
@@ -171,23 +175,23 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
     }
 
     /**
-     * Asserts uniqueness of {@link #name} and {@link #autoSelectionPriority} for {@code factory} in
-     * {@code factories}.
+     * Checks uniqueness of {@link #autoSelectionPriority} for {@code factory} in {@code factories}.
      */
     private static boolean checkUnique(CompilerConfigurationFactory factory, List<CompilerConfigurationFactory> factories) {
         for (CompilerConfigurationFactory other : factories) {
-            if (other != factory && factory.autoSelectionPriority == other.autoSelectionPriority) {
-                assert !other.name.equals(factory.name) : factory.getClass().getName() + " cannot have the same selector as " + other.getClass().getName() + ": " + factory.name;
-                assert other.autoSelectionPriority != factory.autoSelectionPriority : factory.getClass().getName() + " cannot have the same auto-selection priority as " +
-                                other.getClass().getName() +
-                                ": " + factory.autoSelectionPriority;
+            if (other != factory) {
+                GraalError.guarantee(other.autoSelectionPriority != factory.autoSelectionPriority, "%s cannot have the same auto-selection priority as %s: %s",
+                                factory.getClass().getName(),
+                                other.getClass().getName(),
+                                factory.autoSelectionPriority);
             }
         }
         return true;
     }
 
     /**
-     * @return sorted list of {@link CompilerConfigurationFactory}s
+     * @return list of {@link CompilerConfigurationFactory}s sorted by {@linkplain #compareTo
+     *         decreasing auto-priority order}
      */
     @SuppressFBWarnings(value = "DLS_DEAD_LOCAL_STORE", justification = "false positive on dead store to `candidates`")
     private static List<CompilerConfigurationFactory> getAllCandidates() {
@@ -201,7 +205,7 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
     }
 
     // Ensures ShowConfiguration output is printed once per VM process.
-    private static final GlobalAtomicLong shownConfiguration = new GlobalAtomicLong(0L);
+    private static final GlobalAtomicLong shownConfiguration = new GlobalAtomicLong("SHOWN_CONFIGURATION", 0L);
 
     /**
      * Selects and instantiates a {@link CompilerConfigurationFactory}. The selection algorithm is
@@ -226,6 +230,7 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
             } else if (value != null) {
                 for (CompilerConfigurationFactory candidate : getAllCandidates()) {
                     if (candidate.name.equals(value)) {
+                        // Selects highest priority candidate with specified name
                         factory = candidate;
                         break;
                     }
@@ -239,7 +244,7 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
                 if (candidates.isEmpty()) {
                     throw new GraalError("No %s providers found", CompilerConfigurationFactory.class.getName());
                 }
-                factory = candidates.get(0);
+                factory = candidates.getFirst();
             }
         }
         assert factory != null;
@@ -272,23 +277,23 @@ public abstract class CompilerConfigurationFactory implements Comparable<Compile
      * loaded from.
      */
     private Object getLoadedFromLocation(boolean verbose) {
-        if (Services.IS_IN_NATIVE_IMAGE) {
-            if (nativeImageLocationQualifier != null) {
-                return "a " + nativeImageLocationQualifier + " Native Image shared library";
+        if (LibGraalSupport.inLibGraalRuntime()) {
+            String justification = "properties initialized via org.graalvm.nativeimage.hosted.RuntimeSystemProperties " +
+                            "are not accessible via GraalServices.getSavedProperties()";
+            String settings = GraalServices.getSystemProperties(justification).entrySet().stream()//
+                            .filter(e -> e.getKey().toString().startsWith(LIBGRAAL_SETTING_PROPERTY_PREFIX))//
+                            .map(e -> {
+                                String key = e.getKey().toString().substring(LIBGRAAL_SETTING_PROPERTY_PREFIX.length());
+                                String val = e.getValue().toString();
+                                return val.isEmpty() ? key : key + "=" + val;
+                            })//
+                            .collect(Collectors.joining(", "));
+            if (!settings.isEmpty()) {
+                return "a Native Image shared library (" + settings + ")";
             }
             return "a Native Image shared library";
         }
         return verbose ? getClass().getResource(getClass().getSimpleName() + ".class") : "class files";
-    }
-
-    private static String nativeImageLocationQualifier;
-
-    /**
-     * Records a qualifier for the libgraal library (e.g., "PGO optimized").
-     */
-    public static void setNativeImageLocationQualifier(String s) {
-        GraalError.guarantee(nativeImageLocationQualifier == null, "Native image location qualifier is already set to %s", nativeImageLocationQualifier);
-        nativeImageLocationQualifier = s;
     }
 
     private static void printConfigInfo(CompilerConfigurationFactory factory) {

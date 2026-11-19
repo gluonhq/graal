@@ -29,13 +29,14 @@ import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 
+import com.oracle.svm.shared.util.SubstrateUtil;
 import jdk.internal.misc.Unsafe;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 
 final class NativeSecureRandomFilesCloserTearDownHook implements RuntimeSupport.Hook {
     @Override

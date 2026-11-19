@@ -35,19 +35,17 @@ import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
 import com.oracle.svm.core.collections.AbstractUninterruptibleHashtable;
 import com.oracle.svm.core.collections.UninterruptibleEntry;
-import com.oracle.svm.core.deopt.DeoptimizationSupport;
 import com.oracle.svm.core.headers.LibC;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
 import com.oracle.svm.core.jfr.sampler.JfrExecutionSampler;
-import com.oracle.svm.core.jfr.traceid.JfrTraceIdEpoch;
+import com.oracle.svm.core.jfr.traceid.JfrEpoch;
 import com.oracle.svm.core.jfr.utils.JfrVisited;
 import com.oracle.svm.core.locks.VMMutex;
 import com.oracle.svm.core.memory.NullableNativeMemory;
@@ -55,8 +53,9 @@ import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.sampler.SamplerSampleWriter;
 import com.oracle.svm.core.sampler.SamplerSampleWriterData;
 import com.oracle.svm.core.sampler.SamplerSampleWriterDataAccess;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Repository that collects all metadata about stacktraces.
@@ -94,14 +93,14 @@ public class JfrStackTraceRepository implements JfrRepository {
         epochData1.teardown();
     }
 
+    public void reset() {
+        epochData0.clear(false);
+        epochData1.clear(false);
+    }
+
     @NeverInline("Starting a stack walk in the caller frame.")
     @Uninterruptible(reason = "Result is only valid until epoch changes.", callerMustBe = true)
     public long getStackTraceId(int skipCount) {
-        if (DeoptimizationSupport.enabled()) {
-            /* Stack traces are not supported if JIT compilation is used (GR-43686). */
-            return 0;
-        }
-
         /*
          * JFR stack traces use the same thread-local buffers as the execution sampler. So, we need
          * to prevent the sampler from modifying the buffer, while it is used by the code below.
@@ -126,7 +125,7 @@ public class JfrStackTraceRepository implements JfrRepository {
             int errorCode = JfrStackWalker.walkCurrentThread(data, ip, sp, false);
             return switch (errorCode) {
                 case JfrStackWalker.NO_ERROR, JfrStackWalker.TRUNCATED -> storeDeduplicatedStackTrace(data);
-                case JfrStackWalker.BUFFER_SIZE_EXCEEDED -> 0L;
+                case JfrStackWalker.BUFFER_SIZE_EXCEEDED, JfrStackWalker.SKIPPED -> 0L;
                 case JfrStackWalker.UNPARSEABLE_STACK -> throw VMError.shouldNotReachHere("Only the async sampler may encounter an unparseable stack.");
                 default -> throw VMError.shouldNotReachHere("Unexpected return value");
             };
@@ -211,12 +210,12 @@ public class JfrStackTraceRepository implements JfrRepository {
 
                 /* Hashtable entry allocation failed. */
                 NullableNativeMemory.free(to);
-                to = WordFactory.nullPointer();
+                to = Word.nullPointer();
             }
 
             /* Some allocation failed. */
             statusPtr.write(JfrStackTraceTableEntryStatus.INSERT_FAILED);
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
     }
 
@@ -262,7 +261,7 @@ public class JfrStackTraceRepository implements JfrRepository {
 
     @Uninterruptible(reason = "Result is only valid until epoch changes.", callerMustBe = true)
     private JfrStackTraceEpochData getEpochData(boolean previousEpoch) {
-        boolean epoch = previousEpoch ? JfrTraceIdEpoch.getInstance().previousEpoch() : JfrTraceIdEpoch.getInstance().currentEpoch();
+        boolean epoch = previousEpoch ? JfrEpoch.getInstance().previousEpoch() : JfrEpoch.getInstance().currentEpoch();
         return epoch ? epochData0 : epochData1;
     }
 
@@ -326,7 +325,7 @@ public class JfrStackTraceRepository implements JfrRepository {
             JfrStackTraceTableEntry entry1 = (JfrStackTraceTableEntry) a;
             JfrStackTraceTableEntry entry2 = (JfrStackTraceTableEntry) b;
             /* We explicitly ignore the field 'serialized' because its value can change. */
-            return entry1.getSize() == entry2.getSize() && LibC.memcmp(entry1.getRawStackTrace(), entry2.getRawStackTrace(), WordFactory.unsigned(entry1.getSize())) == 0;
+            return entry1.getSize() == entry2.getSize() && LibC.memcmp(entry1.getRawStackTrace(), entry2.getRawStackTrace(), Word.unsigned(entry1.getSize())) == 0;
         }
 
         @Override
@@ -385,7 +384,7 @@ public class JfrStackTraceRepository implements JfrRepository {
             table.teardown();
             unflushedEntries = 0;
             JfrBufferAccess.free(buffer);
-            buffer = WordFactory.nullPointer();
+            buffer = Word.nullPointer();
         }
     }
 }

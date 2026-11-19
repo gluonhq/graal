@@ -25,7 +25,7 @@
 package com.oracle.svm.core.graal.nodes;
 
 import com.oracle.svm.core.graal.snippets.OpenTypeWorldDispatchTableSnippets;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
 
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.graph.NodeClass;
@@ -47,7 +47,7 @@ public class LoadOpenTypeWorldDispatchTableStartingOffset extends FixedWithNextN
     public static final NodeClass<LoadOpenTypeWorldDispatchTableStartingOffset> TYPE = NodeClass.create(LoadOpenTypeWorldDispatchTableStartingOffset.class);
 
     @Input protected ValueNode hub;
-    @OptionalInput protected ValueNode interfaceTypeID;
+    @OptionalInput protected ValueNode interfaceID;
 
     protected final SharedMethod target;
 
@@ -55,28 +55,25 @@ public class LoadOpenTypeWorldDispatchTableStartingOffset extends FixedWithNextN
         super(TYPE, StampFactory.forInteger(64));
         this.hub = hub;
         this.target = target;
-        this.interfaceTypeID = null;
+        this.interfaceID = null;
     }
 
-    protected LoadOpenTypeWorldDispatchTableStartingOffset(ValueNode hub, ValueNode interfaceTypeID) {
+    public LoadOpenTypeWorldDispatchTableStartingOffset(ValueNode hub, ValueNode interfaceID) {
         super(TYPE, StampFactory.forInteger(64));
         this.hub = hub;
         this.target = null;
-        this.interfaceTypeID = interfaceTypeID;
+        this.interfaceID = interfaceID;
     }
 
     public ValueNode getHub() {
         return hub;
     }
 
-    public ValueNode getInterfaceTypeID() {
-        return interfaceTypeID;
+    public ValueNode getInterfaceID() {
+        return interfaceID;
     }
 
     public SharedMethod getTarget() {
         return target;
     }
-
-    @NodeIntrinsic
-    public static native long createOpenTypeWorldLoadDispatchTableStartingOffset(Object hub, int interfaceTypeID);
 }

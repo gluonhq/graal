@@ -28,11 +28,17 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.jdk.RuntimeSupport;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.api.replacements.Fold;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class CounterSupport {
     private final Counter.Group[] enabledGroups;
 
@@ -51,8 +57,8 @@ public class CounterSupport {
         return ImageSingletons.lookup(CounterSupport.class);
     }
 
-    public static RuntimeSupport.Hook shutdownHook() {
-        return (isFirstIsolate) -> CounterSupport.singleton().logValues(Log.log());
+    public static RuntimeSupport.Hook teardownHook() {
+        return _ -> CounterSupport.singleton().logValues(Log.log());
     }
 
     /**

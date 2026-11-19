@@ -33,8 +33,6 @@ import java.util.function.Function;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.util.VMError;
-
 @Platforms(Platform.HOSTED_ONLY.class)
 public final class ClassInstanceReplacer<S, T> implements Function<Object, Object> {
 
@@ -42,7 +40,6 @@ public final class ClassInstanceReplacer<S, T> implements Function<Object, Objec
     private final List<T> imageHeapList;
     private final Function<S, T> createReplacement;
     private final Map<S, T> replacements = Collections.synchronizedMap(new IdentityHashMap<>());
-    private boolean sealed;
 
     public ClassInstanceReplacer(Class<S> sourceClass, List<T> imageHeapList, Function<S, T> createReplacement) {
         this.sourceClass = sourceClass;
@@ -59,7 +56,6 @@ public final class ClassInstanceReplacer<S, T> implements Function<Object, Objec
     }
 
     private T doReplace(S object) {
-        VMError.guarantee(!sealed, "new object introduced after static analysis");
         T replacement = createReplacement.apply(object);
         assert replacement.getClass() != sourceClass : "leads to recursive replacement";
         if (imageHeapList != null) {

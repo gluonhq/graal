@@ -60,8 +60,7 @@ abstract class SystemThread extends Thread {
     @Override
     @SuppressWarnings("try")
     public final void run() {
-        AbstractPolyglotImpl rootPolyglot = polyglot.getRootImpl();
-        try (AbstractPolyglotImpl.ThreadScope threadScope = rootPolyglot.createThreadScope()) {
+        try (AbstractPolyglotImpl.ThreadScope threadScope = polyglot.createThreadScope()) {
             beforeExecute();
             TL_HANDSHAKE.ensureThreadInitialized();
             try {
@@ -104,7 +103,7 @@ abstract class SystemThread extends Thread {
     static final class LanguageSystemThread extends SystemThread {
 
         final String languageId;
-        private final PolyglotContextImpl polyglotContext;
+        final PolyglotContextImpl polyglotContext;
 
         LanguageSystemThread(PolyglotLanguageContext polyglotLanguageContext, Runnable runnable, ThreadGroup threadGroup) {
             super(runnable, threadGroup, polyglotLanguageContext.context.engine.impl);

@@ -33,13 +33,25 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.jdk.Resources;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 @Platforms(Platform.HOSTED_ONLY.class)
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class EmbeddedResourcesInfo {
+    private final boolean collectEmbeddedResourcesInfo;
 
-    private final ConcurrentHashMap<Resources.ModuleResourceKey, List<String>> registeredResources = new ConcurrentHashMap<>();
+    EmbeddedResourcesInfo(boolean collectEmbeddedResourcesInfo) {
+        this.collectEmbeddedResourcesInfo = collectEmbeddedResourcesInfo;
+    }
 
-    public ConcurrentHashMap<Resources.ModuleResourceKey, List<String>> getRegisteredResources() {
+    record SourceAndOrigin(String source, Object origin) {
+    }
+
+    private final ConcurrentHashMap<Resources.ModuleResourceKey, List<SourceAndOrigin>> registeredResources = new ConcurrentHashMap<>();
+
+    public ConcurrentHashMap<Resources.ModuleResourceKey, List<SourceAndOrigin>> getRegisteredResources() {
         return registeredResources;
     }
 
@@ -47,16 +59,28 @@ public class EmbeddedResourcesInfo {
         return ImageSingletons.lookup(EmbeddedResourcesInfo.class);
     }
 
-    public void declareResourceAsRegistered(Module module, String resource, String source) {
-        if (!ResourcesFeature.Options.GenerateEmbeddedResourcesFile.getValue()) {
+    public void declareResourceAsRegistered(ClassLoader owner, Module module, String resource, String source, Object origin) {
+        if (!collectEmbeddedResourcesInfo) {
             return;
         }
 
-        Resources.ModuleResourceKey key = Resources.createStorageKey(module, resource);
-        registeredResources.compute(key, (k, v) -> {
+        Resources.ModuleResourceKey key = Resources.createStorageKey(owner, module, resource);
+
+        /*
+         * If we already have an entry with this key, and it was a NEGATIVE_QUERY, the new resource
+         * would either be ignored if it was another NEGATIVE_QUERY or it will override existing
+         * NEGATIVE_QUERY for that key. In both cases we can remove previous NEGATIVE_QUERY since it
+         * will be replaced with either new NEGATIVE_QUERY or with resource that exists.
+         */
+        List<SourceAndOrigin> existingEntries = registeredResources.get(key);
+        if (existingEntries != null && existingEntries.size() == 1 && isNegativeQuery(existingEntries.get(0))) {
+            registeredResources.remove(key);
+        }
+
+        registeredResources.compute(key, (_, v) -> {
             if (v == null) {
-                ArrayList<String> newValue = new ArrayList<>();
-                newValue.add(source);
+                ArrayList<SourceAndOrigin> newValue = new ArrayList<>();
+                newValue.add(new SourceAndOrigin(source, origin));
                 return newValue;
             }
 
@@ -67,10 +91,21 @@ public class EmbeddedResourcesInfo {
              * so we have to perform same check here, to avoid duplicates when collecting
              * information about resource.
              */
-            if (!v.contains(source)) {
-                v.add(source);
+            boolean found = false;
+            for (var existing : v) {
+                if (existing.source.equals(source)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                v.add(new SourceAndOrigin(source, origin));
             }
             return v;
         });
+    }
+
+    private static boolean isNegativeQuery(SourceAndOrigin entry) {
+        return entry.source().equalsIgnoreCase("") && ((String) entry.origin()).equalsIgnoreCase("");
     }
 }

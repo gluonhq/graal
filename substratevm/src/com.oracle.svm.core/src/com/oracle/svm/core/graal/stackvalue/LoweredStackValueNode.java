@@ -26,8 +26,7 @@ package com.oracle.svm.core.graal.stackvalue;
 
 import org.graalvm.word.WordBase;
 
-import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.lir.ConstantValue;
@@ -100,7 +99,7 @@ public final class LoweredStackValueNode extends StackValueNode implements LIRLo
         stackSlotHolder.gen = gen;
 
         if (sizeInBytes == 0) {
-            gen.setResult(this, new ConstantValue(gen.getLIRGeneratorTool().getLIRKind(FrameAccess.getWordStamp()), JavaConstant.forIntegerKind(ConfigurationValues.getWordKind(), 0)));
+            gen.setResult(this, new ConstantValue(gen.getLIRGeneratorTool().getLIRKind(SubstrateTarget.getWordStamp()), JavaConstant.forIntegerKind(SubstrateTarget.getWordKind(), 0)));
         } else {
             VirtualStackSlot slot = stackSlotHolder.slot;
             if (slot == null) {

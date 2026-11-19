@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,15 +24,12 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
-import static jdk.vm.ci.amd64.AMD64.rcx;
-import static jdk.vm.ci.amd64.AMD64.rdi;
-import static jdk.vm.ci.amd64.AMD64.rdx;
-import static jdk.vm.ci.amd64.AMD64.rsi;
-import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.DWORD;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.QWORD;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.XMM;
 import static jdk.graal.compiler.asm.amd64.AVXKind.AVXSize.YMM;
+import static jdk.vm.ci.amd64.AMD64.rcx;
+import static jdk.vm.ci.code.ValueUtil.asRegister;
 
 import java.util.EnumSet;
 
@@ -48,11 +45,9 @@ import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.SyncPort;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
 import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.Value;
 
@@ -61,45 +56,24 @@ import jdk.vm.ci.meta.Value;
  * instructions where possible.
  */
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/7bb59dc8da0c61c5da5c3aab5d56a6e4880001ce/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L7147-L7365",
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/58853f39377ea6168c4570327347294899d51f95/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L6658-L6876",
           sha1 = "72f9b7a60b75ecabf09fc10cb01a9504be97957a")
 // @formatter:on
 @Opcode("VECTORIZED_MISMATCH")
 public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
     public static final LIRInstructionClass<AMD64VectorizedMismatchOp> TYPE = LIRInstructionClass.create(AMD64VectorizedMismatchOp.class);
 
-    private static final Register REG_ARRAY_A = rsi;
-    private static final Register REG_ARRAY_B = rdi;
-    private static final Register REG_LENGTH = rdx;
-    private static final Register REG_STRIDE = rcx;
-
     private static final int ONES_16 = 0xffff;
     private static final int ONES_32 = 0xffffffff;
 
     @Def({OperandFlag.REG}) private Value resultValue;
-    @Use({OperandFlag.REG}) private Value arrayAValue;
-    @Use({OperandFlag.REG}) private Value arrayBValue;
-    @Use({OperandFlag.REG}) private Value lengthValue;
+    @UseKill({OperandFlag.REG}) private Value arrayAValue;
+    @UseKill({OperandFlag.REG}) private Value arrayBValue;
+    @UseKill({OperandFlag.REG}) private Value lengthValue;
     @Alive({OperandFlag.REG}) private Value strideValue;
-
-    @Temp({OperandFlag.REG}) private Value arrayAValueTemp;
-    @Temp({OperandFlag.REG}) private Value arrayBValueTemp;
-    @Temp({OperandFlag.REG}) private Value lengthValueTemp;
 
     @Temp({OperandFlag.REG}) Value[] temp;
     @Temp({OperandFlag.REG}) Value[] vectorTemp;
-
-    private AMD64VectorizedMismatchOp(LIRGeneratorTool tool, EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
-                    Value result, Value arrayA, Value arrayB, Value length, Value stride) {
-        super(TYPE, tool, runtimeCheckedCPUFeatures, YMM);
-        this.resultValue = result;
-        this.arrayAValue = this.arrayAValueTemp = arrayA;
-        this.arrayBValue = this.arrayBValueTemp = arrayB;
-        this.lengthValue = this.lengthValueTemp = length;
-        this.strideValue = stride;
-        this.temp = allocateTempRegisters(tool, AMD64Kind.QWORD, 2);
-        this.vectorTemp = allocateVectorRegisters(tool, JavaKind.Byte, 3);
-    }
 
     /**
      * Compares array regions of length {@code length} in {@code arrayA} and {@code arrayB}.
@@ -107,17 +81,20 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
      * @param length length (number of array slots respective to stride) of the region to compare.
      * @param stride element size in log2 format (0: byte, 1: char, 2: int, 3: long).
      */
-    public static AMD64VectorizedMismatchOp movParamsAndCreate(LIRGeneratorTool tool, EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
+    public AMD64VectorizedMismatchOp(LIRGeneratorTool tool, EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
                     Value result, Value arrayA, Value arrayB, Value length, Value stride) {
-        RegisterValue regArrayA = REG_ARRAY_A.asValue(arrayA.getValueKind());
-        RegisterValue regArrayB = REG_ARRAY_B.asValue(arrayB.getValueKind());
-        RegisterValue regLength = REG_LENGTH.asValue(length.getValueKind());
-        RegisterValue regStride = REG_STRIDE.asValue(length.getValueKind());
-        tool.emitMove(regArrayA, arrayA);
-        tool.emitMove(regArrayB, arrayB);
-        tool.emitMove(regLength, length);
-        tool.emitMove(regStride, stride);
-        return new AMD64VectorizedMismatchOp(tool, runtimeCheckedCPUFeatures, result, regArrayA, regArrayB, regLength, regStride);
+        super(TYPE, tool, runtimeCheckedCPUFeatures, YMM);
+
+        // Only stride stays fixed because shlq(length) takes its shift count from cl/rcx.
+        GraalError.guarantee(asRegister(stride).equals(rcx), "expect stride at rcx, but was %s", stride);
+
+        this.resultValue = result;
+        this.arrayAValue = arrayA;
+        this.arrayBValue = arrayB;
+        this.lengthValue = length;
+        this.strideValue = stride;
+        this.temp = allocateTempRegisters(tool, AMD64Kind.QWORD, 2);
+        this.vectorTemp = allocateVectorRegisters(tool, JavaKind.Byte, 3);
     }
 
     /**
@@ -127,6 +104,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
      */
     @Override
     public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler asm) {
+        AMD64Assembler.AMD64SIMDInstructionEncoding oldEncoding = asm.setTemporaryAvxEncoding(AMD64Assembler.AMD64SIMDInstructionEncoding.VEX);
+
         Register result = asRegister(resultValue);
         Register arrayA = asRegister(arrayAValue);
         Register arrayB = asRegister(arrayBValue);
@@ -153,7 +132,6 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         Label scalarTail = new Label();
         Label scalarLoop = new Label();
 
-        GraalError.guarantee(asRegister(strideValue).equals(rcx), "stride must be in rcx for shift op");
         // convert length to byte-length (uses stride in the RCX register as implicit argument)
         asm.shlq(length);
         // result = 0
@@ -208,7 +186,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
             asm.movdqu(vectorSize, vector2, new AMD64Address(arrayB, result, stride));
             asm.pcmpeq(vectorSize, stride, vector1, vector2);
             asm.pmovmsk(vectorSize, tmp, vector1);
-            asm.xorlAndJcc(tmp, vectorSize == XMM ? ONES_16 : ONES_32, ConditionFlag.NotZero, diffFound, true);
+            asm.xorl(tmp, vectorSize == XMM ? ONES_16 : ONES_32);
+            asm.jccb(ConditionFlag.NotZero, diffFound);
             // regions are equal, continue the loop
             asm.addq(result, bytesPerVector);
             asm.subqAndJcc(length, bytesPerVector, ConditionFlag.NotZero, vectorLoop, true);
@@ -221,7 +200,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
             asm.movdqu(vectorSize, vector2, new AMD64Address(arrayB, result, stride));
             asm.pcmpeq(vectorSize, stride, vector1, vector2);
             asm.pmovmsk(vectorSize, tmp, vector1);
-            asm.xorlAndJcc(tmp, vectorSize == XMM ? ONES_16 : ONES_32, ConditionFlag.Zero, returnEqualLabel, false);
+            asm.xorl(tmp, vectorSize == XMM ? ONES_16 : ONES_32);
+            asm.jcc(ConditionFlag.Zero, returnEqualLabel);
 
             asm.align(preferredBranchTargetAlignment(crb));
             asm.bind(diffFound);
@@ -249,7 +229,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
             // combine results into one YMM vector, by copying vector2 to the upper half of vector1
             AMD64Assembler.VexRVMIOp.VPERM2I128.emit(asm, YMM, vector1, vector2, vector1, 0x02);
             asm.pmovmsk(YMM, result, vector1);
-            asm.xorlAndJcc(result, ONES_32, ConditionFlag.Zero, returnEqualLabel, false);
+            asm.xorl(result, ONES_32);
+            asm.jcc(ConditionFlag.Zero, returnEqualLabel);
             bsfq(asm, result, result);
             // if the resulting index is greater than XMM bytes, we have to adjust it to be based on
             // the end of the array
@@ -266,7 +247,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         // region is guaranteed to be between 8 and 15 bytes at this point
         // check first 8 bytes
         asm.movq(result, new AMD64Address(arrayA));
-        asm.xorqAndJcc(result, new AMD64Address(arrayB), ConditionFlag.Zero, qwordTail2, true);
+        asm.xorq(result, new AMD64Address(arrayB));
+        asm.jccb(ConditionFlag.Zero, qwordTail2);
         bsfq(asm, result, result);
         asm.shrq(result, 3);
         asm.jmp(returnLabel);
@@ -274,7 +256,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         // check last 8 bytes
         asm.bind(qwordTail2);
         asm.movq(result, new AMD64Address(arrayA, tailLength, stride, -QWORD.getBytes()));
-        asm.xorqAndJcc(result, new AMD64Address(arrayB, tailLength, stride, -QWORD.getBytes()), ConditionFlag.Zero, returnEqualLabel, true);
+        asm.xorq(result, new AMD64Address(arrayB, tailLength, stride, -QWORD.getBytes()));
+        asm.jccb(ConditionFlag.Zero, returnEqualLabel);
         bsfq(asm, result, result);
         asm.shrl(result, 3);
         asm.leaq(result, new AMD64Address(result, tailLength, Stride.S1, -QWORD.getBytes()));
@@ -287,7 +270,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         // region is guaranteed to be between 4 and 7 bytes at this point
         // check first 4 bytes
         asm.movl(result, new AMD64Address(arrayA));
-        asm.xorlAndJcc(result, new AMD64Address(arrayB), ConditionFlag.Zero, dwordTail2, true);
+        asm.xorl(result, new AMD64Address(arrayB));
+        asm.jccb(ConditionFlag.Zero, dwordTail2);
         bsfq(asm, result, result);
         asm.shrl(result, 3);
         asm.jmpb(returnLabel);
@@ -295,7 +279,8 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         // check last 4 bytes
         asm.bind(dwordTail2);
         asm.movl(result, new AMD64Address(arrayA, tailLength, stride, -DWORD.getBytes()));
-        asm.xorlAndJcc(result, new AMD64Address(arrayB, tailLength, stride, -DWORD.getBytes()), ConditionFlag.Zero, returnEqualLabel, true);
+        asm.xorl(result, new AMD64Address(arrayB, tailLength, stride, -DWORD.getBytes()));
+        asm.jccb(ConditionFlag.Zero, returnEqualLabel);
         bsfq(asm, result, result);
         asm.shrl(result, 3);
         asm.leaq(result, new AMD64Address(result, tailLength, Stride.S1, -DWORD.getBytes()));
@@ -319,5 +304,7 @@ public final class AMD64VectorizedMismatchOp extends AMD64ComplexVectorOp {
         asm.bind(returnLabel);
         // scale byte-based result back to stride
         asm.sarq(result);
+
+        asm.resetAvxEncoding(oldEncoding);
     }
 }

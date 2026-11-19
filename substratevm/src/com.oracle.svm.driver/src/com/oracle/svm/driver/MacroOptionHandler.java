@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,22 +26,24 @@ package com.oracle.svm.driver;
 
 import java.io.File;
 import java.nio.file.Path;
-import java.util.HashSet;
+
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.svm.core.OS;
-import com.oracle.svm.core.option.OptionUtils.InvalidMacroException;
 import com.oracle.svm.driver.MacroOption.AddedTwiceException;
 import com.oracle.svm.driver.MacroOption.VerboseInvalidMacroException;
 import com.oracle.svm.driver.NativeImage.ArgumentQueue;
 import com.oracle.svm.driver.NativeImage.BuildConfiguration;
+import com.oracle.svm.shared.option.OptionOrigin;
+import com.oracle.svm.shared.option.OptionUtils.InvalidMacroException;
 
 class MacroOptionHandler extends NativeImage.OptionHandler<NativeImage> {
 
-    private final HashSet<MacroOption> addedCheck;
+    private final EconomicSet<MacroOption> addedCheck;
 
     MacroOptionHandler(NativeImage nativeImage) {
         super(nativeImage);
-        addedCheck = new HashSet<>();
+        addedCheck = EconomicSet.create();
     }
 
     @Override
@@ -79,26 +81,11 @@ class MacroOptionHandler extends NativeImage.OptionHandler<NativeImage> {
         }
 
         BuildConfiguration config = nativeImage.config;
-        boolean ignoreIfBuilderOnClasspath = Boolean.parseBoolean(enabledOption.getProperty(config, "IgnoreIfBuilderOnClasspath"));
-        if (ignoreIfBuilderOnClasspath && !config.modulePathBuild) {
-            return;
-        }
-
-        String propertyName = "BuilderOnClasspath";
-        String propertyValue = enabledOption.getProperty(config, propertyName);
-        if (propertyValue != null) {
-            boolean modulePathBuild = !Boolean.valueOf(propertyValue);
-            String imageBuilderModeEnforcer = enabledOption.getOption().toString();
-            if (config.imageBuilderModeEnforcer != null && modulePathBuild != config.modulePathBuild) {
-                NativeImage.showError(String.format("Conflicting %s property values. %s (%b) vs %s (%b)", propertyName,
-                                imageBuilderModeEnforcer, modulePathBuild, config.imageBuilderModeEnforcer, config.modulePathBuild));
-            }
-            config.imageBuilderModeEnforcer = imageBuilderModeEnforcer;
-            config.modulePathBuild = modulePathBuild;
-        }
 
         enabledOption.forEachPropertyValue(config,
-                        "ImageBuilderClasspath", entry -> nativeImage.addImageBuilderClasspath(Path.of(entry)), PATH_SEPARATOR_REGEX);
+                        "ProvidedHostedOptions", nativeImage.apiOptionHandler::injectKnownHostedOption, NativeImage.MANY_SPACES_REGEX);
+        enabledOption.forEachPropertyValue(config,
+                        "ImageProvidedJars", entry -> nativeImage.addImageProvidedJars(Path.of(entry)), PATH_SEPARATOR_REGEX);
         enabledOption.forEachPropertyValue(config,
                         "ImageBuilderModulePath", entry -> nativeImage.addImageBuilderModulePath(Path.of(entry)), PATH_SEPARATOR_REGEX);
         boolean explicitImageModulePath = enabledOption.forEachPropertyValue(config,
@@ -111,12 +98,12 @@ class MacroOptionHandler extends NativeImage.OptionHandler<NativeImage> {
 
         String imageName = enabledOption.getProperty(config, "ImageName");
         if (imageName != null) {
-            nativeImage.addPlainImageBuilderArg(nativeImage.oHName + imageName);
+            nativeImage.addPlainImageBuilderArg(nativeImage.oHName + imageName, OptionOrigin.originDriver);
         }
 
         String imagePath = enabledOption.getProperty(config, "ImagePath");
         if (imagePath != null) {
-            nativeImage.addPlainImageBuilderArg(nativeImage.oHPath + imagePath);
+            nativeImage.addPlainImageBuilderArg(nativeImage.oHPath + imagePath, OptionOrigin.originDriver);
         }
 
         String imageClass = enabledOption.getProperty(config, "ImageClass");

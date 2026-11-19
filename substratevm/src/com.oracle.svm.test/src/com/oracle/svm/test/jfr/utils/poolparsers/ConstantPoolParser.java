@@ -29,9 +29,8 @@ package com.oracle.svm.test.jfr.utils.poolparsers;
 import static org.junit.Assert.assertFalse;
 
 import java.io.IOException;
-import java.util.HashSet;
-import java.util.Set;
 
+import org.graalvm.collections.EconomicSet;
 import org.junit.Assert;
 
 import com.oracle.svm.core.jfr.JfrType;
@@ -40,9 +39,9 @@ import com.oracle.svm.test.jfr.utils.RecordingInput;
 
 public abstract class ConstantPoolParser {
     private final JfrFileParser parser;
-    private final Set<Long> reservedIds = new HashSet<>();
-    private final Set<Long> foundIds = new HashSet<>();
-    private final Set<Long> expectedIds = new HashSet<>();
+    private final EconomicSet<Long> reservedIds = EconomicSet.create();
+    private final EconomicSet<Long> foundIds = EconomicSet.create();
+    private final EconomicSet<Long> expectedIds = EconomicSet.create();
 
     protected ConstantPoolParser(JfrFileParser parser, long... reservedIds) {
         this.parser = parser;
@@ -60,13 +59,17 @@ public abstract class ConstantPoolParser {
         assertFalse("ID " + id + " is reserved and must not be found in " + this + " constant pool.", reservedIds.contains(id));
     }
 
+    public boolean hasFoundId(long id) {
+        return foundIds.contains(id);
+    }
+
     protected void addExpectedId(JfrType typeId, long id) {
         ConstantPoolParser poolParser = parser.getSupportedConstantPools().get(typeId.getId());
         poolParser.expectedIds.add(id);
     }
 
     public void compareFoundAndExpectedIds() {
-        HashSet<Long> missingIds = new HashSet<>(expectedIds);
+        EconomicSet<Long> missingIds = EconomicSet.create(expectedIds);
         missingIds.removeAll(reservedIds);
         missingIds.removeAll(foundIds);
 

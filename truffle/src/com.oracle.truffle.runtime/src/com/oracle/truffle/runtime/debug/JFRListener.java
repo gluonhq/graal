@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.runtime.debug;
 
+import java.nio.ByteBuffer;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
@@ -55,14 +56,20 @@ import com.oracle.truffle.compiler.TruffleCompilerListener.CompilationResultInfo
 import com.oracle.truffle.compiler.TruffleCompilerListener.GraphInfo;
 import com.oracle.truffle.runtime.AbstractCompilationTask;
 import com.oracle.truffle.runtime.AbstractGraalTruffleRuntimeListener;
-import com.oracle.truffle.runtime.OptimizedTruffleRuntime;
-import com.oracle.truffle.runtime.ModuleUtil;
+import com.oracle.truffle.runtime.CompilationTask;
+import com.oracle.truffle.runtime.FixedPointMath;
+import com.oracle.truffle.runtime.ModulesSupport;
 import com.oracle.truffle.runtime.OptimizedCallTarget;
+import com.oracle.truffle.runtime.OptimizedTruffleRuntime;
+import com.oracle.truffle.runtime.jfr.CompilationDequeuedEvent;
 import com.oracle.truffle.runtime.jfr.CompilationEvent;
+import com.oracle.truffle.runtime.jfr.CompilationQueuedEvent;
+import com.oracle.truffle.runtime.jfr.CompilationStartedEvent;
 import com.oracle.truffle.runtime.jfr.CompilationStatisticsEvent;
 import com.oracle.truffle.runtime.jfr.DeoptimizationEvent;
 import com.oracle.truffle.runtime.jfr.EventFactory;
 import com.oracle.truffle.runtime.jfr.InvalidationEvent;
+import com.oracle.truffle.runtime.jfr.ProfileResetEvent;
 import com.oracle.truffle.runtime.serviceprovider.TruffleRuntimeServices;
 
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -74,11 +81,14 @@ import jdk.vm.ci.meta.UnresolvedJavaType;
  */
 public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
 
-    private static final EventFactory factory = lookupFactory();
+    private static final int RATE_WIDTH = 8;
+
+    private static final EventFactory FACTORY = lookupFactory();
 
     // Support for JFRListener#isInstrumented
     private static final Set<InstrumentedMethodPattern> instrumentedMethodPatterns = createInstrumentedPatterns();
     private static final AtomicReference<InstrumentedFilterState> instrumentedFilterState = new AtomicReference<>(InstrumentedFilterState.NEW);
+    private static final ByteBuffer nativeInstrumentedFilterState = ByteBuffer.allocateDirect(1);
     private static volatile ResolvedJavaType resolvedJfrEventClass;
 
     private final ThreadLocal<CompilationData> currentCompilation = new ThreadLocal<>();
@@ -87,27 +97,123 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     private JFRListener(OptimizedTruffleRuntime runtime) {
         super(runtime);
         statistics = new Statistics();
-        factory.addPeriodicEvent(CompilationStatisticsEvent.class, statistics);
+
+        if (FACTORY.isInitialized()) {
+            FACTORY.addPeriodicEvent(CompilationStatisticsEvent.class, statistics);
+        } else {
+            // avoid eager initialization for better class initialization
+            FACTORY.addInitializationListener(() -> {
+                FACTORY.addPeriodicEvent(CompilationStatisticsEvent.class, statistics);
+            });
+        }
+
     }
 
     public static void install(OptimizedTruffleRuntime runtime) {
-        if (factory != null) {
+        if (FACTORY != null) {
             runtime.addListener(new JFRListener(runtime));
         }
     }
 
     public static boolean isInstrumented(ResolvedJavaMethod method) {
-        // Initialization must be deferred into the image execution time
+        if (!isActive()) {
+            return false;
+        }
+        return isInstrumentedImpl(method);
+    }
+
+    public static boolean isActive() {
         InstrumentedFilterState currentState = instrumentedFilterState.get();
         if (currentState == InstrumentedFilterState.INACTIVE) {
             return false;
         }
-        return isInstrumentedImpl(method, currentState);
+        if (currentState == InstrumentedFilterState.NEW) {
+            currentState = initializeInstrumentedFilter();
+        }
+        // If JFR is not active or we are in the image build time return false
+        return currentState != InstrumentedFilterState.NEW && currentState != InstrumentedFilterState.INACTIVE;
+    }
+
+    public static ByteBuffer nativeState() {
+        if (instrumentedFilterState.get() == InstrumentedFilterState.NEW) {
+            initializeInstrumentedFilter();
+        }
+        return nativeInstrumentedFilterState;
+    }
+
+    @Override
+    public void onCompilationQueued(OptimizedCallTarget target, int tier) {
+        CompilationQueuedEvent event = FACTORY.createCompilationQueuedEvent();
+        if (event.isEnabled()) {
+            int callAndLoopThreshold = (target.engine.multiTier && tier == 2) ? target.engine.callAndLoopThresholdInFirstTier : target.engine.callAndLoopThresholdInInterpreter;
+            int scale = runtime.compilationThresholdScale();
+            event.setRootFunction(target);
+            event.setTier(tier);
+            event.setCompilationCount(target.getCallAndLoopCount());
+            event.setCompilationThreshold(OptimizedCallTarget.scaledThreshold(callAndLoopThreshold));
+            event.setQueueSize(runtime.getCompilationQueueSize());
+            event.setQueueChange(1);
+            event.setQueueLoad(FixedPointMath.toDouble(scale));
+            event.setQueueTime(0);
+            event.publish();
+        }
+    }
+
+    @Override
+    public void onCompilationDequeued(OptimizedCallTarget target, Object source, CharSequence reason, int tier) {
+        CompilationDequeuedEvent event = FACTORY.createCompilationDequeuedEvent();
+        if (event.isEnabled()) {
+            int callAndLoopThreshold = tier == 1 ? target.engine.callAndLoopThresholdInInterpreter : target.engine.callAndLoopThresholdInFirstTier;
+            int scale = runtime.compilationThresholdScale();
+            event.setRootFunction(target);
+            event.setTier(tier);
+            event.setCompilationCount(target.getCallAndLoopCount());
+            event.setCompilationThreshold(FixedPointMath.multiply(scale, callAndLoopThreshold));
+            event.setQueueSize(runtime.getCompilationQueueSize());
+            event.setQueueChange(0);
+            event.setQueueLoad(FixedPointMath.toDouble(scale));
+            event.setQueueTime(0);
+            event.setReason(reason == null ? null : reason.toString());
+            event.publish();
+        }
     }
 
     @Override
     public void onCompilationStarted(OptimizedCallTarget target, AbstractCompilationTask task) {
-        CompilationEvent event = factory.createCompilationEvent();
+        CompilationStartedEvent startEvent = FACTORY.createCompilationStartedEvent();
+        if (startEvent.isEnabled()) {
+            double weight;
+            long time;
+            double rate;
+            int queueChange;
+            String appliedBonuses;
+            if (task instanceof CompilationTask t) {
+                weight = t.weight();
+                time = t.time();
+                rate = t.rate();
+                queueChange = t.queueChange();
+                appliedBonuses = String.join(", ", t.bonusDescriptors());
+            } else {
+                weight = 0.0d;
+                time = 0;
+                rate = Double.NaN;
+                queueChange = 0;
+                appliedBonuses = "";
+            }
+            String rateString = String.format("%.6f", rate);
+            startEvent.setRootFunction(target);
+            startEvent.setTier(task.tier());
+            startEvent.setPriority((long) weight);
+            startEvent.setRate(rateString.length() <= RATE_WIDTH ? rateString : rateString.substring(0, RATE_WIDTH));
+            startEvent.setQueueSize(runtime.getCompilationQueueSize());
+            startEvent.setQueueChange(queueChange);
+            startEvent.setQueueLoad(FixedPointMath.toDouble(runtime.compilationThresholdScale()));
+            startEvent.setQueueTime(time / 1000);
+            startEvent.setBonuses(appliedBonuses);
+            startEvent.publish();
+        }
+
+        CompilationEvent event = FACTORY.createCompilationEvent();
         if (event.isEnabled()) {
             event.setRootFunction(target);
             event.compilationStarted();
@@ -118,8 +224,19 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     }
 
     @Override
-    public void onCompilationDeoptimized(OptimizedCallTarget target, Frame frame) {
-        DeoptimizationEvent event = factory.createDeoptimizationEvent();
+    public void onCompilationDeoptimized(OptimizedCallTarget target, Frame frame, String reason) {
+        DeoptimizationEvent event = FACTORY.createDeoptimizationEvent();
+        if (event.isEnabled()) {
+            event.setRootFunction(target);
+            event.setInvalidated(!target.isValid());
+            event.setReason(reason);
+            event.publish();
+        }
+    }
+
+    @Override
+    public void onProfileReset(OptimizedCallTarget target) {
+        ProfileResetEvent event = FACTORY.createProfileResetEvent();
         if (event.isEnabled()) {
             event.setRootFunction(target);
             event.publish();
@@ -130,6 +247,7 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     public void onCompilationTruffleTierFinished(OptimizedCallTarget target, AbstractCompilationTask task, GraphInfo graph) {
         CompilationData data = getCurrentData();
         if (data.event != null) {
+            data.partialEvaluationSuccess = true;
             data.partialEvalNodeCount = graph.getNodeCount();
             data.timePartialEvaluationFinished = System.nanoTime();
         }
@@ -138,9 +256,16 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     @Override
     public void onCompilationFailed(OptimizedCallTarget target, String reason, boolean bailout, boolean permanentBailout, int tier, Supplier<String> lazyStackTrace) {
         CompilationData data = getCurrentData();
+        if (!data.partialEvaluationSuccess) {
+            data.timePartialEvaluationFinished = System.nanoTime();
+        }
+        boolean permanentFailure = isPermanentFailure(bailout, permanentBailout);
+        if (!permanentFailure) {
+            onCompilationDequeued(target, null, "Non permanent bailout: " + reason, tier);
+        }
         statistics.finishCompilation(data.finish(), bailout, 0);
         if (data.event != null) {
-            data.event.failed(tier, isPermanentFailure(bailout, permanentBailout), reason, lazyStackTrace);
+            data.event.failed(tier, permanentFailure, reason, lazyStackTrace);
             data.event.publish();
         }
         currentCompilation.remove();
@@ -167,6 +292,7 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
             event.setGraalNodeCount(graph.getNodeCount());
             event.setPartialEvaluationNodeCount(data.partialEvalNodeCount);
             event.setPartialEvaluationTime((data.timePartialEvaluationFinished - data.timeCompilationStarted) / 1_000_000);
+            event.setCompilationId(TraceCompilationListener.getCompilationId(result));
             event.publish();
             currentCompilation.remove();
         }
@@ -175,7 +301,7 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     @Override
     public void onCompilationInvalidated(OptimizedCallTarget target, Object source, CharSequence reason) {
         statistics.invalidations.incrementAndGet();
-        InvalidationEvent event = factory.createInvalidationEvent();
+        InvalidationEvent event = FACTORY.createInvalidationEvent();
         if (event.isEnabled()) {
             event.setRootFunction(target);
             event.setReason(reason);
@@ -190,6 +316,7 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     private static final class CompilationData {
         final CompilationEvent event;
         final long timeCompilationStarted;
+        boolean partialEvaluationSuccess;
         int partialEvalNodeCount;
         long timePartialEvaluationFinished;
 
@@ -198,36 +325,41 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
             this.timeCompilationStarted = System.nanoTime();
         }
 
-        int finish() {
-            return (int) (System.nanoTime() - timeCompilationStarted) / 1_000_000;
+        long finish() {
+            return System.nanoTime() - timeCompilationStarted;
         }
     }
 
     private static final class Statistics implements Runnable {
+        private static final long NANOS_PER_MILLI = 1_000_000L;
 
         private long compiledMethods;
         private long bailouts;
         private long compiledCodeSize;
         private long totalTime;
-        private int peakTime;
+        private long totalTimeNanosRemainder;
+        private long peakTime;
         final AtomicLong invalidations = new AtomicLong();
 
         Statistics() {
         }
 
-        synchronized void finishCompilation(int time, boolean bailout, int codeSize) {
+        synchronized void finishCompilation(long timeNanos, boolean bailout, int codeSize) {
             compiledMethods++;
             if (bailout) {
                 bailouts++;
             }
             compiledCodeSize += codeSize;
-            totalTime += time;
-            peakTime = Math.max(peakTime, time);
+            totalTime += timeNanos / NANOS_PER_MILLI;
+            totalTimeNanosRemainder += timeNanos % NANOS_PER_MILLI;
+            totalTime += totalTimeNanosRemainder / NANOS_PER_MILLI;
+            totalTimeNanosRemainder %= NANOS_PER_MILLI;
+            peakTime = Math.max(peakTime, timeNanos / NANOS_PER_MILLI);
         }
 
         @Override
         public void run() {
-            CompilationStatisticsEvent event = factory.createCompilationStatisticsEvent();
+            CompilationStatisticsEvent event = FACTORY.createCompilationStatisticsEvent();
             if (event.isEnabled()) {
                 synchronized (this) {
                     event.setCompiledMethods(compiledMethods);
@@ -243,13 +375,13 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     }
 
     private static EventFactory lookupFactory() {
-        if (ImageInfo.inImageCode()) {
+        if (ImageInfo.inImageRuntimeCode()) {
             return ImageSingletons.contains(EventFactory.class) ? ImageSingletons.lookup(EventFactory.class) : null;
         } else {
             Iterator<EventFactory.Provider> it = TruffleRuntimeServices.load(EventFactory.Provider.class).iterator();
             EventFactory.Provider provider = it.hasNext() ? it.next() : null;
             if (provider != null) {
-                ModuleUtil.exportTo(provider.getClass());
+                ModulesSupport.exportTruffleRuntimeTo(provider.getClass());
                 return provider.getEventFactory();
             } else {
                 return null;
@@ -265,18 +397,7 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     }
 
     // Support for JFRListener#isInstrumented
-    private static boolean isInstrumentedImpl(ResolvedJavaMethod method, InstrumentedFilterState state) {
-
-        InstrumentedFilterState currentState = state;
-        if (currentState == InstrumentedFilterState.NEW) {
-            currentState = initializeInstrumentedFilter();
-        }
-
-        // If JFR is not active or we are in the image build time return false
-        if (currentState == InstrumentedFilterState.NEW || currentState == InstrumentedFilterState.INACTIVE) {
-            return false;
-        }
-
+    private static boolean isInstrumentedImpl(ResolvedJavaMethod method) {
         /*
          * Between JDK-11 and JDK-21, JFR utilizes instrumentation to inject calls to
          * jdk.jfr.internal.instrument.ThrowableTracer into constructors of Throwable and Error.
@@ -311,12 +432,15 @@ public final class JFRListener extends AbstractGraalTruffleRuntimeListener {
     private static InstrumentedFilterState initializeInstrumentedFilter() {
         // Do not initialize during image building.
         if (!ImageInfo.inImageBuildtimeCode()) {
-            if (factory != null) {
-                factory.addInitializationListener(() -> {
+            if (FACTORY != null) {
+                FACTORY.addInitializationListener(() -> {
                     instrumentedFilterState.set(InstrumentedFilterState.ACTIVE);
+                    nativeInstrumentedFilterState.put(0, (byte) 1);
                 });
-                InstrumentedFilterState currentState = factory.isInitialized() ? InstrumentedFilterState.ACTIVE : InstrumentedFilterState.INACTIVE;
-                instrumentedFilterState.compareAndSet(InstrumentedFilterState.NEW, currentState);
+                InstrumentedFilterState currentState = FACTORY.isInitialized() ? InstrumentedFilterState.ACTIVE : InstrumentedFilterState.INACTIVE;
+                if (instrumentedFilterState.compareAndSet(InstrumentedFilterState.NEW, currentState)) {
+                    nativeInstrumentedFilterState.put(0, (byte) (currentState == InstrumentedFilterState.ACTIVE ? 1 : 0));
+                }
             } else {
                 instrumentedFilterState.set(InstrumentedFilterState.INACTIVE);
             }

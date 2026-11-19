@@ -32,13 +32,12 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.impl.clinit.ClassInitializationTracking;
 
-import com.oracle.graal.pointsto.ObjectScanner;
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
@@ -47,27 +46,42 @@ import com.oracle.graal.pointsto.util.Timer;
 import com.oracle.graal.pointsto.util.TimerCollection;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedSnippets;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.meta.SubstrateForeignCallsProvider;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
-import com.oracle.svm.core.option.OptionOrigin;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.core.snippets.SnippetRuntime;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.FeatureImpl;
 import com.oracle.svm.hosted.FeatureImpl.AfterAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
-import com.oracle.svm.util.LogUtils;
+import com.oracle.svm.shared.option.OptionOrigin;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.GuestType;
+import com.oracle.svm.util.JVMCIReflectionUtil;
 
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.java.LambdaUtils;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 @AutomaticallyRegisteredFeature
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class ClassInitializationFeature implements InternalFeature {
+    @Override
+    public void onRegistration(OnRegistrationAccess access) {
+        ImageSingletons.add(ClassInitializationFeature.class, this);
+    }
+
     private static final String NATIVE_IMAGE_CLASS_REASON = "Native Image classes are always initialized at build time";
 
     private ClassInitializationSupport classInitializationSupport;
@@ -75,8 +89,8 @@ public class ClassInitializationFeature implements InternalFeature {
     public static void processClassInitializationOptions(ClassInitializationSupport initializationSupport) {
         initializeNativeImagePackagesAtBuildTime(initializationSupport);
         ClassInitializationOptions.ClassInitialization.getValue().getValuesWithOrigins().forEach(entry -> {
-            for (String optionValue : entry.getLeft().split(",")) {
-                processClassInitializationOption(initializationSupport, optionValue, entry.getRight());
+            for (String optionValue : entry.value().split(",")) {
+                processClassInitializationOption(initializationSupport, optionValue, entry.origin());
             }
         });
     }
@@ -128,6 +142,7 @@ public class ClassInitializationFeature implements InternalFeature {
 
         initializationSupport.initializeAtBuildTime("org.graalvm.collections", NATIVE_IMAGE_CLASS_REASON);
         initializationSupport.initializeAtBuildTime("jdk.graal.compiler", NATIVE_IMAGE_CLASS_REASON);
+        initializationSupport.initializeAtBuildTime("org.graalvm.nativeimage.libgraal", NATIVE_IMAGE_CLASS_REASON);
         initializationSupport.initializeAtBuildTime("org.graalvm.word", NATIVE_IMAGE_CLASS_REASON);
         initializationSupport.initializeAtBuildTime("org.graalvm.nativeimage", NATIVE_IMAGE_CLASS_REASON);
         initializationSupport.initializeAtBuildTime("org.graalvm.nativebridge", NATIVE_IMAGE_CLASS_REASON);
@@ -141,23 +156,27 @@ public class ClassInitializationFeature implements InternalFeature {
     public void duringSetup(DuringSetupAccess a) {
         FeatureImpl.DuringSetupAccessImpl access = (FeatureImpl.DuringSetupAccessImpl) a;
         classInitializationSupport = access.getHostVM().getClassInitializationSupport();
-        access.registerObjectReachableCallback(Object.class, this::checkImageHeapInstance);
     }
 
     @SuppressWarnings("unused")
-    private void checkImageHeapInstance(DuringAnalysisAccess access, Object obj, ObjectScanner.ScanReason reason) {
+    public void checkImageHeapInstance(Object obj) {
         /*
          * Note that initializeAtBuildTime also memoizes the class as InitKind.BUILD_TIME, which
          * means that the user cannot later manually register it as RERUN or RUN_TIME.
          */
-        if (obj != null && !classInitializationSupport.maybeInitializeAtBuildTime(obj.getClass())) {
+        /*
+         * GR-73164: Reachable-object validation still materializes the guest constant as a builder
+         * object. Remove this conversion when that path becomes constant-native.
+         */
+        ResolvedJavaType guestType = obj == null ? null : GuestAccess.get().lookupType(obj.getClass());
+        if (guestType != null && !classInitializationSupport.maybeInitializeAtBuildTime(guestType)) {
             String typeName = obj.getClass().getTypeName();
             String proxyLambdaInterfaceCSV = null;
             String proxyLambdaInterfaceList = null;
             boolean proxyOrLambda = ClassInitializationSupport.isProxyOrLambda(obj);
             if (proxyOrLambda) {
-                proxyLambdaInterfaceCSV = StreamSupport.stream(ClassInitializationSupport.allInterfaces(obj.getClass()).spliterator(), false)
-                                .map(Class::getTypeName)
+                proxyLambdaInterfaceCSV = StreamSupport.stream(ClassInitializationSupport.allInterfaces(guestType).spliterator(), false)
+                                .map(JVMCIReflectionUtil::getTypeName)
                                 .collect(Collectors.joining(","));
                 proxyLambdaInterfaceList = "[" + proxyLambdaInterfaceCSV.replaceAll(",", ", ") + "]";
             }
@@ -173,9 +192,9 @@ public class ClassInitializationFeature implements InternalFeature {
                               and that they do not contain any sensitive data that should not become part of the image.
 
                             """
-                            .replaceAll("\n", System.lineSeparator()).formatted(
+                            .replace("\n", System.lineSeparator()).formatted(
                                             typeName,
-                                            classInitializationSupport.reasonForClass(obj.getClass()),
+                                            classInitializationSupport.reasonForClass(guestType),
                                             typeName,
                                             SubstrateOptionsParser.commandArgument(ClassInitializationOptions.ClassInitialization, proxyOrLambda ? proxyLambdaInterfaceCSV : typeName,
                                                             "initialize-at-build-time", true, true),
@@ -183,11 +202,11 @@ public class ClassInitializationFeature implements InternalFeature {
 
             msg += classInitializationSupport.objectInstantiationTraceMessage(obj, "2) ", culprit -> {
                 if (culprit == null) {
-                    return "If if it is not intended that objects of type '" + typeName + "' are persisted in the image heap, examine the stack trace and use " +
+                    return "If it is not intended that objects of type '" + typeName + "' are persisted in the image heap, examine the stack trace and use " +
                                     SubstrateOptionsParser.commandArgument(ClassInitializationOptions.ClassInitialization, "<culprit>", "initialize-at-run-time", true, true) +
                                     "to prevent instantiation of this object." + System.lineSeparator();
                 } else {
-                    return "If if it is not intended that objects of type '" + typeName + "' are persisted in the image heap, examine the stack trace and use " +
+                    return "If it is not intended that objects of type '" + typeName + "' are persisted in the image heap, examine the stack trace and use " +
                                     SubstrateOptionsParser.commandArgument(ClassInitializationOptions.ClassInitialization, culprit, "initialize-at-run-time", true, true) +
                                     "to prevent instantiation of the culprit object.";
                 }
@@ -198,7 +217,7 @@ public class ClassInitializationFeature implements InternalFeature {
                             If you are seeing this message after upgrading to a new GraalVM release, this means that some objects ended up in the image heap without their type being marked with --initialize-at-build-time.
                             To fix this, include %s in your configuration. If the classes do not originate from your code, it is advised to update all library or framework dependencies to the latest version before addressing this error.
                             """
-                            .replaceAll("\n", System.lineSeparator())
+                            .replace("\n", System.lineSeparator())
                             .formatted(SubstrateOptionsParser.commandArgument(ClassInitializationOptions.ClassInitialization, proxyOrLambda ? proxyLambdaInterfaceCSV : typeName,
                                             "initialize-at-build-time", true, false));
 
@@ -232,10 +251,9 @@ public class ClassInitializationFeature implements InternalFeature {
      * Initializes classes that can be proven safe and prints class initialization statistics.
      */
     @Override
-    @SuppressWarnings("try")
     public void afterAnalysis(AfterAnalysisAccess a) {
         AfterAnalysisAccessImpl access = (AfterAnalysisAccessImpl) a;
-        try (Timer.StopTimer ignored = TimerCollection.createTimerAndStart(TimerCollection.Registry.CLINIT)) {
+        try (Timer.StopTimer _ = TimerCollection.createTimerAndStart(TimerCollection.Registry.CLINIT)) {
 
             if (ClassInitializationOptions.PrintClassInitialization.getValue()) {
                 reportClassInitializationInfo(access, SubstrateOptions.reportsPath());
@@ -255,19 +273,47 @@ public class ClassInitializationFeature implements InternalFeature {
                  * the class initialization status of the JDK because the application cannot know
                  * which JDK classes are safe for initialization at image build time.
                  */
+                GuestAccess guestAccess = GuestAccess.get();
+                JavaConstant platformClassLoader = guestAccess.invokeStatic(guestAccess.elements.java_lang_ClassLoader_getPlatformClassLoader);
                 List<String> unspecifiedClasses = classInitializationSupport.classesWithKind(RUN_TIME).stream()
-                                .filter(c -> c.getClassLoader() != null && c.getClassLoader() != ClassLoader.getPlatformClassLoader())
+                                .filter(type -> shouldCheckInitializationPolicy(type, platformClassLoader))
                                 .filter(c -> classInitializationSupport.specifiedInitKindFor(c) == null)
-                                .map(Class::getTypeName)
+                                .map(JVMCIReflectionUtil::getTypeName)
                                 .filter(name -> !name.contains(LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING))
                                 .collect(Collectors.toList());
                 if (!unspecifiedClasses.isEmpty()) {
-                    System.err.println("The following classes have unspecified initialization policy:" + System.lineSeparator() + String.join(System.lineSeparator(), unspecifiedClasses));
+                    System.out.println("The following classes have unspecified initialization policy:" + System.lineSeparator() + String.join(System.lineSeparator(), unspecifiedClasses));
                     UserError.abort("To fix the error either specify the initialization policy for given classes or set %s",
                                     SubstrateOptionsParser.commandArgument(ClassInitializationOptions.AssertInitializationSpecifiedForAllClasses, "-"));
                 }
             }
         }
+    }
+
+    private static boolean shouldCheckInitializationPolicy(ResolvedJavaType type, @GuestType(ClassLoader.class) JavaConstant platformLoader) {
+        /*
+         * GuestTypes.isUserType instead classifies types by the path container from which they were
+         * discovered, which is not equivalent to distinguishing application class loaders from
+         * bootstrap and platform class loaders.
+         */
+        JavaConstant classLoader = JVMCIReflectionUtil.getClassLoader(type);
+        if (classLoader.isNull() || classLoader.equals(platformLoader)) {
+            return false;
+        }
+
+        /*
+         * Some JDK tool modules, for example jdk.compiler and jdk.jpackage, are defined to the
+         * application class loader. Exclude them by module name so the assertion remains limited to
+         * application classes.
+         */
+        ResolvedJavaModule module = JVMCIReflectionUtil.getModule(type);
+        if (module.isNamed()) {
+            String moduleName = module.getName();
+            if (moduleName.startsWith("java.") || moduleName.startsWith("jdk.")) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -283,15 +329,15 @@ public class ClassInitializationFeature implements InternalFeature {
     }
 
     private void reportKind(AfterAnalysisAccessImpl access, PrintWriter writer, InitKind kind) {
-        List<Class<?>> allClasses = new ArrayList<>(classInitializationSupport.classesWithKind(kind));
-        allClasses.sort(Comparator.comparing(Class::getTypeName));
+        List<ResolvedJavaType> allClasses = new ArrayList<>(classInitializationSupport.classesWithKind(kind));
+        allClasses.sort(Comparator.comparing(JVMCIReflectionUtil::getTypeName));
         allClasses.forEach(clazz -> {
-            writer.print(clazz.getTypeName() + ", ");
+            writer.print(JVMCIReflectionUtil.getTypeName(clazz) + ", ");
             boolean simulated = false;
             if (kind != BUILD_TIME) {
-                Optional<AnalysisType> type = access.getMetaAccess().optionalLookupJavaType(clazz);
-                if (type.isPresent()) {
-                    simulated = SimulateClassInitializerSupport.singleton().isClassInitializerSimulated(type.get());
+                AnalysisType type = access.getUniverse().optionalLookup(clazz);
+                if (type != null) {
+                    simulated = SimulateClassInitializerSupport.singleton().isSimulatedOrInitializedAtBuildTime(type);
                 }
             }
             if (simulated) {
@@ -304,6 +350,10 @@ public class ClassInitializationFeature implements InternalFeature {
     }
 
     private static void reportTrackedClassInitializationTraces(String path) {
+        /*
+         * GR-80277: This map is populated by a JVMTI agent in the image-builder VM. Migrate trace
+         * collection and reporting for class initializers executed in the Terminus guest context.
+         */
         Map<Class<?>, StackTraceElement[]> initializedClasses = ClassInitializationTracking.initializedClasses;
         int size = initializedClasses.size();
         if (size > 0) {

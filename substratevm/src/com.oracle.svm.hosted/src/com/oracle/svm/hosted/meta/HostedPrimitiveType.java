@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.hosted.meta;
 
+import java.util.List;
+
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 import jdk.vm.ci.meta.JavaKind;
@@ -31,7 +33,7 @@ import jdk.vm.ci.meta.JavaKind;
 public class HostedPrimitiveType extends HostedType {
 
     public HostedPrimitiveType(HostedUniverse universe, AnalysisType wrapped, JavaKind kind, JavaKind storageKind) {
-        super(universe, wrapped, kind, storageKind, null, new HostedInterface[0]);
+        super(universe, wrapped, kind, storageKind, null, HostedInterface.EMPTY_ARRAY);
     }
 
     @Override
@@ -70,6 +72,11 @@ public class HostedPrimitiveType extends HostedType {
     }
 
     @Override
+    public List<? extends HostedType> getPermittedSubclasses() {
+        return null;
+    }
+
+    @Override
     public HostedType getBaseType() {
         return this;
     }
@@ -81,7 +88,7 @@ public class HostedPrimitiveType extends HostedType {
 
     @Override
     public HostedField[] getInstanceFields(boolean includeSuperclasses) {
-        return new HostedField[0];
+        return HostedField.EMPTY_ARRAY;
     }
 
     @Override

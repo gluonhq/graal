@@ -29,23 +29,41 @@ import java.lang.reflect.InvocationHandler;
 
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.annotate.TargetElement;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.RuntimeClassLoading.NoRuntimeClassLoading;
+import com.oracle.svm.core.hub.RuntimeClassLoading.WithRuntimeClassLoading;
 
 @TargetClass(java.lang.reflect.Proxy.class)
 final class Target_java_lang_reflect_Proxy {
 
     /** We have our own proxy cache so mark the original one as deleted. */
     @Delete //
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class) //
     private static Target_jdk_internal_loader_ClassLoaderValue proxyCache;
 
+    @Alias
+    @TargetElement(name = "getProxyConstructor", onlyWith = WithRuntimeClassLoading.class)
+    private static native Constructor<?> originalGetProxyConstructor(ClassLoader loader, Class<?>... interfaces);
+
     @Substitute
-    @SuppressWarnings("unused")
-    private static Constructor<?> getProxyConstructor(Class<?> caller, ClassLoader loader, Class<?>... interfaces) {
-        final Class<?> cl = ImageSingletons.lookup(DynamicProxyRegistry.class).getProxyClass(loader, interfaces);
+    private static Constructor<?> getProxyConstructor(ClassLoader loader, Class<?>... interfaces) {
+        if (RuntimeClassLoading.isSupported()) {
+            for (Class<?> iface : interfaces) {
+                if (DynamicHub.fromClass(iface).isRuntimeLoaded()) {
+                    return originalGetProxyConstructor(loader, interfaces);
+                }
+            }
+        }
+        final Class<?> cl = ImageSingletons.lookup(DynamicProxyRegistry.class).getProxyClass(loader, RuntimeClassLoading.isSupported(), interfaces);
+        if (RuntimeClassLoading.isSupported() && cl == null) {
+            return originalGetProxyConstructor(loader, interfaces);
+        }
         try {
             final Constructor<?> cons = cl.getConstructor(InvocationHandler.class);
             cons.setAccessible(true);
@@ -61,16 +79,24 @@ final class Target_java_lang_reflect_Proxy {
      * be explicitly excluded. GR-51931 tracks the automatic discovery of such lambdas.
      */
     @Delete
-    @TargetElement(name = "lambda$getProxyConstructor$0")
+    @TargetElement(name = "lambda$getProxyConstructor$0", onlyWith = NoRuntimeClassLoading.class)
     private static native Constructor<?> lambdaGetProxyConstructor0(ClassLoader ld, Target_jdk_internal_loader_AbstractClassLoaderValue_Sub clv);
 
     @Delete
-    @TargetElement(name = "lambda$getProxyConstructor$1")
+    @TargetElement(name = "lambda$getProxyConstructor$1", onlyWith = NoRuntimeClassLoading.class)
     private static native Constructor<?> lambdaGetProxyConstructor1(ClassLoader ld, Target_jdk_internal_loader_AbstractClassLoaderValue_Sub clv);
+
+    @Alias
+    @TargetElement(name = "isProxyClass", onlyWith = WithRuntimeClassLoading.class)
+    public static native boolean originalIsProxyClass(Class<?> cl);
 
     @Substitute
     public static boolean isProxyClass(Class<?> cl) {
-        return DynamicHub.fromClass(cl).isProxyClass();
+        DynamicHub dynamicHub = DynamicHub.fromClass(cl);
+        if (dynamicHub.isRuntimeLoaded()) {
+            return originalIsProxyClass(cl);
+        }
+        return dynamicHub.isProxyClass();
     }
 }
 

@@ -25,33 +25,40 @@
 package com.oracle.svm.core.jvmstat;
 
 import static com.oracle.svm.core.jvmstat.PerfManager.Options.PerfDataSamplingInterval;
-import static com.oracle.svm.core.option.RuntimeOptionKey.RuntimeOptionKeyFlag.Immutable;
+import static com.oracle.svm.guest.staging.option.RuntimeOptionKey.RuntimeOptionKeyFlag.Immutable;
 
 import java.util.ArrayList;
 
 import org.graalvm.collections.EconomicMap;
-import jdk.graal.compiler.options.Option;
-import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CLongPointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.IsolateArgumentParser;
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.VMInspectionOptions;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 import com.oracle.svm.core.locks.VMCondition;
 import com.oracle.svm.core.locks.VMMutex;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.RuntimeOptionKey;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
+import com.oracle.svm.core.thread.RecurringCallbackSupport;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.options.Option;
 
 /**
  * Used to create and manage performance data entries.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class PerfManager {
     private final ArrayList<PerfDataHolder> perfDataHolders;
     private final ArrayList<MutablePerfDataEntry> mutablePerfDataEntries;
@@ -64,7 +71,7 @@ public class PerfManager {
     public PerfManager() {
         perfDataHolders = new ArrayList<>();
         mutablePerfDataEntries = new ArrayList<>();
-        longEntries = EconomicMap.create();
+        longEntries = ImageHeapMap.createNonLayeredMap();
         perfDataThread = new PerfDataThread(this);
     }
 
@@ -110,7 +117,7 @@ public class PerfManager {
 
     public static boolean usePerfData() {
         int optionIndex = IsolateArgumentParser.getOptionIndex(SubstrateOptions.ConcealedOptions.UsePerfData);
-        return VMInspectionOptions.hasJvmstatSupport() && IsolateArgumentParser.getBooleanOptionValue(optionIndex);
+        return VMInspectionOptions.hasJvmstatSupport() && IsolateArgumentParser.singleton().getBooleanOptionValue(optionIndex);
     }
 
     /** Returns a pointer into the image heap. */
@@ -118,7 +125,7 @@ public class PerfManager {
         waitForInitialization();
         PerfLong entry = longEntries.get(name);
         assert Heap.getHeap().isInImageHeap(entry);
-        return (CLongPointer) Word.objectToUntrackedPointer(entry).add(WordFactory.unsigned(PerfLong.VALUE_OFFSET));
+        return (CLongPointer) Word.objectToUntrackedPointer(entry).add(Word.unsigned(PerfLong.VALUE_OFFSET));
     }
 
     public boolean hasLongPerfEntry(String name) {
@@ -144,7 +151,7 @@ public class PerfManager {
     }
 
     public RuntimeSupport.Hook initializationHook() {
-        return isFirstIsolate -> {
+        return _ -> {
             if (usePerfData()) {
                 startTime = System.nanoTime();
                 perfDataThread.start();
@@ -153,7 +160,7 @@ public class PerfManager {
     }
 
     public RuntimeSupport.Hook teardownHook() {
-        return isFirstIsolate -> {
+        return _ -> {
             if (usePerfData()) {
                 perfDataThread.shutdown();
 
@@ -176,7 +183,7 @@ public class PerfManager {
             super("Performance data");
             this.manager = manager;
             this.initializationMutex = new VMMutex("perfDataInitialization");
-            this.initializationCondition = new VMCondition(initializationMutex);
+            this.initializationCondition = new VMCondition(initializationMutex, "perfDataInitialization");
             this.initialized = false;
 
             setDaemon(true);
@@ -184,8 +191,9 @@ public class PerfManager {
 
         @Override
         public void run() {
-            initializeMemory();
+            RecurringCallbackSupport.suspendCallbackTimer("Performance data thread must not execute recurring callbacks.");
 
+            initializeMemory();
             try {
                 sampleData();
                 ImageSingletons.lookup(PerfMemory.class).setAccessible();
@@ -213,8 +221,11 @@ public class PerfManager {
 
                 initialized = true;
                 initializationCondition.broadcast();
+            } catch (OutOfMemoryError e) {
+                /* For now, we can only rethrow the error to terminate the thread (see GR-40601). */
+                throw e;
             } catch (Throwable e) {
-                VMError.shouldNotReachHere(ERROR_DURING_INITIALIZATION, e);
+                throw VMError.shouldNotReachHere(ERROR_DURING_INITIALIZATION, e);
             } finally {
                 initializationMutex.unlock();
             }

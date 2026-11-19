@@ -1,0 +1,159 @@
+/*
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted.imagelayer;
+
+import static com.oracle.svm.hosted.NativeImageClassLoaderSupport.PathDigestEntry;
+
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.jar.JarOutputStream;
+
+import org.graalvm.nativeimage.Platform;
+
+import com.oracle.svm.core.BuildArtifacts;
+import com.oracle.svm.core.BuildArtifacts.ArtifactType;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.util.ArchiveSupport;
+import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.hosted.NativeImageClassLoaderSupport;
+import com.oracle.svm.hosted.NativeImageGenerator;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+
+/* Builds an image layer, either initial or intermediate. */
+public class WriteLayerArchiveSupport extends LayerArchiveSupport {
+    private static final int CLASS_IDENTITY_HASH_CODES_MAGIC = 0x4A434948;
+
+    record ClassIdentityHashCode(int identityHashCode, String loaderName, String className) {
+    }
+
+    private final List<String> builderArguments;
+    private final List<PathDigestEntry> buildPathDigests;
+    private List<ClassIdentityHashCode> classIdentityHashCodes = List.of();
+
+    public WriteLayerArchiveSupport(String layerName, NativeImageClassLoaderSupport classLoaderSupport, Path tempDir, ArchiveSupport archiveSupport, boolean enableLogging) {
+        super(layerName, classLoaderSupport.getLayerFile(), tempDir.resolve(LAYER_TEMP_DIR_PREFIX + "write"), archiveSupport, enableLogging);
+        if (!layerName.startsWith(SHARED_LIB_NAME_PREFIX)) {
+            throw UserError.abort("Shared layer library image name given with '" +
+                            SubstrateOptionsParser.commandArgument(SubstrateOptions.Name, layerName) +
+                            "' needs to start with '" + SHARED_LIB_NAME_PREFIX + "'");
+        }
+        builderArguments = new ArrayList<>(classLoaderSupport.getHostedOptionParser().getArguments());
+        buildPathDigests = new ArrayList<>(classLoaderSupport.getPathEntryDigests());
+    }
+
+    @Override
+    protected void validateLayerFile() {
+        super.validateLayerFile();
+
+        Path layerFilePath = layerFile.toAbsolutePath();
+        Path layerParentPath = layerFilePath.getParent();
+        if (layerParentPath == null) {
+            throw UserError.abort("The given layer file " + layerFile + " doesn't have a parent directory.");
+        }
+        if (!Files.isWritable(layerParentPath)) {
+            throw UserError.abort("The layer file parent directory " + layerParentPath + " is not writeable.");
+        }
+        if (Files.exists(layerFilePath) && !Files.isWritable(layerFilePath)) {
+            throw UserError.abort("The given layer file " + layerFile + " is not writeable.");
+        }
+    }
+
+    private static <T> void writeBuildEntries(Path path, List<T> buildEntries, String buildEntryTypeDescription) {
+        try {
+            Files.write(path, buildEntries.stream().map(T::toString).toList());
+        } catch (IOException e) {
+            throw UserError.abort("Unable to write " + buildEntryTypeDescription + " to file " + path);
+        }
+    }
+
+    public void setClassIdentityHashCodes(List<ClassIdentityHashCode> entries) {
+        classIdentityHashCodes = List.copyOf(entries);
+    }
+
+    /**
+     * Writes the binary input format required by HotSpot's {@code JVMCIClassIdentityHashCodeFile}
+     * option. The format is defined in {@code src/hotspot/share/jvmci/jvmci_globals.cpp}. Changes
+     * must remain compatible with that reader.
+     * <p>
+     * The file contains big-endian 32-bit integers for the magic {@code 0x4A434948} ({@code JCIH})
+     * and entry count, followed by each entry's positive 32-bit identity hash code, loader name,
+     * and class name. Both names use {@link DataOutputStream#writeUTF(String)}: a big-endian
+     * unsigned 16-bit encoded byte length followed by modified UTF-8 bytes. Names must be nonempty,
+     * and each pair of loader and class names must be unique. There is no padding, version field,
+     * or trailing data. An empty mapping consists of the magic and a zero entry count.
+     */
+    private void writeClassIdentityHashCodes(Path path) {
+        try (DataOutputStream out = new DataOutputStream(Files.newOutputStream(path))) {
+            out.writeInt(CLASS_IDENTITY_HASH_CODES_MAGIC);
+            out.writeInt(classIdentityHashCodes.size());
+            for (ClassIdentityHashCode entry : classIdentityHashCodes) {
+                out.writeInt(entry.identityHashCode());
+                out.writeUTF(entry.loaderName());
+                out.writeUTF(entry.className());
+            }
+        } catch (IOException e) {
+            throw UserError.abort("Unable to write class identity hash codes to file " + path);
+        }
+    }
+
+    public void write(Platform current) {
+        try (JarOutputStream jarOutStream = new JarOutputStream(Files.newOutputStream(layerFile), archiveSupport.createManifest())) {
+            // disable compression for significant (un)archiving speedup at the cost of file size
+            jarOutStream.setLevel(0);
+            // write builder arguments file and add to jar
+            Path builderArgumentsFilePath = getBuilderArgumentsFilePath();
+            writeBuildEntries(builderArgumentsFilePath, builderArguments, "builder arguments");
+            archiveSupport.addFileToJar(layerDir, builderArgumentsFilePath, layerFile, jarOutStream);
+            // write environment variables file and add to jar
+            Path envVariablesFilePath = getEnvVariablesFilePath();
+            writeBuildEntries(envVariablesFilePath, parseEnvVariables(), "environment variables");
+            archiveSupport.addFileToJar(layerDir, envVariablesFilePath, layerFile, jarOutStream);
+            // write image class and module paths digests file and add to jar
+            Path buildPathDigestsFilePath = getBuildPathDigestsFilePath();
+            writeBuildEntries(buildPathDigestsFilePath, buildPathDigests, "build path digests");
+            archiveSupport.addFileToJar(layerDir, buildPathDigestsFilePath, layerFile, jarOutStream);
+            // copy the layer snapshot file and its graphs file to the jar
+            archiveSupport.addFileToJar(layerDir, getSnapshotPath(), layerFile, jarOutStream);
+            archiveSupport.addFileToJar(layerDir, getSnapshotGraphsPath(), layerFile, jarOutStream);
+            Path classIdentityHashCodesPath = layerDir.resolve(CLASS_IDENTITY_HASH_CODES_FILE_NAME);
+            writeClassIdentityHashCodes(classIdentityHashCodesPath);
+            archiveSupport.addFileToJar(layerDir, classIdentityHashCodesPath, layerFile, jarOutStream);
+            // copy the shared object file to the jar
+            Path sharedLibFile = BuildArtifacts.singleton().get(BuildArtifacts.ArtifactType.IMAGE_LAYER).getFirst();
+            archiveSupport.addFileToJar(NativeImageGenerator.getOutputDirectory(), sharedLibFile, layerFile, jarOutStream);
+            // write properties file and add to jar
+            layerProperties.write(current);
+            archiveSupport.addFileToJar(layerDir, getLayerPropertiesFile(), layerFile, jarOutStream);
+            BuildArtifacts.singleton().add(ArtifactType.IMAGE_LAYER_BUNDLE, layerFile);
+        } catch (IOException e) {
+            throw UserError.abort("Failed to create Native Image Layer file " + layerFile.getFileName(), e);
+        }
+        info("Layer written to %s", layerFile);
+    }
+}

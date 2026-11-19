@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,12 +41,12 @@
 package com.oracle.truffle.host;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.Fallback;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.ArityException;
+import com.oracle.truffle.api.interop.HeapIsolationException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
@@ -68,37 +68,41 @@ final class HostFunction implements TruffleObject {
         this.context = context;
     }
 
-    public static boolean isInstance(HostLanguage language, TruffleObject obj) {
-        return isInstance(language, (Object) obj);
-    }
-
-    public static boolean isInstance(HostLanguage language, Object obj) {
-        return HostLanguage.unwrapIfScoped(language, obj) instanceof HostFunction;
-    }
-
     @SuppressWarnings("static-method")
     @ExportMessage
     boolean isExecutable() {
         return true;
     }
 
+    @SuppressWarnings("static-method")
+    @ExportMessage
+    boolean isHostObject() {
+        return true;
+    }
+
+    @SuppressWarnings("static-method")
+    @ExportMessage
+    Object asHostObject() throws HeapIsolationException {
+        throw HeapIsolationException.create();
+    }
+
     @ExportMessage
     Object execute(Object[] args,
-                    @Bind("$node") Node node,
+                    @Bind Node node,
                     @Cached HostExecuteNode execute) throws UnsupportedTypeException, ArityException {
         return execute.execute(node, method, obj, args, context);
     }
 
     @SuppressWarnings("static-method")
     @ExportMessage
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @SuppressWarnings("static-method")
     @ExportMessage
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return HostLanguage.class;
+    String getLanguageId() {
+        return HostLanguage.ID;
     }
 
     @ExportMessage
@@ -146,5 +150,4 @@ final class HostFunction implements TruffleObject {
     public int hashCode() {
         return method.hashCode();
     }
-
 }

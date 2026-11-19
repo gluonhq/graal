@@ -31,6 +31,8 @@ import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.hub.RuntimeClassLoading.NoRuntimeClassLoading;
 import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
 
 @TargetClass(java.lang.invoke.MethodType.class)
@@ -52,12 +54,25 @@ final class Target_java_lang_invoke_MethodType {
 
 @TargetClass(className = "java.lang.invoke.Invokers")
 final class Target_java_lang_invoke_Invokers {
+
+    /**
+     * Substitute to remove the {@code @DontInline} from the original method.
+     */
+    @Substitute
+    static void maybeCustomize(Target_java_lang_invoke_MethodHandle mh) {
+        /*
+         * MethodHandle.maybeCustomized() is _currently_ substituted by an empty method. We still
+         * call it here and represent the original behavior to make it future-proof.
+         */
+        mh.maybeCustomize();
+    }
 }
 
 @TargetClass(className = "java.lang.invoke.InvokerBytecodeGenerator")
 final class Target_java_lang_invoke_InvokerBytecodeGenerator {
     @SuppressWarnings("unused")
     @Substitute
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class)
     static Target_java_lang_invoke_MemberName generateLambdaFormInterpreterEntryPoint(MethodType mt) {
         return null; /* Prevent runtime compilation of invokers */
     }

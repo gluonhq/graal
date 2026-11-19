@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -352,8 +352,12 @@ public abstract class AbstractProcessor extends javax.annotation.processing.Abst
      * line containing {@code serviceClassName}.
      */
     public void createProviderFile(String providerClassName, String serviceClassName, Element... originatingElements) {
+        createRegistrationFile("providers", providerClassName, serviceClassName, originatingElements);
+    }
+
+    public void createRegistrationFile(String namespace, String providerClassName, String serviceClassName, Element... originatingElements) {
         assert originatingElements.length > 0;
-        String filename = "META-INF/providers/" + providerClassName;
+        String filename = "META-INF/" + namespace + "/" + providerClassName;
         try {
             FileObject file = processingEnv.getFiler().createResource(StandardLocation.CLASS_OUTPUT, "", filename, originatingElements);
             PrintWriter writer = new PrintWriter(new OutputStreamWriter(file.openOutputStream(), "UTF-8"));

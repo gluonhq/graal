@@ -28,7 +28,9 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.ComparableWord;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Wrapper for arrays that will be part of the image heap and be unmovable as such, but are accessed

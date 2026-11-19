@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -86,9 +86,9 @@ def checkCFiles(clangFormat, target, reason):
                 if f.endswith('.c') or f.endswith('.cpp') or f.endswith('.h') or f.endswith('.hpp'):
                     files_to_check.append(os.path.join(path, f))
     if not files_to_check:
-        mx.logv("clang-format: no files found {} ({})".format(target, reason))
+        mx.logv(f"clang-format: no files found {target} ({reason})")
         return True
-    mx.logv("clang-format: checking {} ({}, {} files)".format(target, reason, len(files_to_check)))
+    mx.logv(f"clang-format: checking {target} ({reason}, {len(files_to_check)} files)")
     for f in files_to_check:
         if not checkCFile(clangFormat, f):
             error = True
@@ -100,13 +100,13 @@ def checkCFile(clangFormat, targetFile):
     """ Checks the formatting of a C file and returns True if the formatting is okay """
     formatCommand = [clangFormat, targetFile]
     formattedContent = subprocess.check_output(formatCommand).decode().splitlines()
-    with open(targetFile) as f:
+    with open(targetFile, encoding='utf-8') as f:
         originalContent = f.read().splitlines()
     if not formattedContent == originalContent:
         # modify the file to the right format
         subprocess.check_output(formatCommand + ['-i'])
         mx.log('\n'.join(formattedContent))
-        mx.log('\nmodified formatting in {0} to the format above'.format(targetFile))
+        mx.log(f'\nmodified formatting in {targetFile} to the format above')
         mx.logv("command: " + " ".join(formatCommand))
         return False
     return True

@@ -3,11 +3,15 @@ import_export_functions/main;friend;man-in-the-middle
 import_export_table/main;man-in-the-middle;table-registry
 import_export_globals/main;man-in-the-middle;runtime
 import_export_mutable_globals/main;man-in-the-middle;runtime
+import_export_exceptions/main;man-in-the-middle;friend
+import_export_legacy_exceptions/main;man-in-the-middle;friend
 import_func_twice/main;lib
 global_initialization/main;mediator;runtime
 relative_data_section/main;constant-pools;runtime
 relative_elem_section/main;virtual-tables;runtime
 global_const_expressions/main;mediator;runtime
-dynamic_data_offset/main;constant-pools;runtime
-dynamic_elem_offset/main;virtual-tables;runtime
+dynamic_data_offset/main;constant-pools-globals;constant-pools;runtime
+dynamic_elem_offset/main;virtual-tables;runtime-globals;runtime
+tail_call_in_start
 unsafe_passive_data_segment
+memory_import_requires_maximum/main;memory

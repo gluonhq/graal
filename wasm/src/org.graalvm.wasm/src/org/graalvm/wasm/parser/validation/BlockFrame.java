@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,55 +41,62 @@
 
 package org.graalvm.wasm.parser.validation;
 
-import org.graalvm.wasm.collection.IntArrayList;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
+import java.util.ArrayList;
+import java.util.BitSet;
+
+import org.graalvm.wasm.SymbolTable;
+import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.parser.bytecode.BytecodeFixup;
 import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 
 /**
  * Representation of a wasm block during module validation.
  */
 class BlockFrame extends ControlFrame {
-    private final IntArrayList branches;
+    private final ArrayList<BytecodeFixup> labelFixups;
 
-    BlockFrame(byte[] paramTypes, byte[] resultTypes, int initialStackSize, boolean unreachable) {
-        super(paramTypes, resultTypes, initialStackSize, unreachable);
-        branches = new IntArrayList();
+    private BlockFrame(int[] paramTypes, int[] resultTypes, SymbolTable symbolTable, int initialStackSize, BitSet initializedLocals, int legacyCatchDepth) {
+        super(paramTypes, resultTypes, symbolTable, initialStackSize, initializedLocals, legacyCatchDepth);
+        labelFixups = new ArrayList<>();
+    }
+
+    BlockFrame(int[] paramTypes, int[] resultTypes, int initialStackSize, ControlFrame parentFrame) {
+        this(paramTypes, resultTypes, parentFrame.getSymbolTable(), initialStackSize, (BitSet) parentFrame.initializedLocals.clone(), parentFrame.legacyCatchDepth());
+    }
+
+    static BlockFrame createFunctionFrame(int[] paramTypes, int[] resultTypes, int[] locals, SymbolTable symbolTable) {
+        BitSet initializedLocals = new BitSet(locals.length);
+        for (int localIndex = 0; localIndex < locals.length; localIndex++) {
+            if (localIndex < paramTypes.length || WasmType.hasDefaultValue(locals[localIndex])) {
+                initializedLocals.set(localIndex);
+            }
+        }
+        return new BlockFrame(paramTypes, resultTypes, symbolTable, 0, initializedLocals, 0);
     }
 
     @Override
-    byte[] labelTypes() {
+    int[] labelTypes() {
         return resultTypes();
     }
 
     @Override
-    void enterElse(ParserState state, RuntimeBytecodeGen bytecode) {
-        throw WasmException.create(Failure.TYPE_MISMATCH, "Expected then branch. Else branch requires preceding then branch.");
+    void exit(ParserState state, RuntimeBytecodeGen bytecode) {
+        exitBlock(bytecode);
+        registerDelegateContinuationFixups(state, -1);
     }
 
-    @Override
-    void exit(RuntimeBytecodeGen bytecode) {
-        if (branches.size() == 0) {
+    protected void exitBlock(RuntimeBytecodeGen bytecode) {
+        if (labelFixups.isEmpty()) {
             return;
         }
-        final int location = bytecode.addLabel(resultTypeLength(), initialStackSize(), commonResultType());
-        for (int branchLocation : branches.toArray()) {
-            bytecode.patchLocation(branchLocation, location);
+        final int location = addBranchLabel(bytecode);
+        for (BytecodeFixup labelFixup : labelFixups) {
+            labelFixup.patch(location);
         }
     }
 
     @Override
-    void addBranch(RuntimeBytecodeGen bytecode) {
-        branches.add(bytecode.addBranchLocation());
-    }
-
-    @Override
-    void addBranchIf(RuntimeBytecodeGen bytecode) {
-        branches.add(bytecode.addBranchIfLocation());
-    }
-
-    @Override
-    void addBranchTableItem(RuntimeBytecodeGen bytecode) {
-        branches.add(bytecode.addBranchTableItemLocation());
+    void addLabelFixup(BytecodeFixup fixup) {
+        labelFixups.add(fixup);
     }
 }

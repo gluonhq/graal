@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,11 @@
  */
 package jdk.graal.compiler.lir.aarch64;
 
+import static jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDInstruction.LD1_MULTIPLE_1R;
+import static jdk.graal.compiler.asm.aarch64.AArch64Address.AddressingMode.IMMEDIATE_PAIR_SIGNED_SCALED;
+import static jdk.graal.compiler.asm.aarch64.AArch64Address.AddressingMode.IMMEDIATE_UNSIGNED_SCALED;
+import static jdk.graal.compiler.lir.LIRInstruction.OperandFlag.REG;
+import static jdk.graal.compiler.lir.aarch64.AArch64AESEncryptOp.asFloatRegister;
 import static jdk.vm.ci.aarch64.AArch64.v0;
 import static jdk.vm.ci.aarch64.AArch64.v1;
 import static jdk.vm.ci.aarch64.AArch64.v2;
@@ -38,13 +43,6 @@ import static jdk.vm.ci.aarch64.AArch64.v5;
 import static jdk.vm.ci.aarch64.AArch64.v6;
 import static jdk.vm.ci.aarch64.AArch64.v7;
 import static jdk.vm.ci.code.ValueUtil.asRegister;
-import static jdk.graal.compiler.asm.aarch64.AArch64Address.AddressingMode.IMMEDIATE_PAIR_SIGNED_SCALED;
-import static jdk.graal.compiler.asm.aarch64.AArch64Address.AddressingMode.IMMEDIATE_POST_INDEXED;
-import static jdk.graal.compiler.asm.aarch64.AArch64Address.AddressingMode.IMMEDIATE_SIGNED_UNSCALED;
-import static jdk.graal.compiler.lir.LIRInstruction.OperandFlag.REG;
-import static jdk.graal.compiler.lir.aarch64.AArch64AESEncryptOp.asFloatRegister;
-
-import java.util.Arrays;
 
 import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.asm.aarch64.AArch64ASIMDAssembler.ASIMDSize;
@@ -53,11 +51,10 @@ import jdk.graal.compiler.asm.aarch64.AArch64Address;
 import jdk.graal.compiler.asm.aarch64.AArch64Assembler.ConditionFlag;
 import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
 import jdk.graal.compiler.debug.GraalError;
-import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.SyncPort;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.aarch64.AArch64Kind;
 import jdk.vm.ci.code.Register;
@@ -65,9 +62,9 @@ import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.Value;
 
 // @formatter:off
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/43a2f17342af8f5bf1f5823df9fa0bf0bdfdfce2/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L6177-L6311",
-          sha1 = "84b96e679b2ff5dc836da5c28fbbc779b5320a2b")
-@SyncPort(from = "https://github.com/openjdk/jdk/blob/12358e6c94bc96e618efc3ec5299a2cfe1b4669d/src/hotspot/cpu/aarch64/macroAssembler_aarch64_aes.cpp#L285-L691",
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/c59e44a7aa2aeff0823830b698d524523b996650/src/hotspot/cpu/aarch64/stubGenerator_aarch64.cpp#L9616-L9752",
+          sha1 = "e385b7b468c17a8a20a214415d878d732cab6d39")
+@SyncPort(from = "https://github.com/openjdk/jdk25u/blob/98a93e115137a305aed6b7dbf1d4a7d5906fe77c/src/hotspot/cpu/aarch64/macroAssembler_aarch64_aes.cpp#L284-L690",
           sha1 = "1cd41d8f202ebe127aa31053ab3c6851f3900034")
 // @formatter:on
 public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
@@ -101,7 +98,7 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         this.dataValue = tool.newVariable(originalDataValue.getValueKind());
         this.blocksValue = tool.newVariable(originalBlocksValue.getValueKind());
 
-        this.temps = Arrays.stream(AArch64.simdRegisters.toArray()).map(Register::asValue).toArray(Value[]::new);
+        this.temps = AArch64.simdRegisters.stream().map(Register::asValue).toArray(Value[]::new);
     }
 
     @Override
@@ -125,7 +122,7 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         masm.mov(64, data, originalData);
         masm.mov(32, blocks, originalBlocks);
 
-        masm.compare(32, blocks, 8);
+        masm.compare(64, blocks, 8);
         masm.branchConditionally(ConditionFlag.LT, labelSmall);
 
         // No need to save/restore states as we already mark all SIMD registers as killed.
@@ -145,7 +142,7 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         // AArch64Address.createStructureImmediatePostIndexAddress(ASIMDInstruction.LD1_MULTIPLE_4R,
         // ASIMDSize.FullReg, ElementSize.Byte, sp, 64));
 
-        masm.compare(32, blocks, 0);
+        masm.compare(64, blocks, 0);
         masm.branchConditionally(ConditionFlag.LE, labelDone);
 
         masm.bind(labelSmall);
@@ -171,6 +168,8 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         Register vzr = v30;
         masm.neon.eorVVV(ASIMDSize.FullReg, vzr, vzr, vzr); // zero register
         // The field polynomial
+        // HotSpot loads this from an inline code literal. SVM rejects direct AArch64
+        // literal-load relocations, so materialize the same vector through a scratch register.
         try (AArch64MacroAssembler.ScratchRegister sc = masm.getScratchRegister()) {
             Register scratch = sc.getRegister();
             masm.mov(scratch, 0x00000087L);
@@ -195,7 +194,7 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         masm.bind(labelGHASHLoop);
 
         // Load the data, bit reversing each byte
-        masm.fldr(128, v2, AArch64Address.createImmediateAddress(128, IMMEDIATE_POST_INDEXED, data, 0x10));
+        masm.neon.ld1MultipleV(ASIMDSize.FullReg, ElementSize.Byte, v2, AArch64Address.createStructureImmediatePostIndexAddress(LD1_MULTIPLE_1R, ASIMDSize.FullReg, ElementSize.Byte, data, 0x10));
         masm.neon.rbitVV(ASIMDSize.FullReg, v2, v2);
         // bit-swapped data ^ bit-swapped state
         masm.neon.eorVVV(ASIMDSize.FullReg, v2, v0, v2);
@@ -219,19 +218,19 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
                         vzr,
                         /* temp */v3);
 
-        masm.sub(32, blocks, blocks, 1);
-        masm.cbnz(32, blocks, labelGHASHLoop);
+        masm.sub(64, blocks, blocks, 1);
+        masm.cbnz(64, blocks, labelGHASHLoop);
 
         // The bit-reversed result is at this point in v0
         masm.neon.rev64VV(ASIMDSize.FullReg, ElementSize.Byte, v0, v0);
         masm.neon.rbitVV(ASIMDSize.FullReg, v0, v0);
-        masm.fstr(128, v0, AArch64Address.createBaseRegisterOnlyAddress(128, state));
+        masm.neon.st1MultipleV(ASIMDSize.FullReg, ElementSize.Byte, v0, AArch64Address.createStructureNoOffsetAddress(state));
     }
 
     /**
      * Interleaved GHASH processing. Clobbers all vector registers.
      */
-    private static void ghashProcessBlocksWide(AArch64MacroAssembler masm,
+    static void ghashProcessBlocksWide(AArch64MacroAssembler masm,
                     Register state,
                     Register subkeyH,
                     Register data,
@@ -244,6 +243,8 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         masm.neon.eorVVV(ASIMDSize.FullReg, vzr, vzr, vzr); // zero register
 
         // The field polynomial
+        // HotSpot loads this from an inline code literal. SVM rejects direct AArch64
+        // literal-load relocations, so materialize the same vector through a scratch register.
         try (AArch64MacroAssembler.ScratchRegister sc = masm.getScratchRegister()) {
             Register scratch = sc.getRegister();
             masm.mov(scratch, 0x00000087L);
@@ -297,13 +298,13 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
                             v2);
             masm.neon.rev64VV(ASIMDSize.FullReg, ElementSize.Byte, v1, v6);
             masm.neon.rbitVV(ASIMDSize.FullReg, v1, v1);
-            masm.fstr(128, v1, AArch64Address.createImmediateAddress(128, IMMEDIATE_SIGNED_UNSCALED, subkeyH, 16 * i));
+            masm.fstr(128, v1, AArch64Address.createImmediateAddress(128, IMMEDIATE_UNSIGNED_SCALED, subkeyH, 16 * i));
         }
         masm.jmp(labelDone);
         masm.bind(labelAlreadyCalculated);
 
         // Load the largest power of H we need into v6.
-        masm.fldr(128, v6, AArch64Address.createImmediateAddress(128, IMMEDIATE_SIGNED_UNSCALED, subkeyH, 16 * (unrolls - 1)));
+        masm.fldr(128, v6, AArch64Address.createImmediateAddress(128, IMMEDIATE_UNSIGNED_SCALED, subkeyH, 16 * (unrolls - 1)));
         masm.neon.rev64VV(ASIMDSize.FullReg, ElementSize.Byte, v6, v6);
         masm.neon.rbitVV(ASIMDSize.FullReg, v6, v6);
 
@@ -326,7 +327,8 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
 
         // Load #unrolls blocks of data
         for (int ofs = 0; ofs < unrolls * REGISTER_STRIDE; ofs += REGISTER_STRIDE) {
-            masm.fldr(128, asFloatRegister(v2, ofs), AArch64Address.createImmediateAddress(128, IMMEDIATE_POST_INDEXED, data, 0x10));
+            masm.neon.ld1MultipleV(ASIMDSize.FullReg, ElementSize.Byte, asFloatRegister(v2, ofs),
+                            AArch64Address.createStructureImmediatePostIndexAddress(LD1_MULTIPLE_1R, ASIMDSize.FullReg, ElementSize.Byte, data, 0x10));
         }
 
         // Register assignments, replicated across 4 clones, v0 ... v23
@@ -391,8 +393,8 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
                         /* temp */v3,
                         true).unroll();
 
-        masm.sub(32, blocks, blocks, unrolls);
-        masm.compare(32, blocks, unrolls * 2);
+        masm.sub(64, blocks, blocks, unrolls);
+        masm.compare(64, blocks, unrolls * 2);
         masm.branchConditionally(ConditionFlag.GE, labelGHASHLoop);
 
         // Merge the #unrolls states. Note that the data for the next
@@ -401,7 +403,7 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
         // First, we multiply/reduce each clone by the appropriate power of H.
         for (int i = 0; i < unrolls; i++) {
             int ofs = i * REGISTER_STRIDE;
-            masm.fldr(128, hPrime, AArch64Address.createImmediateAddress(128, IMMEDIATE_SIGNED_UNSCALED, subkeyH, 16 * (unrolls - i - 1)));
+            masm.fldr(128, hPrime, loadSubkeyHAddress(subkeyH, 16 * (unrolls - i - 1)));
 
             masm.neon.rbitVV(ASIMDSize.FullReg, asFloatRegister(v2, ofs), asFloatRegister(v2, ofs));
             // bit-swapped data ^ bit-swapped state
@@ -433,12 +435,16 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
             masm.neon.eorVVV(ASIMDSize.FullReg, v0, v0, asFloatRegister(v0, ofs + REGISTER_STRIDE));
         }
 
-        masm.sub(32, blocks, blocks, unrolls);
+        masm.sub(64, blocks, blocks, unrolls);
 
         // And finally bit-reverse the state back to big endian.
         masm.neon.rev64VV(ASIMDSize.FullReg, ElementSize.Byte, v0, v0);
         masm.neon.rbitVV(ASIMDSize.FullReg, v0, v0);
-        masm.fstr(128, v0, AArch64Address.createBaseRegisterOnlyAddress(128, state));
+        masm.neon.st1MultipleV(ASIMDSize.FullReg, ElementSize.Byte, v0, AArch64Address.createStructureNoOffsetAddress(state));
+    }
+
+    private static AArch64Address loadSubkeyHAddress(Register subkeyH, int offset) {
+        return offset == 0 ? AArch64Address.createBaseRegisterOnlyAddress(128, subkeyH) : AArch64Address.createImmediateAddress(128, IMMEDIATE_UNSIGNED_SCALED, subkeyH, offset);
     }
 
     static final class GHASHMultiplyGenerator extends AArch64AESEncryptOp.KernelGenerator {
@@ -652,8 +658,8 @@ public final class AArch64GHASHProcessBlocksOp extends AArch64LIRInstruction {
             if (!Register.None.equals(data) && once) {
                 assert length() >= unrolls : "not enough room for interleaved loads";
                 if (index < unrolls) {
-                    masm.fldr(128, asFloatRegister(data, index * REGISTER_STRIDE),
-                                    AArch64Address.createImmediateAddress(128, IMMEDIATE_POST_INDEXED, dataPtr, 0x10));
+                    masm.neon.ld1MultipleV(ASIMDSize.FullReg, ElementSize.Byte, asFloatRegister(data, index * REGISTER_STRIDE),
+                                    AArch64Address.createStructureImmediatePostIndexAddress(LD1_MULTIPLE_1R, ASIMDSize.FullReg, ElementSize.Byte, dataPtr, 0x10));
                 }
             }
         }

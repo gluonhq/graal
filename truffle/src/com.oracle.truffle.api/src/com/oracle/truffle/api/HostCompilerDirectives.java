@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -89,6 +89,68 @@ public final class HostCompilerDirectives {
     }
 
     /**
+     * Marks a switch statement within a loop as a candidate for threaded switch optimization.
+     * Threaded switch replicates the switch statement at the end of each case, improving branch
+     * prediction at the processor level.
+     *
+     * Usage example:
+     *
+     * <pre>
+     * while (cond) {
+     *   input = inlinedNextOpcode();
+     *   switch (markThreadedSwitch(input)) {
+     *     case op1: { body1; }
+     *     case op2: { body2; }
+     *   }
+     * }
+     * </pre>
+     *
+     * The compiler recognizes the code blocks from the loop header up to the switch and duplicates
+     * them into each case that continues the while loop. This effectively transforms the structure
+     * as follows:
+     *
+     * <pre>
+     * if (cond) {
+     *   input = inlinedNextOpcode();
+     *   switch (markThreadedSwitch(input)) {
+     *     case op1: {
+     *         body1;
+     *         if (cond) {
+     *           input = inlinedNextOpcode();
+     *           switch (markThreadedSwitch(input)) // go to matching case of outer switch
+     *         }
+     *     }
+     *     case op2: {
+     *         body2;
+     *         if (cond) {
+     *           input = inlinedNextOpcode();
+     *           switch (markThreadedSwitch(input)) // go to matching case of outer switch
+     *         }
+     *     }
+     *   }
+     * }
+     * </pre>
+     *
+     * When additional statements follow the switch block within a loop, the compiler may trigger an
+     * optimization to duplicate these statements into each case block. If this duplication does not
+     * occur, the compiler can still identify the loop as a candidate for threaded switch
+     * optimization and apply relevant optimizations to minimize overhead in the loop header, such
+     * as postponing register spilling from the loop header to cases with actual register pressure,
+     * even at the cost of code bloat. However, due to the presence of these tail statements, the
+     * loop has only one back edge, which effectively disables threading.
+     *
+     * The compiler may also reject candidates for threaded switch optimization if the identified
+     * code blocks, after inlining, contain complex control flow or operations beyond memory reads.
+     * To log decisions related to threaded switch optimization, use the Graal option
+     * {@code TraceThreadedSwitchOptimization}.
+     *
+     * @since 25.1
+     */
+    public static int markThreadedSwitch(int input) {
+        return input;
+    }
+
+    /**
      * Marks a method that is an implementation of a Truffle interpreter, and which should receive
      * additional optimization budget.
      * <p>
@@ -101,26 +163,6 @@ public final class HostCompilerDirectives {
     @Retention(RetentionPolicy.RUNTIME)
     @Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
     public @interface BytecodeInterpreterSwitch {
-    }
-
-    /**
-     * Marks a method that is called from a Truffle interpreter, but is not called frequently and is
-     * not important for interpreter performance.
-     * <p>
-     * This annotation is used to annotate methods that are called from a bytecode interpreter, but
-     * should generally not be inlined into the body of the bytecode interpreter. Language
-     * implementers are advised to inspect the IR of the interpreter when using this.
-     *
-     * @see BytecodeInterpreterSwitch to annotate the root method of a bytecode interpreter
-     *
-     * @deprecated use is no longer needed. boundaries for {@link BytecodeInterpreterSwitch} are
-     *             mostly determined automatically. To migrate remove all usages.
-     * @since 21.0
-     */
-    @Retention(RetentionPolicy.RUNTIME)
-    @Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
-    @Deprecated(since = "22.2")
-    public @interface BytecodeInterpreterSwitchBoundary {
     }
 
     /**
@@ -158,4 +200,275 @@ public final class HostCompilerDirectives {
     public @interface InliningCutoff {
     }
 
+    /**
+     * Marks a method as a candidate for Truffle host inlining. The host compiler may use this
+     * information to guide inlining and optimization decisions.
+     * <p>
+     * Annotated methods must be designed for partial evaluation. This annotation should not be
+     * applied to arbitrary Java code or third-party libraries, as doing so may cause severe
+     * performance degradation.
+     * <p>
+     * Typical examples include {@code execute} methods of cached nodes. The Truffle DSL
+     * automatically applies this annotation to every generated execute method. It is recommended to
+     * be used for manually written {@code execute} methods as well.
+     * <p>
+     * For more details, see the
+     * <a href="https://github.com/oracle/graal/blob/master/truffle/docs/HostCompilation.md">
+     * Truffle host compilation documentation</a>.
+     *
+     * @since 25.1
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
+    public @interface InliningRoot {
+    }
+
+    /**
+     * Annotates a method that serves as a Truffle interpreter bytecode handler, that is, a method
+     * implements the complete semantics of a single bytecode instruction.
+     * <p>
+     * For more details, see the <a href=
+     * "https://github.com/oracle/graal/blob/master/truffle/docs/OneCompilationPerBytecodeHandler.md">
+     * One Compilation per Bytecode Handler documentation</a>.
+     *
+     * @since 25.1
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface BytecodeInterpreterHandler {
+        /**
+         * The handled bytecode's opcodes.
+         */
+        int[] value();
+
+        /**
+         * Indicates whether to enable tail call threading at the end of this handler. If
+         * {@code false}, the threading will terminate, and control will return to the switch-loop
+         * after this handler is executed. Alternatively, omitting the
+         * {@link BytecodeInterpreterHandler} annotation will cause control to return to the
+         * switch-loop before this handler is executed.
+         */
+        boolean threading() default true;
+
+        /**
+         * Indicates whether host safepoint should be inserted in the stub correspond to this
+         * handler.
+         */
+        boolean safepoint() default true;
+    }
+
+    /**
+     * Configuration for all bytecode interpreter handler arguments, including the receiver. Must be
+     * used in conjunction with {@link BytecodeInterpreterSwitch}.
+     *
+     * @see BytecodeInterpreterHandler
+     * @since 25.1
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface BytecodeInterpreterHandlerConfig {
+        /**
+         * Configuration for a bytecode interpreter handler argument.
+         *
+         * @see BytecodeInterpreterHandler
+         * @since 25.1
+         */
+        @Retention(RetentionPolicy.RUNTIME)
+        @Target(ElementType.METHOD)
+        public @interface Argument {
+            enum ExpansionKind {
+                /**
+                 * No expansion.
+                 */
+                NONE,
+
+                /**
+                 * The argument is expanded into its subfields in addition to the original argument.
+                 */
+                MATERIALIZED,
+
+                /**
+                 * The argument is expanded into its subfields without the original argument.
+                 */
+                VIRTUAL,
+            }
+
+            /**
+             * Configuration for an expanded field.
+             *
+             * @since 25.1
+             */
+            @Retention(RetentionPolicy.RUNTIME)
+            @Target(ElementType.METHOD)
+            public @interface Field {
+                /**
+                 * Name of the field.
+                 */
+                String name();
+
+                /**
+                 * Indicates that this field is always non-null. A null check will be placed before
+                 * the call site and before threading dispatch. This property is irrelevant for
+                 * primitive fields.
+                 */
+                boolean nonNull() default true;
+
+                /**
+                 * Marks this field as template state for threaded bytecode handlers. A value of
+                 * {@code N >= 2} creates one handler variant for each field value in the range
+                 * {@code [0, N)}. A value of {@code 0} disables template specialization for this
+                 * field, and {@code 1} is invalid.
+                 * <p>
+                 * Each variant starts with the corresponding field value. Before control transfers
+                 * to the next threaded handler, every control-flow path must assign a known valid
+                 * value or retain the current value. If multiple template fields are updated, their
+                 * values must be resolved through the same control-flow merge.
+                 * <p>
+                 * When threading ends, the current field value is written back to the original
+                 * argument. When template mode is disabled, the field behaves like an ordinary
+                 * expanded field.
+                 * <p>
+                 * The field must be an {@code int} field of a {@link ExpansionKind#VIRTUAL}
+                 * argument.
+                 * <p>
+                 * See the <a href=
+                 * "https://github.com/oracle/graal/blob/master/truffle/docs/OneCompilationPerBytecodeHandler.md#template">
+                 * template handler documentation</a> for examples and additional restrictions.
+                 *
+                 * @since 25.5
+                 */
+                int templateVariable() default 0;
+
+                /**
+                 * Names the template-variable field on the same virtual-expanded argument that
+                 * controls whether this field's incoming value is valid. An empty name disables
+                 * conditional validity and requires {@link #valid()} to be empty.
+                 * <p>
+                 * Only non-final, non-template {@code long} or {@code double} fields of {@link ExpansionKind#VIRTUAL} arguments
+                 * support conditional validity. This metadata is ignored on HotSpot and whenever
+                 * template mode is disabled.
+                 *
+                 * @since 25.5
+                 */
+                String validWhen() default "";
+
+                /**
+                 * Values of {@link #validWhen()} for which the incoming field value is valid.
+                 * Otherwise, the generated handler starts with an arbitrary field value that must
+                 * not be observed, including through exception-state materialization. The handler
+                 * may overwrite the field before reading it. This contract applies at handler
+                 * entry, not to subsequent changes of the template-variable field. This metadata
+                 * is ignored on HotSpot and whenever template mode is disabled.
+                 *
+                 * @since 25.5
+                 */
+                int[] valid() default {};
+            }
+
+            /**
+             * Indicates that this argument will be updated with the return value of the handler. The
+             * interpreter must store the handler result directly back to the logical local represented
+             * by this argument. Threaded handler stubs rely on that direct store shape to keep the
+             * local consistent when an exception unwinds before the normal return-value update path
+             * runs.
+             */
+            boolean returnValue() default false;
+
+            /**
+             * Indicates that this argument will be expanded in a Truffle interpreter bytecode
+             * handler stub if its expansion kind is not {@link ExpansionKind#NONE}.
+             */
+            ExpansionKind expand() default ExpansionKind.NONE;
+
+            /**
+             * Exact concrete type reconstructed for a {@link ExpansionKind#VIRTUAL} argument.
+             * {@code void.class} uses the declared parameter type. An explicit type must be a
+             * concrete instance class assignable to the parameter type. It may be defined by a
+             * different class loader from the handler's declaring class. At each outlined call,
+             * the compiler must prove that the argument is non-null and has this exact type.
+             * All instance fields, including inherited fields, are expanded. The expansion type
+             * must have at least one instance field. This property is ignored on HotSpot, which
+             * uses the declared parameter type.
+             *
+             * @since 25.5
+             */
+            Class<?> expandedType() default void.class;
+
+            /**
+             * Indicates the fields to be expanded of this argument if its expansion kind is
+             * {@link ExpansionKind#MATERIALIZED}.
+             */
+            Field[] fields() default {};
+
+            /**
+             * Indicates that this argument is always non-null. A null check will be placed before
+             * the call site and before threading dispatch. This property is irrelevant for
+             * primitive arguments.
+             */
+            boolean nonNull() default true;
+        }
+
+        /**
+         * The maximum unsigned value of the opcode. This is relevant for
+         * {@link BytecodeInterpreterHandler} when tail call threading is enabled, and is used to
+         * construct a handler table.
+         */
+        int maximumOperationCode();
+
+        /**
+         * Configuration for each method argument. For non-static methods, the first element
+         * corresponds to the receiver.
+         */
+        Argument[] arguments();
+
+        /**
+         * Indicates that the annotated method implements a secondary partition of a bytecode
+         * interpreter switch.
+         * <p>
+         * A secondary switch is expected to be inlined into a primary
+         * {@link BytecodeInterpreterSwitch} method during host compilation. Its handler
+         * configuration is retained so that handler calls originating from the inlined secondary
+         * switch can be mapped to the primary switch's handler stubs.
+         * <p>
+         * When compiled as a separate method, however, handler calls in a secondary switch are not
+         * outlined. In particular, a deoptimization target may invoke the separately compiled
+         * secondary switch without first passing through host inlining. Keeping its handler calls
+         * ordinary prevents such execution from entering threaded handler stubs without the
+         * primary switch's exception and state-management paths.
+         *
+         * @return {@code true} if the annotated method is a secondary switch partition whose
+         *         handler calls must not be outlined when the method is compiled separately
+         */
+        boolean secondarySwitch() default false;
+
+        /**
+         * Enables tail duplication for this interpreter's threaded bytecode handler stubs. When
+         * enabled, the compiler removes the control-flow anchor at the handler return and encourages
+         * duplication of the dispatch tail, allowing different handler paths to have separate
+         * indirect tail-call sites. Duplication remains subject to compiler safety checks and code
+         * size budgets; enabling this option does not guarantee that a tail will be duplicated.
+         * <p>
+         * Separate dispatch sites can improve branch prediction, but the additional code can also
+         * reduce performance. This option is disabled by default and should only be enabled after
+         * measuring the effect on the interpreter's workloads. When disabled, the return anchor is
+         * retained and no tail-duplication hint is emitted. This option has no effect on non-threaded
+         * stubs, which always retain their return anchor.
+         *
+         * @since 25.5
+         */
+        boolean enableTailDuplication() default false;
+    }
+
+    /**
+     * Annotates a method that fetches the next opcode. The annotated method must be side-effect
+     * free, must not throw for valid interpreter state, and share the same signature with
+     * {@link BytecodeInterpreterHandler}-annotated methods in the same enclosing class. It will be
+     * inlined into Truffle interpreter bytecode handler stubs to enable tail call threading.
+     *
+     * @since 25.1
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target({ElementType.METHOD})
+    public @interface BytecodeInterpreterFetchOpcode {
+    }
 }

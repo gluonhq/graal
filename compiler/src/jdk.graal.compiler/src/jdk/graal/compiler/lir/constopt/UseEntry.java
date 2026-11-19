@@ -59,10 +59,9 @@ class UseEntry {
 
     private static void replaceValue(LIRInstruction op, Value oldValue, Value newValue) {
         ValueProcedure proc = (value, mode, flags) -> value.identityEquals(oldValue) ? newValue : value;
-        op.forEachAlive(proc);
-        op.forEachInput(proc);
-        op.forEachOutput(proc);
-        op.forEachTemp(proc);
+        // This is a structural rewrite of operand buckets, so it uses the canonical forward
+        // operand walk.
+        op.forEachValue(proc);
         op.forEachState(proc);
     }
 

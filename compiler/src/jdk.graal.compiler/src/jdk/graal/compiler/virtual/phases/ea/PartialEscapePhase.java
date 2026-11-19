@@ -28,10 +28,13 @@ import static jdk.graal.compiler.core.common.GraalOptions.EscapeAnalysisIteratio
 import static jdk.graal.compiler.core.common.GraalOptions.EscapeAnalyzeOnly;
 
 import java.util.Optional;
+import java.util.function.Function;
 
 import org.graalvm.collections.EconomicSet;
+
 import jdk.graal.compiler.debug.DebugCloseable;
 import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -133,15 +136,29 @@ public class PartialEscapePhase extends EffectsPhase<CoreProviders> {
     }
 
     @Override
+    public void updateGraphState(GraphState graphState) {
+        super.updateGraphState(graphState);
+        // This may be set more than once but the goal is to record whether PartialEscapePhase has
+        // even been run.
+        if (!graphState.isAfterStage(StageFlag.PARTIAL_ESCAPE)) {
+            graphState.setAfterStage(StageFlag.PARTIAL_ESCAPE);
+        }
+    }
+
+    @Override
     @SuppressWarnings("try")
     protected void run(StructuredGraph graph, CoreProviders context) {
-        if (VirtualUtil.matches(graph, EscapeAnalyzeOnly.getValue(graph.getOptions()))) {
+        if (matchGraph(graph)) {
             if (readElimination || graph.hasVirtualizableAllocation()) {
                 try (DebugCloseable ignored = graph.getOptimizationLog().enterPartialEscapeAnalysis()) {
                     runAnalysis(graph, context);
                 }
             }
         }
+    }
+
+    protected boolean matchGraph(StructuredGraph graph) {
+        return VirtualUtil.matches(graph, EscapeAnalyzeOnly.getValue(graph.getOptions()));
     }
 
     @Override
@@ -151,14 +168,23 @@ public class PartialEscapePhase extends EffectsPhase<CoreProviders> {
         }
         assert schedule != null;
         if (readElimination) {
-            return new PEReadEliminationClosure(schedule, context);
+            return new PEReadEliminationClosure(schedule, context, virtualAnchorSupplier());
         } else {
-            return new PartialEscapeClosure.Final(schedule, context);
+            return new PartialEscapeClosure.Final(schedule, context, virtualAnchorSupplier());
         }
     }
 
     @Override
     public boolean checkContract() {
         return false;
+    }
+
+    /**
+     * Returns a function that takes a {@link VirtualObjectNode} and provides a
+     * {@link FixedWithNextNode} which anchors the virtual object. Returns {@code null} if no
+     * anchoring is needed.
+     */
+    protected Function<VirtualObjectNode, FixedWithNextNode> virtualAnchorSupplier() {
+        return null;
     }
 }

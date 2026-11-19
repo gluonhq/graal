@@ -25,43 +25,20 @@
 
 package com.oracle.svm.core.posix;
 
-import static com.oracle.svm.core.posix.PosixSubstrateSigprofHandler.isSignalHandlerBasedExecutionSamplerEnabled;
-import static com.oracle.svm.core.posix.PosixSubstrateSigprofHandler.Options.SignalHandlerBasedExecutionSampler;
-
-import java.util.List;
-
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
 import org.graalvm.nativeimage.c.function.CodePointer;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.IsolateListenerSupport;
-import com.oracle.svm.core.IsolateListenerSupportFeature;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.RegisterDumper;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
-import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.jfr.HasJfrSupport;
-import com.oracle.svm.core.jfr.JfrExecutionSamplerSupported;
-import com.oracle.svm.core.jfr.JfrFeature;
-import com.oracle.svm.core.jfr.sampler.JfrExecutionSampler;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.posix.headers.Signal;
-import com.oracle.svm.core.posix.linux.LinuxSubstrateSigprofHandler;
 import com.oracle.svm.core.sampler.SubstrateSigprofHandler;
-import com.oracle.svm.core.thread.ThreadListenerSupport;
-import com.oracle.svm.core.thread.ThreadListenerSupportFeature;
-import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
-
-import jdk.graal.compiler.options.Option;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * <p>
@@ -87,6 +64,12 @@ public abstract class PosixSubstrateSigprofHandler extends SubstrateSigprofHandl
     private static final CEntryPointLiteral<Signal.AdvancedSignalDispatcher> advancedSignalDispatcher = CEntryPointLiteral.create(PosixSubstrateSigprofHandler.class,
                     "dispatch", int.class, Signal.siginfo_t.class, Signal.ucontext_t.class);
 
+    @Override
+    protected void installSignalHandler() {
+        PosixSignalHandlerSupport.installNativeSignalHandler(Signal.SignalEnum.SIGPROF, advancedSignalDispatcher.getFunctionPointer(), Signal.SA_RESTART(),
+                        SubstrateOptions.isSignalHandlingAllowed());
+    }
+
     @SuppressWarnings("unused")
     @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
     @CEntryPointOptions(prologue = CEntryPointOptions.NoPrologue.class, epilogue = CEntryPointOptions.NoEpilogue.class)
@@ -94,74 +77,21 @@ public abstract class PosixSubstrateSigprofHandler extends SubstrateSigprofHandl
     @Uninterruptible(reason = "Signal handler may only execute uninterruptible code.")
     private static void dispatch(@SuppressWarnings("unused") int signalNumber, @SuppressWarnings("unused") Signal.siginfo_t sigInfo, Signal.ucontext_t uContext) {
         /* We need to keep the code in this method to a minimum to avoid races. */
-        if (tryEnterIsolate()) {
-            CodePointer ip = (CodePointer) RegisterDumper.singleton().getIP(uContext);
-            Pointer sp = (Pointer) RegisterDumper.singleton().getSP(uContext);
-            tryUninterruptibleStackWalk(ip, sp, true);
+        int savedErrno = LibC.errno();
+        try {
+            if (tryEnterIsolate()) {
+                dispatch0(uContext);
+            }
+        } finally {
+            LibC.setErrno(savedErrno);
         }
     }
 
-    @Override
-    protected void installSignalHandler() {
-        PosixUtils.installSignalHandler(Signal.SignalEnum.SIGPROF, advancedSignalDispatcher.getFunctionPointer(), Signal.SA_RESTART());
-    }
-
-    static boolean isSignalHandlerBasedExecutionSamplerEnabled() {
-        if (SignalHandlerBasedExecutionSampler.hasBeenSet()) {
-            return SignalHandlerBasedExecutionSampler.getValue();
-        } else {
-            return isPlatformSupported();
-        }
-    }
-
-    private static boolean isPlatformSupported() {
-        return (Platform.includedIn(Platform.LINUX.class) || Platform.includedIn(Platform.DARWIN.class)) && SubstrateOptions.EnableSignalHandling.getValue();
-    }
-
-    private static void validateSamplerOption(HostedOptionKey<Boolean> isSamplerEnabled) {
-        if (isSamplerEnabled.getValue()) {
-            UserError.guarantee(isPlatformSupported(),
-                            "The %s cannot be used to profile on this platform.",
-                            SubstrateOptionsParser.commandArgument(isSamplerEnabled, "+"));
-        }
-    }
-
-    static class Options {
-        @Option(help = "Determines if JFR uses a signal handler for execution sampling.")//
-        public static final HostedOptionKey<Boolean> SignalHandlerBasedExecutionSampler = new HostedOptionKey<>(null, PosixSubstrateSigprofHandler::validateSamplerOption);
-    }
-}
-
-@AutomaticallyRegisteredFeature
-class PosixSubstrateSigProfHandlerFeature implements InternalFeature {
-    @Override
-    public List<Class<? extends Feature>> getRequiredFeatures() {
-        return List.of(ThreadListenerSupportFeature.class, IsolateListenerSupportFeature.class, JfrFeature.class);
-    }
-
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        if (JfrExecutionSamplerSupported.isSupported() && isSignalHandlerBasedExecutionSamplerEnabled()) {
-            SubstrateSigprofHandler sampler = makeNewSigprofHandler();
-            ImageSingletons.add(JfrExecutionSampler.class, sampler);
-            ImageSingletons.add(SubstrateSigprofHandler.class, sampler);
-
-            ThreadListenerSupport.get().register(sampler);
-            IsolateListenerSupport.singleton().register(sampler);
-        }
-    }
-
-    private static SubstrateSigprofHandler makeNewSigprofHandler() {
-        /*
-         * For JFR, we should employ a global timer instead of a per-thread timer to adhere to the
-         * sampling frequency specified in .jfc.
-         */
-        if (Platform.includedIn(Platform.DARWIN.class) || HasJfrSupport.get()) {
-            return new PosixSubstrateGlobalSigprofHandler();
-        } else if (Platform.includedIn(Platform.LINUX.class)) {
-            return new LinuxSubstrateSigprofHandler();
-        } else {
-            throw VMError.shouldNotReachHere("The JFR-based sampler is not supported on this platform.");
-        }
+    @Uninterruptible(reason = "The method executes during signal handling.", callerMustBe = true)
+    @NeverInline("Base registers are set in caller, prevent reads from floating before that.")
+    private static void dispatch0(Signal.ucontext_t uContext) {
+        CodePointer ip = (CodePointer) RegisterDumper.singleton().getIP(uContext);
+        Pointer sp = (Pointer) RegisterDumper.singleton().getSP(uContext);
+        tryUninterruptibleStackWalk(ip, sp, true);
     }
 }

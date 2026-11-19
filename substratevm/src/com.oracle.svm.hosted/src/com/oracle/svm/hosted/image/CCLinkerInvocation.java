@@ -24,8 +24,6 @@
  */
 package com.oracle.svm.hosted.image;
 
-import static com.oracle.svm.core.SubstrateOptions.SpawnIsolates;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +33,9 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -48,18 +49,20 @@ import com.oracle.svm.core.LinkerInvocation;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.c.libc.BionicLibC;
 import com.oracle.svm.core.c.libc.LibCBase;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.AccumulatingLocatableMultiOptionValue;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.c.CGlobalDataFeature;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.c.codegen.CCompilerInvoker;
 import com.oracle.svm.hosted.c.libc.HostedLibCBase;
-import com.oracle.svm.hosted.jdk.JNIRegistrationSupport;
+import com.oracle.svm.hosted.imagelayer.HostedDynamicLayerInfo;
+import com.oracle.svm.hosted.jni.JNILibraryLinkagePlan;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.options.Option;
-import jdk.graal.compiler.options.OptionStability;
+import jdk.graal.compiler.options.OptionType;
 
 public abstract class CCLinkerInvocation implements LinkerInvocation {
 
@@ -70,9 +73,23 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
     }
 
     public static class Options {
-        @Option(help = "Pass the provided raw option that will be appended to the linker command to produce the final binary. The possible options are platform specific and passed through without any validation.", //
-                        stability = OptionStability.STABLE)//
-        public static final HostedOptionKey<AccumulatingLocatableMultiOptionValue.Strings> NativeLinkerOption = new HostedOptionKey<>(AccumulatingLocatableMultiOptionValue.Strings.build());
+        private static final Pattern ELF_SYMBOL_VERSION_PATTERN = Pattern.compile("[A-Za-z_][A-Za-z0-9_.]*");
+
+        @Option(help = "Assign the specified ELF symbol version to all exported image symbols.", type = OptionType.Expert)//
+        public static final HostedOptionKey<String> ExportedSymbolsVersion = new HostedOptionKey<>(null, Options::validateExportedSymbolsVersion);
+
+        private static void validateExportedSymbolsVersion(HostedOptionKey<String> optionKey) {
+            String value = optionKey.getValue();
+            if (value == null) {
+                return;
+            }
+            if (!Platform.includedIn(Platform.LINUX.class)) {
+                throw UserError.invalidOptionValue(optionKey, value, "ELF symbol versions are only supported on Linux.");
+            }
+            if (!ELF_SYMBOL_VERSION_PATTERN.matcher(value).matches()) {
+                throw UserError.invalidOptionValue(optionKey, value, "The value must be a valid ELF symbol version identifier.");
+            }
+        }
     }
 
     protected final List<String> additionalPreOptions = new ArrayList<>();
@@ -244,7 +261,7 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
     }
 
     protected List<String> getNativeLinkerOptions() {
-        return Stream.of(nativeLinkerOptions, Options.NativeLinkerOption.getValue().values())
+        return Stream.of(nativeLinkerOptions, SubstrateOptions.NativeLinkerOption.getValue().values())
                         .flatMap(Collection::stream)
                         .collect(Collectors.toList());
     }
@@ -261,26 +278,75 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
             additionalPreOptions.add("noexecstack");
 
             // The linker should fail if DT_TEXTREL is needed, otherwise the image won't work on
-            // SELinux. If SpawnIsolates are disabled, this won't work as dynamic relocations
-            // are needed for heap access.
+            // SELinux.
             additionalPreOptions.add("-z");
-            additionalPreOptions.add(SpawnIsolates.getValue() ? "text" : "notext");
+            additionalPreOptions.add("text");
+
+            /*
+             * Make the linker aware of the page size used for aligning the native image object file
+             * sections. This makes sure that the resulting object file is always properly aligned,
+             * otherwise it would cause an error in ld-linux (glibc older than 2.35) if a specific
+             * linker version is involved (e.g. GNU binutils ld 2.38).
+             *
+             * In older glibc versions this is caused by a stricter page alignment check. Page
+             * alignment is checked against the alignment that comes from the linker instead of the
+             * system page size. This allows technically incorrect ELF object files to run on newer
+             * versions.
+             */
+            additionalPreOptions.add("-z");
+            additionalPreOptions.add("common-page-size=" + SubstrateOptions.getPageSize());
 
             if (SubstrateOptions.RemoveUnusedSymbols.getValue()) {
                 /* Perform garbage collection of unused input sections. */
                 additionalPreOptions.add("-Wl,--gc-sections");
             }
-            if (SubstrateOptions.IgnoreUndefinedReferences.getValue()) {
-                /* Ignore references to undefined symbols from the object files. */
-                additionalPreOptions.add("-Wl,--unresolved-symbols=ignore-in-object-files");
+
+            boolean pieDefault = imageKind.isExecutable &&
+                            imageKind != AbstractImage.NativeImageKind.STATIC_EXECUTABLE &&
+                            !customStaticLibs; // these might not be PIC
+            if (pieDefault) {
+                /*
+                 * Default to building position-independent executables (PIE). They have security
+                 * advantages and are enabled by default in the toolchains of many Linux OSes, but
+                 * not all. Even then, their software packages typically use PIE.
+                 *
+                 * Thanks to RelativeCodePointers, the number of extra relocations is typically low
+                 * at the cost of a register and additional address arithmetic.
+                 *
+                 * Adding the linker option here enables overriding it from a feature or option.
+                 *
+                 * Note: 1. *Static* PIE are a different type of binary (-static-pie) that is less
+                 * commonly used or supported and we don't bother with them; 2. PIE have long been
+                 * the default on macOS and Windows, so no need to change anything for them.
+                 */
+                additionalPreOptions.add("-pie");
+            }
+
+            if (imageKind.isImageLayer) {
+                /*
+                 * We do not want interposition to affect the resolution of symbols we define and
+                 * reference within this library.
+                 */
+                additionalPreOptions.add("-Wl,-Bsymbolic");
+            } else if (imageKind == AbstractImage.NativeImageKind.SHARED_LIBRARY) {
+                /*
+                 * NativeLibraries.c is linked into the image and calls JVM_FindLibraryEntry. Keep
+                 * those calls bound to this image's implementation instead of allowing HotSpot's
+                 * libjvm symbol to preempt them.
+                 */
+                additionalPreOptions.add("-Wl,-Bsymbolic-functions");
             }
 
             /* Use --version-script to control the visibility of image symbols. */
             try {
                 StringBuilder exportedSymbols = new StringBuilder();
+                String exportedSymbolsVersion = Options.ExportedSymbolsVersion.getValue();
+                if (exportedSymbolsVersion != null) {
+                    exportedSymbols.append(exportedSymbolsVersion).append(' ');
+                }
                 exportedSymbols.append("{\n");
                 /* Only exported symbols are global ... */
-                Set<String> globalSymbols = Stream.concat(getImageSymbols(true).stream(), JNIRegistrationSupport.getShimLibrarySymbols()).collect(Collectors.toSet());
+                Set<String> globalSymbols = Stream.concat(getImageSymbols(true).stream(), JNILibraryLinkagePlan.getShimLibrarySymbols()).collect(Collectors.toSet());
                 if (!globalSymbols.isEmpty()) {
                     exportedSymbols.append("global:\n");
                     globalSymbols.forEach(symbol -> exportedSymbols.append('\"').append(symbol).append("\";\n"));
@@ -298,7 +364,7 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
 
             additionalPreOptions.addAll(HostedLibCBase.singleton().getAdditionalLinkerOptions(imageKind));
 
-            if (SubstrateOptions.DeleteLocalSymbols.getValue()) {
+            if (SubstrateOptions.DeleteLocalSymbols.getValue() && !SubstrateOptions.StripDebugInfo.getValue()) {
                 additionalPreOptions.add("-Wl,-x");
             }
         }
@@ -334,12 +400,19 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
         @Override
         protected List<String> getLibrariesCommand() {
             List<String> cmd = new ArrayList<>();
+            String pushState = "-Wl,--push-state";
+            String popState = "-Wl,--pop-state";
             if (customStaticLibs) {
-                cmd.add("-Wl,--push-state");
+                cmd.add(pushState);
             }
+            String previousLayerLib = null;
             for (String lib : libs) {
                 String linkingMode = null;
-                if (dynamicLibC) {
+                if (ImageLayerBuildingSupport.buildingExtensionLayer() && HostedDynamicLayerInfo.singleton().isImageLayerLib(lib)) {
+                    VMError.guarantee(!lib.isEmpty());
+                    VMError.guarantee(previousLayerLib == null, "We currently only support one previous layer."); // GR-58631
+                    previousLayerLib = lib;
+                } else if (dynamicLibC) {
                     linkingMode = LIB_C_NAMES.contains(lib) ? "dynamic" : "static";
                 } else if (staticLibCpp) {
                     linkingMode = lib.equals("stdc++") ? "static" : "dynamic";
@@ -350,7 +423,14 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
                 cmd.add("-l" + lib);
             }
             if (customStaticLibs) {
-                cmd.add("-Wl,--pop-state");
+                cmd.add(popState);
+            }
+
+            if (previousLayerLib != null) {
+                cmd.add(pushState);
+                cmd.add("-Wl,-Bdynamic");
+                cmd.add("-l" + previousLayerLib);
+                cmd.add(popState);
             }
 
             // Make sure libgcc gets statically linked
@@ -399,14 +479,15 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
              */
             try {
                 Path exportedSymbolsPath = nativeLibs.tempDirectory.resolve("exported_symbols.list");
-                Files.write(exportedSymbolsPath, getImageSymbols(true));
+                Set<String> globalSymbols = Stream.concat(getImageSymbols(true).stream(), JNILibraryLinkagePlan.getShimLibrarySymbols().map("_"::concat)).collect(Collectors.toSet());
+                Files.write(exportedSymbolsPath, globalSymbols);
                 additionalPreOptions.add("-Wl,-exported_symbols_list");
                 additionalPreOptions.add("-Wl," + exportedSymbolsPath.toAbsolutePath());
             } catch (IOException e) {
                 VMError.shouldNotReachHere(e);
             }
 
-            if (SubstrateOptions.DeleteLocalSymbols.getValue()) {
+            if (SubstrateOptions.DeleteLocalSymbols.getValue() && !SubstrateOptions.StripDebugInfo.getValue()) {
                 additionalPreOptions.add("-Wl,-x");
             }
 
@@ -451,6 +532,7 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
                 case STATIC_EXECUTABLE:
                     // checked in the definition of --static
                     throw VMError.shouldNotReachHereUnexpectedInput(imageKind);
+                case IMAGE_LAYER:
                 case SHARED_LIBRARY:
                     cmd.add("-shared");
                     if (Platform.includedIn(Platform.DARWIN.class)) {
@@ -463,6 +545,7 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
     }
 
     private static class WindowsCCLinkerInvocation extends CCLinkerInvocation {
+        private static final Pattern UNRESOLVED_EXTERNAL_SYMBOL_PATTERN = Pattern.compile("\\bLNK(?:2001|2019): unresolved external symbol (\\S+)");
 
         private final String imageName;
 
@@ -496,6 +579,32 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
         }
 
         @Override
+        public void verifyLinkerOutput(List<String> lines, Set<String> allowedUnresolvedSymbols) {
+            if (imageKind != AbstractImage.NativeImageKind.IMAGE_LAYER) {
+                return;
+            }
+
+            Set<String> unresolvedSymbols = new TreeSet<>();
+            for (String line : lines) {
+                Matcher matcher = UNRESOLVED_EXTERNAL_SYMBOL_PATTERN.matcher(line);
+                if (matcher.find()) {
+                    unresolvedSymbols.add(matcher.group(1));
+                }
+            }
+
+            if (unresolvedSymbols.isEmpty()) {
+                return;
+            }
+
+            Set<String> unexpectedSymbols = new TreeSet<>(unresolvedSymbols);
+            unexpectedSymbols.removeAll(allowedUnresolvedSymbols);
+            if (!unexpectedSymbols.isEmpty()) {
+                throw UserError.abort("Linking the image layer produced unexpected unresolved PE/COFF symbols: %s. Allowed unresolved symbols are: %s",
+                                unexpectedSymbols, new TreeSet<>(allowedUnresolvedSymbols));
+            }
+        }
+
+        @Override
         public List<String> getCommand() {
             List<String> compilerCmd = getCompilerCommand(additionalPreOptions);
 
@@ -510,6 +619,18 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
             cmd.add("/link");
             cmd.add("/INCREMENTAL:NO");
             cmd.add("/NODEFAULTLIB:LIBCMT");
+
+            if (imageKind == AbstractImage.NativeImageKind.IMAGE_LAYER) {
+                /*
+                 * Image layer DLLs have forward references to symbols defined in the application
+                 * layer (e.g. CGlobalData forSymbol references, delayed method symbols). On
+                 * ELF/Mach-O, these are undefined symbols resolved by the dynamic linker at load
+                 * time. On PE/COFF, we must allow the link to succeed with unresolved externals.
+                 * The application layer exports the required symbols and Windows runtime support
+                 * patches the recorded forward-reference slots at isolate startup.
+                 */
+                cmd.add("/FORCE:UNRESOLVED");
+            }
 
             /* Use page size alignment to support memory mapping of the image heap. */
             cmd.add("/FILEALIGN:4096");
@@ -543,15 +664,31 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
                 cmd.add(library + ".lib");
             }
 
+            if (imageKind.isExecutable && ImageLayerBuildingSupport.buildingApplicationLayer()) {
+                /*
+                 * Application layer executables can be small enough that the link does not pull in
+                 * any MSVC-built object with a /DEFAULTLIB:msvcrt directive. The GraalVM-generated
+                 * object file does not contain such directives, so add the CRT import library
+                 * explicitly for mainCRTStartup.
+                 */
+                cmd.add("msvcrt.lib");
+            }
+
             // Add required Windows Libraries
             cmd.add("advapi32.lib");
             cmd.add("ws2_32.lib");
             cmd.add("secur32.lib");
             cmd.add("iphlpapi.lib");
             cmd.add("userenv.lib");
+
+            // GR-77836: added libraries should not be necessary
+            if (ClassRegistries.respectClassLoader()) {
+                cmd.add("shell32.lib");
+                cmd.add("ole32.lib");
+            }
+
             /* JDK-8295231 removed implicit linking via pragma directives in source files. */
             cmd.add("mswsock.lib");
-
             if (SubstrateOptions.EnableWildcardExpansion.getValue() && imageKind == AbstractImage.NativeImageKind.EXECUTABLE) {
                 /*
                  * Enable wildcard expansion in command line arguments, see
@@ -583,7 +720,7 @@ public abstract class CCLinkerInvocation implements LinkerInvocation {
                 break;
         }
 
-        Path outputFile = outputDirectory.resolve(imageName + imageKind.getFilenameSuffix());
+        Path outputFile = outputDirectory.resolve(imageKind.getOutputFilename(imageName));
         UserError.guarantee(!Files.isDirectory(outputFile), "Cannot write image to %s. Path exists as directory (use '-o /path/to/image').", outputFile);
         inv.setOutputFile(outputFile);
         inv.setTempDirectory(tempDirectory);

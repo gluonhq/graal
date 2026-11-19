@@ -33,6 +33,7 @@ import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateControlFlowIntegrity;
 import com.oracle.svm.core.SubstrateOptions;
 
+import com.oracle.svm.core.SubstrateTarget;
 import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.ConditionFlag;
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
@@ -72,6 +73,7 @@ public final class AMD64FarReturnOp extends AMD64BlockEndOp {
         if (!SubstrateOptions.PreserveFramePointer.getValue() && !fromMethodWithCalleeSavedRegisters) {
             /* No need to restore anything in the frame of the new stack pointer. */
             masm.movq(AMD64.rsp, asRegister(sp));
+            masm.movq(masm.makeAddress(AMD64.rsp, -FrameAccess.returnAddressSize()), asRegister(ip));
             masm.jmp(asRegister(ip));
             return;
         }
@@ -98,7 +100,7 @@ public final class AMD64FarReturnOp extends AMD64BlockEndOp {
          */
         int calleeFrameSize = FrameAccess.returnAddressSize();
         if (fromMethodWithCalleeSavedRegisters || SubstrateOptions.PreserveFramePointer.getValue()) {
-            calleeFrameSize += FrameAccess.wordSize();
+            calleeFrameSize += SubstrateTarget.getWordSize();
         }
         if (fromMethodWithCalleeSavedRegisters) {
             calleeFrameSize += CalleeSavedRegisters.singleton().getSaveAreaSize();

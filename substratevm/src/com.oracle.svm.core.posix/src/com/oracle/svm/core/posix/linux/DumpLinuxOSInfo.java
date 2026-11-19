@@ -27,19 +27,20 @@ package com.oracle.svm.core.posix.linux;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunkRegistry;
 import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.os.RawFileOperationSupport;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
 
 import jdk.graal.compiler.core.common.NumUtil;
 
@@ -75,7 +76,7 @@ class DumpLinuxOSInfo extends SubstrateDiagnostics.DiagnosticThunk {
 
     private static void printFirstLine(Log log, CCharPointer filename) {
         RawFileOperationSupport fs = RawFileOperationSupport.nativeByteOrder();
-        RawFileOperationSupport.RawFileDescriptor fd = fs.open(filename, RawFileOperationSupport.FileAccessMode.READ);
+        RawFileOperationSupport.RawFileDescriptor fd = fs.open((RawFileOperationSupport.RawFilePath) filename, RawFileOperationSupport.FileAccessMode.READ);
         if (!fs.isValid(fd)) {
             log.string("unknown");
             return;
@@ -84,7 +85,7 @@ class DumpLinuxOSInfo extends SubstrateDiagnostics.DiagnosticThunk {
         try {
             int bufferSize = 64;
             CCharPointer buffer = StackValue.get(bufferSize);
-            long readBytes = fs.read(fd, (Pointer) buffer, WordFactory.unsigned(bufferSize));
+            long readBytes = fs.read(fd, (Pointer) buffer, Word.unsigned(bufferSize));
             int length = countLineBytes(buffer, NumUtil.safeToInt(readBytes));
             log.string(buffer, length);
         } finally {
@@ -105,9 +106,14 @@ class DumpLinuxOSInfo extends SubstrateDiagnostics.DiagnosticThunk {
 @AutomaticallyRegisteredFeature
 class DumpLinuxOSInfoFeature implements InternalFeature {
     @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
+    @Override
     public void afterRegistration(AfterRegistrationAccess access) {
         if (!SubstrateOptions.AsyncSignalSafeDiagnostics.getValue()) {
-            DiagnosticThunkRegistry.singleton().addAfter(new DumpLinuxOSInfo(), SubstrateDiagnostics.DumpMachineInfo.class);
+            DiagnosticThunkRegistry.singleton().addAfter(new DumpLinuxOSInfo(), SubstrateDiagnostics.DumpRuntimeInfo.class);
         }
     }
 }

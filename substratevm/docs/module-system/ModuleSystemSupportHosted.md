@@ -125,7 +125,6 @@ HOME=/home/graaluser \
 LANG=en_US.UTF-8 \
 PATH=/home/graaluser/OLabs/jdk-21/bin:/home/graaluser/OLabs/main/mx:/home/graaluser/.sdkman/candidates/java/current/bin:/home/graaluser/.sdkman/candidates/gradle/current/bin:/home/graaluser/.local/bin:/home/graaluser/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin \
 PWD=/home/graaluser/OLabs/main/graal-enterprise/substratevm-enterprise/spring-boot-3_2-graalvm-21-native-image-bug/mvn \
-USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM=true \
 /home/graaluser/OLabs/main/graal/sdk/mxbuild/linux-amd64/GRAALVM_427B7851E4_JAVA21/graalvm-427b7851e4-java21-24.0.0-dev/bin/java \
 -XX:+UseParallelGC \
 -XX:+UnlockExperimentalVMOptions \
@@ -185,7 +184,7 @@ if [[ "${module_launcher}" == "True" ]]; then
 For native-image `Feature` implementations that are not always used (e.g. because they are only enabled when its related
 option is on) and all other optional code paths in the builder it makes sense to open up packages/classes only
 on-demand. To make this process as painless as possible we have the `access*`-methods in class
-`com.oracle.svm.util.ModuleSupport` that is part of our `org.graalvm.nativeimage.base` module.
+`com.oracle.svm.shared.util.ModuleSupport` that is part of our `org.graalvm.nativeimage.shared` module.
 ```java
 class ModuleSupport {
 
@@ -205,24 +204,6 @@ class ModuleSupport {
 }
 ```
 How to use those methods can easily be inferred by the exiting calls in our codebase. 
-
-### Do not use (rely on) USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM=false
-
-When environment variable `USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM` was introduced in June 2022 we made clear 
-from the beginning that it will be removed eventually. Do not rely on `USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM`.
-We are close to removing it:
-
-* `GR-30433` Disallow the deprecated environment variable USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM=false.
-
-⚠️ If an image-build uses builder-internal classes (e.g. as part of one of its NI `Feature` implementations) removing
-`USE_NATIVE_IMAGE_JAVA_PLATFORM_MODULE_SYSTEM=false` often requires adding `--add-exports=...` to the arguments of the VM
-that runs the image builder. E.g. often `--add-exports=jdk.graal.compiler/jdk.graal.compiler.options=ALL-UNNAMED`
-needs to be added because a NI Feature defines/uses something like
-```text
-@Option //
-public static final OptionKey<Boolean> MyFeatureOption = new OptionKey<>(true);
-```
-Better than adding that add exports is to not rely on Builder (or Graal) internals. E.g. use a system property instead. 
 
 # NativeImageClassLoader
 

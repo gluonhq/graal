@@ -20,13 +20,14 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.impl;
 
-import static com.oracle.truffle.espresso.impl.LoadingConstraints.INVALID_LOADER_ID;
-
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -34,17 +35,22 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
-import com.oracle.truffle.espresso.descriptors.Types;
+import com.oracle.truffle.espresso.cds.ArchivedRegistryData;
+import com.oracle.truffle.espresso.cds.CDSSupport;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.classfile.descriptors.TypeSymbols;
+import com.oracle.truffle.espresso.classfile.tables.AbstractModuleTable;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
 import com.oracle.truffle.espresso.jdwp.api.ModuleRef;
 import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.redefinition.DefineKlassListener;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.constraints.LoadingConstraintViolationException;
 import com.oracle.truffle.espresso.substitutions.JavaType;
-import com.oracle.truffle.espresso.vm.InterpreterToVM;
 
 public final class ClassRegistries {
 
@@ -68,21 +74,39 @@ public final class ClassRegistries {
 
     public ClassRegistries(EspressoContext context) {
         this.context = context;
-        this.bootClassRegistry = new BootClassRegistry(context.getClassLoadingEnv().getNewLoaderId());
+        this.bootClassRegistry = createBootClassRegistry(context);
         this.constraints = new LoadingConstraints(context);
     }
 
+    private static BootClassRegistry createBootClassRegistry(EspressoContext context) {
+        ArchivedRegistryData archivedRegistryData = null;
+        CDSSupport cds = context.getCDS();
+        if (cds != null && cds.isUsingArchive()) {
+            archivedRegistryData = cds.getBootClassRegistryData();
+        }
+        return new BootClassRegistry(context.getClassLoadingEnv().getNewLoaderId(), archivedRegistryData);
+    }
+
     public void initJavaBaseModule() {
-        this.javaBaseModule = bootClassRegistry.modules().createAndAddEntry(Symbol.Name.java_base, bootClassRegistry);
+        // Do not create java.base new if already (partially) loaded from CDS archive.
+        CDSSupport cds = context.getCDS();
+        // java.base is already registered in the boot registry IFF CDS is enabled.
+        assert (cds == null || !cds.isUsingArchive()) == (bootClassRegistry.modules().lookup(Names.java_base) == null);
+        this.javaBaseModule = bootClassRegistry.modules().lookupOrCreate(Names.java_base, new AbstractModuleTable.ModuleData<>(null, null, null, 0, false));
     }
 
     public ClassRegistry getClassRegistry(@JavaType(ClassLoader.class) StaticObject classLoader) {
         if (StaticObject.isNull(classLoader)) {
             return bootClassRegistry;
         }
+        ClassRegistry classRegistry = getOrInitializeClassRegistry(classLoader, null);
+        assert classRegistry != null;
+        return classRegistry;
+    }
 
+    public ClassRegistry getOrInitializeClassRegistry(StaticObject classLoader, ArchivedRegistryData archivedRegistryData) {
         // Double-checked locking to attach class registry to guest instance.
-        ClassRegistry classRegistry = (ClassRegistry) context.getMeta().HIDDEN_CLASS_LOADER_REGISTRY.getHiddenObject(classLoader, true);
+        ClassRegistry classRegistry = (ClassRegistry) context.getMeta().java_lang_ClassLoader_0registry.getHiddenObject(classLoader, true);
         if (classRegistry == null) {
             // Synchronizing on the classLoader instance would be the natural choice here, but:
             // On SubstrateVM, synchronizing on a StaticObject instance will add an extra slot/field
@@ -91,23 +115,22 @@ public final class ClassRegistries {
             // Setting the class registry happens only once, for such rare operations, no contention
             // is expected.
             synchronized (weakClassLoaderSet) {
-                classRegistry = (ClassRegistry) context.getMeta().HIDDEN_CLASS_LOADER_REGISTRY.getHiddenObject(classLoader, true);
+                classRegistry = (ClassRegistry) context.getMeta().java_lang_ClassLoader_0registry.getHiddenObject(classLoader, true);
                 if (classRegistry == null) {
-                    classRegistry = registerRegistry(classLoader);
+                    classRegistry = registerRegistry(classLoader, archivedRegistryData);
                 }
             }
         }
-
-        assert classRegistry != null;
         return classRegistry;
     }
 
     @TruffleBoundary
-    private ClassRegistry registerRegistry(@JavaType(ClassLoader.class) StaticObject classLoader) {
+    private ClassRegistry registerRegistry(@JavaType(ClassLoader.class) StaticObject classLoader, ArchivedRegistryData archivedRegistryData) {
         assert Thread.holdsLock(weakClassLoaderSet);
         ClassRegistry classRegistry;
-        classRegistry = new GuestClassRegistry(context.getClassLoadingEnv(), classLoader);
-        context.getMeta().HIDDEN_CLASS_LOADER_REGISTRY.setHiddenObject(classLoader, classRegistry, true);
+        classRegistry = new GuestClassRegistry(context.getClassLoadingEnv(), classLoader, archivedRegistryData);
+        context.getMeta().java_lang_ClassLoader_0registry.setHiddenObject(classLoader, classRegistry, true);
+        context.getMeta().java_lang_ClassLoader_0weakSelf.setHiddenObject(classLoader, new WeakReference<>(classLoader), true);
         // Register the class loader in the weak set.
         weakClassLoaderSet.add(classLoader);
         totalClassLoadersSet++;
@@ -125,31 +148,51 @@ public final class ClassRegistries {
 
     public ModuleTable.ModuleEntry getPolyglotAPIModule() {
         if (polyglotAPIModule == null) {
-            ModuleRef[] allModuleRefs = getAllModuleRefs();
-            for (ModuleRef module : allModuleRefs) {
-                if ("espresso.polyglot".equals(module.jdwpName())) {
-                    polyglotAPIModule = (ModuleTable.ModuleEntry) module;
-                    break;
-                }
-            }
+            polyglotAPIModule = findPlatformOrBootModule(Names.espresso_polyglot);
         }
         return polyglotAPIModule;
     }
 
+    private ModuleTable.ModuleEntry findPlatformOrBootModule(Symbol<Name> name) {
+        ModuleTable.ModuleEntry m = bootClassRegistry.modules().lookup(name);
+        if (m != null) {
+            return m;
+        }
+        ObjectKlass platformClassLoaderKlass = context.getMeta().jdk_internal_loader_ClassLoaders$PlatformClassLoader;
+        if (platformClassLoaderKlass == null) {
+            return null;
+        }
+        synchronized (weakClassLoaderSet) {
+            for (StaticObject loader : weakClassLoaderSet) {
+                if (loader != null) {
+                    if (platformClassLoaderKlass.isAssignableFrom(loader.getKlass())) {
+                        m = getClassRegistry(loader).modules().lookup(name);
+                        if (m != null) {
+                            return m;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     public boolean javaBaseDefined() {
-        return javaBaseModule != null && !StaticObject.isNull(javaBaseModule.module());
+        boolean result = javaBaseModule != null && javaBaseModule.module() != null;
+        assert !result || StaticObject.notNull(javaBaseModule.module());
+        return result;
     }
 
     @TruffleBoundary
     public Klass findLoadedClass(Symbol<Type> type, @JavaType(ClassLoader.class) StaticObject classLoader) {
         assert classLoader != null : "use StaticObject.NULL for BCL";
 
-        if (Types.isArray(type)) {
+        if (TypeSymbols.isArray(type)) {
             Klass elemental = findLoadedClass(context.getTypes().getElementalType(type), classLoader);
             if (elemental == null) {
                 return null;
             }
-            return elemental.getArrayClass(Types.getArrayDimensions(type));
+            return elemental.getArrayKlass(TypeSymbols.getArrayDimensions(type));
         }
 
         ClassRegistry registry = getClassRegistry(classLoader);
@@ -158,15 +201,44 @@ public final class ClassRegistries {
     }
 
     @TruffleBoundary
-    public List<Klass> getLoadedClassesByLoader(StaticObject classLoader) {
+    public Set<Klass> getLoadedClassesByLoader(StaticObject classLoader, boolean includeHidden) {
         if (classLoader == StaticObject.NULL) {
-            ArrayList<Klass> result = new ArrayList<>(bootClassRegistry.classes.size());
+            Set<Klass> result = new HashSet<>();
             for (RegistryEntry value : bootClassRegistry.classes.values()) {
                 result.add(value.klass());
             }
+            if (includeHidden) {
+                addAllHiddenKlasses(bootClassRegistry, result);
+            }
+            // include array classes
+            result.addAll(getLoadedArrayClasses(result));
+            // include primitive array classes, but not the primitive classes themselves
+            result.addAll(getLoadedArrayClasses(Arrays.asList(context.getMeta().PRIMITIVE_KLASSES)));
             return result;
         }
-        return getClassRegistry(classLoader).getLoadedKlasses();
+        ClassRegistry classRegistry = getClassRegistry(classLoader);
+        if (classRegistry == null) {
+            return Collections.emptySet();
+        }
+        Set<Klass> result = classRegistry.getLoadedKlasses();
+        if (includeHidden) {
+            addAllHiddenKlasses(classRegistry, result);
+        }
+
+        // include loaded array classes
+        result.addAll(getLoadedArrayClasses(result));
+        return result;
+    }
+
+    private static void addAllHiddenKlasses(ClassRegistry registry, Set<Klass> result) {
+        synchronized (registry.getStrongHiddenClassRegistrationLock()) {
+            if (registry.strongHiddenKlasses != null) {
+                result.addAll(registry.strongHiddenKlasses);
+            }
+            if (registry.getHiddenKlasses() != null) {
+                result.addAll(registry.getHiddenKlasses());
+            }
+        }
     }
 
     @TruffleBoundary
@@ -177,7 +249,7 @@ public final class ClassRegistries {
             klasses.add(bootClassRegistry.classes.get(type).klass());
             // if a type loaded by the boot loader, there can't
             // be any others, so return immediately
-            return klasses.toArray(new Klass[0]);
+            return klasses.toArray(Klass.EMPTY_ARRAY);
         }
         // continue search in all other registries
         synchronized (weakClassLoaderSet) {
@@ -188,42 +260,50 @@ public final class ClassRegistries {
                 }
             }
         }
-        return klasses.toArray(new Klass[0]);
+        return klasses.toArray(Klass.EMPTY_ARRAY);
     }
 
     @TruffleBoundary
-    public Klass[] getAllLoadedClasses() {
-        ArrayList<Klass> list = new ArrayList<>();
-        // add classes from boot registry
-        for (RegistryEntry entry : bootClassRegistry.classes.values()) {
-            list.add(entry.klass());
-        }
+    public Set<Klass> getAllLoadedClasses() {
+        // first add classes from boot registry
+        HashSet<Klass> set = new HashSet<>(getLoadedClassesByLoader(StaticObject.NULL, true));
+
         // add classes from all other registries
         synchronized (weakClassLoaderSet) {
             for (StaticObject classLoader : weakClassLoaderSet) {
-                for (RegistryEntry entry : getClassRegistry(classLoader).classes.values()) {
-                    list.add(entry.klass());
-                }
+                set.addAll(getLoadedClassesByLoader(classLoader, true));
             }
         }
-        return list.toArray(Klass.EMPTY_ARRAY);
+        return set;
+    }
+
+    private static Set<Klass> getLoadedArrayClasses(Collection<Klass> elementalKlasses) {
+        Set<Klass> result = new HashSet<>();
+        for (Klass elementalKlass : elementalKlasses) {
+            ArrayKlass arrayKlass = elementalKlass.getArrayKlass(false);
+            while (arrayKlass != null) {
+                result.add(arrayKlass);
+                arrayKlass = arrayKlass.getArrayKlass(false);
+            }
+        }
+        return result;
     }
 
     public ModuleRef[] getAllModuleRefs() {
         ArrayList<ModuleRef> list = new ArrayList<>();
         // add modules from boot registry
-        list.addAll(bootClassRegistry.modules().values());
+        bootClassRegistry.modules().collectValues(list::add);
 
         // add modules from all other registries
         synchronized (weakClassLoaderSet) {
             for (StaticObject classLoader : weakClassLoaderSet) {
-                list.addAll(getClassRegistry(classLoader).modules().values());
+                getClassRegistry(classLoader).modules().collectValues(list::add);
             }
         }
         return list.toArray(ModuleRef.EMPTY_ARRAY);
     }
 
-    public ModuleTable.ModuleEntry findUniqueModule(Symbol<Symbol.Name> name) {
+    public ModuleTable.ModuleEntry findUniqueModule(Symbol<Name> name) {
         ModuleTable.ModuleEntry result = bootClassRegistry.modules().lookup(name);
         synchronized (weakClassLoaderSet) {
             for (StaticObject classLoader : weakClassLoaderSet) {
@@ -251,20 +331,15 @@ public final class ClassRegistries {
     public Klass loadKlass(Symbol<Type> type, @JavaType(ClassLoader.class) StaticObject classLoader, StaticObject protectionDomain) throws EspressoClassLoadingException {
         assert classLoader != null : "use StaticObject.NULL for BCL";
 
-        if (Types.isArray(type)) {
+        if (TypeSymbols.isArray(type)) {
             Klass elemental = loadKlass(context.getTypes().getElementalType(type), classLoader, protectionDomain);
             if (elemental == null) {
                 return null;
             }
-            return elemental.getArrayClass(Types.getArrayDimensions(type));
+            return elemental.getArrayKlass(TypeSymbols.getArrayDimensions(type));
         }
         ClassRegistry registry = getClassRegistry(classLoader);
         return registry.loadKlass(context, type, protectionDomain);
-    }
-
-    @TruffleBoundary
-    public ObjectKlass defineKlass(Symbol<Type> type, byte[] bytes, StaticObject classLoader) throws EspressoClassLoadingException {
-        return defineKlass(type, bytes, classLoader, ClassRegistry.ClassDefinitionInfo.EMPTY);
     }
 
     @TruffleBoundary
@@ -281,21 +356,29 @@ public final class ClassRegistries {
     @TruffleBoundary
     public void checkLoadingConstraint(Symbol<Type> type, StaticObject loader1, StaticObject loader2) {
         Symbol<Type> toCheck = context.getTypes().getElementalType(type);
-        if (!Types.isPrimitive(toCheck) && loader1 != loader2) {
-            constraints.checkConstraint(toCheck, loader1, loader2);
+        if (!TypeSymbols.isPrimitive(toCheck) && loader1 != loader2) {
+            try {
+                constraints.checkConstraint(toCheck, loader1, loader2);
+            } catch (LoadingConstraintViolationException e) {
+                throw context.getMeta().throwExceptionWithMessage(context.getMeta().java_lang_LinkageError, e.getMessage());
+            }
         }
     }
 
     void recordConstraint(Symbol<Type> type, Klass klass, StaticObject loader) {
-        assert !Types.isArray(type);
-        if (!Types.isPrimitive(type)) {
-            constraints.recordConstraint(type, klass, loader);
+        assert !TypeSymbols.isArray(type);
+        if (!TypeSymbols.isPrimitive(type)) {
+            try {
+                constraints.recordConstraint(type, klass, loader);
+            } catch (LoadingConstraintViolationException e) {
+                throw context.getMeta().throwExceptionWithMessage(context.getMeta().java_lang_LinkageError, e.getMessage());
+            }
         }
     }
 
-    void removeUnloadedKlassConstraint(Klass klass, Symbol<Type> type) {
-        assert klass.isInstanceClass();
-        constraints.removeUnloadedKlassConstraint(klass, type);
+    void updateConstraint(Symbol<Type> type, Klass oldKlass, Klass newKlass) {
+        assert oldKlass.isInstanceClass();
+        constraints.updateConstraint(type, oldKlass, newKlass);
     }
 
     @TruffleBoundary
@@ -310,15 +393,6 @@ public final class ClassRegistries {
         return result;
     }
 
-    public boolean isClassLoader(StaticObject object) {
-        if (InterpreterToVM.instanceOf(object, context.getMeta().java_lang_ClassLoader)) {
-            synchronized (weakClassLoaderSet) {
-                return weakClassLoaderSet.contains(object);
-            }
-        }
-        return false;
-    }
-
     public void addToFixupList(Klass k) {
         fixupModuleList.add(k);
     }
@@ -326,32 +400,12 @@ public final class ClassRegistries {
     public void processFixupList(StaticObject javaBase) {
         assert StaticObject.notNull(javaBase);
         for (PrimitiveKlass k : context.getMeta().PRIMITIVE_KLASSES) {
-            context.getMeta().java_lang_Class_module.setObject(k.initializeEspressoClass(), javaBase);
+            context.getMeta().java_lang_Class_module.setObject(k.initializeGuestClassMirror(), javaBase);
         }
         for (Klass k : fixupModuleList) {
-            context.getMeta().java_lang_Class_module.setObject(k.initializeEspressoClass(), javaBase);
+            context.getMeta().java_lang_Class_module.setObject(k.initializeGuestClassMirror(), javaBase);
         }
         fixupModuleList = null;
-    }
-
-    /**
-     * Collects IDs of all class loaders that have not been collected by the GC.
-     */
-    long[] aliveLoaders() {
-        long[] loaders = new long[weakClassLoaderSet.size() + 1];
-        loaders[0] = context.getBootClassLoaderID(); // Boot loader is always alive
-        int i = 1;
-        synchronized (weakClassLoaderSet) {
-            for (StaticObject loader : weakClassLoaderSet) {
-                if (loader != null) {
-                    loaders[i++] = getClassRegistry(loader).getLoaderID();
-                }
-            }
-        }
-        if (i < loaders.length) {
-            loaders[i++] = INVALID_LOADER_ID;
-        }
-        return loaders;
     }
 
     public void registerListener(DefineKlassListener listener) {
@@ -370,6 +424,7 @@ public final class ClassRegistries {
         private volatile Set<StaticObject> domains = null;
 
         RegistryEntry(Klass k) {
+            assert k != null;
             this.klass = k;
         }
 
@@ -387,7 +442,7 @@ public final class ClassRegistries {
                 return;
             }
             // throws SecurityException if access is not allowed.
-            meta.java_lang_ClassLoader_checkPackageAccess.invokeDirect(classLoader, klass.mirror(), protectionDomain);
+            meta.java_lang_ClassLoader_checkPackageAccess.invokeDirectSpecial(classLoader, klass.mirror(), protectionDomain);
             cachedDomains.add(protectionDomain);
         }
 

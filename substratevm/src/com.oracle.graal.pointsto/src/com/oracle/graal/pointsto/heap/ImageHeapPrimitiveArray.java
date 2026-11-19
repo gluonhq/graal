@@ -24,47 +24,64 @@
  */
 package com.oracle.graal.pointsto.heap;
 
-import java.lang.reflect.Array;
 import java.util.function.Consumer;
 
 import com.oracle.graal.pointsto.ObjectScanner;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.JavaKind;
 
+/**
+ * Image-heap model for primitive arrays whose snapshot storage is represented as a guest
+ * {@link JavaConstant} array object.
+ */
 public final class ImageHeapPrimitiveArray extends ImageHeapArray {
 
     private static final class PrimitiveArrayData extends ConstantData {
 
-        private final Object array;
+        /**
+         * A copy of the array represented by the hosted object.
+         */
+        private final JavaConstant snapshot;
         private final int length;
 
-        private PrimitiveArrayData(AnalysisType type, JavaConstant hostedObject, Object array, int length, int identityHashCode) {
-            super(type, hostedObject, identityHashCode);
-            this.array = array;
+        private PrimitiveArrayData(AnalysisType type, JavaConstant hostedObject, JavaConstant snapshot, int length, int identityHashCode, int id) {
+            super(type, hostedObject, identityHashCode, id);
+            this.snapshot = snapshot;
             this.length = length;
             assert type.isArray() && type.getComponentType().isPrimitive() : type;
         }
     }
 
+    /**
+     * Creates a detached primitive-array snapshot for arrays that are not backed by a hosted
+     * object.
+     */
     ImageHeapPrimitiveArray(AnalysisType type, int length) {
         super(new PrimitiveArrayData(type, null,
                         /* Without a hosted object, we need to create a backing primitive array. */
-                        Array.newInstance(type.getComponentType().getStorageKind().toJavaClass(), length),
-                        length, -1), false);
+                        GuestAccess.get().createPrimitiveArray(type.getComponentType().getJavaKind(), length),
+                        length, -1, -1), false);
     }
 
-    ImageHeapPrimitiveArray(AnalysisType type, JavaConstant hostedObject, Object array, int length) {
-        this(type, hostedObject, array, length, -1);
+    /**
+     * Creates a primitive-array snapshot from a hosted object with default metadata fields.
+     */
+    ImageHeapPrimitiveArray(AnalysisType type, JavaConstant hostedObject, JavaConstant snapshot, int length) {
+        this(type, hostedObject, snapshot, length, -1, -1);
     }
 
-    ImageHeapPrimitiveArray(AnalysisType type, JavaConstant hostedObject, Object array, int length, int identityHashCode) {
+    /**
+     * Creates a primitive-array snapshot with explicit identity metadata for image-layer
+     * persistence.
+     */
+    public ImageHeapPrimitiveArray(AnalysisType type, JavaConstant hostedObject, JavaConstant snapshot, int length, int identityHashCode, int id) {
         super(new PrimitiveArrayData(type, hostedObject,
                         /* We need a clone of the hosted array so that we have a stable snapshot. */
-                        getClone(type.getComponentType().getJavaKind(), array),
-                        length, identityHashCode), false);
+                        cloneArray(snapshot),
+                        length, identityHashCode, id), false);
     }
 
     private ImageHeapPrimitiveArray(ConstantData constantData, boolean compressed) {
@@ -76,22 +93,18 @@ public final class ImageHeapPrimitiveArray extends ImageHeapArray {
         return (PrimitiveArrayData) super.getConstantData();
     }
 
-    private static Object getClone(JavaKind kind, Object arrayObject) {
-        return switch (kind) {
-            case Boolean -> ((boolean[]) arrayObject).clone();
-            case Byte -> ((byte[]) arrayObject).clone();
-            case Short -> ((short[]) arrayObject).clone();
-            case Char -> ((char[]) arrayObject).clone();
-            case Int -> ((int[]) arrayObject).clone();
-            case Long -> ((long[]) arrayObject).clone();
-            case Float -> ((float[]) arrayObject).clone();
-            case Double -> ((double[]) arrayObject).clone();
-            default -> throw new IllegalArgumentException("Unsupported kind: " + kind);
-        };
+    /**
+     * Clones a primitive array guest constant to preserve a stable snapshot copy.
+     */
+    private static JavaConstant cloneArray(JavaConstant original) {
+        return GuestAccess.get().clonePrimitiveArray(original);
     }
 
-    public Object getArray() {
-        return getConstantData().array;
+    /**
+     * Returns the snapshot array constant that stores primitive element values for this model.
+     */
+    public JavaConstant getArray() {
+        return getConstantData().snapshot;
     }
 
     /**
@@ -103,17 +116,23 @@ public final class ImageHeapPrimitiveArray extends ImageHeapArray {
         return readElementValue(idx);
     }
 
+    /**
+     * Reads a primitive element from the snapshot array as a guest {@link JavaConstant}.
+     */
     @Override
     public JavaConstant readElementValue(int idx) {
-        return JavaConstant.forBoxedPrimitive(Array.get(getArray(), idx));
+        return GuestAccess.get().getProviders().getConstantReflection().readArrayElement(getArray(), idx);
     }
 
+    /**
+     * Writes a primitive element into the snapshot array after validating the component kind.
+     */
     @Override
     public void setElement(int idx, JavaConstant value) {
         if (value.getJavaKind() != constantData.type.getComponentType().getJavaKind()) {
             throw AnalysisError.shouldNotReachHere("Cannot store value of kind " + value.getJavaKind() + " into primitive array of type " + getConstantData().type);
         }
-        Array.set(getArray(), idx, value.asBoxedPrimitive());
+        GuestAccess.get().writeArrayElement(getArray(), idx, value);
     }
 
     @Override
@@ -133,13 +152,16 @@ public final class ImageHeapPrimitiveArray extends ImageHeapArray {
         return new ImageHeapPrimitiveArray(constantData, false);
     }
 
+    /**
+     * Produces a cloned primitive-array constant that is detached from any hosted object.
+     */
     @Override
     public ImageHeapConstant forObjectClone() {
         assert constantData.type.isCloneableWithAllocation() : "all arrays implement Cloneable";
 
         PrimitiveArrayData data = getConstantData();
-        Object newArray = getClone(data.type.getComponentType().getJavaKind(), data.array);
+        JavaConstant newArray = cloneArray(data.snapshot);
         /* The new constant is never backed by a hosted object, regardless of the input object. */
-        return new ImageHeapPrimitiveArray(new PrimitiveArrayData(data.type, null, newArray, data.length, -1), compressed);
+        return new ImageHeapPrimitiveArray(new PrimitiveArrayData(data.type, null, newArray, data.length, -1, -1), compressed);
     }
 }

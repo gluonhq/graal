@@ -26,57 +26,73 @@ package com.oracle.svm.hosted.code.aarch64;
 
 import java.util.function.Consumer;
 
-import com.oracle.svm.core.meta.MethodPointer;
-import com.oracle.svm.hosted.meta.HostedMethod;
-import jdk.graal.compiler.asm.Assembler.CodeAnnotation;
-import jdk.graal.compiler.asm.aarch64.AArch64Assembler.SingleInstructionAnnotation;
-import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
-import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler.MovSequenceAnnotation.MovAction;
-import jdk.graal.compiler.code.CompilationResult;
-import jdk.vm.ci.meta.VMConstant;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.objectfile.ObjectFile.RelocationKind;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.graal.code.CGlobalDataReference;
+import com.oracle.svm.core.graal.code.CGlobalDataDirectReference;
+import com.oracle.svm.core.graal.code.CGlobalDataIndirectReference;
 import com.oracle.svm.core.graal.code.PatchConsumerFactory;
+import com.oracle.svm.guest.staging.meta.MethodPointer;
 import com.oracle.svm.core.meta.SubstrateMethodPointerConstant;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.code.HostedPatcher;
 import com.oracle.svm.hosted.image.RelocatableBuffer;
+import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.asm.Assembler.CodeAnnotation;
+import jdk.graal.compiler.asm.aarch64.AArch64Assembler.PatcherUtil;
+import jdk.graal.compiler.asm.aarch64.AArch64Assembler.SingleInstructionAnnotation;
+import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
+import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler.MovSequenceAnnotation.MovAction;
+import jdk.graal.compiler.code.CompilationResult;
 import jdk.vm.ci.code.site.ConstantReference;
 import jdk.vm.ci.code.site.DataSectionReference;
 import jdk.vm.ci.code.site.Reference;
+import jdk.vm.ci.meta.VMConstant;
 
 @AutomaticallyRegisteredFeature
 @Platforms({Platform.AARCH64.class})
 public class AArch64HostedPatcherFeature implements InternalFeature {
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(PatchConsumerFactory.HostedPatchConsumerFactory.class, new PatchConsumerFactory.HostedPatchConsumerFactory() {
-            @Override
-            public Consumer<CodeAnnotation> newConsumer(CompilationResult compilationResult) {
-                return new Consumer<>() {
-                    @Override
-                    public void accept(CodeAnnotation annotation) {
-                        if (annotation instanceof SingleInstructionAnnotation) {
-                            compilationResult.addAnnotation(new SingleInstructionHostedPatcher((SingleInstructionAnnotation) annotation));
-                        } else if (annotation instanceof AArch64MacroAssembler.MovSequenceAnnotation) {
-                            compilationResult.addAnnotation(new MovSequenceHostedPatcher((AArch64MacroAssembler.MovSequenceAnnotation) annotation));
-                        } else if (annotation instanceof AArch64MacroAssembler.AdrpLdrMacroInstruction) {
-                            compilationResult.addAnnotation(new AdrpLdrMacroInstructionHostedPatcher((AArch64MacroAssembler.AdrpLdrMacroInstruction) annotation));
-                        } else if (annotation instanceof AArch64MacroAssembler.AdrpAddMacroInstruction) {
-                            compilationResult.addAnnotation(new AdrpAddMacroInstructionHostedPatcher((AArch64MacroAssembler.AdrpAddMacroInstruction) annotation));
+        ImageSingletons.add(PatchConsumerFactory.HostedPatchConsumerFactory.class, new AArch64HostedPatchConsumerFactory());
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
+    private static final class AArch64HostedPatchConsumerFactory extends PatchConsumerFactory.HostedPatchConsumerFactory {
+        @Override
+        public Consumer<CodeAnnotation> newConsumer(CompilationResult compilationResult) {
+            return new Consumer<>() {
+                @Override
+                public void accept(CodeAnnotation annotation) {
+                    if (annotation instanceof SingleInstructionAnnotation) {
+                        compilationResult.addAnnotation(new SingleInstructionHostedPatcher((SingleInstructionAnnotation) annotation));
+                    } else if (annotation instanceof AArch64MacroAssembler.MovSequenceReferenceAnnotation refAnnotation) {
+                        if (refAnnotation.getReference() instanceof CGlobalDataIndirectReference reference) {
+                            compilationResult.recordDataPatch(refAnnotation.getInstructionPosition(), reference);
+                            compilationResult.addAnnotation(new AArch64HostedCGlobalDataIndirectReferencePatcher(refAnnotation, reference));
+                        } else {
+                            throw VMError.shouldNotReachHere("Unexpected reference annotation: " + refAnnotation.getReference());
                         }
+                    } else if (annotation instanceof AArch64MacroAssembler.MovSequenceAnnotation) {
+                        compilationResult.addAnnotation(new MovSequenceHostedPatcher((AArch64MacroAssembler.MovSequenceAnnotation) annotation));
+                    } else if (annotation instanceof AArch64MacroAssembler.AdrpLdrMacroInstruction) {
+                        compilationResult.addAnnotation(new AdrpLdrMacroInstructionHostedPatcher((AArch64MacroAssembler.AdrpLdrMacroInstruction) annotation));
+                    } else if (annotation instanceof AArch64MacroAssembler.AdrpAddMacroInstruction) {
+                        compilationResult.addAnnotation(new AdrpAddMacroInstructionHostedPatcher((AArch64MacroAssembler.AdrpAddMacroInstruction) annotation));
                     }
-                };
-            }
-        });
+                }
+            };
+        }
     }
 }
 
@@ -89,7 +105,7 @@ class SingleInstructionHostedPatcher extends CompilationResult.CodeAnnotation im
     }
 
     @Override
-    public void relocate(Reference ref, RelocatableBuffer relocs, int compStart) {
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
         /*
          * Right now relocations need to have the ability to access a value via a PC-relative 32 bit
          * immediate, which is too big for a single instruction. Instead, either adrp/ldr, adrp/add,
@@ -109,6 +125,11 @@ class SingleInstructionHostedPatcher extends CompilationResult.CodeAnnotation im
     public boolean equals(Object obj) {
         return obj == this;
     }
+
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{annotation=" + annotation + '}';
+    }
 }
 
 class AdrpLdrMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
@@ -120,10 +141,10 @@ class AdrpLdrMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotat
     }
 
     @Override
-    public void relocate(Reference ref, RelocatableBuffer relocs, int compStart) {
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
         int siteOffset = compStart + macroInstruction.instructionPosition;
 
-        relocs.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADR_PREL_PG_HI21, ref);
+        codeBuffer.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADR_PREL_PG_HI21, ref);
         siteOffset += 4;
         RelocationKind secondRelocation;
         switch (macroInstruction.srcSize) {
@@ -145,7 +166,7 @@ class AdrpLdrMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotat
             default:
                 throw VMError.shouldNotReachHere("Unknown macro instruction src size of " + macroInstruction.srcSize);
         }
-        relocs.addRelocationWithoutAddend(siteOffset, secondRelocation, ref);
+        codeBuffer.addRelocationWithoutAddend(siteOffset, secondRelocation, ref);
     }
 
     @Uninterruptible(reason = ".")
@@ -160,6 +181,10 @@ class AdrpLdrMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotat
         return this == obj;
     }
 
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{macroInstruction=" + macroInstruction + '}';
+    }
 }
 
 class AdrpAddMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
@@ -171,25 +196,26 @@ class AdrpAddMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotat
     }
 
     @Override
-    public void relocate(Reference ref, RelocatableBuffer relocs, int compStart) {
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
         Object relocVal = ref;
         if (ref instanceof ConstantReference constantRef) {
             VMConstant constant = constantRef.getConstant();
             if (constant instanceof SubstrateMethodPointerConstant methodPointerConstant) {
                 MethodPointer pointer = methodPointerConstant.pointer();
-                HostedMethod hMethod = (HostedMethod) pointer.getMethod();
+                HostedMethod hMethod = (HostedMethod) methodPointerConstant.getMethod();
+                VMError.guarantee(!hMethod.isCompiledInPriorLayer(), "Method %s was compiled in a prior layer", hMethod);
                 VMError.guarantee(hMethod.isCompiled(), "Method %s is not compiled although there is a method pointer constant created for it.", hMethod);
                 relocVal = pointer;
             }
         } else {
-            VMError.guarantee(ref instanceof DataSectionReference || ref instanceof CGlobalDataReference, "Unexpected reference: %s", ref);
+            VMError.guarantee(ref instanceof DataSectionReference || ref instanceof CGlobalDataDirectReference, "Unexpected reference: %s", ref);
         }
 
         int siteOffset = compStart + macroInstruction.instructionPosition;
-        relocs.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADR_PREL_PG_HI21, relocVal);
+        codeBuffer.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADR_PREL_PG_HI21, relocVal);
 
         siteOffset += 4;
-        relocs.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADD_ABS_LO12_NC, relocVal);
+        codeBuffer.addRelocationWithoutAddend(siteOffset, RelocationKind.AARCH64_R_AARCH64_ADD_ABS_LO12_NC, relocVal);
     }
 
     @Uninterruptible(reason = ".")
@@ -202,6 +228,63 @@ class AdrpAddMacroInstructionHostedPatcher extends CompilationResult.CodeAnnotat
     @Override
     public boolean equals(Object obj) {
         return this == obj;
+    }
+
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{macroInstruction=" + macroInstruction + '}';
+    }
+}
+
+class AArch64HostedCGlobalDataIndirectReferencePatcher extends CompilationResult.CodeAnnotation implements HostedPatcher {
+    private final AArch64MacroAssembler.MovSequenceReferenceAnnotation annotation;
+    private final CGlobalDataIndirectReference reference;
+
+    AArch64HostedCGlobalDataIndirectReferencePatcher(AArch64MacroAssembler.MovSequenceReferenceAnnotation annotation, CGlobalDataIndirectReference reference) {
+        super(annotation.getInstructionPosition());
+        this.annotation = annotation;
+        this.reference = reference;
+    }
+
+    @Override
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
+        throw VMError.shouldNotReachHere("Indirect CGlobalData access through image heap should be patched during image generation.");
+    }
+
+    @Override
+    public void patch(int compStart, int relative, byte[] code) {
+        assert compStart == -1 && relative == -1 : "We do not need compStart and relative arguments when patching CGlobalDataReference object";
+        int offset = reference.getDataInfo().getOffset();
+        int siteOffset = 0;
+        for (MovAction include : annotation.getIncludeSet()) {
+            int value = offset & 0xFFFF;
+            offset >>>= 16;
+            switch (include) {
+                case USED:
+                    int instOffset = annotation.getInstructionPosition() + siteOffset;
+                    int originalInst = PatcherUtil.readInstruction(code, instOffset);
+                    int newInst = PatcherUtil.patchMov(originalInst, value);
+                    PatcherUtil.writeInstruction(code, instOffset, newInst);
+                    siteOffset += 4;
+                    break;
+                case SKIPPED:
+                    VMError.guarantee(value == 0, "Unable to patch skipped MOV chunk with non-zero value %s.", value);
+                    break;
+                case NEGATED:
+                    throw VMError.shouldNotReachHere("Negated MOV chunks are not used for indirect CGlobalData offsets.");
+            }
+        }
+        VMError.guarantee(offset == 0, "CGlobalData offset does not fit in the annotated MOV sequence.");
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        return this == obj;
+    }
+
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{annotation=" + annotation + ", reference=" + reference + '}';
     }
 }
 
@@ -214,7 +297,7 @@ class MovSequenceHostedPatcher extends CompilationResult.CodeAnnotation implemen
     }
 
     @Override
-    public void relocate(Reference ref, RelocatableBuffer relocs, int compStart) {
+    public void relocate(Reference ref, RelocatableBuffer codeBuffer, int compStart) {
         /*
          * The relocation site is the start of some instruction, which is some offset into the
          * method, which is some offset into the text section (a.k.a. code cache). The offset we get
@@ -222,7 +305,7 @@ class MovSequenceHostedPatcher extends CompilationResult.CodeAnnotation implemen
          * method. We add the method start to get the section-relative offset.
          */
         int siteOffset = compStart + annotation.instructionPosition;
-        if (ref instanceof DataSectionReference || ref instanceof CGlobalDataReference || ref instanceof ConstantReference) {
+        if (ref instanceof DataSectionReference || ref instanceof CGlobalDataDirectReference || ref instanceof ConstantReference) {
             if (ref instanceof ConstantReference constantRef) {
                 VMError.guarantee(!(constantRef.getConstant() instanceof SubstrateMethodPointerConstant), "SubstrateMethodPointerConstants should not be relocated %s", constantRef);
             }
@@ -251,9 +334,9 @@ class MovSequenceHostedPatcher extends CompilationResult.CodeAnnotation implemen
                     continue;
                 }
                 if (i == lastMovIndex) {
-                    relocs.addRelocationWithoutAddend(siteOffset, relocations[i], ref);
+                    codeBuffer.addRelocationWithoutAddend(siteOffset, relocations[i], ref);
                 } else {
-                    relocs.addRelocationWithoutAddend(siteOffset, noCheckRelocations[i], ref);
+                    codeBuffer.addRelocationWithoutAddend(siteOffset, noCheckRelocations[i], ref);
                 }
                 siteOffset = siteOffset + 4;
             }
@@ -272,5 +355,10 @@ class MovSequenceHostedPatcher extends CompilationResult.CodeAnnotation implemen
     @Override
     public boolean equals(Object obj) {
         return obj == this;
+    }
+
+    @Override
+    public String toString() {
+        return ClassUtil.getUnqualifiedName(getClass()) + "{annotation=" + annotation + '}';
     }
 }

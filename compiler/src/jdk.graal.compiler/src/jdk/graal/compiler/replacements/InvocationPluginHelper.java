@@ -24,11 +24,10 @@
  */
 package jdk.graal.compiler.replacements;
 
-import static jdk.vm.ci.services.Services.IS_BUILDING_NATIVE_IMAGE;
-
 import java.util.ArrayList;
 
-import jdk.graal.compiler.api.replacements.Snippet;
+import org.graalvm.word.impl.Word;
+
 import jdk.graal.compiler.core.common.calc.CanonicalCondition;
 import jdk.graal.compiler.core.common.calc.Condition;
 import jdk.graal.compiler.core.common.type.Stamp;
@@ -76,7 +75,6 @@ import jdk.graal.compiler.nodes.java.LoadFieldNode;
 import jdk.graal.compiler.nodes.memory.address.AddressNode;
 import jdk.graal.compiler.nodes.memory.address.OffsetAddressNode;
 import jdk.graal.compiler.nodes.type.StampTool;
-import jdk.graal.compiler.word.Word;
 import jdk.vm.ci.code.CodeUtil;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -322,16 +320,6 @@ public class InvocationPluginHelper implements DebugCloseable {
             }
         }
         throw new GraalError("missing field " + fieldName + " in type " + type);
-    }
-
-    /**
-     * Gets the offset of a field. Normally InvocationPlugins are run in the target VM so nothing
-     * special needs to be done to handle these offsets but if a {@link Snippet} even triggers a
-     * plugin that uses a field offset them some extra machinery will be needed to delay the lookup.
-     */
-    public ValueNode getFieldOffset(ResolvedJavaType type, String fieldName) {
-        GraalError.guarantee(!IS_BUILDING_NATIVE_IMAGE || !b.parsingIntrinsic(), "these values must be deferred in substitutions and snippets");
-        return ConstantNode.forInt(getField(type, fieldName).getOffset());
     }
 
     /**

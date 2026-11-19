@@ -43,9 +43,6 @@ package com.oracle.truffle.tck;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.lang.reflect.AccessibleObject;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -122,6 +119,22 @@ public final class DebuggerTester implements AutoCloseable {
         out.println("DebuggerTester: " + message);
     }
 
+    private static Boolean optimizingRuntimeUsed;
+
+    private static boolean isOptimizingRuntime() {
+        Boolean optimizing = optimizingRuntimeUsed;
+        if (optimizing == null) {
+            try (Engine e = Engine.create()) {
+                optimizingRuntimeUsed = optimizing = !e.getImplementationName().equals("Interpreted");
+            }
+        }
+        return optimizing;
+    }
+
+    private static boolean isDeoptLoopDetectionAvailable() {
+        return Runtime.version().feature() >= 25;
+    }
+
     private final ExecutingLoop executingLoop;
     private SuspendedCallback handler;
 
@@ -133,7 +146,7 @@ public final class DebuggerTester implements AutoCloseable {
      * @since 0.16
      */
     public DebuggerTester() {
-        this(null);
+        this(null, null);
     }
 
     /**
@@ -141,16 +154,37 @@ public final class DebuggerTester implements AutoCloseable {
      *
      * @param contextBuilder a pre-set context builder. Only out and err streams are set on this
      *            builder prior the {@link Context} instance creation.
-     *
      * @see #DebuggerTester()
      * @since 0.31
      */
     public DebuggerTester(Context.Builder contextBuilder) {
+        this(null, contextBuilder);
+    }
+
+    /**
+     * Constructs a new debugger tester instance with a pre-set context builder and engine.
+     *
+     * @param engine engine to use for the context builder.
+     * @param contextBuilder a pre-set context builder. Only out and err streams are set on this
+     *            builder prior the {@link Context} instance creation.
+     * @see #DebuggerTester()
+     * @since 25.0
+     */
+    public DebuggerTester(Engine engine, Context.Builder contextBuilder) {
         this.newEvent = new ArrayBlockingQueue<>(1);
         this.executing = new Semaphore(0);
         this.initialized = new Semaphore(0);
         final AtomicReference<Engine> engineRef = new AtomicReference<>();
         final AtomicReference<Throwable> error = new AtomicReference<>();
+        if (engine != null) {
+            contextBuilder.engine(engine);
+        } else if (isOptimizingRuntime()) {
+            // TODO GR-65179
+            contextBuilder.option("engine.MaximumCompilations", "-1");
+            if (isDeoptLoopDetectionAvailable()) {
+                contextBuilder.option("compiler.DeoptCycleDetectionThreshold", "-1");
+            }
+        }
         this.executingLoop = new ExecutingLoop(contextBuilder, engineRef, error);
         this.evalThread = new Thread(executingLoop);
         this.evalThread.start();
@@ -806,55 +840,7 @@ public final class DebuggerTester implements AutoCloseable {
      * @since 0.28
      */
     public static com.oracle.truffle.api.source.Source getSourceImpl(Source source) {
-        return (com.oracle.truffle.api.source.Source) getField(source, "receiver");
-    }
-
-    // Copied from ReflectionUtils.
-    private static Object getField(Object value, String name) {
-        try {
-            Field f = value.getClass().getDeclaredField(name);
-            setAccessible(f, true);
-            return f.get(value);
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
-    }
-
-    private static void setAccessible(Field field, boolean flag) {
-        openForReflectionTo(field.getDeclaringClass(), DebuggerTester.class);
-        field.setAccessible(flag);
-    }
-
-    /**
-     * Opens {@code declaringClass}'s package to allow a method declared in {@code accessor} to call
-     * {@link AccessibleObject#setAccessible(boolean)} on an {@link AccessibleObject} representing a
-     * field or method declared by {@code declaringClass}.
-     */
-    private static void openForReflectionTo(Class<?> declaringClass, Class<?> accessor) {
-        try {
-            Method getModule = Class.class.getMethod("getModule");
-            Class<?> moduleClass = getModule.getReturnType();
-            Class<?> modulesClass = Class.forName("jdk.internal.module.Modules");
-            Method addOpens = maybeGetAddOpensMethod(moduleClass, modulesClass);
-            if (addOpens != null) {
-                Object moduleToOpen = getModule.invoke(declaringClass);
-                Object accessorModule = getModule.invoke(accessor);
-                if (moduleToOpen != accessorModule) {
-                    addOpens.invoke(null, moduleToOpen, declaringClass.getPackage().getName(), accessorModule);
-                }
-            }
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
-    }
-
-    private static Method maybeGetAddOpensMethod(Class<?> moduleClass, Class<?> modulesClass) {
-        try {
-            return modulesClass.getDeclaredMethod("addOpens", moduleClass, String.class, moduleClass);
-        } catch (NoSuchMethodException e) {
-            // This method was introduced by JDK-8169069
-            return null;
-        }
+        return TruffleTCKAccessor.ENGINE.getSourceReceiver(source);
     }
 
     private void putEvent(Object event) {

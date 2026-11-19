@@ -27,10 +27,8 @@ package jdk.graal.compiler.lir.stackslotalloc;
 import static jdk.graal.compiler.lir.LIRValueUtil.asVirtualStackSlot;
 import static jdk.graal.compiler.lir.LIRValueUtil.isVirtualStackSlot;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
-import java.util.Deque;
 import java.util.EnumSet;
 
 import org.graalvm.collections.EconomicSet;
@@ -48,6 +46,7 @@ import jdk.graal.compiler.lir.LIRInstruction.OperandFlag;
 import jdk.graal.compiler.lir.LIRInstruction.OperandMode;
 import jdk.graal.compiler.lir.VirtualStackSlot;
 import jdk.graal.compiler.lir.framemap.SimpleVirtualStackSlotAlias;
+import jdk.graal.compiler.lir.util.BlockWorkList;
 
 import jdk.vm.ci.meta.Value;
 
@@ -82,8 +81,8 @@ final class FixPointIntervalBuilder {
      * virtual stack slots.
      */
     EconomicSet<LIRInstruction> build() {
-        Deque<BasicBlock<?>> worklist = new ArrayDeque<>();
         BasicBlock<?>[] blocks = lir.getControlFlowGraph().getBlocks();
+        BlockWorkList worklist = new BlockWorkList(blocks.length);
         for (int i = blocks.length - 1; i >= 0; i--) {
             worklist.add(blocks[i]);
         }
@@ -116,7 +115,7 @@ final class FixPointIntervalBuilder {
     }
 
     @SuppressWarnings("try")
-    private void processBlock(BasicBlock<?> block, Deque<BasicBlock<?>> worklist) {
+    private void processBlock(BasicBlock<?> block, BlockWorkList worklist) {
         DebugContext debug = lir.getDebug();
         if (updateOutBlock(block)) {
             try (Indent indent = debug.logAndIndent("handle block %s", block)) {
@@ -204,6 +203,8 @@ final class FixPointIntervalBuilder {
             DebugContext debug = lir.getDebug();
             try (Indent indent = debug.logAndIndent("handle op %d, %s", op.id(), op)) {
                 // kills
+                // The fixpoint liveness walk models @UseKill as a kill at this op.
+                op.visitEachUseKill(defConsumer);
                 op.visitEachTemp(defConsumer);
                 op.visitEachOutput(defConsumer);
 
@@ -213,6 +214,9 @@ final class FixPointIntervalBuilder {
                 // mark locations
                 // gen
                 op.visitEachInput(useConsumer);
+                // The same walk also models @UseKill as a use because the value is still live when
+                // the instruction starts.
+                op.visitEachUseKill(useConsumer);
             }
         }
 
@@ -253,7 +257,7 @@ final class FixPointIntervalBuilder {
                 // Stack slot is marked uninitialized so we have to assume it is live all
                 // the time.
                 DebugContext debug = lir.getDebug();
-                if (debug.isCountEnabled() && !(interval.from() == 0 && interval.to() == maxOpId)) {
+                if (debug.areCountersEnabled() && !(interval.from() == 0 && interval.to() == maxOpId)) {
                     uninitializedSlots.increment(debug);
                 }
                 interval.addFrom(0);

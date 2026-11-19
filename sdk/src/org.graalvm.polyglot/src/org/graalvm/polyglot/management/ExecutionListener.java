@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package org.graalvm.polyglot.management;
 
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -192,13 +193,25 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
  */
 public final class ExecutionListener implements AutoCloseable {
 
-    private static final ExecutionListener EMPTY = new ExecutionListener(null, null);
+    private static final ExecutionListener EMPTY = new ExecutionListener();
     final AbstractExecutionListenerDispatch dispatch;
     final Object receiver;
+    /**
+     * Strong reference to {@link Engine} to prevent it from being garbage collected and closed
+     * while {@link ExecutionListener} is still reachable.
+     */
+    final Engine creatorEngine;
 
-    ExecutionListener(AbstractExecutionListenerDispatch dispatch, Object receiver) {
+    ExecutionListener(AbstractExecutionListenerDispatch dispatch, Object receiver, Engine creatorEngine) {
         this.dispatch = dispatch;
         this.receiver = receiver;
+        this.creatorEngine = Objects.requireNonNull(creatorEngine);
+    }
+
+    private ExecutionListener() {
+        this.dispatch = null;
+        this.receiver = null;
+        this.creatorEngine = null;
     }
 
     /**
@@ -216,6 +229,16 @@ public final class ExecutionListener implements AutoCloseable {
      */
     public void close() {
         dispatch.closeExecutionListener(receiver);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 25.3
+     */
+    @Override
+    public String toString() {
+        return "ExecutionListener[id=" + Integer.toHexString(System.identityHashCode(this)) + ", engineId=" + Integer.toHexString(System.identityHashCode(creatorEngine)) + "]";
     }
 
     /**
@@ -401,6 +424,56 @@ public final class ExecutionListener implements AutoCloseable {
         public Builder collectExceptions(boolean enabled) {
             this.collectExceptions = enabled;
             return this;
+        }
+
+        /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("ExecutionListener.newBuilder()");
+            if (onEnter != null) {
+                appendCall(b, "onEnter", onEnter);
+            }
+            if (onReturn != null) {
+                appendCall(b, "onReturn", onReturn);
+            }
+            if (sourceFilter != null) {
+                appendCall(b, "sourceFilter", sourceFilter);
+            }
+            if (rootNameFilter != null) {
+                appendCall(b, "rootNameFilter", rootNameFilter);
+            }
+            if (expressions) {
+                appendCall(b, "expressions", true);
+            }
+            if (statements) {
+                appendCall(b, "statements", true);
+            }
+            if (roots) {
+                appendCall(b, "roots", true);
+            }
+            if (collectInputValues) {
+                appendCall(b, "collectInputValues", true);
+            }
+            if (collectReturnValues) {
+                appendCall(b, "collectReturnValue", true);
+            }
+            if (collectExceptions) {
+                appendCall(b, "collectExceptions", true);
+            }
+            return b.toString();
+        }
+
+        private static void appendCall(StringBuilder b, String methodName, Object value) {
+            b.append('\n');
+            b.append("  .");
+            b.append(methodName);
+            b.append('(');
+            b.append(String.valueOf(value));
+            b.append(')');
         }
 
         /**

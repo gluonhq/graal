@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,13 +24,16 @@
  */
 package com.oracle.graal.pointsto.flow;
 
+import java.util.List;
+
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.api.HostVM;
 import com.oracle.graal.pointsto.infrastructure.GraphProvider.Purpose;
+import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.phases.SubstrateIntrinsicGraphBuilder;
 import com.oracle.graal.pointsto.util.AnalysisError;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.util.ClassUtil;
 
 import jdk.graal.compiler.api.runtime.GraalJVMCICompiler;
 import jdk.graal.compiler.bytecode.Bytecode;
@@ -39,8 +42,10 @@ import jdk.graal.compiler.core.common.PermanentBailoutException;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.DebugContext.Builder;
 import jdk.graal.compiler.debug.DebugContext.Description;
+import jdk.graal.compiler.debug.DebugOptions;
 import jdk.graal.compiler.debug.Indent;
 import jdk.graal.compiler.nodes.EncodedGraph;
+import jdk.graal.compiler.nodes.GraphDecoder;
 import jdk.graal.compiler.nodes.GraphEncoder;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
@@ -56,6 +61,67 @@ import jdk.vm.ci.runtime.JVMCI;
 public final class AnalysisParsedGraph {
 
     /**
+     * Analysis graph parsing is (currently) done in two stages. This is necessary to break cyclic
+     * dependencies between methods when performing pre-analysis optimizations. For example, if an
+     * optimization {@code Opt0} processes the graph of {@code methodA} on {@code threadA}, it will
+     * hold a lock during this operation. Assume {@code Opt0} requires to access the graph of
+     * {@code methodB}. This will issue a parsing request that may be executed by a different thread
+     * {@code threadB}. Now, it may be that {@code Opt0} also processes the graph of {@code methodB}
+     * and to do so, it needs to access the graph of {@code methodA}. This would end up in a
+     * deadlock. Staged parsing avoids this problem. In stage {@link #BYTECODE_PARSED}, only
+     * bytecode parsing will be done and any pre-analysis optimizations run in stage
+     * {@link #OPTIMIZATIONS_APPLIED}. Hence, {@code Opt0} can request the graph of the previous
+     * stage to break the cycle.
+     *
+     * Right now, it is not supported to add further parsing stages, and we are limited to the
+     * existing two stages. If further parsing stages are required, we first need to figure out: (1)
+     * if and how the stage graphs should be persisted for layered images, and (2) how to specify if
+     * a stage graph can be skipped if a later stage was requested.
+     */
+    public enum Stage {
+        /**
+         * This stage only performs bytecode parsing for the requested method. No additional
+         * optimizations are applied except of any graph builder plugins that are used by the
+         * bytecode parser.
+         */
+        BYTECODE_PARSED(null),
+
+        /**
+         * This stage performs additional after-parsing optimizations before the graph is published.
+         */
+        OPTIMIZATIONS_APPLIED(BYTECODE_PARSED);
+
+        private final Stage previous;
+
+        Stage(Stage previous) {
+            this.previous = previous;
+        }
+
+        public static Stage finalStage() {
+            return OPTIMIZATIONS_APPLIED;
+        }
+
+        public static Stage firstStage() {
+            return BYTECODE_PARSED;
+        }
+
+        public Stage previous() {
+            return previous;
+        }
+
+        public boolean hasPrevious() {
+            return previous != null;
+        }
+
+        public static boolean isRequiredStage(Stage stage, AnalysisMethod method) {
+            return switch (stage) {
+                case BYTECODE_PARSED -> method.isOriginalMethod() && method.isClassInitializer();
+                case OPTIMIZATIONS_APPLIED -> true;
+            };
+        }
+    }
+
+    /**
      * The architecture that the image builder is running on. This determines whether unaligned
      * memory accesses are available for graph encoding / decoding at image build time.
      */
@@ -65,31 +131,75 @@ public final class AnalysisParsedGraph {
         HOST_ARCHITECTURE = compiler.getGraalRuntime().getCapability(RuntimeProvider.class).getHostBackend().getTarget().arch;
     }
 
-    private static final AnalysisParsedGraph EMPTY = new AnalysisParsedGraph(null, false);
+    /**
+     * Immutable metadata captured for one parsed graph, retained with its encoding so subsequent
+     * parsing of the same method cannot replace it. Closed-field writes describe field write effects
+     * resolved at the collection boundary, including Unsafe stores and atomic updates with symbolic
+     * field offsets, and effects eliminated before encoding. They conservatively retain validation
+     * obligations rather than describing only the encoded graph's remaining effects.
+     *
+     * @param closedFieldWrites always-closed fields written before optimizations can remove their
+     *            effects; this is validation metadata for later layers and does not mark fields as
+     *            written in the analysis
+     */
+    public record GraphMetadata(List<AnalysisField> closedFieldWrites) {
+        private static final GraphMetadata EMPTY = new GraphMetadata(List.of());
+
+        public GraphMetadata {
+            closedFieldWrites = List.copyOf(closedFieldWrites);
+        }
+
+        /** Collects metadata during one parsing operation, before publishing the encoded graph. */
+        public static final class Builder {
+            private List<AnalysisField> closedFieldWrites = List.of();
+
+            public void setClosedFieldWrites(List<AnalysisField> closedFieldWrites) {
+                this.closedFieldWrites = List.copyOf(closedFieldWrites);
+            }
+
+            public GraphMetadata build() {
+                return closedFieldWrites.isEmpty() ? EMPTY : new GraphMetadata(closedFieldWrites);
+            }
+        }
+    }
+
+    private static final AnalysisParsedGraph EMPTY = new AnalysisParsedGraph(null, false, GraphMetadata.EMPTY);
 
     private final EncodedGraph encodedGraph;
     private final boolean isIntrinsic;
+    private final GraphMetadata metadata;
 
-    private AnalysisParsedGraph(EncodedGraph encodedGraph, boolean isIntrinsic) {
+    public AnalysisParsedGraph(EncodedGraph encodedGraph, boolean isIntrinsic, GraphMetadata metadata) {
         this.isIntrinsic = isIntrinsic;
         this.encodedGraph = encodedGraph;
+        this.metadata = metadata;
     }
 
     public EncodedGraph getEncodedGraph() {
         return encodedGraph;
     }
 
+    public GraphMetadata getMetadata() {
+        return metadata;
+    }
+
     public boolean isIntrinsic() {
         return isIntrinsic;
     }
 
-    @SuppressWarnings("try")
     public static AnalysisParsedGraph parseBytecode(BigBang bb, AnalysisMethod method) {
+        return parseBytecodeForStage(bb, method, Stage.BYTECODE_PARSED);
+    }
+
+    @SuppressWarnings("try")
+    private static AnalysisParsedGraph parseBytecodeForStage(BigBang bb, AnalysisMethod method, Stage stage) {
         if (bb == null) {
             throw AnalysisError.shouldNotReachHere("BigBang object required for parsing method " + method.format("%H.%p(%n)"));
         }
 
-        OptionValues options = bb.getOptions();
+        // Persisted analysis graphs do not consume the structured optimization log, so avoid
+        // capturing its debug-only state in encoded graphs.
+        OptionValues options = bb.getOptions().derive(DebugOptions.OptimizationLog, null);
         Description description = new Description(method, ClassUtil.getUnqualifiedName(method.getClass()) + ":" + method.getId());
         DebugContext debug = new Builder(options, new GraalDebugHandlersFactory(bb.getSnippetReflectionProvider())).description(description).build();
 
@@ -98,7 +208,7 @@ public final class AnalysisParsedGraph {
             Object result = bb.getHostVM().parseGraph(bb, debug, method);
             if (result != HostVM.PARSING_UNHANDLED) {
                 if (result instanceof StructuredGraph) {
-                    return optimizeAndEncode(bb, method, (StructuredGraph) result, false);
+                    return optimizeAndEncode(bb, method, (StructuredGraph) result, false, stage);
                 } else {
                     assert result == HostVM.PARSING_FAILED : result;
                     return EMPTY;
@@ -107,7 +217,7 @@ public final class AnalysisParsedGraph {
 
             StructuredGraph graph = method.buildGraph(debug, method, bb.getProviders(method), Purpose.ANALYSIS);
             if (graph != null) {
-                return optimizeAndEncode(bb, method, graph, false);
+                return optimizeAndEncode(bb, method, graph, false, stage);
             }
 
             InvocationPlugin plugin = bb.getProviders(method).getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method, options);
@@ -115,7 +225,7 @@ public final class AnalysisParsedGraph {
                 Bytecode code = new ResolvedJavaMethodBytecode(method);
                 graph = new SubstrateIntrinsicGraphBuilder(options, debug, bb.getProviders(method), code).buildGraph(plugin);
                 if (graph != null) {
-                    return optimizeAndEncode(bb, method, graph, true);
+                    return optimizeAndEncode(bb, method, graph, true, stage);
                 }
             }
 
@@ -149,21 +259,78 @@ public final class AnalysisParsedGraph {
             } catch (Throwable e) {
                 throw debug.handle(e);
             }
-            return optimizeAndEncode(bb, method, graph, false);
+            return optimizeAndEncode(bb, method, graph, false, stage);
+        }
+    }
+
+    /**
+     * Creates the final stage (i.e. {@link Stage#OPTIMIZATIONS_APPLIED}) graph for the given
+     * method.
+     *
+     * There are two ways for how the final stage graph can be created: The stage 1 graph is (1)
+     * available, or (2) is not available.
+     *
+     * For {@code (1)}, the graph was usually created with {@link #parseBytecode} (i.e. stage
+     * {@link Stage#BYTECODE_PARSED}) but this is neither a strong requirement nor enforced. The
+     * graph will then be decoded, the {@link HostVM#methodAfterParsingHook after parsing hook} will
+     * be called, and again encoded.
+     *
+     * For {@code (2)} (if the input graph is {@code null}), the final stage graph will directly be
+     * created. In particular, this will parse the method's bytecode and call
+     * {@link #optimizeAndEncode} directly for stage {@link Stage#OPTIMIZATIONS_APPLIED}. This means
+     * that the {@link HostVM#methodAfterParsingHook after parsing hook} will ONLY be called for
+     * {@link Stage#OPTIMIZATIONS_APPLIED}.
+     */
+    public static AnalysisParsedGraph createFinalStage(BigBang bb, AnalysisMethod method, AnalysisParsedGraph stage1Graph) {
+        if (stage1Graph == null) {
+            assert !Stage.isRequiredStage(Stage.firstStage(), method);
+            return parseBytecodeForStage(bb, method, Stage.OPTIMIZATIONS_APPLIED);
+        }
+        if (stage1Graph.encodedGraph == null) {
+            return EMPTY;
+        }
+        return optimizeAndEncode(bb, method, decodeParsedGraph(bb, method, stage1Graph), stage1Graph.isIntrinsic, Stage.OPTIMIZATIONS_APPLIED);
+    }
+
+    /** Decode a non-empty parsed graph without inlining or applying optimizations. */
+    @SuppressWarnings("try")
+    private static StructuredGraph decodeParsedGraph(BigBang bb, AnalysisMethod method, AnalysisParsedGraph analysisParsedGraph) {
+        // Persisted analysis graphs do not consume the structured optimization log, so avoid
+        // recreating it while decoding a graph for re-encoding.
+        OptionValues options = bb.getOptions().derive(DebugOptions.OptimizationLog, null);
+        DebugContext.Description description = new DebugContext.Description(method, ClassUtil.getUnqualifiedName(method.getClass()) + ":" + method.getId());
+        DebugContext debug = new DebugContext.Builder(options, new GraalDebugHandlersFactory(bb.getSnippetReflectionProvider())).description(description).build();
+
+        StructuredGraph result = new StructuredGraph.Builder(options, debug, bb.getHostVM().allowAssumptions(method))
+                        .method(method)
+                        .trackNodeSourcePosition(analysisParsedGraph.encodedGraph.trackNodeSourcePosition())
+                        .recordInlinedMethods(analysisParsedGraph.encodedGraph.isRecordingInlinedMethods())
+                        .build();
+
+        try (DebugContext.Scope s = debug.scope("ClosedWorldAnalysis", result, method)) {
+            GraphDecoder decoder = new GraphDecoder(HOST_ARCHITECTURE, result);
+            decoder.decode(analysisParsedGraph.encodedGraph);
+            return result;
+        } catch (Throwable ex) {
+            throw debug.handle(ex);
         }
     }
 
     @SuppressWarnings("try")
-    private static AnalysisParsedGraph optimizeAndEncode(BigBang bb, AnalysisMethod method, StructuredGraph graph, boolean isIntrinsic) {
+    private static AnalysisParsedGraph optimizeAndEncode(BigBang bb, AnalysisMethod method, StructuredGraph graph, boolean isIntrinsic, Stage stage) {
         try (DebugContext.Scope s = graph.getDebug().scope("ClosedWorldAnalysis", graph, method)) {
             /*
              * Must be called before any other thread can access the graph, i.e., before the graph
              * is published.
              */
-            bb.getHostVM().methodAfterParsingHook(bb, method, graph);
+            GraphMetadata.Builder metadata = new GraphMetadata.Builder();
+            switch (stage) {
+                case BYTECODE_PARSED -> bb.getHostVM().methodAfterBytecodeParsedHook(bb, method, graph);
+                case OPTIMIZATIONS_APPLIED -> bb.getHostVM().methodAfterParsingHook(bb, method, graph, metadata);
+            }
 
             EncodedGraph encodedGraph = GraphEncoder.encodeSingleGraph(graph, HOST_ARCHITECTURE);
-            return new AnalysisParsedGraph(encodedGraph, isIntrinsic);
+            return new AnalysisParsedGraph(encodedGraph, isIntrinsic, metadata.build());
         } catch (Throwable e) {
             throw graph.getDebug().handle(e);
         }

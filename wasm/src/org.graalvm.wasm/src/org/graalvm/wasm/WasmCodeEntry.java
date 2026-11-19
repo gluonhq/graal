@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,19 +47,30 @@ public final class WasmCodeEntry {
 
     private final WasmFunction function;
     @CompilationFinal(dimensions = 1) private final byte[] bytecode;
-    @CompilationFinal(dimensions = 1) private final byte[] localTypes;
-    @CompilationFinal(dimensions = 1) private final byte[] resultTypes;
+    @CompilationFinal(dimensions = 1) private final int[] localTypes;
+    @CompilationFinal(dimensions = 1) private final int[] resultTypes;
     private final BranchProfile errorBranch = BranchProfile.create();
+    private final BranchProfile exceptionBranch = BranchProfile.create();
+    private final BranchProfile subtypingBranch = BranchProfile.create();
     private final int numLocals;
+    private final int maxLegacyCatchDepth;
+    private final int stackBase;
     private final int resultCount;
+    private final boolean usesMemoryZero;
 
-    public WasmCodeEntry(WasmFunction function, byte[] bytecode, byte[] localTypes, byte[] resultTypes) {
+    public WasmCodeEntry(WasmFunction function, byte[] bytecode, int[] localTypes, int[] resultTypes, int maxLegacyCatchDepth, boolean usesMemoryZero) {
         this.function = function;
         this.bytecode = bytecode;
         this.localTypes = localTypes;
         this.numLocals = localTypes.length;
+        this.maxLegacyCatchDepth = maxLegacyCatchDepth;
+        // Legacy catches keep the caught exception object in reserved frame slots between the
+        // locals and the operand stack. stackBase therefore stays constant for the whole function
+        // and already accounts for the maximum nesting of legacy catches in the body.
+        this.stackBase = numLocals + maxLegacyCatchDepth;
         this.resultTypes = resultTypes;
         this.resultCount = resultTypes.length;
+        this.usesMemoryZero = usesMemoryZero;
     }
 
     public WasmFunction function() {
@@ -70,12 +81,20 @@ public final class WasmCodeEntry {
         return bytecode;
     }
 
-    public byte localType(int index) {
+    public int localType(int index) {
         return localTypes[index];
     }
 
     public int localCount() {
         return numLocals;
+    }
+
+    public int maxLegacyCatchDepth() {
+        return maxLegacyCatchDepth;
+    }
+
+    public int stackBase() {
+        return stackBase;
     }
 
     public int functionIndex() {
@@ -86,12 +105,24 @@ public final class WasmCodeEntry {
         return resultCount;
     }
 
-    public byte resultType(int index) {
+    public int resultType(int index) {
         return resultTypes[index];
     }
 
     public void errorBranch() {
         errorBranch.enter();
+    }
+
+    public void exceptionBranch() {
+        exceptionBranch.enter();
+    }
+
+    public void subtypingBranch() {
+        subtypingBranch.enter();
+    }
+
+    public boolean usesMemoryZero() {
+        return usesMemoryZero;
     }
 
     @Override

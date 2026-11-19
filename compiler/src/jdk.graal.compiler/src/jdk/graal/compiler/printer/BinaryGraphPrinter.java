@@ -30,12 +30,14 @@ import static jdk.graal.compiler.graph.Edges.Type.Successors;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
@@ -52,6 +54,12 @@ import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.graph.NodeMap;
 import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.graal.compiler.graph.SourceLanguagePosition;
+import jdk.graal.compiler.graphio.GraphBlocks;
+import jdk.graal.compiler.graphio.GraphElements;
+import jdk.graal.compiler.graphio.GraphLocations;
+import jdk.graal.compiler.graphio.GraphOutput;
+import jdk.graal.compiler.graphio.GraphStructure;
+import jdk.graal.compiler.graphio.GraphTypes;
 import jdk.graal.compiler.nodes.AbstractBeginNode;
 import jdk.graal.compiler.nodes.AbstractEndNode;
 import jdk.graal.compiler.nodes.AbstractMergeNode;
@@ -64,20 +72,13 @@ import jdk.graal.compiler.nodes.PhiNode;
 import jdk.graal.compiler.nodes.ProxyNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.VirtualState;
-import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
+import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.memory.MemoryAccess;
 import jdk.graal.compiler.nodes.memory.MemoryKill;
 import jdk.graal.compiler.nodes.memory.MultiMemoryKill;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.util.JavaConstantFormattable;
-import jdk.graal.compiler.graphio.GraphBlocks;
-import jdk.graal.compiler.graphio.GraphElements;
-import jdk.graal.compiler.graphio.GraphLocations;
-import jdk.graal.compiler.graphio.GraphOutput;
-import jdk.graal.compiler.graphio.GraphStructure;
-import jdk.graal.compiler.graphio.GraphTypes;
-
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -101,6 +102,12 @@ public class BinaryGraphPrinter implements
                         types(this)
         );
         // @formatter:on
+        this.snippetReflection = snippetReflection;
+    }
+
+    @SuppressWarnings("this-escape")
+    public BinaryGraphPrinter(WritableByteChannel channel, SnippetReflectionProvider snippetReflection) throws IOException {
+        this.output = GraphOutput.newBuilder(this).blocks(this).elementsAndLocations(this, this).types(this).build(channel);
         this.snippetReflection = snippetReflection;
     }
 
@@ -385,7 +392,16 @@ public class BinaryGraphPrinter implements
 
     @Override
     public void print(DebugContext debug, Graph graph, Map<Object, Object> properties, int id, String format, Object... args) throws IOException {
-        output.print(new GraphInfo(debug, graph), properties, id, format, args);
+        String theFormat = format;
+        Object[] theArgs = args;
+        if (args.length == 1 && args[0] instanceof GraalError graalError) {
+            theFormat = String.format(Locale.ENGLISH, format, graalError.getRawFormat());
+            theArgs = graalError.getArguments();
+            if (theArgs == null) {
+                theArgs = new Object[0];
+            }
+        }
+        output.print(new GraphInfo(debug, graph), properties, id, theFormat, theArgs);
     }
 
     @Override

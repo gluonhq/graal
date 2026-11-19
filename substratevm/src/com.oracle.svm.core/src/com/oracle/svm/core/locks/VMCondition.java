@@ -24,21 +24,32 @@
  */
 package com.oracle.svm.core.locks;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.c.CIsolateData;
+import com.oracle.svm.guest.staging.core.c.CIsolateDataFactory;
+import com.oracle.svm.core.locks.PlatformLockingSupport.PlatformCondition;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * A condition that has minimal requirements on Java code. The implementation does not perform
  * memory allocation, exception unwinding, or other complicated operations. This allows it to be
  * used in early startup and shutdown phases of the VM, as well as to coordinate garbage collection.
- *
+ * <p>
  * It is not possible to allocate new VM conditions at run time. All VM conditions must be allocated
  * during image generation. They are initialized during startup of the VM, i.e., every VM condition
  * consumes resources and contributes to VM startup time.
+ * <p>
+ * This class is a hosted-only placeholder. Image building replaces reachable instances with
+ * {@link RuntimeVMCondition} objects.
  */
 public class VMCondition extends VMLockingPrimitive {
     protected final VMMutex mutex;
@@ -47,33 +58,23 @@ public class VMCondition extends VMLockingPrimitive {
     private final String name;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public VMCondition(VMMutex mutex) {
-        this(mutex, null);
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
     public VMCondition(VMMutex mutex, String name) {
         this.mutex = mutex;
-        this.name = name;
+        this.name = mutex.getName() + "_" + name;
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public String getName() {
-        return name == null ? mutex.getName() : mutex.getName() + "_" + name;
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public String getConditionName() {
         return name;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public VMMutex getMutex() {
         return mutex;
     }
 
     /**
-     * Waits until the condition variable gets signaled.
+     * Waits until this condition is signaled, or a spurious wakeup occurs.
      */
     public void block() {
         throw VMError.shouldNotReachHere("VMCondition cannot be used during native image generation");
@@ -90,18 +91,21 @@ public class VMCondition extends VMLockingPrimitive {
     }
 
     /**
-     * Waits until the condition variable gets signaled or the given number of nanoseconds has
-     * elapsed. Returns any nanoseconds remaining if it returned early.
+     * Waits until this condition is signaled, the time limit elapses, or a spurious wakeup occurs.
+     *
+     * @return {@code false} if the wait timed out, or {@code true} if the return happened early.
      */
-    public long block(@SuppressWarnings("unused") long nanoseconds) {
+    public boolean block(@SuppressWarnings("unused") long timeoutNanos) {
         throw VMError.shouldNotReachHere("VMCondition cannot be used during native image generation");
     }
 
     /**
-     * Like {@linkplain #blockNoTransition()} but with a timeout (see {@linkplain #block(long)}).
+     * Like {@linkplain #block(long)} but without a thread status transition. This method can only
+     * be called from uninterruptible code that did an <b>explicit</b> to-native transition before,
+     * as blocking while still in Java-mode could result in a deadlock.
      */
     @Uninterruptible(reason = "Should only be called if the thread did an explicit transition to native earlier.", callerMustBe = true)
-    public long blockNoTransition(@SuppressWarnings("unused") long nanoseconds) {
+    public boolean blockNoTransition(@SuppressWarnings("unused") long timeoutNanos) {
         throw VMError.shouldNotReachHere("VMCondition cannot be used during native image generation");
     }
 
@@ -117,7 +121,7 @@ public class VMCondition extends VMLockingPrimitive {
     /**
      * Wakes up a single thread that is waiting on this condition.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void signal() {
         throw VMError.shouldNotReachHere("VMCondition cannot be used during native image generation");
     }
@@ -125,8 +129,103 @@ public class VMCondition extends VMLockingPrimitive {
     /**
      * Wakes up all threads that are waiting on this condition.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public void broadcast() {
         throw VMError.shouldNotReachHere("VMCondition cannot be used during native image generation");
+    }
+}
+
+final class RuntimeVMCondition extends VMCondition {
+    private final CIsolateData<PlatformCondition> platformCondition;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    RuntimeVMCondition(RuntimeVMMutex mutex, String name) {
+        super(mutex, name);
+        UnsignedWord size = Word.unsigned(PlatformLockingSupport.singleton().conditionSize());
+        platformCondition = CIsolateDataFactory.create("condition_" + getName(), size);
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public RuntimeVMMutex getMutex() {
+        return (RuntimeVMMutex) super.getMutex();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Too early for safepoints.")
+    public int initialize() {
+        return PlatformLockingSupport.singleton().initializeCondition(getPlatformCondition());
+    }
+
+    @Override
+    @Uninterruptible(reason = "The isolate teardown is in progress.")
+    public int destroy() {
+        return PlatformLockingSupport.singleton().destroyCondition(getPlatformCondition());
+    }
+
+    @Override
+    public void block() {
+        mutex.clearCurrentThreadOwner();
+        PlatformLockingSupport.singleton().awaitCondition(getPlatformCondition(), getMutex().getPlatformMutex());
+        mutex.setOwnerToCurrentThread();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Should only be called if the thread did an explicit transition to native earlier.", callerMustBe = true)
+    public void blockNoTransition() {
+        mutex.clearCurrentThreadOwner();
+        PlatformLockingSupport.singleton().awaitConditionNoTransition(getPlatformCondition(), getMutex().getPlatformMutex());
+        mutex.setOwnerToCurrentThread();
+    }
+
+    @Override
+    public boolean block(long timeoutNanos) {
+        if (timeoutNanos <= 0) {
+            return false;
+        }
+
+        mutex.clearCurrentThreadOwner();
+        boolean result = PlatformLockingSupport.singleton().timedAwaitCondition(getPlatformCondition(), getMutex().getPlatformMutex(), timeoutNanos);
+        mutex.setOwnerToCurrentThread();
+        return result;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Should only be called if the thread did an explicit transition to native earlier.", callerMustBe = true)
+    public boolean blockNoTransition(long timeoutNanos) {
+        if (timeoutNanos <= 0) {
+            return false;
+        }
+
+        mutex.clearCurrentThreadOwner();
+        boolean result = PlatformLockingSupport.singleton().timedAwaitConditionNoTransition(getPlatformCondition(), getMutex().getPlatformMutex(), timeoutNanos);
+        mutex.setOwnerToCurrentThread();
+        return result;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Should only be called if the thread did an explicit transition to native earlier.", callerMustBe = true)
+    public void blockNoTransitionUnspecifiedOwner() {
+        mutex.clearUnspecifiedOwner();
+        PlatformLockingSupport.singleton().awaitConditionNoTransition(getPlatformCondition(), getMutex().getPlatformMutex());
+        mutex.setOwnerToUnspecified();
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void signal() {
+        PlatformLockingSupport.singleton().signalCondition(getPlatformCondition());
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public void broadcast() {
+        PlatformLockingSupport.singleton().broadcastCondition(getPlatformCondition());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private PlatformCondition getPlatformCondition() {
+        SubstrateUtil.guaranteeRuntimeOnly();
+        return platformCondition.get();
     }
 }

@@ -24,25 +24,26 @@
  */
 package com.oracle.svm.graal.isolated;
 
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.nativeimage.ObjectHandle;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.c.NonmovableObjectArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
 import com.oracle.svm.core.code.ReferenceAdjuster;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.handles.ThreadLocalHandles;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.guest.staging.core.handles.ThreadLocalHandles;
 import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.meta.DirectSubstrateObjectConstant;
 import com.oracle.svm.core.nmt.NmtCategory;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.meta.JavaConstant;
+import org.graalvm.word.impl.Word;
 
 /**
  * Reference adjuster for {@linkplain ClientHandle handles} from an {@link IsolatedObjectConstant},
@@ -58,7 +59,7 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public <T> void setConstantTargetInArray(NonmovableObjectArray<T> array, int index, JavaConstant constant) {
         if (constant instanceof IsolatedObjectConstant) {
-            record(NonmovableArrays.addressOf(array, index), ConfigurationValues.getObjectLayout().getReferenceSize(), ((IsolatedObjectConstant) constant).getHandle());
+            record(NonmovableArrays.addressOf(array, index), ObjectLayout.singleton().getReferenceSize(), ((IsolatedObjectConstant) constant).getHandle());
         } else {
             @SuppressWarnings("unchecked")
             T target = (T) ((DirectSubstrateObjectConstant) constant).getObject();
@@ -72,7 +73,7 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
         if (object instanceof IsolatedMirroredObject<?>) {
             ClientHandle<?> mirror = ((IsolatedMirroredObject<?>) object).getMirror();
             assert !mirror.equal(IsolatedHandles.nullHandle()) : "Mirror object must not be null";
-            record(NonmovableArrays.addressOf(array, index), ConfigurationValues.getObjectLayout().getReferenceSize(), mirror);
+            record(NonmovableArrays.addressOf(array, index), ObjectLayout.singleton().getReferenceSize(), mirror);
         } else {
             VMError.guarantee(ImageHeapObjects.isInImageHeap(object));
             NonmovableArrays.setObject(array, index, object);
@@ -89,7 +90,7 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
             if (target instanceof IsolatedMirroredObject<?>) {
                 ClientHandle<?> mirror = ((IsolatedMirroredObject<?>) target).getMirror();
                 assert !mirror.equal(IsolatedHandles.nullHandle()) : "Mirror object must not be null";
-                record(address, ConfigurationValues.getObjectLayout().getReferenceSize(), mirror);
+                record(address, ObjectLayout.singleton().getReferenceSize(), mirror);
             } else {
                 VMError.guarantee(ImageHeapObjects.isInImageHeap(target));
                 ReferenceAdjuster.writeReference((Pointer) address, length, target);
@@ -120,8 +121,8 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
         data.setAddresses(addresses);
         data.setHandles(handles);
 
-        addresses = WordFactory.nullPointer();
-        handles = WordFactory.nullPointer();
+        addresses = Word.nullPointer();
+        handles = Word.nullPointer();
         count = 0;
 
         return data;
@@ -134,7 +135,7 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
             T handle = (T) NonmovableArrays.getWord(data.getHandles(), i);
             Object targetObject = handleSet.getObject(handle);
             Pointer address = NonmovableArrays.getWord(data.getAddresses(), i);
-            ReferenceAdjuster.writeReference(address, ConfigurationValues.getObjectLayout().getReferenceSize(), targetObject);
+            ReferenceAdjuster.writeReference(address, ObjectLayout.singleton().getReferenceSize(), targetObject);
         }
 
         NonmovableArrays.releaseUnmanagedArray(data.getAddresses());

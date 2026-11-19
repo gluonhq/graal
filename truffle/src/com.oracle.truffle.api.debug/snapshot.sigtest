@@ -114,8 +114,6 @@ meth public com.oracle.truffle.api.debug.DebugValue getDeclaredValue(java.lang.S
 meth public com.oracle.truffle.api.debug.DebugValue getReceiver()
 meth public com.oracle.truffle.api.debug.DebugValue getRootInstance()
 meth public com.oracle.truffle.api.source.SourceSection getSourceSection()
-meth public java.lang.Iterable<com.oracle.truffle.api.debug.DebugValue> getArguments()
- anno 0 java.lang.Deprecated(boolean forRemoval=false, java.lang.String since="20.3")
 meth public java.lang.Iterable<com.oracle.truffle.api.debug.DebugValue> getDeclaredValues()
 meth public java.lang.String getName()
 supr java.lang.Object
@@ -154,8 +152,6 @@ meth public abstract void threadInitialized(com.oracle.truffle.api.debug.DebugCo
 
 CLSS public abstract com.oracle.truffle.api.debug.DebugValue
 meth public !varargs final com.oracle.truffle.api.debug.DebugValue execute(com.oracle.truffle.api.debug.DebugValue[])
-meth public abstract <%0 extends java.lang.Object> {%%0} as(java.lang.Class<{%%0}>)
- anno 0 java.lang.Deprecated(boolean forRemoval=false, java.lang.String since="20.1")
 meth public abstract boolean hasReadSideEffects()
 meth public abstract boolean hasWriteSideEffects()
 meth public abstract boolean isInternal()
@@ -164,8 +160,6 @@ meth public abstract boolean isWritable()
 meth public abstract com.oracle.truffle.api.debug.DebuggerSession getSession()
 meth public abstract java.lang.String getName()
 meth public abstract void set(com.oracle.truffle.api.debug.DebugValue)
-meth public abstract void set(java.lang.Object)
- anno 0 java.lang.Deprecated(boolean forRemoval=false, java.lang.String since="21.2")
 meth public boolean asBoolean()
 meth public boolean equals(java.lang.Object)
 meth public boolean fitsInBigInteger()
@@ -212,6 +206,7 @@ meth public final boolean isNull()
 meth public final com.oracle.truffle.api.debug.DebugValue asInLanguage(com.oracle.truffle.api.nodes.LanguageInfo)
 meth public final com.oracle.truffle.api.debug.DebugValue getMetaObject()
 meth public final com.oracle.truffle.api.debug.DebugValue getProperty(java.lang.String)
+meth public final com.oracle.truffle.api.debug.DebugValue getStaticScope()
 meth public final com.oracle.truffle.api.nodes.LanguageInfo getOriginalLanguage()
 meth public final com.oracle.truffle.api.source.SourceSection getSourceLocation()
 meth public final java.lang.String asString()
@@ -257,13 +252,11 @@ meth public void removeBreakpointAddedListener(java.util.function.Consumer<com.o
 meth public void removeBreakpointRemovedListener(java.util.function.Consumer<com.oracle.truffle.api.debug.Breakpoint>)
 meth public void restoreStepping()
 supr java.lang.Object
-hfds ACCESSOR,TRACE,alwaysHaltBreakpoint,breakpointAddedListeners,breakpointRemovedListeners,breakpoints,disabledSteppingCount,env,propSupport,sessions
+hfds ACCESSOR,EXCEPTION,TRACE,alwaysHaltBreakpoint,breakpointAddedListeners,breakpointRemovedListeners,breakpoints,disabledSteppingCount,env,propSupport,sessions
 hcls AccessorDebug
 
 CLSS public final com.oracle.truffle.api.debug.DebuggerSession
 intf java.io.Closeable
-meth public boolean isBreakpointsActive()
- anno 0 java.lang.Deprecated(boolean forRemoval=false, java.lang.String since="19.0")
 meth public boolean isBreakpointsActive(com.oracle.truffle.api.debug.Breakpoint$Kind)
 meth public boolean suspendHere(com.oracle.truffle.api.nodes.Node)
 meth public com.oracle.truffle.api.debug.Breakpoint install(com.oracle.truffle.api.debug.Breakpoint)
@@ -275,11 +268,10 @@ meth public java.lang.String toString()
 meth public java.util.List<com.oracle.truffle.api.debug.Breakpoint> getBreakpoints()
 meth public java.util.Map<java.lang.String,? extends com.oracle.truffle.api.debug.DebugValue> getExportedSymbols()
 meth public void close()
+meth public void disposeStepping(java.lang.Thread)
 meth public void resume(java.lang.Thread)
 meth public void resumeAll()
 meth public void setAsynchronousStackDepth(int)
-meth public void setBreakpointsActive(boolean)
- anno 0 java.lang.Deprecated(boolean forRemoval=false, java.lang.String since="19.0")
 meth public void setBreakpointsActive(com.oracle.truffle.api.debug.Breakpoint$Kind,boolean)
 meth public void setContextsListener(com.oracle.truffle.api.debug.DebugContextsListener,boolean)
 meth public void setShowHostStackFrames(boolean)
@@ -290,8 +282,8 @@ meth public void suspend(java.lang.Thread)
 meth public void suspendAll()
 meth public void suspendNextExecution()
 supr java.lang.Object
-hfds ANCHOR_SET_AFTER,ANCHOR_SET_ALL,ANCHOR_SET_BEFORE,SESSIONS,allBindings,alwaysHaltBreakpointsActive,breakpoints,callback,closed,currentSuspendedEventMap,debugger,exceptionBreakpointsActive,executionLifecycle,hasExpressionElement,hasRootElement,ignoreLanguageContextInitialization,inEvalInContext,includeAvailableSourceSectionsOnly,includeInternal,locationBreakpointsActive,sessionId,showHostStackFrames,sourceElements,sourceFilter,sources,stepping,steppingEnabledSlots,strategyMap,suspendAll,suspendNext,suspensionFilterUnchanged,syntaxElementsBinding,threadSuspensions
-hcls Caller,RootSteppingDepthNode,StableBoolean,SteppingNode,SuspendContextAndFrame,ThreadSuspension
+hfds ANCHOR_SET_AFTER,ANCHOR_SET_ALL,ANCHOR_SET_BEFORE,SESSIONS,allBindings,alwaysHaltBreakpointsActive,breakpoints,callback,closed,currentSuspendedEventMap,debugger,exceptionBreakpointsActive,executionLifecycle,hasExpressionElement,hasRootElement,ignoreLanguageContextInitialization,inEvalInContext,includeAvailableSourceSectionsOnly,includeInternal,locationBreakpointsActive,newThreadStrategy,sessionId,showHostStackFrames,sourceElements,sourceFilter,sources,stepping,steppingEnabledSlots,strategyMap,suspendAll,suspendNext,suspensionFilterUnchanged,syntaxElementsBinding,threadSuspensions
+hcls AddStrategyUpdater,Caller,NewThreadStrategyProvider,RootSteppingDepthNode,StableBoolean,SteppingNode,SuspendContextAndFrame,ThreadSuspension
 
 CLSS public final com.oracle.truffle.api.debug.DebuggerTags
 innr public final AlwaysHalt
@@ -365,7 +357,7 @@ meth public void prepareUnwindFrame(com.oracle.truffle.api.debug.DebugStackFrame
 meth public void prepareUnwindFrame(com.oracle.truffle.api.debug.DebugStackFrame,com.oracle.truffle.api.debug.DebugValue)
 meth public void setReturnValue(com.oracle.truffle.api.debug.DebugValue)
 supr java.lang.Object
-hfds HOST_INTEROP_NODE_NAME,breakpoints,cachedAsyncFrames,cachedFrames,conditionFailures,context,disposed,exception,inputValuesProvider,insertableNode,materializedFrame,nextStrategy,returnValue,session,sourceSection,suspendAnchor,thread
+hfds HOST_INTEROP_NODE_NAME,breakpoints,cachedAsyncFrames,cachedFrames,conditionFailures,context,disposed,exception,inputValuesProvider,insertableNode,isUnwind,materializedFrame,nextStrategy,returnValue,session,singleStepCompleted,sourceSection,suspendAnchor,thread
 hcls DebugAsyncStackFrameLists,DebugStackFrameIterable
 
 CLSS public final com.oracle.truffle.api.debug.SuspensionFilter
@@ -479,7 +471,7 @@ meth public void printStackTrace(java.io.PrintStream)
 meth public void printStackTrace(java.io.PrintWriter)
 meth public void setStackTrace(java.lang.StackTraceElement[])
 supr java.lang.Object
-hfds CAUSE_CAPTION,EMPTY_THROWABLE_ARRAY,NULL_CAUSE_MESSAGE,SELF_SUPPRESSION_MESSAGE,SUPPRESSED_CAPTION,SUPPRESSED_SENTINEL,UNASSIGNED_STACK,backtrace,cause,depth,detailMessage,serialVersionUID,stackTrace,suppressedExceptions
+hfds CAUSE_CAPTION,EMPTY_THROWABLE_ARRAY,NULL_CAUSE_MESSAGE,SELF_SUPPRESSION_MESSAGE,SUPPRESSED_CAPTION,SUPPRESSED_SENTINEL,UNASSIGNED_STACK,backtrace,cause,depth,detailMessage,jfrTracing,serialVersionUID,stackTrace,suppressedExceptions
 hcls PrintStreamOrWriter,SentinelHolder,WrappedPrintStream,WrappedPrintWriter
 
 CLSS public abstract interface java.lang.constant.Constable

@@ -27,21 +27,27 @@ package com.oracle.svm.core;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 import org.graalvm.nativeimage.impl.UnsafeMemorySupport;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-@AutomaticallyRegisteredImageSingleton(UnsafeMemorySupport.class)
+@AutomaticallyRegisteredImageSingleton(value = UnsafeMemorySupport.class)
 @Platforms(InternalPlatform.NATIVE_ONLY.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class UnsafeMemoryUtil implements UnsafeMemorySupport {
 
     /** Implementation of {@code Unsafe.copyMemory}. */
     @Override
     public void unsafeCopyMemory(Object srcBase, long srcOffset, Object destBase, long destOffset, long bytes) {
         if (srcBase != null || destBase != null) {
-            JavaMemoryUtil.copyOnHeap(srcBase, WordFactory.unsigned(srcOffset), destBase, WordFactory.unsigned(destOffset), WordFactory.unsigned(bytes));
+            JavaMemoryUtil.copyOnHeap(srcBase, Word.unsigned(srcOffset), destBase, Word.unsigned(destOffset), Word.unsigned(bytes));
         } else {
-            UnmanagedMemoryUtil.copy(WordFactory.pointer(srcOffset), WordFactory.pointer(destOffset), WordFactory.unsigned(bytes));
+            UnmanagedMemoryUtil.copy(Word.pointer(srcOffset), Word.pointer(destOffset), Word.unsigned(bytes));
         }
     }
 
@@ -52,7 +58,7 @@ public class UnsafeMemoryUtil implements UnsafeMemorySupport {
         if (destBase != null) {
             JavaMemoryUtil.fillOnHeap(destBase, destOffset, bytes, bvalue);
         } else {
-            JavaMemoryUtil.fill(WordFactory.pointer(destOffset), WordFactory.unsigned(bytes), bvalue);
+            JavaMemoryUtil.fill(Word.pointer(destOffset), Word.unsigned(bytes), bvalue);
         }
     }
 
@@ -62,7 +68,7 @@ public class UnsafeMemoryUtil implements UnsafeMemorySupport {
         if (srcBase != null || destBase != null) {
             JavaMemoryUtil.copySwapOnHeap(srcBase, srcOffset, destBase, destOffset, bytes, elemSize);
         } else {
-            JavaMemoryUtil.copySwap(WordFactory.unsigned(srcOffset), WordFactory.unsigned(destOffset), WordFactory.unsigned(bytes), WordFactory.unsigned(elemSize));
+            JavaMemoryUtil.copySwap(Word.unsigned(srcOffset), Word.unsigned(destOffset), Word.unsigned(bytes), Word.unsigned(elemSize));
         }
     }
 }

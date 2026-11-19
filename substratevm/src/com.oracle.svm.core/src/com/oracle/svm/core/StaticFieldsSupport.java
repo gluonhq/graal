@@ -25,25 +25,40 @@
 package com.oracle.svm.core;
 
 import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_0;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_0;
 import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_1;
 
 import java.util.Objects;
 
+import com.oracle.svm.shared.util.SubstrateUtil;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.meta.SharedField;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.jvmci.shared.meta.SharedField;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.LayeredImageSingletonSupport;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.MultiLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.calc.FloatingNode;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
@@ -54,6 +69,7 @@ import jdk.graal.compiler.nodes.spi.LoweringTool;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -65,99 +81,190 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * Implementation notes: The arrays are created after static analysis, but before compilation. We
  * need to know how many static fields are reachable in order to compute the appropriate size for
  * the arrays, which is only available after static analysis.
- *
+ * <p>
  * When bytecode is parsed before static analysis, the arrays are not available yet. Therefore, the
- * accessor functions {@link #getStaticObjectFields()}} and {@link #getStaticPrimitiveFields()} are
- * intrinsified to a {@link StaticFieldBaseNode}, which is then during compilation lowered to the
- * constant arrays. This also solves memory graph problems in the Graal compiler: Direct
- * loads/stores using the arrays, for example via Unsafe or VarHandle, alias with static field
- * loads/stores that have dedicated {@link LocationIdentity}. If the arrays are already exposed in
- * the high-level optimization phases of Graal, the compiler would miss the alias since the location
- * identities for arrays are considered non-aliasing with location identities for fields. Replacing
- * the {@link StaticFieldBaseNode} with a {@link ConstantNode} only in the low tier of the compiler
- * solves this problem.
+ * accessor functions {@link StaticFieldsSupport#getStaticObjectFieldsAtRuntime},
+ * {@link StaticFieldsSupport#getStaticPrimitiveFieldsAtRuntime} may be intrinsified to
+ * {@link StaticFieldResolvedBaseNode}, or a {@link StaticFieldBaseProxyNode} is created. These
+ * nodes are then during compilation either lowered to the constant arrays or folded away. This also
+ * solves memory graph problems in the Graal compiler: Direct loads/stores using the arrays, for
+ * example via Unsafe or VarHandle, alias with static field loads/stores that have dedicated
+ * {@link LocationIdentity}. If the arrays are already exposed in the high-level optimization phases
+ * of Graal, the compiler would miss the alias since the location identities for arrays are
+ * considered non-aliasing with location identities for fields. Replacing the
+ * {@link StaticFieldResolvedBaseNode} with a {@link ConstantNode} and/or removing
+ * {@link StaticFieldBaseProxyNode} only in the low tier of the compiler solves this problem.
  */
-@AutomaticallyRegisteredImageSingleton
 public final class StaticFieldsSupport {
 
-    @Platforms(Platform.HOSTED_ONLY.class) //
-    private Object[] staticObjectFields;
-    @Platforms(Platform.HOSTED_ONLY.class) //
-    private byte[] staticPrimitiveFields;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public abstract static class HostedStaticFieldSupport {
+
+        static HostedStaticFieldSupport singleton() {
+            return ImageSingletons.lookup(HostedStaticFieldSupport.class);
+        }
+
+        protected abstract JavaConstant getStaticFieldBaseTransformation(int layerNum, boolean primitive);
+
+        protected abstract FloatingNode getStaticFieldsBaseReplacement(int layerNum, boolean primitive, LoweringTool tool, StructuredGraph graph);
+
+        protected abstract boolean isPrimitive(ResolvedJavaField field);
+
+        protected abstract int getInstalledLayerNum(ResolvedJavaField field);
+
+        public abstract ResolvedJavaField toHostedField(ResolvedJavaField field);
+
+        /**
+         * Looks up the {@code field} using the {@code UniverseMetaAccess} instance passed via the
+         * {code metaAccess} parameter. For example, if the {@code metaAccess} comes from the Hosted
+         * Universe, it will return a {@code HostedField}, if it origins from the Analysis Universe,
+         * it will return an {code AnalysisField}. The method throws an error if the provided
+         * {@link MetaAccessProvider} is not a {@code UniverseMetaAccess}.
+         */
+        public abstract ResolvedJavaField toUniverseField(MetaAccessProvider metaAccess, ResolvedJavaField field);
+    }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    protected StaticFieldsSupport() {
+    private StaticFieldsSupport() {
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public static void setData(Object[] staticObjectFields, byte[] staticPrimitiveFields) {
-        StaticFieldsSupport support = ImageSingletons.lookup(StaticFieldsSupport.class);
-        support.staticObjectFields = Objects.requireNonNull(staticObjectFields);
-        support.staticPrimitiveFields = Objects.requireNonNull(staticPrimitiveFields);
+        var singleton = MultiLayeredStaticFieldsBase.currentLayer();
+        singleton.setData(staticObjectFields, staticPrimitiveFields);
     }
 
-    /* Intrinsified by the graph builder plugin below. */
-    public static Object getStaticObjectFields() {
-        Object[] result = ImageSingletons.lookup(StaticFieldsSupport.class).staticObjectFields;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static Object getCurrentLayerStaticObjectFields() {
+        var result = MultiLayeredStaticFieldsBase.currentLayer().getObjectFields();
         VMError.guarantee(result != null, "arrays that hold static fields are only available after static analysis");
         return result;
     }
 
-    /* Intrinsified by the graph builder plugin below. */
-    public static Object getStaticPrimitiveFields() {
-        byte[] result = ImageSingletons.lookup(StaticFieldsSupport.class).staticPrimitiveFields;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static Object getCurrentLayerStaticPrimitiveFields() {
+        var result = MultiLayeredStaticFieldsBase.currentLayer().getPrimitiveFields();
         VMError.guarantee(result != null, "arrays that hold static fields are only available after static analysis");
         return result;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static JavaConstant getStaticFieldBaseTransformation(ResolvedJavaField field) {
+        var hostedSupport = HostedStaticFieldSupport.singleton();
+        ResolvedJavaField hField = hostedSupport.toHostedField(field);
+        boolean primitive = hostedSupport.isPrimitive(hField);
+        int layerNum = getInstalledLayerNum(hField);
+        return hostedSupport.getStaticFieldBaseTransformation(layerNum, primitive);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static ResolvedJavaField toUniverseField(MetaAccessProvider metaAccess, ResolvedJavaField field) {
+        return HostedStaticFieldSupport.singleton().toUniverseField(metaAccess, field);
+    }
+
+    public static int getInstalledLayerNum(ResolvedJavaField field) {
+        if (!ImageLayerBuildingSupport.buildingImageLayer()) {
+            return MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
+        }
+        if (field instanceof SharedField sField) {
+            return sField.getInstalledLayerNum();
+        } else {
+            return HostedStaticFieldSupport.singleton().getInstalledLayerNum(field);
+        }
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static Object getStaticObjectFieldsAtRuntime(int layerNum) {
+        return StaticFieldBaseProxyNode.staticFieldBaseProxyNode(MultiLayeredStaticFieldsBase.forLayer(layerNum).getObjectFields());
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static Object getStaticPrimitiveFieldsAtRuntime(int layerNum) {
+        return StaticFieldBaseProxyNode.staticFieldBaseProxyNode(MultiLayeredStaticFieldsBase.forLayer(layerNum).getPrimitiveFields());
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static Object staticFieldBaseProxy(Object staticFields) {
+        return StaticFieldBaseProxyNode.staticFieldBaseProxyNode(staticFields);
     }
 
     public static FloatingNode createStaticFieldBaseNode(ResolvedJavaField field) {
-        return new StaticFieldBaseNode(field);
+        if (field instanceof SharedField sField) {
+            assert sField.getStaticFieldBaseForRuntimeLoadedClass() == null : "Static field support with static field base should be handled in lowering providers";
+            boolean primitive = sField.getStorageKind().isPrimitive();
+            return new StaticFieldResolvedBaseNode(primitive, sField.getInstalledLayerNum());
+        } else {
+            if (!SubstrateUtil.HOSTED) {
+                throw VMError.shouldNotReachHere("Not possible at runtime");
+            }
+            boolean primitive = HostedStaticFieldSupport.singleton().isPrimitive(field);
+            int layerNumber = getInstalledLayerNum(field);
+            return new StaticFieldResolvedBaseNode(primitive, layerNumber);
+        }
     }
 
-    public static FloatingNode createStaticFieldBaseNode(boolean primitive) {
-        return new StaticFieldBaseNode(primitive);
-    }
+    /**
+     * Represents a proxy for static field base node. See the comment on {@link StaticFieldsSupport}
+     * for why this node and {@link StaticFieldResolvedBaseNode} must exist.
+     */
+    @NodeInfo(cycles = CYCLES_0, size = SIZE_0)
+    static final class StaticFieldBaseProxyNode extends ValueNode implements Lowerable {
+        public static final NodeClass<StaticFieldBaseProxyNode> TYPE = NodeClass.create(StaticFieldBaseProxyNode.class);
 
-    @NodeInfo(cycles = CYCLES_0, size = SIZE_1)
-    public static final class StaticFieldBaseNode extends FloatingNode implements Lowerable {
-        public static final NodeClass<StaticFieldBaseNode> TYPE = NodeClass.create(StaticFieldBaseNode.class);
-
-        public final boolean primitive;
-        public final ResolvedJavaField field;
+        @Input ValueNode staticFieldsArray;
 
         /**
          * We must not expose that the stamp will eventually be an array, to avoid memory graph
          * problems. See the comment on {@link StaticFieldsSupport}.
          */
-        protected StaticFieldBaseNode(boolean primitive) {
+        protected StaticFieldBaseProxyNode(ValueNode staticFieldsArray) {
             super(TYPE, StampFactory.objectNonNull());
-            this.field = null;
-            this.primitive = primitive;
+            this.staticFieldsArray = staticFieldsArray;
         }
 
-        protected StaticFieldBaseNode(ResolvedJavaField field) {
+        @Override
+        public void lower(LoweringTool tool) {
+            if (tool.getLoweringStage() != LoweringTool.StandardLoweringStage.LOW_TIER) {
+                /*
+                 * Removing this node must only happen after the memory graph has been built, i.e.,
+                 * when the information that static fields are stored in an array is no longer
+                 * misleading alias analysis.
+                 */
+                return;
+            }
+
+            replaceAtUsagesAndDelete(staticFieldsArray);
+        }
+
+        @NodeIntrinsic
+        public static native Object staticFieldBaseProxyNode(Object array);
+    }
+
+    @NodeInfo(cycles = CYCLES_0, size = SIZE_1)
+    public static final class StaticFieldResolvedBaseNode extends FloatingNode implements Lowerable {
+        public static final NodeClass<StaticFieldResolvedBaseNode> TYPE = NodeClass.create(StaticFieldResolvedBaseNode.class);
+
+        public final boolean primitive;
+        public final int layerNum;
+
+        /**
+         * We must not expose that the stamp will eventually be an array, to avoid memory graph
+         * problems. See the comment on {@link StaticFieldsSupport}.
+         */
+        protected StaticFieldResolvedBaseNode(boolean primitive, int layerNum) {
             super(TYPE, StampFactory.objectNonNull());
-            this.field = Objects.requireNonNull(field);
-            this.primitive = false; // this value doesn't matter if field is not-null
+            this.primitive = primitive;
+            this.layerNum = layerNum;
         }
 
         /**
-         * At first glance, this method looks like a circular dependency:
-         * {@link StaticFieldsSupport#getStaticPrimitiveFields} is intrinsified to a
-         * {@link StaticFieldBaseNode}, and {@link StaticFieldBaseNode} is lowered by calling
-         * {@link StaticFieldsSupport#getStaticPrimitiveFields}. So why does this code work?
-         *
-         * The intrinsification to the {@link StaticFieldBaseNode} is only effective for code
-         * executed at image run time. So when executed during AOT compilation,
-         * {@link StaticFieldBaseNode#lower} really invokes
-         * {@link StaticFieldsSupport#getStaticPrimitiveFields}, which returns the proper result.
-         *
-         * For an image that uses Graal as a JIT compiler, {@link StaticFieldBaseNode#lower} is
-         * reachable at run time. But it is AOT compiled, and lowering during that AOT compilation
-         * again invokes {@link StaticFieldsSupport#getStaticPrimitiveFields}.
-         *
-         * So in summary, this code works because there is proper "bootstrapping" during AOT
-         * compilation where the intrinsification is not applied.
+         * 
+         * Note when lowering during JIT compilation this code will be AOT compiled so that there is
+         * not a circular dependency on the intrinsification of
+         * {@link StaticFieldsSupport#getStaticPrimitiveFieldsAtRuntime} and
+         * {@link StaticFieldsSupport#getStaticObjectFieldsAtRuntime}. While this code is being AOT
+         * compiled the HOSTED variant of the lowering will be triggered, so an actual constant will
+         * be returned.
          */
         @Override
         public void lower(LoweringTool tool) {
@@ -169,46 +276,117 @@ public final class StaticFieldsSupport {
                  */
                 return;
             }
-            JavaConstant constant;
-            if (field != null) {
-                SharedField sharedField = (SharedField) field;
-                if (sharedField.isInBaseLayer()) {
-                    constant = sharedField.getStaticFieldBase();
-                } else {
-                    /*
-                     * Cannot check primitive flag before we know that the field is SharedField, so
-                     * we can access the storage kind.
-                     */
-                    boolean isPrimitive = sharedField.getStorageKind().isPrimitive();
-                    constant = tool.getSnippetReflection().forObject(isPrimitive ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields());
-                }
+            FloatingNode replacement;
+            if (SubstrateUtil.HOSTED) {
+                /*
+                 * Build-time version of lowering.
+                 */
+                HostedStaticFieldSupport hostedSupport = HostedStaticFieldSupport.singleton();
+                replacement = hostedSupport.getStaticFieldsBaseReplacement(layerNum, primitive, tool, graph());
             } else {
-                constant = tool.getSnippetReflection().forObject(primitive ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields());
+                /*
+                 * JIT version of lowering.
+                 */
+                JavaConstant constant = tool.getSnippetReflection()
+                                .forObject(primitive ? StaticFieldsSupport.getStaticPrimitiveFieldsAtRuntime(layerNum) : StaticFieldsSupport.getStaticObjectFieldsAtRuntime(layerNum));
+                replacement = ConstantNode.forConstant(constant, tool.getMetaAccess(), graph());
             }
-            assert constant.isNonNull() : constant;
-            replaceAndDelete(ConstantNode.forConstant(constant, tool.getMetaAccess(), graph()));
+            replaceAndDelete(graph().addOrUniqueWithInputs(replacement));
         }
+    }
+
+    /**
+     * We must ensure we are not querying the offset of a static field of a type assignable from
+     * {@link org.graalvm.word.WordBase}.
+     */
+    public interface StaticFieldValidator {
+        static void checkFieldOffsetAllowed(ResolvedJavaField field) {
+            if (field.isStatic()) {
+                if (SubstrateUtil.HOSTED) {
+                    ImageSingletons.lookup(StaticFieldValidator.class).hostedCheckFieldOffsetAllowed(field);
+                } else {
+                    SharedField sField = (SharedField) field;
+                    boolean wordType = ((SharedType) sField.getType()).isWordType();
+                    VMError.guarantee(!wordType, "static Word field offsets cannot be queried");
+                }
+            }
+        }
+
+        void hostedCheckFieldOffsetAllowed(ResolvedJavaField field);
     }
 }
 
+@AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = MultiLayer.class)
+class MultiLayeredStaticFieldsBase {
+
+    @UnknownObjectField(availability = BuildPhaseProvider.AfterHostedUniverse.class) private Object[] staticObjectFields = null;
+
+    @UnknownObjectField(availability = BuildPhaseProvider.AfterHostedUniverse.class) private byte[] staticPrimitiveFields = null;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    static MultiLayeredStaticFieldsBase currentLayer() {
+        return LayeredImageSingletonSupport.singleton().lookup(MultiLayeredStaticFieldsBase.class, false, true);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static MultiLayeredStaticFieldsBase forLayer(int layerNum) {
+        return MultiLayeredImageSingleton.getForLayer(MultiLayeredStaticFieldsBase.class, layerNum);
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    Object[] getObjectFields() {
+        return staticObjectFields;
+    }
+
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    byte[] getPrimitiveFields() {
+        return staticPrimitiveFields;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    void setData(Object[] objectFields, byte[] primitiveFields) {
+        this.staticObjectFields = Objects.requireNonNull(objectFields);
+        this.staticPrimitiveFields = Objects.requireNonNull(primitiveFields);
+    }
+}
+
+/**
+ * When the base is known, then we create a {@link StaticFieldsSupport.StaticFieldResolvedBaseNode}.
+ * See {@link StaticFieldsSupport} for how this prevents aliasing issues.
+ */
 @AutomaticallyRegisteredFeature
 final class StaticFieldsFeature implements InternalFeature {
 
     @Override
     public void registerInvocationPlugins(Providers providers, Plugins plugins, ParsingReason reason) {
         Registration r = new Registration(plugins.getInvocationPlugins(), StaticFieldsSupport.class);
-        r.register(new RequiredInvocationPlugin("getStaticObjectFields") {
+        r.register(new RequiredInvocationPlugin("getStaticObjectFieldsAtRuntime", int.class) {
             @Override
-            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver unused) {
-                b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldBaseNode(false));
-                return true;
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver unused, ValueNode layerNum) {
+                if (!ImageLayerBuildingSupport.buildingImageLayer()) {
+                    b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldResolvedBaseNode(false, MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER));
+                    return true;
+                } else if (layerNum.isJavaConstant()) {
+                    int num = layerNum.asJavaConstant().asInt();
+                    b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldResolvedBaseNode(false, num));
+                    return true;
+                }
+                return false;
             }
         });
-        r.register(new RequiredInvocationPlugin("getStaticPrimitiveFields") {
+        r.register(new RequiredInvocationPlugin("getStaticPrimitiveFieldsAtRuntime", int.class) {
             @Override
-            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver unused) {
-                b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldBaseNode(true));
-                return true;
+            public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver unused, ValueNode layerNum) {
+                if (!ImageLayerBuildingSupport.buildingImageLayer()) {
+                    b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldResolvedBaseNode(true, MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER));
+                    return true;
+                } else if (layerNum.isJavaConstant()) {
+                    int num = layerNum.asJavaConstant().asInt();
+                    b.addPush(JavaKind.Object, new StaticFieldsSupport.StaticFieldResolvedBaseNode(true, num));
+                    return true;
+                }
+                return false;
             }
         });
     }

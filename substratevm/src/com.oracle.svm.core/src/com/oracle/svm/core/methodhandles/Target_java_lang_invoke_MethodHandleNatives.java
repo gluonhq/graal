@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +24,13 @@
  */
 package com.oracle.svm.core.methodhandles;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
-import static com.oracle.svm.core.util.VMError.unimplemented;
-import static com.oracle.svm.core.util.VMError.unsupportedFeature;
+import static com.oracle.svm.core.invoke.MethodHandleUtils.getResolvedMember;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.unsupportedFeature;
 
 import java.lang.invoke.CallSite;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -38,24 +39,34 @@ import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 
-import jdk.graal.compiler.debug.GraalError;
 import org.graalvm.nativeimage.MissingReflectionRegistrationError;
 
 import com.oracle.svm.core.StaticFieldsSupport;
-import com.oracle.svm.core.SubstrateUtil;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.AnnotateOriginal;
 import com.oracle.svm.core.annotate.Delete;
+import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
-import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.RuntimeClassLoading.NoRuntimeClassLoading;
+import com.oracle.svm.core.hub.RuntimeClassLoading.WithRuntimeClassLoading;
+import com.oracle.svm.core.hub.crema.CremaSupport;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
-import com.oracle.svm.core.reflect.target.Target_java_lang_reflect_Field;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.core.reflect.UnsafeFieldUtil;
+import com.oracle.svm.guest.staging.reflect.target.Target_java_lang_reflect_Field;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.debug.GraalError;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import sun.invoke.util.VerifyAccess;
 
 /**
@@ -64,7 +75,7 @@ import sun.invoke.util.VerifyAccess;
  */
 @SuppressWarnings("unused")
 @TargetClass(className = "java.lang.invoke.MethodHandleNatives")
-final class Target_java_lang_invoke_MethodHandleNatives {
+public final class Target_java_lang_invoke_MethodHandleNatives {
 
     /*
      * MemberName native constructor. We need to resolve the actual type and flags of the member and
@@ -83,6 +94,11 @@ final class Target_java_lang_invoke_MethodHandleNatives {
             /* The code calling this expects a getter, and will change it to a setter if needed */
             refKind = Modifier.isStatic(field.getModifiers()) ? Target_java_lang_invoke_MethodHandleNatives_Constants.REF_getStatic
                             : Target_java_lang_invoke_MethodHandleNatives_Constants.REF_getField;
+            if (RuntimeClassLoading.isSupported()) {
+                var resolved = CremaSupport.singleton().toJVMCI(field);
+                self.resolved = resolved;
+                flags |= CremaSupport.singleton().getExtraFieldMemberNameFlags(resolved);
+            }
         } else if (member instanceof Method) {
             Method method = (Method) member;
             Object[] typeInfo = new Object[2];
@@ -93,10 +109,23 @@ final class Target_java_lang_invoke_MethodHandleNatives {
             flags = Target_java_lang_invoke_MethodHandleNatives_Constants.MN_IS_METHOD | mods;
             if (Modifier.isStatic(mods)) {
                 refKind = Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeStatic;
-            } else if (Modifier.isInterface(mods)) {
+            } else if (RuntimeClassLoading.isSupported() && (Modifier.isFinal(mods) || Modifier.isPrivate(mods) || Modifier.isFinal(method.getDeclaringClass().getModifiers()))) {
+                assert !Modifier.isAbstract(mods);
+                /*
+                 * This path is only enabled in run-time-class-loading-mode because the standard
+                 * mode's REF_invokeSpecial handling doesn't support caller sensitive methods. See
+                 * Util_java_lang_invoke_MethodHandle.invokeInternal.
+                 */
+                refKind = Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeSpecial;
+            } else if (Modifier.isInterface(method.getDeclaringClass().getModifiers())) {
                 refKind = Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeInterface;
             } else {
                 refKind = Target_java_lang_invoke_MethodHandleNatives_Constants.REF_invokeVirtual;
+            }
+            if (RuntimeClassLoading.isSupported()) {
+                var resolved = CremaSupport.singleton().toJVMCI(method);
+                self.resolved = resolved;
+                flags |= CremaSupport.singleton().getExtraMethodMemberNameFlags(resolved);
             }
         } else if (member instanceof Constructor) {
             Constructor<?> constructor = (Constructor<?>) member;
@@ -106,6 +135,11 @@ final class Target_java_lang_invoke_MethodHandleNatives {
             type = typeInfo;
             flags = Target_java_lang_invoke_MethodHandleNatives_Constants.MN_IS_CONSTRUCTOR | constructor.getModifiers();
             refKind = Target_java_lang_invoke_MethodHandleNatives_Constants.REF_newInvokeSpecial;
+            if (RuntimeClassLoading.isSupported()) {
+                var resolved = CremaSupport.singleton().toJVMCI(constructor);
+                self.resolved = resolved;
+                flags |= CremaSupport.singleton().getExtraMethodMemberNameFlags(resolved);
+            }
         } else {
             throw new InternalError("Unknown member type: " + member.getClass());
         }
@@ -122,7 +156,7 @@ final class Target_java_lang_invoke_MethodHandleNatives {
 
     @Substitute
     private static long objectFieldOffset(Target_java_lang_invoke_MemberName self) {
-        if (self.reflectAccess == null && self.intrinsic == null) {
+        if (self.reflectAccess == null && self.intrinsic == null && getResolvedMember(self) == null) {
             throw new InternalError("Unresolved field");
         }
         if (!self.isField() || self.isStatic()) {
@@ -133,16 +167,20 @@ final class Target_java_lang_invoke_MethodHandleNatives {
         if (self.intrinsic != null) {
             return -1L;
         }
-        int offset = SubstrateUtil.cast(self.reflectAccess, Target_java_lang_reflect_Field.class).offset;
-        if (offset == -1) {
-            throw unsupportedFeature("Trying to access field " + self.reflectAccess + " without registering it as unsafe accessed.");
+        if (RuntimeClassLoading.isSupported() && self.resolved != null) {
+            ResolvedJavaField field = (ResolvedJavaField) self.resolved;
+            int offset = field.getOffset();
+            if (offset < 0) {
+                throw new InternalError(field.format("Field %T.%n has no offset"));
+            }
+            return offset;
         }
-        return offset;
+        return UnsafeFieldUtil.getFieldOffset(SubstrateUtil.cast(self.reflectAccess, Target_java_lang_reflect_Field.class));
     }
 
     @Substitute
     private static long staticFieldOffset(Target_java_lang_invoke_MemberName self) {
-        if (self.reflectAccess == null && self.intrinsic == null) {
+        if (self.reflectAccess == null && self.intrinsic == null && getResolvedMember(self) == null) {
             throw new InternalError("Unresolved field");
         }
         if (!self.isField() || !self.isStatic()) {
@@ -152,22 +190,40 @@ final class Target_java_lang_invoke_MethodHandleNatives {
         if (self.intrinsic != null) {
             return -1L;
         }
-        int offset = SubstrateUtil.cast(self.reflectAccess, Target_java_lang_reflect_Field.class).offset;
-        if (offset == -1) {
-            throw unsupportedFeature("Trying to access field " + self.reflectAccess + " without registering it as unsafe accessed.");
+        if (RuntimeClassLoading.isSupported() && self.resolved != null) {
+            ResolvedJavaField field = (ResolvedJavaField) self.resolved;
+            int offset = field.getOffset();
+            if (offset < 0) {
+                throw new InternalError(field.format("Static field %T.%n has no offset"));
+            }
+            return offset;
         }
-        return offset;
+        return UnsafeFieldUtil.getFieldOffset(SubstrateUtil.cast(self.reflectAccess, Target_java_lang_reflect_Field.class));
     }
 
     @Substitute
     private static Object staticFieldBase(Target_java_lang_invoke_MemberName self) {
-        if (self.reflectAccess == null) {
+        if (self.reflectAccess == null && getResolvedMember(self) == null) {
             throw new InternalError("Unresolved field");
         }
         if (!self.isField() || !self.isStatic()) {
             throw new InternalError("Static field required");
         }
-        return ((Field) self.reflectAccess).getType().isPrimitive() ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields();
+        if (RuntimeClassLoading.isSupported() && self.resolved != null) {
+            return CremaSupport.singleton().getStaticStorage((ResolvedJavaField) self.resolved);
+        }
+        Field field = (Field) self.reflectAccess;
+        int layerNumber;
+        if (ImageLayerBuildingSupport.buildingImageLayer()) {
+            layerNumber = SubstrateUtil.cast(field, Target_java_lang_reflect_Field.class).installedLayerNumber;
+        } else {
+            layerNumber = MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
+        }
+        if (field.getType().isPrimitive()) {
+            return StaticFieldsSupport.getStaticPrimitiveFieldsAtRuntime(layerNumber);
+        } else {
+            return StaticFieldsSupport.getStaticObjectFieldsAtRuntime(layerNumber);
+        }
     }
 
     @Substitute
@@ -176,10 +232,32 @@ final class Target_java_lang_invoke_MethodHandleNatives {
     }
 
     @Delete
-    private static native void setCallSiteTargetNormal(CallSite site, MethodHandle target);
+    @TargetElement(name = "setCallSiteTargetNormal", onlyWith = NoRuntimeClassLoading.class)
+    private static native void deleteSetCallSiteTargetNormal(CallSite site, MethodHandle target);
 
     @Delete
-    private static native void setCallSiteTargetVolatile(CallSite site, MethodHandle target);
+    @TargetElement(name = "setCallSiteTargetVolatile", onlyWith = NoRuntimeClassLoading.class)
+    private static native void deleteSetCallSiteTargetVolatile(CallSite site, MethodHandle target);
+
+    @Substitute
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    private static void setCallSiteTargetNormal(CallSite site, MethodHandle target) {
+        if (Heap.getHeap().isInImageHeap(site)) {
+            // GR-36064 The target might have been folded at build time
+            throw new UnsupportedOperationException("MethodHandleNatives.setCallSiteTargetNormal is not supported for sites created at build-time");
+        }
+        RuntimeCallSiteTargetSupport.setCallSiteTargetNormal(site, target);
+    }
+
+    @Substitute
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    private static void setCallSiteTargetVolatile(CallSite site, MethodHandle target) {
+        if (Heap.getHeap().isInImageHeap(site)) {
+            // GR-36064 The target might have been folded at build time
+            throw new UnsupportedOperationException("MethodHandleNatives.setCallSiteTargetVolatile is not supported for sites created at build-time");
+        }
+        RuntimeCallSiteTargetSupport.setCallSiteTargetVolatile(site, target);
+    }
 
     @Delete
     private static native void registerNatives();
@@ -190,11 +268,6 @@ final class Target_java_lang_invoke_MethodHandleNatives {
     @Delete
     private static native void copyOutBootstrapArguments(Class<?> caller, int[] indexInfo, int start, int end, Object[] buf, int pos, boolean resolve, Object ifNotAvailable);
 
-    @Substitute
-    private static void clearCallSiteContext(Target_java_lang_invoke_MethodHandleNatives_CallSiteContext context) {
-        throw unimplemented("CallSiteContext not supported");
-    }
-
     @AnnotateOriginal
     static native boolean refKindIsMethod(byte refKind);
 
@@ -202,11 +275,11 @@ final class Target_java_lang_invoke_MethodHandleNatives {
     static native String refKindName(byte refKind);
 
     @Substitute
-    static Target_java_lang_invoke_MemberName resolve(Target_java_lang_invoke_MemberName self, Class<?> caller, int lookupMode, boolean speculativeResolve)
+    public static Target_java_lang_invoke_MemberName resolve(Target_java_lang_invoke_MemberName self, Class<?> caller, int lookupMode, boolean speculativeResolve)
                     throws LinkageError, ClassNotFoundException {
         Class<?> declaringClass = self.getDeclaringClass();
         Target_java_lang_invoke_MemberName resolved = Util_java_lang_invoke_MethodHandleNatives.resolve(self, caller, speculativeResolve);
-        assert resolved == null || resolved.reflectAccess != null || resolved.intrinsic != null;
+        assert resolved == null || resolved.reflectAccess != null || resolved.intrinsic != null || getResolvedMember(resolved) != null;
         if (resolved != null && resolved.reflectAccess != null && caller != null &&
                         !Util_java_lang_invoke_MethodHandleNatives.verifyAccess(declaringClass, resolved.reflectAccess.getDeclaringClass(), resolved.reflectAccess.getModifiers(), caller,
                                         lookupMode)) {
@@ -215,14 +288,74 @@ final class Target_java_lang_invoke_MethodHandleNatives {
         return resolved;
     }
 
+    @Alias
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    public static native Target_java_lang_invoke_MemberName linkCallSite(Object callerObj,
+                    Object bootstrapMethodObj,
+                    Object nameObj, Object typeObj,
+                    Object staticArguments,
+                    Object[] appendixResult);
+
+    @Alias
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    public static native Object linkDynamicConstant(Object callerObj,
+                    Object bootstrapMethodObj,
+                    Object nameObj, Object typeObj,
+                    Object staticArguments);
+
+    @Alias
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    public static native MethodType findMethodHandleType(Class<?> rtype, Class<?>[] ptypes);
+
     @Delete
-    static native MethodHandle linkMethodHandleConstant(Class<?> callerClass, int refKind, Class<?> defc, String name, Object type);
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class, name = "linkMethodHandleConstant")
+    static native MethodHandle linkMethodHandleConstantDeleted(Class<?> callerClass, int refKind, Class<?> defc, String name, Object type);
+
+    @Alias
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    public static native MethodHandle linkMethodHandleConstant(Class<?> callerClass, int refKind, Class<?> defc, String name, Object type);
+
+    @Alias
+    @TargetElement(onlyWith = WithRuntimeClassLoading.class)
+    public static native Target_java_lang_invoke_MemberName linkMethod(Class<?> callerClass, int refKind,
+                    Class<?> defc, String name, Object type,
+                    Object[] appendixResult);
+}
+
+@TargetClass(className = "java.lang.invoke.MutableCallSite", onlyWith = NoRuntimeClassLoading.class)
+final class Target_java_lang_invoke_MutableCallSite_NoRuntimeClassLoading {
+    @SuppressWarnings({"static-method", "unused"})
+    @Substitute
+    public void setTarget(MethodHandle newTarget) {
+        // Without runtime class loading this reaches the deleted normal call-site target update.
+        throw unsupportedFeature("MutableCallSite.setTarget()");
+    }
+}
+
+@TargetClass(className = "java.lang.invoke.VolatileCallSite", onlyWith = NoRuntimeClassLoading.class)
+final class Target_java_lang_invoke_VolatileCallSite_NoRuntimeClassLoading {
+    @SuppressWarnings({"static-method", "unused"})
+    @Substitute
+    public void setTarget(MethodHandle newTarget) {
+        // Without runtime class loading this reaches the deleted volatile call-site target update.
+        throw unsupportedFeature("VolatileCallSite.setTarget()");
+    }
+}
+
+@TargetClass(className = "java.lang.invoke.ConstantCallSite", onlyWith = NoRuntimeClassLoading.class)
+final class Target_java_lang_invoke_ConstantCallSite_NoRuntimeClassLoading {
+    @SuppressWarnings("unused")
+    @Substitute
+    protected Target_java_lang_invoke_ConstantCallSite_NoRuntimeClassLoading(MethodType targetType, MethodHandle createTarget) throws Throwable {
+        // This constructor delegates to the deleted CallSite(MethodType, MethodHandle) constructor.
+        throw unsupportedFeature("ConstantCallSite.<init>(MethodType, MethodHandle)");
+    }
 }
 
 /**
  * The method handles API looks up methods and fields in a different way than the reflection API.
- * The specified member is searched in the given declaring class and its superclasses (like
- * {@link Class#getMethod(String, Class[])}) but including private members (like
+ * The specified member is searched in the given declaring class and its superclasses and interfaces
+ * (like {@link Class#getMethod(String, Class[])}) but including private members (like
  * {@link Class#getDeclaredMethod(String, Class[])}). We solve this by recursively looking up the
  * declared methods of the declaring class and its superclasses.
  * <p>
@@ -246,11 +379,21 @@ final class Util_java_lang_invoke_MethodHandleNatives {
         } catch (NoSuchMethodException | MissingReflectionRegistrationError e) {
             /*
              * Getting a MissingReflectionRegistration error during lookup is not a problem if we
-             * find a matching method in a superclass, since if an overriding method existed a
-             * hiding method would have been registered.
+             * find a matching method in a superclass or an interface, since if an overriding method
+             * existed a hiding method would have been registered.
              */
-            Class<?> superClass = declaringClazz.getSuperclass();
             Throwable newOriginalException = originalException == null ? e : originalException;
+            for (Class<?> intf : declaringClazz.getInterfaces()) {
+                try {
+                    return lookupMethod(intf, name, parameterTypes, newOriginalException);
+                } catch (NoSuchMethodException | MissingReflectionRegistrationError t) {
+                    /*
+                     * Ignore exception, the original exception will be thrown if no method is found
+                     * at the end of the lookup
+                     */
+                }
+            }
+            Class<?> superClass = declaringClazz.getSuperclass();
             if (superClass == null) {
                 if (newOriginalException instanceof NoSuchMethodException noSuchMethodException) {
                     throw noSuchMethodException;
@@ -297,13 +440,23 @@ final class Util_java_lang_invoke_MethodHandleNatives {
 
     @SuppressWarnings("unused")
     public static Target_java_lang_invoke_MemberName resolve(Target_java_lang_invoke_MemberName self, Class<?> caller, boolean speculativeResolve)
-                    throws LinkageError, ClassNotFoundException {
-        if (self.reflectAccess != null || self.intrinsic != null) {
-            return self;
-        }
+                    throws LinkageError {
         Class<?> declaringClass = self.getDeclaringClass();
         if (declaringClass == null) {
             return null;
+        }
+        if (RuntimeClassLoading.isSupported()) {
+            try {
+                return CremaSupport.singleton().resolveMemberName(self, caller);
+            } catch (Throwable t) {
+                if (speculativeResolve) {
+                    return null;
+                }
+                throw t;
+            }
+        }
+        if (self.reflectAccess != null || self.intrinsic != null) {
+            return self;
         }
 
         /* Intrinsic methods */
@@ -378,33 +531,18 @@ final class Util_java_lang_invoke_MethodHandleNatives {
     }
 }
 
-@TargetClass(className = "java.lang.invoke.MethodHandleNatives", innerClass = "Constants")
-final class Target_java_lang_invoke_MethodHandleNatives_Constants {
-    // Checkstyle: stop
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_IS_METHOD;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_IS_CONSTRUCTOR;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_IS_FIELD;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_IS_TYPE;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_CALLER_SENSITIVE;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static int MN_REFERENCE_KIND_SHIFT;
+@TargetClass(value = CallSite.class)
+final class Target_java_lang_invoke_CallSite {
+    /** Lazily allocated runtime target-assumption state owned by this CallSite. */
+    @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset) //
+    RuntimeCallSiteTargetSupport.CallSiteDependencyState runtimeTargetAssumptionState;
 
-    /**
-     * Constant pool reference-kind codes, as used by CONSTANT_MethodHandle CP entries.
-     */
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_NONE;  // null
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_getField;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_getStatic;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_putField;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_putStatic;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_invokeVirtual;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_invokeStatic;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_invokeSpecial;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_newInvokeSpecial;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_invokeInterface;
-    @Alias @RecomputeFieldValue(isFinal = true, kind = Kind.None) static byte REF_LIMIT;
-    // Checkstyle: resume
-}
+    @Delete
+    @TargetElement(onlyWith = NoRuntimeClassLoading.class)
+    @SuppressWarnings("unused")
+    Target_java_lang_invoke_CallSite(MethodType targetType, MethodHandle createTarget) throws Throwable {
+    }
 
-@TargetClass(className = "java.lang.invoke.MethodHandleNatives", innerClass = "CallSiteContext")
-final class Target_java_lang_invoke_MethodHandleNatives_CallSiteContext {
+    @Alias
+    static native long getTargetOffset();
 }

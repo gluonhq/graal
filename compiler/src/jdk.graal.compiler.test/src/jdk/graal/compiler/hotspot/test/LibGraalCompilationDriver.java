@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,12 +25,11 @@
 package jdk.graal.compiler.hotspot.test;
 
 import static jdk.graal.compiler.debug.MemUseTrackerKey.getCurrentThreadAllocatedBytes;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static jdk.internal.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
 
-import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,18 +48,19 @@ import com.oracle.truffle.runtime.hotspot.libgraal.LibGraalIsolate;
 import com.oracle.truffle.runtime.hotspot.libgraal.LibGraalScope;
 
 import jdk.graal.compiler.api.test.ModuleSupport;
+import jdk.graal.compiler.core.ProfileReplaySupport;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.debug.TTY;
 import jdk.graal.compiler.hotspot.CompilationTask;
 import jdk.graal.compiler.hotspot.HotSpotGraalCompiler;
 import jdk.graal.compiler.hotspot.HotSpotGraalRuntimeProvider;
-import jdk.graal.compiler.hotspot.ProfileReplaySupport;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.serviceprovider.GraalServices;
-import jdk.graal.compiler.serviceprovider.GraalUnsafeAccess;
+import jdk.graal.compiler.util.EconomicHashMap;
 import jdk.graal.compiler.util.OptionsEncoder;
+import jdk.internal.misc.Unsafe;
 import jdk.vm.ci.hotspot.HotSpotCompilationRequest;
 import jdk.vm.ci.hotspot.HotSpotCompilationRequestResult;
 import jdk.vm.ci.hotspot.HotSpotInstalledCode;
@@ -68,7 +68,6 @@ import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
 import jdk.vm.ci.hotspot.HotSpotResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.runtime.JVMCICompiler;
-import sun.misc.Unsafe;
 
 /**
  * Encapsulates functionality to compile a batch of methods for stand-alone compile test programs
@@ -82,6 +81,7 @@ public class LibGraalCompilationDriver {
 
     static {
         // To be able to use Unsafe
+        ModuleSupport.exportAndOpenAllPackagesToUnnamed("java.base");
         ModuleSupport.exportAndOpenAllPackagesToUnnamed("jdk.graal.compiler");
     }
 
@@ -93,7 +93,7 @@ public class LibGraalCompilationDriver {
      * Per-isolate values used to control if metrics should be printed and reset as part of the next
      * compilation in the isolate.
      */
-    private final Map<Long, AtomicBoolean> printMetrics = new HashMap<>();
+    private final Map<Long, AtomicBoolean> printMetrics = new EconomicHashMap<>();
 
     /**
      * If true, will invalidate all generated code after compilation to prevent filling up the code
@@ -117,8 +117,8 @@ public class LibGraalCompilationDriver {
     private final boolean multiThreaded;
 
     /**
-     * Number of threads to use for multithreaded compilation. If 0, the value of
-     * {@code Runtime.getRuntime().availableProcessors()} is used instead.
+     * Number of threads to use for multithreaded compilation. If 0, a good default value is picked
+     * by {@link #getThreadCount()}.
      */
     private final int numThreads;
 
@@ -153,13 +153,13 @@ public class LibGraalCompilationDriver {
         return compiler.getGraalRuntime();
     }
 
-    private static final Unsafe UNSAFE = GraalUnsafeAccess.getUnsafe();
+    private static final Unsafe UNSAFE = Unsafe.getUnsafe();
 
     /**
      * Implemented by
-     * {@code com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints.compileMethod}.
+     * {@code com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints#compileMethod}.
      */
-    public static native long compileMethodInLibgraal(long isolateThread,
+    public static native long compileMethodInLibgraal(long isolateThreadAddress,
                     long methodHandle,
                     boolean useProfilingInfo,
                     boolean installAsDefault,
@@ -168,8 +168,8 @@ public class LibGraalCompilationDriver {
                     long optionsAddress,
                     int optionsSize,
                     int optionsHash,
-                    long encodedThrowableBufferAddress,
-                    int encodedThrowableBufferSize,
+                    long compilationFailureBufferAddress,
+                    int compilationFailureBufferSize,
                     long timeAndMemBufferAddress,
                     long profileLoadAddress);
 
@@ -236,6 +236,29 @@ public class LibGraalCompilationDriver {
         }
 
         /**
+         * A buffer holding a zero-terminated UTF-8 string.
+         */
+        public static class UTF8CStringBuffer extends NativeBuffer {
+            private final byte[] encoded;
+
+            public UTF8CStringBuffer(String string) {
+                byte[] utf8Bytes = string.getBytes(StandardCharsets.UTF_8);
+                encoded = new byte[utf8Bytes.length + 1];
+                System.arraycopy(utf8Bytes, 0, encoded, 0, utf8Bytes.length);
+            }
+
+            @Override
+            public void initialize(long address) {
+                UNSAFE.copyMemory(encoded, ARRAY_BYTE_BASE_OFFSET, null, address, encoded.length);
+            }
+
+            @Override
+            public int length() {
+                return encoded.length;
+            }
+        }
+
+        /**
          * Native memory containing {@linkplain OptionsEncoder encoded} {@link OptionValues}.
          */
         public static class OptionsBuffer extends NativeBuffer {
@@ -243,7 +266,7 @@ public class LibGraalCompilationDriver {
             final int hash;
 
             OptionsBuffer(OptionValues options) {
-                Map<String, Object> map = new HashMap<>();
+                Map<String, Object> map = new EconomicHashMap<>();
                 UnmodifiableMapCursor<OptionKey<?>, Object> cursor = options.getMap().getEntries();
                 while (cursor.advance()) {
                     final OptionKey<?> key = cursor.getKey();
@@ -270,13 +293,28 @@ public class LibGraalCompilationDriver {
         }
 
         /**
-         * Manages native memory for receiving a {@linkplain Throwable#printStackTrace() stack
-         * trace} from libgraal serialized via {@link ByteArrayOutputStream} to a byte array.
+         * Manages native memory for receiving failure information from libgraal. The buffer has the
+         * following format:
+         *
+         * <pre>
+         * struct {
+         *     int   retry;
+         *     int   stackTraceLength;
+         *     byte  stackTrace[stackTraceLength]; // Bytes from a stack trace printed to a ByteArrayOutputStream.
+         * }
+         * </pre>
          */
-        public static class StackTraceBuffer extends NativeBuffer {
+        public static class CompilationFailureBuffer extends NativeBuffer {
+            /** Offset of the flag indicating whether the failed compilation should be retried. */
+            private static final int RETRY_OFFSET = 0;
+            /** Offset of the stack trace length in bytes. */
+            private static final int STACK_TRACE_LENGTH_OFFSET = Integer.BYTES;
+            /** Offset of the first byte of the serialized stack trace. */
+            private static final int STACK_TRACE_OFFSET = 2 * Integer.BYTES;
+
             final int capacity;
 
-            StackTraceBuffer(int capacity) {
+            CompilationFailureBuffer(int capacity) {
                 this.capacity = capacity;
             }
 
@@ -285,12 +323,32 @@ public class LibGraalCompilationDriver {
                 return capacity;
             }
 
+            @Override
+            public void initialize(long addr) {
+                super.initialize(addr);
+                UNSAFE.setMemory(getAddress(), length(), (byte) 0);
+            }
+
             public String readToString() {
                 long address = getAddress();
-                int size = UNSAFE.getInt(address);
+                int size = UNSAFE.getInt(address + STACK_TRACE_LENGTH_OFFSET);
                 byte[] data = new byte[size];
-                UNSAFE.copyMemory(null, address + Integer.BYTES, data, ARRAY_BYTE_BASE_OFFSET, size);
+                UNSAFE.copyMemory(null, address + STACK_TRACE_OFFSET, data, ARRAY_BYTE_BASE_OFFSET, size);
                 return new String(data).trim();
+            }
+
+            public boolean hasBeenWritten() {
+                GraalError.guarantee(getAddress() != 0, "Must have allocated native buffer already to use this API");
+                int size = UNSAFE.getInt(getAddress() + STACK_TRACE_LENGTH_OFFSET);
+                GraalError.guarantee(size >= 0, "Size cannot be negative but is %s", size);
+                return size > 0;
+            }
+
+            /**
+             * @return whether a failed compilation should be retried
+             */
+            public boolean shouldRetry() {
+                return UNSAFE.getInt(getAddress() + RETRY_OFFSET) != 0;
             }
         }
 
@@ -312,14 +370,11 @@ public class LibGraalCompilationDriver {
                 return UNSAFE.getLong(getAddress());
             }
 
-            static final long NANOS_IN_MILLI = 1_000_000;
-
             /**
              * @return compilation time as output by libgraal, in nanoseconds.
              */
             public long readTimeElapsed() {
-                // Libgraal uses milliseconds, convert to nano for consistency.
-                return UNSAFE.getLong(getAddress() + Long.BYTES) * NANOS_IN_MILLI;
+                return UNSAFE.getLong(getAddress() + Long.BYTES);
             }
         }
 
@@ -329,7 +384,7 @@ public class LibGraalCompilationDriver {
         public static class ProfilePathBuffer extends NativeBuffer {
             private final byte[] profilesPathBytes;
 
-            ProfilePathBuffer(String profilesPath) {
+            public ProfilePathBuffer(String profilesPath) {
                 /* Append the terminating 0. */
                 byte[] stringBytes = profilesPath.getBytes();
                 this.profilesPathBytes = Arrays.copyOf(stringBytes, stringBytes.length + 1);
@@ -363,19 +418,19 @@ public class LibGraalCompilationDriver {
 
         }
 
-        private final List<StackTraceBuffer> stackTraceBuffers = new ArrayList<>();
+        private final List<CompilationFailureBuffer> compilationFailureBuffers = new ArrayList<>();
 
         /**
-         * Gets a stack trace buffer for the current thread.
+         * Gets a compilation failure buffer for the current thread.
          */
-        public StackTraceBuffer getStackTraceBuffer() {
-            return stackTraceBuffer.get();
+        public CompilationFailureBuffer getCompilationFailureBuffer() {
+            return compilationFailureBuffer.get();
         }
 
-        private final ThreadLocal<StackTraceBuffer> stackTraceBuffer = ThreadLocal.withInitial(() -> {
-            StackTraceBuffer buffer = new StackTraceBuffer(10_000);
-            synchronized (stackTraceBuffers) {
-                stackTraceBuffers.add(buffer);
+        private final ThreadLocal<CompilationFailureBuffer> compilationFailureBuffer = ThreadLocal.withInitial(() -> {
+            CompilationFailureBuffer buffer = new CompilationFailureBuffer(10_000);
+            synchronized (compilationFailureBuffers) {
+                compilationFailureBuffers.add(buffer);
             }
             return buffer;
         });
@@ -383,7 +438,7 @@ public class LibGraalCompilationDriver {
         private final List<MemoryAndTimeMeasurementsBuffer> memTimeBuffers = new ArrayList<>();
 
         /**
-         * Gets a stack trace buffer for the current thread.
+         * Gets a memory and time measurements buffer for the current thread.
          */
         public MemoryAndTimeMeasurementsBuffer getMemoryAndTimeBuffer() {
             return memTimeBuffer.get();
@@ -412,11 +467,11 @@ public class LibGraalCompilationDriver {
                 }
                 optionsBuffers.clear();
             }
-            synchronized (stackTraceBuffers) {
-                for (StackTraceBuffer buffer : stackTraceBuffers) {
+            synchronized (compilationFailureBuffers) {
+                for (CompilationFailureBuffer buffer : compilationFailureBuffers) {
                     buffer.free();
                 }
-                stackTraceBuffers.clear();
+                compilationFailureBuffers.clear();
             }
             synchronized (memTimeBuffers) {
                 for (MemoryAndTimeMeasurementsBuffer buffer : memTimeBuffers) {
@@ -526,7 +581,7 @@ public class LibGraalCompilationDriver {
         long methodHandle = LibGraal.translate(method);
         long isolateThread = LibGraalScope.getIsolateThread();
 
-        LibGraalParams.StackTraceBuffer stackTraceBuffer = libgraal.getStackTraceBuffer();
+        LibGraalParams.CompilationFailureBuffer failureBuffer = libgraal.getCompilationFailureBuffer();
         LibGraalParams.OptionsBuffer options = libgraal.getOptions();
         LibGraalParams.MemoryAndTimeMeasurementsBuffer memTimeBuffer = libgraal.getMemoryAndTimeBuffer();
 
@@ -541,19 +596,33 @@ public class LibGraalCompilationDriver {
                             options.getAddress(),
                             options.length(),
                             options.getHash(),
-                            stackTraceBuffer.getAddress(),
-                            stackTraceBuffer.length(),
+                            failureBuffer.getAddress(),
+                            failureBuffer.length(),
                             memTimeBuffer.getAddress(),
                             profileBuffer == null ? 0 : profileBuffer.getAddress());
 
             HotSpotInstalledCode installedCode = LibGraal.unhand(HotSpotInstalledCode.class, installedCodeHandle);
             if (installedCode == null) {
-                String stackTrace = stackTraceBuffer.readToString();
-                TTY.println("%s : Error compiling method: %s", compilation.testName(), compilation);
-                TTY.println(stackTrace);
+                /*
+                 * Most exceptions during compilation in libgraal are already handled by the
+                 * libgraal side. Only exceptions happening during setting up compile contexts etc
+                 * may be thrown here. In general a compilation result of null means compilation
+                 * exception (handled or not), only if the exception buffer was written the
+                 * exception was not handled already on the libgraal side.
+                 */
+                if (failureBuffer.hasBeenWritten()) {
+                    String stackTrace = failureBuffer.readToString();
+                    TTY.println("%s : Error compiling method: %s", compilation.testName(), compilation);
+                    TTY.println(stackTrace);
+                }
+                failedCompilations.getAndAdd(1);
                 return null;
             }
-            return new CompilationResult(installedCode, memTimeBuffer.readTimeElapsed(), memTimeBuffer.readBytesAllocated());
+            long memoryUsed = memTimeBuffer.readBytesAllocated();
+            long compileTime = memTimeBuffer.readTimeElapsed();
+            GraalError.guarantee(compileTime != 0L, "Compilation time cannot be 0");
+            GraalError.guarantee(memoryUsed != 0L, "Compilation memory used cannot be 0");
+            return new CompilationResult(installedCode, compileTime, memoryUsed);
         }
     }
 
@@ -576,6 +645,11 @@ public class LibGraalCompilationDriver {
         int entryBCI = JVMCICompiler.INVOCATION_ENTRY_BCI;
         HotSpotCompilationRequest request = new HotSpotCompilationRequest(method, entryBCI, 0L);
         return createCompilationTask(jvmciRuntime, compiler, request, useProfilingInfo, installAsDefault);
+    }
+
+    protected void handleFailure(HotSpotCompilationRequestResult result) {
+        failedCompilations.getAndAdd(1);
+        throw new GraalError("Compilation request failed: %s", result.getFailureMessage());
     }
 
     /**
@@ -604,14 +678,13 @@ public class LibGraalCompilationDriver {
             CompilationTask task = createCompilationTask(method, useProfilingInfo, installAsDefault);
             HotSpotCompilationRequestResult result = task.runCompilation(compileOptions);
             if (result.getFailure() != null) {
-                var error = new GraalError("Compilation request failed: %s", result.getFailureMessage());
                 if (result.getRetry() && !retried) {
-                    error.printStackTrace(TTY.out);
-                    TTY.println("Retrying...");
+                    TTY.println("Retrying %s after transient failure...", task);
                     retried = true;
                     continue;
                 }
-                throw error;
+                handleFailure(result);
+                return null;
             }
             HotSpotInstalledCode installedCode = task.getInstalledCode();
             assert installedCode != null : "installed code is null yet no failure detected";
@@ -626,7 +699,6 @@ public class LibGraalCompilationDriver {
     /**
      * Compiles all the given methods, using libgraal if available.
      */
-    @SuppressWarnings("try")
     public void compileAll(List<? extends Compilation> compilations, OptionValues options) {
         try (LibGraalParams libgraal = LibGraal.isAvailable() ? new LibGraalParams(options) : null) {
             compileAll(libgraal, compilations, options);
@@ -671,7 +743,12 @@ public class LibGraalCompilationDriver {
         if (multiThreaded) {
             threadCount = numThreads;
             if (threadCount == 0) {
-                threadCount = Runtime.getRuntime().availableProcessors();
+                /*
+                 * On very large machine there might be hundreds of processors and the compiler
+                 * doesn't really scale well enough for that so limit the max number of threads. 32
+                 * was picked as that seemed to scale well enough in testing.
+                 */
+                threadCount = Math.min(32, Runtime.getRuntime().availableProcessors());
             }
         }
         return threadCount;
@@ -690,7 +767,6 @@ public class LibGraalCompilationDriver {
                     Map<ResolvedJavaMethod, CompilationResult> results) {
         CompilationResult result = compile(task, libgraal, options);
         if (result == null) {
-            failedCompilations.getAndAdd(1);
             return;
         }
         compileTime.getAndAdd(result.compileTime());
@@ -705,16 +781,15 @@ public class LibGraalCompilationDriver {
     /**
      * Compiles all methods in {@code compilations} sequentially on one thread.
      */
-    @SuppressWarnings("try")
     private Map<ResolvedJavaMethod, CompilationResult> compileAllSingleThreaded(
                     LibGraalParams libgraal, List<? extends Compilation> compilations, OptionValues options,
                     AtomicLong compileTime, AtomicLong memoryUsed, AtomicLong codeSize) {
-        Map<ResolvedJavaMethod, CompilationResult> results = new HashMap<>();
+        Map<ResolvedJavaMethod, CompilationResult> results = new EconomicHashMap<>();
 
         long intervalStart = System.currentTimeMillis();
         long lastCompletedTaskCount = 0;
         long completedTaskCount = 0;
-        try (LibGraalScope scope = libgraal == null ? null : new LibGraalScope()) {
+        try (LibGraalScope _ = libgraal == null ? null : new LibGraalScope()) {
             for (Compilation task : compilations) {
                 compileAndRecord(task, libgraal, options, compileTime, memoryUsed, codeSize, results);
                 completedTaskCount++;
@@ -742,11 +817,10 @@ public class LibGraalCompilationDriver {
             setDaemon(true);
         }
 
-        @SuppressWarnings("try")
         @Override
         public void run() {
             setContextClassLoader(getClass().getClassLoader());
-            try (LibGraalScope scope = libgraal == null ? null : new LibGraalScope()) {
+            try (LibGraalScope _ = libgraal == null ? null : new LibGraalScope()) {
                 super.run();
             }
         }
@@ -818,7 +892,7 @@ public class LibGraalCompilationDriver {
      */
     private boolean shouldPrintMetrics(LibGraalIsolate isolate) {
         synchronized (printMetrics) {
-            return printMetrics.computeIfAbsent(isolate.getId(), id -> new AtomicBoolean()).getAndSet(false);
+            return printMetrics.computeIfAbsent(isolate.getId(), _ -> new AtomicBoolean()).getAndSet(false);
         }
     }
 

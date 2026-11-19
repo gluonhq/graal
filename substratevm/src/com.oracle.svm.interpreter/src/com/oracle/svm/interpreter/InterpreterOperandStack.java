@@ -1,0 +1,436 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.interpreter;
+
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Boolean;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Byte;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Char;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Double;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Float;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Int;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Long;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Object;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Short;
+import static com.oracle.svm.espresso.classfile.Constants.JVM_ArrayType_Void;
+import static jdk.graal.compiler.api.directives.GraalDirectives.uncheckedCast;
+
+import com.oracle.svm.interpreter.metadata.InterpreterUnresolvedSignature;
+import com.oracle.svm.shared.AlwaysInline;
+
+import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.internal.misc.Unsafe;
+import jdk.vm.ci.meta.JavaKind;
+
+/**
+ * Provides an operand-stack overlay on an {@link InterpreterFrame}. This object defines the stack
+ * operations required by the interpreter and owns the logical stack top, while primitive and
+ * reference values remain stored directly in the frame supplied to each operation.
+ *
+ * When a handler passes an operand to a call, it should peek the operand and pop it only after the
+ * call returns. Updating {@link #top} before the call makes the derived {@code top - 1} value part
+ * of the call's frame state. Keeping the canonical top across the call avoids that intermediate
+ * frame-state value.
+ */
+class InterpreterOperandStack {
+    private static final Unsafe UNSAFE = Unsafe.getUnsafe();
+
+    /**
+     * Normal execution with all operands in the frame. {@link CachedInterpreterOperandStack} adds
+     * states for normal execution with cached primitive slots.
+     */
+    static final int STATE_NORMAL = 0;
+    /** Profiling execution with all operands in the frame and caching disabled. */
+    static final int STATE_PROFILING = 1;
+    /** Debugging execution with all operands in the frame and caching disabled. */
+    static final int STATE_DEBUGGING = 2;
+
+    /** First stack slot above the operand stack. */
+    long top;
+    /** Execution mode used to select the bytecode handler variant. */
+    int state = STATE_NORMAL;
+
+    @AlwaysInline("Expose the operand-stack overlay to escape analysis in interpreter entry")
+    InterpreterOperandStack(long top) {
+        this.top = top;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final int getState() {
+        return state;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void setState(int state) {
+        assert isValidState(state);
+        this.state = state;
+    }
+
+    /** Flushes cached operands to the frame, if any. */
+    void flushCache(@SuppressWarnings("unused") InterpreterFrame frame) {
+    }
+
+    /** Prepares the operand stack for dispatch to the next bytecode handler. */
+    void beforeDispatch() {
+    }
+
+    @AlwaysInline("Keep state validation from materializing the operand stack")
+    boolean isValidState(int candidateState) {
+        return candidateState >= STATE_NORMAL && candidateState <= STATE_DEBUGGING;
+    }
+
+    /**
+     * Returns the stack top for an operation that accesses operand-stack slots directly through
+     * the frame.
+     *
+     * @return the first stack slot above the operand stack
+     */
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    long topForFrameStackOperation() {
+        return top;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pushInt(InterpreterFrame frame, int value) {
+        frame.setPrimitive(top, 0, value);
+        top++;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void pushFloat(InterpreterFrame frame, float value) {
+        pushInt(frame, Float.floatToRawIntBits(value));
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pushLong(InterpreterFrame frame, long value) {
+        frame.setStackLong(top, value);
+        top += 2;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void pushDouble(InterpreterFrame frame, double value) {
+        pushLong(frame, Double.doubleToRawLongBits(value));
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pushObject(InterpreterFrame frame, Object value) {
+        frame.setReference(top, 0, value);
+        top++;
+    }
+
+    /** Replaces the top operand with a reference without changing the stack height. */
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void replaceTopObject(InterpreterFrame frame, Object value) {
+        frame.setReference(top, -1, value);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pushReturnAddress(InterpreterFrame frame, int targetBCI) {
+        Object value = ReturnAddress.create(targetBCI);
+        frame.setReference(top, 0, value);
+        top++;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    int popInt(InterpreterFrame frame) {
+        int value = (int) frame.getPrimitive(top, -1);
+        top--;
+        return value;
+    }
+
+    /** Pops ints into the destination from last to first, preserving their stack order. */
+    @AlwaysInline("Keep bulk int pops in bytecode-handler stubs")
+    void popInts(InterpreterFrame frame, int[] values) {
+        // Only primitive operands are popped here; reference slots are unchanged, so stack
+        // walking remains safe even if oop maps are later computed lazily from the bytecode state.
+        for (int i = values.length - 1; i >= 0; --i) {
+            values[i] = popInt(frame);
+        }
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    float popFloat(InterpreterFrame frame) {
+        float value = Float.intBitsToFloat((int) frame.getPrimitive(top, -1));
+        top--;
+        return value;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    long popLong(InterpreterFrame frame) {
+        long value = frame.getPrimitive(top, -1);
+        top -= 2;
+        return value;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final double popDouble(InterpreterFrame frame) {
+        return Double.longBitsToDouble(popLong(frame));
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    Object popObject(InterpreterFrame frame) {
+        Object value = frame.getReference(top, -1);
+        frame.setReference(top, -1, null);
+        top--;
+        return value;
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions in bytecode-handler stubs")
+    private Object popBasicType(InterpreterFrame frame, int basicType) {
+        return switch (basicType) {
+            case JVM_ArrayType_Boolean -> popInt(frame) != 0;
+            case JVM_ArrayType_Byte -> (byte) popInt(frame);
+            case JVM_ArrayType_Short -> (short) popInt(frame);
+            case JVM_ArrayType_Char -> (char) popInt(frame);
+            case JVM_ArrayType_Int -> popInt(frame);
+            case JVM_ArrayType_Float -> popFloat(frame);
+            case JVM_ArrayType_Long -> popLong(frame);
+            case JVM_ArrayType_Double -> popDouble(frame);
+            case JVM_ArrayType_Object -> popObject(frame);
+            default -> throw InterpreterUtil.shouldNotReachHereAtRuntime();
+        };
+    }
+
+    @AlwaysInline("Keep invocation return stack transitions in bytecode-handler stubs")
+    final void pushBasicType(InterpreterFrame frame, Object value, int basicType) {
+        switch (basicType) {
+            case JVM_ArrayType_Boolean -> pushInt(frame, uncheckedCast(value, Boolean.class) ? 1 : 0);
+            case JVM_ArrayType_Byte -> pushInt(frame, uncheckedCast(value, Byte.class));
+            case JVM_ArrayType_Short -> pushInt(frame, uncheckedCast(value, Short.class));
+            case JVM_ArrayType_Char -> pushInt(frame, uncheckedCast(value, Character.class));
+            case JVM_ArrayType_Int -> pushInt(frame, uncheckedCast(value, Integer.class));
+            case JVM_ArrayType_Float -> pushFloat(frame, uncheckedCast(value, Float.class));
+            case JVM_ArrayType_Long -> pushLong(frame, uncheckedCast(value, Long.class));
+            case JVM_ArrayType_Double -> pushDouble(frame, uncheckedCast(value, Double.class));
+            case JVM_ArrayType_Object -> pushObject(frame, value);
+            case JVM_ArrayType_Void -> {
+            }
+            default -> throw InterpreterUtil.shouldNotReachHereAtRuntime();
+        }
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions in bytecode-handler stubs")
+    final void popArguments(InterpreterFrame frame, byte[] argumentKinds, Object[] arguments, Object appendix) {
+        InterpreterUtil.guarantee(argumentKinds != null);
+        // Subtract before widening to avoid retaining a long copy of the allocation length.
+        long argumentIndex = arguments.length - 1;
+        if (GraalDirectives.injectBranchProbability(GraalDirectives.SLOWPATH_PROBABILITY, appendix != null)) {
+            assert UNSAFE.getByte(argumentKinds, Unsafe.ARRAY_BYTE_BASE_OFFSET + argumentIndex * Unsafe.ARRAY_BYTE_INDEX_SCALE) == JVM_ArrayType_Object;
+            UNSAFE.putReference(arguments, Unsafe.ARRAY_OBJECT_BASE_OFFSET + argumentIndex * Unsafe.ARRAY_OBJECT_INDEX_SCALE, appendix);
+            argumentIndex--;
+        }
+        popArguments(frame, argumentKinds, arguments, argumentIndex);
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions in bytecode-handler stubs")
+    void popArguments(InterpreterFrame frame, byte[] argumentKinds, Object[] arguments, long initialArgumentIndex) {
+        long argumentIndex = initialArgumentIndex;
+        for (; GraalDirectives.injectBranchProbability(GraalDirectives.LIKELY_PROBABILITY, argumentIndex >= 0); argumentIndex--) {
+            popArgument(frame, argumentKinds, arguments, argumentIndex);
+        }
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions in bytecode-handler stubs")
+    final void popArgument(InterpreterFrame frame, byte[] argumentKinds, Object[] arguments, long argumentIndex) {
+        int basicType = UNSAFE.getByte(argumentKinds, Unsafe.ARRAY_BYTE_BASE_OFFSET + argumentIndex * Unsafe.ARRAY_BYTE_INDEX_SCALE);
+        Object value = popBasicType(frame, basicType);
+        UNSAFE.putReference(arguments, Unsafe.ARRAY_OBJECT_BASE_OFFSET + argumentIndex * Unsafe.ARRAY_OBJECT_INDEX_SCALE, value);
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions in bytecode-handler stubs")
+    final Object popKind(InterpreterFrame frame, JavaKind kind) {
+        return popBasicType(frame, kind.getBasicType());
+    }
+
+    @AlwaysInline("Keep invocation return stack transitions in bytecode-handler stubs")
+    final void pushKind(InterpreterFrame frame, Object value, JavaKind kind) {
+        pushBasicType(frame, value, kind.getBasicType());
+    }
+
+    @AlwaysInline("Keep invocation argument stack transitions together")
+    void popArgumentsWithAppendix(InterpreterFrame frame, boolean hasReceiver, InterpreterUnresolvedSignature signature, Object[] arguments, Object appendix) {
+        int argumentCount = signature.getParameterCount(false);
+        int receiverCount = hasReceiver ? 1 : 0;
+
+        int lastStackArgument = argumentCount - 1;
+        assert signature.getParameterKind(lastStackArgument) == JavaKind.Object;
+        arguments[lastStackArgument + receiverCount] = appendix;
+        lastStackArgument--;
+        for (int index = lastStackArgument; index >= 0; index--) {
+            arguments[index + receiverCount] = popKind(frame, signature.getParameterKind(index));
+        }
+        if (hasReceiver) {
+            arguments[0] = popObject(frame);
+        }
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void pop1(InterpreterFrame frame) {
+        pop1(frame, true);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pop1(InterpreterFrame frame, boolean clear) {
+        if (clear) {
+            frame.setReference(top, -1, null);
+        }
+        top--;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final void pop2(InterpreterFrame frame) {
+        pop2(frame, true);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void pop2(InterpreterFrame frame, boolean clear) {
+        if (clear) {
+            frame.setReference(top, -1, null);
+            frame.setReference(top, -2, null);
+        }
+        top -= 2;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    int peekInt(InterpreterFrame frame, long offset) {
+        return (int) frame.getPrimitive(top, offset);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    float peekFloat(InterpreterFrame frame, long offset) {
+        return Float.intBitsToFloat((int) frame.getPrimitive(top, offset));
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    long peekLong(InterpreterFrame frame, long offset) {
+        return frame.getPrimitive(top, offset);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    final double peekDouble(InterpreterFrame frame, long offset) {
+        return Double.longBitsToDouble(peekLong(frame, offset));
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    Object peekObject(InterpreterFrame frame, long offset) {
+        return frame.getReference(top, offset);
+    }
+
+    @AlwaysInline("Keep return value reads in the interpreter root")
+    final Object peekKindAsObject(InterpreterFrame frame, JavaKind kind) {
+        // @formatter:off
+        return switch (kind) {
+            case Boolean -> (peekInt(frame, -1) & 1) != 0;
+            case Byte    -> (byte) peekInt(frame, -1);
+            case Short   -> (short) peekInt(frame, -1);
+            case Char    -> (char) peekInt(frame, -1);
+            case Int     -> peekInt(frame, -1);
+            case Long    -> peekLong(frame, -1);
+            case Float   -> peekFloat(frame, -1);
+            case Double  -> peekDouble(frame, -1);
+            case Void    -> null;
+            case Object  -> peekObject(frame, -1);
+            default      -> throw InterpreterUtil.shouldNotReachHereAtRuntime();
+        };
+        // @formatter:on
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dup1(InterpreterFrame frame) {
+        copySlot(frame, -1, 0);
+        top++;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dupx1(InterpreterFrame frame) {
+        copySlot(frame, -1, 0);
+        copySlot(frame, -2, -1);
+        copySlot(frame, 0, -2);
+        top++;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dupx2(InterpreterFrame frame) {
+        copySlot(frame, -1, 0);
+        copySlot(frame, -2, -1);
+        copySlot(frame, -3, -2);
+        copySlot(frame, 0, -3);
+        top++;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dup2(InterpreterFrame frame) {
+        copySlot(frame, -2, 0);
+        copySlot(frame, -1, 1);
+        top += 2;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dup2x1(InterpreterFrame frame) {
+        copySlot(frame, -2, 0);
+        copySlot(frame, -1, 1);
+        copySlot(frame, -3, -1);
+        copySlot(frame, 0, -3);
+        copySlot(frame, 1, -2);
+        top += 2;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void dup2x2(InterpreterFrame frame) {
+        copySlot(frame, -1, 1);
+        copySlot(frame, -2, 0);
+        copySlot(frame, -3, -1);
+        copySlot(frame, -4, -2);
+        copySlot(frame, 0, -4);
+        copySlot(frame, 1, -3);
+        top += 2;
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void swap(InterpreterFrame frame) {
+        long primitive = frame.getPrimitive(top, -1);
+        long value = frame.getPrimitive(top, -2);
+        frame.setPrimitive(top, -1, value);
+        frame.setPrimitive(top, -2, primitive);
+
+        Object reference = frame.getReference(top, -1);
+        Object value1 = frame.getReference(top, -2);
+        frame.setReference(top, -1, value1);
+        frame.setReference(top, -2, reference);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    private void copySlot(InterpreterFrame frame, long constantSrcOffset, long constantDstOffset) {
+        long value = frame.getPrimitive(top, constantSrcOffset);
+        frame.setPrimitive(top, constantDstOffset, value);
+        Object value1 = frame.getReference(top, constantSrcOffset);
+        frame.setReference(top, constantDstOffset, value1);
+    }
+
+    @AlwaysInline("Keep InterpreterOperandStack virtual-expanded")
+    void clearOperandStack(InterpreterFrame frame) {
+        frame.clearOperandStack(top);
+        top = frame.method.getMaxLocals();
+    }
+}

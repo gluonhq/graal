@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,21 +24,21 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import jdk.graal.compiler.nodes.ValueNode;
-
 import com.oracle.graal.pointsto.meta.AnalysisType;
+
+import jdk.graal.compiler.nodes.ValueNode;
 
 /**
  * A sink type flow for the context insensitive invoke used to link in parameters in each caller
  * context.
  */
-public class ActualParameterTypeFlow extends TypeFlow<ValueNode> {
+public class ActualParameterTypeFlow extends TypeFlow<ValueNode> implements GlobalFlow {
     public ActualParameterTypeFlow(AnalysisType declaredType) {
-        super(null, filterUncheckedInterface(declaredType));
+        super(null, dropUncheckedInterfaceBound(declaredType));
     }
 
     @Override
     public String toString() {
-        return "ActualParameter<" + getState() + '>';
+        return "ActualParameter<" + getStateDescription() + '>';
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,9 +26,12 @@ package com.oracle.svm.hosted.phases;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+
+import com.oracle.svm.core.code.FactoryMethodMarker;
+import com.oracle.svm.core.snippets.ImplicitExceptions;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.FixedNode;
@@ -46,15 +49,11 @@ import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
 import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode.BytecodeExceptionKind;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.java.NewInstanceNode;
+import jdk.graal.compiler.nodes.java.NewInstanceWithExceptionNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.phases.BasePhase;
-
-import com.oracle.svm.core.code.FactoryMethodMarker;
-import com.oracle.svm.core.snippets.ImplicitExceptions;
-import com.oracle.svm.util.ReflectionUtil;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
-import org.graalvm.nativeimage.AnnotationAccess;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * Code that must be allocation free cannot throw new {@link AssertionError}. Therefore we convert
@@ -73,7 +72,7 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
 
     @Override
     protected void run(StructuredGraph graph, CoreProviders context) {
-        if (AnnotationAccess.isAnnotationPresent(graph.method().getDeclaringClass(), FactoryMethodMarker.class)) {
+        if (GuestAnnotationAccess.isAnnotationPresent(graph.method().getDeclaringClass(), FactoryMethodMarker.class)) {
             /*
              * Factory methods, which includes methods in ImplicitExceptions, are the methods that
              * actually perform the allocations at run time.
@@ -101,17 +100,21 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
             return;
         }
         MethodCallTargetNode callTargetNode = (MethodCallTargetNode) constructorInvoke.callTarget();
-        if (!(callTargetNode.receiver() instanceof NewInstanceNode)) {
+        FixedNode exceptionAllocationFixed;
+        if (callTargetNode.receiver() instanceof NewInstanceNode newInstance) {
+            exceptionAllocationFixed = newInstance;
+        } else if (callTargetNode.receiver() instanceof NewInstanceWithExceptionNode newInstanceWithException) {
+            exceptionAllocationFixed = newInstanceWithException;
+        } else {
             return;
         }
-        NewInstanceNode exceptionAllocation = (NewInstanceNode) callTargetNode.receiver();
 
         /*
          * Ensure that there is a simple control flow path from the constructor to the allocation of
          * the exception.
          */
-        Set<FrameState> usagesToDelete = new HashSet<>();
-        if (!hasSimpleControlFlow(constructorInvoke.predecessor(), exceptionAllocation, usagesToDelete)) {
+        EconomicSet<FrameState> usagesToDelete = EconomicSet.create();
+        if (!hasSimpleControlFlow(constructorInvoke.predecessor(), exceptionAllocationFixed, usagesToDelete)) {
             /*
              * No simple control flow path found. This can happen for example when a ...?...:...
              * conditional is used to construct the exception message. This case is not important
@@ -126,10 +129,10 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
          * either the UnwindNode of the graph, or a phi function that merges a simple control flow
          * path from the constructor.
          */
-        for (Node exceptionUsage : exceptionAllocation.usages()) {
+        for (Node exceptionUsage : exceptionAllocationFixed.usages()) {
             if (exceptionUsage == callTargetNode || exceptionUsage == constructorInvoke.stateAfter()) {
                 /* The constructor invocation that is going to be replaced. */
-            } else if (usagesToDelete.contains(exceptionUsage)) {
+            } else if (exceptionUsage instanceof FrameState && usagesToDelete.contains((FrameState) exceptionUsage)) {
                 /* Frame state between constructor and allocation. */
             } else if (exceptionUsage instanceof UnwindNode) {
                 if (!hasSimpleControlFlow(exceptionUsage, constructorInvoke.asFixedNode(), null)) {
@@ -139,7 +142,7 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
             } else if (exceptionUsage instanceof PhiNode) {
                 PhiNode phi = (PhiNode) exceptionUsage;
                 for (int i = 0; i < phi.valueCount(); i++) {
-                    if (phi.valueAt(i) == exceptionAllocation && !hasSimpleControlFlow(phi.merge().phiPredecessorAt(i), constructorInvoke.asFixedNode(), null)) {
+                    if (phi.valueAt(i) == exceptionAllocationFixed && !hasSimpleControlFlow(phi.merge().phiPredecessorAt(i), constructorInvoke.asFixedNode(), null)) {
                         /* No simple control flow path found to the PhiNode. */
                         return;
                     }
@@ -161,7 +164,18 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
          */
 
         for (FrameState usageToDelete : usagesToDelete) {
-            usageToDelete.replaceAllInputs(exceptionAllocation, null);
+            usageToDelete.replaceAllInputs(exceptionAllocationFixed, null);
+        }
+
+        NewInstanceNode exceptionAllocation;
+        if (exceptionAllocationFixed instanceof NewInstanceWithExceptionNode newInstanceWithException) {
+            /*
+             * The assertion is being replaced by an implicit exception node, so the allocation's
+             * explicit OOME edge is no longer part of the final assertion path.
+             */
+            exceptionAllocation = (NewInstanceNode) newInstanceWithException.replaceWithNonThrowing();
+        } else {
+            exceptionAllocation = (NewInstanceNode) exceptionAllocationFixed;
         }
 
         /*
@@ -190,7 +204,7 @@ public class ImplicitAssertionsPhase extends BasePhase<CoreProviders> {
         graph.replaceFixedWithFloating(exceptionAllocation, replacement);
     }
 
-    private static boolean hasSimpleControlFlow(Node sink, FixedNode source, Set<FrameState> collectedFrameStates) {
+    private static boolean hasSimpleControlFlow(Node sink, FixedNode source, EconomicSet<FrameState> collectedFrameStates) {
         Node cur = sink;
         while (true) {
             if (cur == null) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,6 +27,9 @@ package jdk.graal.compiler.nodes.graphbuilderconf;
 import static jdk.graal.compiler.core.common.GraalOptions.StrictDeoptInsertionChecks;
 import static jdk.graal.compiler.core.common.type.StampFactory.objectNonNull;
 import static jdk.vm.ci.meta.DeoptimizationAction.InvalidateReprofile;
+
+import java.util.List;
+import java.util.function.Supplier;
 
 import jdk.graal.compiler.bytecode.Bytecode;
 import jdk.graal.compiler.core.common.type.AbstractPointerStamp;
@@ -71,13 +74,17 @@ import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
 import jdk.graal.compiler.nodes.extended.GuardingNode;
 import jdk.graal.compiler.nodes.java.InstanceOfDynamicNode;
 import jdk.graal.compiler.nodes.type.StampTool;
+import jdk.internal.misc.ScopedMemoryAccess;
 import jdk.vm.ci.code.BailoutException;
+import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.Assumptions;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * Used by a {@link GraphBuilderPlugin} to interface with an object that parses the bytecode of a
@@ -190,6 +197,16 @@ public interface GraphBuilderContext extends GraphBuilderTool {
     void handleReplacedInvoke(CallTargetNode callTarget, JavaKind resultType);
 
     /**
+     * Replaces an invocation of a method annotated with {@code Fold}. Implementations can execute
+     * the Java implementation or return another value that represents a constant resolved outside
+     * the current compilation context.
+     */
+    @SuppressWarnings("unused")
+    default ValueNode executeFold(ResolvedJavaMethod targetMethod, ValueNode[] arguments, Supplier<JavaConstant> operation) {
+        return ConstantNode.forConstant(operation.get(), getMetaAccess(), getGraph());
+    }
+
+    /**
      * Creates a snap shot of the current frame state with the BCI of the instruction after the one
      * currently being parsed and assigns it to a given {@linkplain StateSplit#hasSideEffect() side
      * effect} node.
@@ -259,6 +276,13 @@ public interface GraphBuilderContext extends GraphBuilderTool {
      */
     JavaType getInvokeReturnType();
 
+    /**
+     * Gets the referenced type of the invocation currently being parsed. This is only useful if
+     * {@link #getInvokeKind()} is {@link InvokeKind#Interface} and always returns {@code null} in
+     * all other cases.
+     */
+    ResolvedJavaType getInvokeReferencedType();
+
     default StampPair getInvokeReturnStamp(Assumptions assumptions) {
         JavaType returnType = getInvokeReturnType();
         return StampFactory.forDeclaredType(assumptions, returnType, false);
@@ -276,6 +300,21 @@ public interface GraphBuilderContext extends GraphBuilderTool {
             parent = parent.getParent();
         }
         return result;
+    }
+
+    /**
+     * Gets the inlining chain of this context.
+     *
+     * @return the inlining chain of this context represented as a {@link BytecodePosition}, or
+     *         {@code null} if this is the context for the parse root.
+     */
+    default BytecodePosition getInliningChain() {
+        BytecodePosition inliningContext = null;
+        for (GraphBuilderContext cur = getParent(); cur != null; cur = cur.getParent()) {
+            BytecodePosition caller = new BytecodePosition(null, cur.getMethod(), cur.bci());
+            inliningContext = inliningContext == null ? caller : inliningContext.addCaller(caller);
+        }
+        return inliningContext;
     }
 
     /**
@@ -472,28 +511,21 @@ public interface GraphBuilderContext extends GraphBuilderTool {
         return !StrictDeoptInsertionChecks.getValue(getOptions());
     }
 
+    /**
+     * Returns {@code true} if {@link #invokeFallback} can be called without throwing an
+     * unconditional error.
+     */
+    default boolean canInvokeFallback() {
+        return false;
+    }
+
     @SuppressWarnings("all")
     default Invoke invokeFallback(FixedWithNextNode predecessor, EndNode end) {
         throw new GraalError("Cannot be called on a " + getClass().getName() + " object");
     }
 
     /**
-     * Interface whose instances hold inlining information about the current context, in a wider
-     * sense. The wider sense in this case concerns graph building approaches that don't necessarily
-     * keep a chain of {@link GraphBuilderContext} instances normally available through
-     * {@linkplain #getParent()}. Examples of such approaches are partial evaluation and incremental
-     * inlining.
-     */
-    interface ExternalInliningContext {
-        int getInlinedDepth();
-    }
-
-    default ExternalInliningContext getExternalInliningContext() {
-        return null;
-    }
-
-    /**
-     * Adds masking to a given subword value according to a given {@Link JavaKind}, such that the
+     * Adds masking to a given subword value according to a given {@link JavaKind}, such that the
      * masked value falls in the range of the given kind. In the cases where the given kind is not a
      * subword kind, the input value is returned immediately.
      *
@@ -581,10 +613,29 @@ public interface GraphBuilderContext extends GraphBuilderTool {
     }
 
     /**
-     * Determine if the given basic block is inside a {@code try} block of an exception handler
-     * catching {@link OutOfMemoryError} exceptions.
+     * Returns whether allocations appended at the current bytecode position must use explicit OOME
+     * exception edges because the current exception-dispatch chain can observe an
+     * {@link OutOfMemoryError}.
      */
-    default boolean currentBlockCatchesOOM() {
+    default boolean currentBlockCatchesOOME() {
         return false;
+    }
+
+    /**
+     * Iff this parsing context is processing a method that is annotated with
+     * {@link ScopedMemoryAccess} saves the associated session object.
+     *
+     * @param scopedMemorySession the currently parsed session of this context
+     */
+    default void setIsParsingScopedMemoryMethod(ValueNode scopedMemorySession) {
+        // nothing to do
+    }
+
+    /**
+     * Determines if the current parsing context has set any scoped memory access that needs to be
+     * handled.
+     */
+    default List<ValueNode> getScopedMemorySessions() {
+        return null;
     }
 }

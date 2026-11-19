@@ -15,22 +15,15 @@ This allows seamless interoperability with the dynamic languages supported by Gr
 ## Getting Started
 
 The GraalVM LLVM runtime is available as a standalone distribution.
-You can download a standalone based on Oracle GraalVM or GraalVM Community Edition. 
+You can download a standalone based on Oracle GraalVM or GraalVM Community Edition.
 
-1. Download the LLVM 24.0 standalone for your operating system:
+1. Download the LLVM standalone for your operating system:
 
    - Native standalone
-      * [Linux x64](https://gds.oracle.com/download/llvm/archive/llvm-24.0.1-linux-amd64.tar.gz)
-      * [Linux AArch64](https://gds.oracle.com/download/llvm/archive/llvm-24.0.1-linux-aarch64.tar.gz)
-      * [macOS x64](https://gds.oracle.com/download/llvm/archive/llvm-24.0.1-macos-amd64.tar.gz)
-      * [macOS AArch64](https://gds.oracle.com/download/llvm/archive/llvm-24.0.1-macos-aarch64.tar.gz)
-      * [Windows x64](https://gds.oracle.com/download/llvm/archive/llvm-24.0.1-windows-amd64.zip)
-   - JVM standalone
-      * [Linux x64](https://gds.oracle.com/download/llvm/archive/llvm-jvm-24.0.1-linux-amd64.tar.gz)
-      * [Linux AArch64](https://gds.oracle.com/download/llvm/archive/llvm-jvm-24.0.1-linux-aarch64.tar.gz)
-      * [macOS x64](https://gds.oracle.com/download/llvm/archive/llvm-jvm-24.0.1-macos-amd64.tar.gz)
-      * [macOS AArch64](https://gds.oracle.com/download/llvm/archive/llvm-jvm-24.0.1-macos-aarch64.tar.gz)
-      * [Windows x64](https://gds.oracle.com/download/llvm/archive/llvm-jvm-24.0.1-windows-amd64.zip)
+      * [Linux x64](https://gds.oracle.com/download/llvm/archive/llvm-25.4.4.1.1-linux-amd64.tar.gz)
+      * [Linux AArch64](https://gds.oracle.com/download/llvm/archive/llvm-25.4.4.1.1-linux-aarch64.tar.gz)
+      * [macOS AArch64](https://gds.oracle.com/download/llvm/archive/llvm-25.4.4.1.1-macos-aarch64.tar.gz)
+      * [Windows x64](https://gds.oracle.com/download/llvm/archive/llvm-25.4.4.1.1-windows-amd64.zip)
 
 2. Unzip the archive:
 
@@ -38,13 +31,13 @@ You can download a standalone based on Oracle GraalVM or GraalVM Community Editi
     ```shell
     sudo xattr -r -d com.apple.quarantine <archive>.tar.gz
     ```
-    
+
     Extract:
     ```shell
     tar -xzf <archive>.tar.gz
     ```
 
-3. A standalone comes with a JVM in addition to its native launcher. Check the version to see GraalVM LLVM runtime is active:
+3. Check the version to see that the GraalVM LLVM runtime is active:
     ```shell
     ./path/to/bin/lli --version
     ```
@@ -60,7 +53,7 @@ Additionally, a prebuilt LLVM toolchain is bundled with the GraalVM LLVM runtime
     ./path/to/bin/lli --print-toolchain-path
     ```
 
-2. Set the `LLVM_TOOLCHAIN` environment variable: 
+2. Set the `LLVM_TOOLCHAIN` environment variable:
     ```shell
     export LLVM_TOOLCHAIN=$(./path/to/bin/lli --print-toolchain-path)
     ```

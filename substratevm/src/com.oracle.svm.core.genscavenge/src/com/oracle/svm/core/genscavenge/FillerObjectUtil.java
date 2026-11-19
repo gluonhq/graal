@@ -1,0 +1,127 @@
+/*
+ * Copyright (c) 2025, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.genscavenge;
+
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static jdk.graal.compiler.replacements.AllocationSnippets.FillContent.DO_NOT_FILL;
+import static jdk.graal.compiler.replacements.AllocationSnippets.FillContent.WITH_GARBAGE_IF_ASSERTIONS_ENABLED;
+
+import org.graalvm.word.Pointer;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.core.genscavenge.compacting.CompactingAlignedChunkAccess;
+import com.oracle.svm.core.genscavenge.graal.nodes.FormatArrayNode;
+import com.oracle.svm.core.genscavenge.graal.nodes.FormatObjectNode;
+import com.oracle.svm.core.heap.FillerArray;
+import com.oracle.svm.core.heap.FillerObject;
+import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.util.UnsignedUtils;
+
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.replacements.AllocationSnippets.FillContent;
+import jdk.vm.ci.meta.JavaKind;
+
+public class FillerObjectUtil {
+    private static final Class<?> ARRAY_CLASS = FillerArray.class;
+    private static final JavaKind ARRAY_ELEMENT_KIND = JavaKind.Int;
+    private static final int ARRAY_ELEMENT_SIZE = ARRAY_ELEMENT_KIND.getByteCount();
+
+    @Fold
+    static int instanceHeaderSize() {
+        return ObjectLayout.singleton().getFirstFieldOffset();
+    }
+
+    @Fold
+    static int instanceMinSize() {
+        return ObjectLayout.singleton().getMinRuntimeHeapInstanceSize();
+    }
+
+    @Fold
+    static int arrayMinSize() {
+        return NumUtil.safeToInt(ObjectLayoutCompilerSupport.getArraySize(ObjectLayout.singleton(), ARRAY_ELEMENT_KIND, 0, false));
+    }
+
+    @Fold
+    static int arrayBaseOffset() {
+        return ObjectLayoutCompilerSupport.getArrayBaseOffset(ObjectLayout.singleton(), ARRAY_ELEMENT_KIND);
+    }
+
+    /**
+     * Writes a filler object. If {@code mayFillContents} is true, its body may additionally be
+     * filled with garbage.
+     *
+     * Returns the start of the array elements for an array filler, or the end of the object otherwise.
+     * Heap traversal does not access the bytes between the returned pointer and the object's end.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static Pointer writeFillerObjectAt(Pointer p, UnsignedWord size, boolean rememberedSet, boolean mayFillContents) {
+        FillContent fillContent = mayFillContents ? WITH_GARBAGE_IF_ASSERTIONS_ENABLED : DO_NOT_FILL;
+        assert size.equal(instanceMinSize()) || size.aboveOrEqual(arrayMinSize());
+        Pointer unused;
+        if (size.aboveOrEqual(arrayMinSize())) {
+            int length = UnsignedUtils.safeToInt(size.subtract(arrayBaseOffset()).unsignedDivide(ARRAY_ELEMENT_SIZE));
+            FormatArrayNode.formatArray(p, ARRAY_CLASS, length, rememberedSet, false, fillContent, false);
+            unused = p.add(arrayBaseOffset());
+        } else {
+            FormatObjectNode.formatObject(p, FillerObject.class, rememberedSet, fillContent, false);
+            unused = p.add(size);
+        }
+        assert LayoutEncoding.getSizeFromObjectInGC(p.toObject()).equal(size);
+        return unused;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean isFillerObject(Object object) {
+        Class<?> clazz = object.getClass();
+        return clazz == ARRAY_CLASS || clazz == FillerObject.class;
+    }
+
+    /** Zeros the non-header memory of a filler object without changing its array length. */
+    @Uninterruptible(reason = "Uses raw pointers to access filler objects.")
+    static void cleanFillerObjectMemory(Object object, boolean inAlignedChunkWithUncommittedPages) {
+        int contentOffset;
+        if (object.getClass() == ARRAY_CLASS) {
+            contentOffset = arrayBaseOffset();
+        } else {
+            assert object.getClass() == FillerObject.class;
+            contentOffset = instanceHeaderSize();
+        }
+
+        Pointer pointer = Word.objectToUntrackedPointer(object);
+        UnsignedWord size = LayoutEncoding.getSizeFromObjectInlineInGC(object);
+        if (inAlignedChunkWithUncommittedPages) {
+            AlignedHeapChunk.AlignedHeader chunk = AlignedHeapChunk.getEnclosingChunk(object);
+            CompactingAlignedChunkAccess.fillCommittedMemory(chunk, pointer.add(contentOffset), pointer.add(size), 0);
+        } else {
+            UnmanagedMemoryUtil.fill(pointer.add(contentOffset), size.subtract(contentOffset), (byte) 0);
+        }
+    }
+}

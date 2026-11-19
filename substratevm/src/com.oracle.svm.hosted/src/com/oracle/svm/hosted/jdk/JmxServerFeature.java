@@ -28,71 +28,62 @@ package com.oracle.svm.hosted.jdk;
 
 import java.lang.management.PlatformManagedObject;
 import java.util.Map;
-import java.util.Set;
 
 import javax.management.MBeanServer;
 import javax.management.remote.JMXServiceURL;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.RuntimeReflection;
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 
+import com.oracle.svm.configure.ResourcesRegistry;
 import com.oracle.svm.core.VMInspectionOptions;
-import com.oracle.svm.core.configure.ResourcesRegistry;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.jdk.NativeLibrarySupport;
-import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jdk.management.ManagementAgentStartupHook;
 import com.oracle.svm.core.jdk.management.ManagementSupport;
-import com.oracle.svm.core.jdk.proxy.DynamicProxyRegistry;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
+import com.oracle.svm.hosted.reflect.proxy.ProxyRegistry;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeReflection;
+
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 @AutomaticallyRegisteredFeature
 public class JmxServerFeature implements InternalFeature {
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
-        return VMInspectionOptions.hasJmxServerSupport();
-    }
-
-    private static void handleNativeLibraries(BeforeAnalysisAccess access) {
-        // This is required for password authentication.
-        // JMX checks the restrictions on the password file via a JNI native method.
-        NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary("management_agent");
-        BeforeAnalysisAccessImpl beforeAnalysisAccess = (BeforeAnalysisAccessImpl) access;
-        beforeAnalysisAccess.getNativeLibraries().addStaticJniLibrary("management_agent");
-        // Resolve calls to jdk_internal_agent* as builtIn. For calls to native method
-        // isAccessUserOnly0.
-        PlatformNativeLibrarySupport.singleton().addBuiltinPkgNativePrefix("jdk_internal_agent");
+        return ImageLayerBuildingSupport.firstImageBuild() && VMInspectionOptions.hasJmxServerSupport();
     }
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
-        handleNativeLibraries(access);
         registerJMXAgentResources();
-        configureReflection(access);
+        configureReflection((BeforeAnalysisAccessImpl) access);
         configureProxy(access);
         RuntimeSupport.getRuntimeSupport().addStartupHook(new ManagementAgentStartupHook());
     }
 
     private static void registerJMXAgentResources() {
-        ResourcesRegistry<ConfigurationCondition> resourcesRegistry = ResourcesRegistry.singleton();
+        ResourcesRegistry<AccessCondition> resourcesRegistry = ResourcesRegistry.singleton();
 
-        resourcesRegistry.addResourceBundles(ConfigurationCondition.alwaysTrue(),
-                        "jdk.internal.agent.resources.agent");
+        resourcesRegistry.addResourceBundles(AccessCondition.unconditional(),
+                        false, "jdk.internal.agent.resources.agent");
 
-        resourcesRegistry.addResourceBundles(ConfigurationCondition.alwaysTrue(),
-                        "sun.security.util.Resources"); // required for password auth
+        resourcesRegistry.addResourceBundles(AccessCondition.unconditional(),
+                        false, "sun.security.util.resources.security"); // required for password
+                                                                        // auth
     }
 
     private static void configureProxy(BeforeAnalysisAccess access) {
-        DynamicProxyRegistry dynamicProxySupport = ImageSingletons.lookup(DynamicProxyRegistry.class);
+        ProxyRegistry proxyRegistry = ImageSingletons.lookup(ProxyRegistry.class);
 
-        dynamicProxySupport.addProxyClass(ConfigurationCondition.alwaysTrue(), access.findClassByName("java.rmi.Remote"),
+        proxyRegistry.registerProxy(AccessCondition.unconditional(), false, access.findClassByName("java.rmi.Remote"),
                         access.findClassByName("java.rmi.registry.Registry"));
 
-        dynamicProxySupport.addProxyClass(ConfigurationCondition.alwaysTrue(), access.findClassByName("javax.management.remote.rmi.RMIServer"));
+        proxyRegistry.registerProxy(AccessCondition.unconditional(), false, access.findClassByName("javax.management.remote.rmi.RMIServer"));
     }
 
     /**
@@ -106,20 +97,21 @@ public class JmxServerFeature implements InternalFeature {
      * </li>
      * </ul>
      */
-    private static void configureReflection(BeforeAnalysisAccess access) {
-        Set<PlatformManagedObject> platformManagedObjects = ManagementSupport.getSingleton().getPlatformManagedObjects();
+    private static void configureReflection(BeforeAnalysisAccessImpl access) {
+        EconomicSet<PlatformManagedObject> platformManagedObjects = ManagementSupport.getSingleton().getPlatformManagedObjects();
         for (PlatformManagedObject p : platformManagedObjects) {
-
-            // The platformManagedObjects list contains some PlatformManagedObjectSupplier objects
-            // that are meant to help initialize some MXBeans at runtime. Skip them here.
+            /*
+             * The platformManagedObjects list contains some PlatformManagedObjectSupplier objects
+             * that are meant to help initialize some MXBeans at runtime. Skip them here.
+             */
             if (p instanceof ManagementSupport.PlatformManagedObjectSupplier) {
                 continue;
             }
-            Class<?> clazz = p.getClass();
-            RuntimeReflection.register(clazz);
+            JVMCIRuntimeReflection.register(access.getMetaAccess().lookupJavaType(p.getClass()));
         }
 
-        RuntimeReflection.register(access.findClassByName("com.sun.jmx.remote.protocol.rmi.ServerProvider"));
-        RuntimeReflection.register(access.findClassByName("com.sun.jmx.remote.protocol.rmi.ServerProvider").getConstructors());
+        ResolvedJavaType serviceProviderClass = access.findTypeByName("com.sun.jmx.remote.protocol.rmi.ServerProvider");
+        JVMCIRuntimeReflection.register(serviceProviderClass);
+        JVMCIRuntimeReflection.register(JVMCIReflectionUtil.getConstructors(serviceProviderClass));
     }
 }

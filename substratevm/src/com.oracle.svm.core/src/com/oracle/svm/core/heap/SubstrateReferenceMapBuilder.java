@@ -24,18 +24,17 @@
  */
 package com.oracle.svm.core.heap;
 
+import com.oracle.svm.core.CalleeSavedRegisters;
+import com.oracle.svm.shared.util.VMError;
+
 import jdk.graal.compiler.core.common.LIRKind;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.framemap.ReferenceMapBuilder;
-
-import com.oracle.svm.core.CalleeSavedRegisters;
-import com.oracle.svm.core.util.VMError;
-
 import jdk.vm.ci.code.ReferenceMap;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.StackSlot;
 import jdk.vm.ci.code.ValueUtil;
-import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.PlatformKind;
 import jdk.vm.ci.meta.Value;
 
@@ -74,9 +73,9 @@ public class SubstrateReferenceMapBuilder extends ReferenceMapBuilder {
         if (offsetValid && !kind.isValue()) {
 
             if (kind.isUnknownReference()) {
-                throw JVMCIError.shouldNotReachHere("unknown reference alive across safepoint");
+                throw GraalError.shouldNotReachHere("unknown reference alive across safepoint");
             } else if (kind.isDerivedReference()) {
-                throw JVMCIError.shouldNotReachHere("derived references not supported yet on Substrate VM");
+                throw GraalError.shouldNotReachHere("derived references not supported yet on Substrate VM");
 
             } else {
                 int bytes = bytesPerElement(kind);
@@ -97,6 +96,7 @@ public class SubstrateReferenceMapBuilder extends ReferenceMapBuilder {
 
     @Override
     public ReferenceMap finish(LIRFrameState state) {
+        GraalError.guarantee(state.getLiveBasePointers() == null, "computing base pointers is unnecessary %s", state);
         return referenceMap;
     }
 

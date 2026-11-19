@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2025, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.hub;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.RecordComponent;
+
+import com.oracle.svm.guest.staging.configure.RuntimeDynamicAccessMetadata;
+
+/// Internal interface that abstracts the reflection-related metadata for a class in Native Image.
+///
+/// In normal HotSpot JVM execution, APIs like:
+/// - [Class#getDeclaredFields]
+/// - [Class#getDeclaredMethods]
+/// - [Class#getDeclaredConstructors]
+/// - etc
+///
+/// consult rich class metadata that exists at runtime.  In Native Image, metadata is much
+/// more controlled and often precomputed. This interface is an internal contract for objects
+/// that know how to provide that reflection data for a class represented as a [DynamicHub].
+interface ReflectionMetadata {
+    int getClassFlags();
+
+    Field[] getDeclaredFields(DynamicHub declaringClass, boolean publicOnly, int layerNum);
+
+    Method[] getDeclaredMethods(DynamicHub declaringClass, boolean publicOnly, int layerNum);
+
+    Constructor<?>[] getDeclaredConstructors(DynamicHub declaringClass, boolean publicOnly, int layerNum);
+
+    RecordComponent[] getRecordComponents(DynamicHub dynamicHub, int layerNum);
+
+    RuntimeDynamicAccessMetadata getDynamicAccessMetadata(DynamicHub dynamicHub, int layerNum);
+
+    RuntimeDynamicAccessMetadata getUnsafeAllocationMetadata(DynamicHub dynamicHub, int layerNum);
+}

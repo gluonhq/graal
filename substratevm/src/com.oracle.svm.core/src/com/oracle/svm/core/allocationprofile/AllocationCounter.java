@@ -29,10 +29,10 @@ import java.lang.reflect.Field;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.BuildPhaseProvider.AfterCompilation;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.heap.UnknownObjectField;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterCompilation;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Passed as an argument to the allocation snippet during lowering.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,8 +27,8 @@ package com.oracle.svm.core.jdk;
 import java.io.Closeable;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.security.AccessControlContext;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.WeakHashMap;
 
@@ -36,11 +36,34 @@ import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.TargetClass;
 
+@TargetClass(URLClassLoader.class)
+@SuppressWarnings({"unused", "static-method"})
+final class Target_java_net_URLClassLoader {
+    /* Drop build-time resource streams and closeables from URLClassLoader instances in the image heap. */
+    @Alias//
+    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClass = WeakHashMap.class)//
+    private WeakHashMap<Closeable, Void> closeables;
+}
+
 @TargetClass(className = "jdk.internal.loader.URLClassPath")
 @SuppressWarnings({"unused", "static-method"})
 final class Target_jdk_internal_loader_URLClassPath {
 
-    /* Reset fields that can store a Zip file via sun.misc.URLClassPath$JarLoader.jar. */
+    /*
+     * The image heap can contain builder-created class loaders, in particular the JDK app,
+     * platform and boot loaders that SVM intentionally reuses as runtime class loader identity
+     * objects. Reset their URLClassPath state so the image does not embed builder class path URLs,
+     * JarFile/ZipFile caches or other host-side loader state.
+     */
+
+    @Alias
+    public native URL findResource(String name);
+
+    @Alias
+    public native Enumeration<URL> findResources(String name);
+
+    @Alias
+    public native Target_jdk_internal_loader_Resource getResource(String name);
 
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClass = ArrayList.class)//
     private ArrayList<?> loaders;
@@ -48,19 +71,16 @@ final class Target_jdk_internal_loader_URLClassPath {
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClass = HashMap.class)//
     private HashMap<String, ?> lmap;
 
-    /* The original locations of the .jar files are no longer available at run time. */
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClass = ArrayList.class)//
     private ArrayList<URL> path;
-
-    /* Reset acc to null, since contexts in image heap are replaced */
-    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset)//
-    private AccessControlContext acc;
 }
 
-@TargetClass(URLClassLoader.class)
+@TargetClass(className = "jdk.internal.loader.Resource")
 @SuppressWarnings({"unused", "static-method"})
-final class Target_java_net_URLClassLoader {
-    @Alias//
-    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClass = WeakHashMap.class)//
-    private WeakHashMap<Closeable, Void> closeables;
+final class Target_jdk_internal_loader_Resource {
+    @Alias
+    public native byte[] getBytes() throws java.io.IOException;
+
+    @Alias
+    public native URL getCodeSourceURL();
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,10 +43,12 @@ package com.oracle.truffle.regex.tregex.nodes.nfa;
 import java.util.Arrays;
 
 import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.strings.TruffleString;
+import com.oracle.truffle.regex.UnsupportedRegexException;
+import com.oracle.truffle.regex.tregex.TRegexOptions;
 import com.oracle.truffle.regex.tregex.buffer.IntRingBuffer;
-import com.oracle.truffle.regex.tregex.nfa.PureNFATransition;
 import com.oracle.truffle.regex.tregex.nodes.TRegexExecutorLocals;
 import com.oracle.truffle.regex.tregex.parser.CaseFoldData;
 import com.oracle.truffle.regex.tregex.parser.ast.Group;
@@ -58,7 +60,7 @@ import com.oracle.truffle.regex.util.BitSets;
  * a snapshot of the backtracker's state. The backtracker state consists of:
  * <ul>
  * <li>the current index in the input string</li>
- * <li>the current NFA state</li>
+ * <li>the current compact NFA state record</li>
  * <li>all current capture group boundaries (including the number of the last matched group, if
  * tracked)</li>
  * <li>all current quantifier loop counters</li>
@@ -177,7 +179,7 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
                         zeroWidthTermEnclosedCGLow,
                         zeroWidthQuantifierCGOffsets,
                         allocateStackFrameBuffer ? new int[stackFrameSize] : null,
-                        new Stack(new int[stackFrameSize * 4]),
+                        new Stack(new int[MathUtil.ceilPowerOf2(stackFrameSize * 4)]),
                         0,
                         stackFrameSize,
                         BitSets.createBitSetArray(maxNTransitions),
@@ -215,12 +217,13 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
         return newSubLocals(newDontOverwriteLastGroup);
     }
 
-    public TRegexBacktrackingNFAExecutorLocals createSubNFALocals(PureNFATransition t, boolean newDontOverwriteLastGroup) {
+    public TRegexBacktrackingNFAExecutorLocals createSubNFALocals(int[] groupBoundaries, int groupBoundaryRecord, boolean newDontOverwriteLastGroup) {
         dupFrame();
         if (trackLastGroup && newDontOverwriteLastGroup) {
             stack()[offsetLastGroup() + stackFrameSize] = -1;
         }
-        t.getGroupBoundaries().applyExploded(stack(), offsetCaptureGroups() + stackFrameSize, offsetLastGroup() + stackFrameSize, getIndex(), trackLastGroup, dontOverwriteLastGroup);
+        EncodedGroupBoundaries.applyExploded(groupBoundaries, groupBoundaryRecord, stack(), offsetCaptureGroups() + stackFrameSize, offsetLastGroup() + stackFrameSize, getIndex(), trackLastGroup,
+                        dontOverwriteLastGroup);
         return newSubLocals(newDontOverwriteLastGroup);
     }
 
@@ -292,8 +295,8 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
         return offsetZeroWidthQuantifierCG() + zeroWidthQuantifierCGOffsets[zeroWidthIndex];
     }
 
-    public void apply(PureNFATransition t, int index) {
-        t.getGroupBoundaries().applyExploded(stack(), offsetCaptureGroups(), offsetLastGroup(), index, trackLastGroup, dontOverwriteLastGroup);
+    public void apply(int[] groupBoundaries, int groupBoundaryRecord, int index) {
+        EncodedGroupBoundaries.applyExploded(groupBoundaries, groupBoundaryRecord, stack(), offsetCaptureGroups(), offsetLastGroup(), index, trackLastGroup, dontOverwriteLastGroup);
     }
 
     public void resetToInitialState() {
@@ -355,6 +358,10 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
     }
 
     private void ensureSize(int minSize) {
+        if (CompilerDirectives.injectBranchProbability(CompilerDirectives.SLOWPATH_PROBABILITY, minSize > TRegexOptions.TRegexMaxBacktrackingStackSize)) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            throwBacktrackingStackLimitExceeded();
+        }
         if (stack().length < minSize) {
             int newLength = stack().length << 1;
             while (newLength < minSize) {
@@ -364,8 +371,13 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
         }
     }
 
-    public void pushResult(PureNFATransition t, int index) {
-        t.getGroupBoundaries().applyExploded(result, 0, result.length - 1, index, trackLastGroup, dontOverwriteLastGroup);
+    @TruffleBoundary
+    private static void throwBacktrackingStackLimitExceeded() {
+        throw new UnsupportedRegexException("backtracking stack limit exceeded");
+    }
+
+    public void pushResult(int[] groupBoundaries, int groupBoundaryRecord, int index) {
+        EncodedGroupBoundaries.applyExploded(groupBoundaries, groupBoundaryRecord, result, 0, result.length - 1, index, trackLastGroup, dontOverwriteLastGroup);
         pushResult();
     }
 
@@ -498,10 +510,6 @@ public final class TRegexBacktrackingNFAExecutorLocals extends TRegexExecutorLoc
 
     public void setQuantifierCount(int quantifierIndex, int count) {
         stack()[offsetQuantifierCount(quantifierIndex)] = count;
-    }
-
-    public void resetQuantifierCount(int quantifierIndex) {
-        stack()[offsetQuantifierCount(quantifierIndex)] = 0;
     }
 
     public void incQuantifierCount(int quantifierIndex) {

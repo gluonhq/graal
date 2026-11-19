@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,19 +24,21 @@
  */
 package jdk.graal.compiler.nodes.cfg;
 
+import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.Equivalence;
 
+import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.core.common.RetryableBailoutException;
 import jdk.graal.compiler.core.common.cfg.AbstractControlFlowGraph;
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
 import jdk.graal.compiler.core.common.cfg.BasicBlockSet;
-import jdk.graal.compiler.core.common.cfg.CFGVerifier;
 import jdk.graal.compiler.core.common.cfg.CFGLoop;
 import jdk.graal.compiler.core.common.util.CompilationAlarm;
 import jdk.graal.compiler.debug.Assertions;
@@ -45,6 +47,7 @@ import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.debug.MemUseTrackerKey;
 import jdk.graal.compiler.debug.TTY;
+import jdk.graal.compiler.debug.TimerKey;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeMap;
 import jdk.graal.compiler.graph.iterators.NodeIterable;
@@ -55,17 +58,21 @@ import jdk.graal.compiler.nodes.ControlSplitNode;
 import jdk.graal.compiler.nodes.DeoptimizeNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.LoopBeginNode;
 import jdk.graal.compiler.nodes.LoopEndNode;
 import jdk.graal.compiler.nodes.LoopExitNode;
+import jdk.graal.compiler.nodes.MultiReturnNode;
 import jdk.graal.compiler.nodes.ProfileData.LoopFrequencyData;
 import jdk.graal.compiler.nodes.ProfileData.ProfileSource;
 import jdk.graal.compiler.nodes.ReturnNode;
 import jdk.graal.compiler.nodes.StartNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.extended.IntegerSwitchNode;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
+import jdk.graal.compiler.replacements.nodes.LateLoweredNode;
 
 public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock> {
 
@@ -114,6 +121,138 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
     private int maxDominatorDepth;
     private EconomicMap<LoopBeginNode, LoopFrequencyData> localLoopFrequencyData;
 
+    /**
+     * Data marker for the graph transplanting. Determines where a basic block comes from: the
+     * caller CFG or the callee.
+     */
+    public enum BlockTransplantOrigin {
+        CALLER,
+        CALLEE
+    }
+
+    public record BlockTransplantData(HIRBlock oldBlock, BlockTransplantOrigin source, int oldBlockIDBeforeTransplant) {
+    }
+
+    /**
+     * Transplants the blocks of {@code inlineeCFGBeforeInline} into this graph. All nodes of
+     * {@code inlineeCFGBeforeInline} must have already been inlined into this graph.
+     */
+    public EconomicMap<HIRBlock, BlockTransplantData> transplantAndRenumber(LateLoweredNode macroInvoke, ControlFlowGraph inlineeCFGBeforeInline, EconomicMap<Node, Node> inlineeToCallerMap) {
+        final HIRBlock toBeDeletedBlock = blockFor(macroInvoke);
+        GraalError.guarantee(blockFor(macroInvoke).getBeginNode() == macroInvoke, "Macro begin must be the begin node of its own block");
+        final int toBeDeletedIndex = toBeDeletedBlock.getId();
+
+        final HIRBlock[] inlineCFGBeforeInlineReversePostOrder = inlineeCFGBeforeInline.reversePostOrder;
+
+        final HIRBlock[] newReversePostOrder = new HIRBlock[reversePostOrder.length + inlineCFGBeforeInlineReversePostOrder.length - 1];
+        // now copy over all basic blocks, we start with copying
+        int newIndex = 0;
+        int oldIndex = 0;
+
+        final EconomicMap<HIRBlock, BlockTransplantData> newToOldBlocks = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
+
+        // copy first portion of the old blocks
+        for (; newIndex < toBeDeletedIndex; newIndex++) {
+            HIRBlock oldBlock = reversePostOrder[oldIndex++];
+            newReversePostOrder[newIndex] = oldBlock;
+            newToOldBlocks.put(oldBlock, new BlockTransplantData(oldBlock, BlockTransplantOrigin.CALLER, oldBlock.getId()));
+        }
+
+        // then add all the new basic blocks
+        for (int i = 0; i < inlineCFGBeforeInlineReversePostOrder.length; i++) {
+            HIRBlock oldBlock = inlineCFGBeforeInlineReversePostOrder[i];
+            AbstractBeginNode oldBegin = oldBlock.beginNode;
+            AbstractBeginNode newBeginInCaller = (AbstractBeginNode) inlineeToCallerMap.get(oldBegin);
+            GraalError.guarantee(newBeginInCaller != null, "Must find a copy of the abstract begin in the caller for %s", oldBegin);
+            HIRBlock newBlockCopy = oldBlock.copyWithBegin(newBeginInCaller, this);
+            newReversePostOrder[newIndex++] = newBlockCopy;
+            newToOldBlocks.put(newBlockCopy, new BlockTransplantData(oldBlock, BlockTransplantOrigin.CALLEE, oldBlock.getId()));
+            if (macroInvoke.getAfterInlineeBasicBlockAction() != null) {
+                macroInvoke.getAfterInlineeBasicBlockAction().accept(newBlockCopy);
+            }
+        }
+
+        // the rest of the original block is already part of the inlined block
+        oldIndex++;
+
+        // the rest of the old blocks
+        for (; oldIndex < reversePostOrder.length; oldIndex++) {
+            HIRBlock oldBlock = reversePostOrder[oldIndex];
+            newReversePostOrder[newIndex++] = oldBlock;
+            newToOldBlocks.put(oldBlock, new BlockTransplantData(oldBlock, BlockTransplantOrigin.CALLER, oldBlock.getId()));
+        }
+        this.reversePostOrder = newReversePostOrder;
+
+        // build a new node to block map
+        nodeToBlock = new NodeMap<>(graph);
+
+        renumberBlocks();
+
+        HIRBlock.assignPredecessorsAndSuccessors(reversePostOrder, this);
+
+        return newToOldBlocks;
+    }
+
+    private void renumberBlocks() {
+        int newIds = 0;
+        for (HIRBlock block : reversePostOrder) {
+            block.setId(newIds++);
+            FixedWithNextNode cur = block.getBeginNode();
+            while (true) { // TERMINATION ARGUMENT: processing fixed nodes of a basic block, bound
+                           // if the graph is valid
+                CompilationAlarm.checkProgress(graph);
+                assert cur.isAlive() : cur;
+                assert nodeToBlock.get(cur) == null : Assertions.errorMessage("Previous mapping found", nodeToBlock.get(cur));
+                nodeToBlock.set(cur, block);
+                FixedNode next = cur.next();
+                assert next != null : cur;
+                if (next instanceof AbstractBeginNode) {
+                    block.endNode = cur;
+                    break;
+                } else if (next instanceof FixedWithNextNode) {
+                    cur = (FixedWithNextNode) next;
+                } else {
+                    nodeToBlock.set(next, block);
+                    block.endNode = next;
+                    break;
+                }
+            }
+        }
+    }
+
+    public void printCFGToStdout() {
+        TTY.printf("Control flow graph %s%n", this);
+        for (HIRBlock block : reversePostOrder) {
+            TTY.printf("\t%s %s -> %s, dom %s  %n", block, block.getBeginNode(), block.getEndNode(), block.getDominator());
+        }
+    }
+
+    /**
+     * Performs a deep copy of this control flow graph, only copying the control flow graph and no
+     * additional dominance or loop data.
+     */
+    public ControlFlowGraph deepCopyReversePostOrderOnly() {
+        ControlFlowGraph copy = new ControlFlowGraph(graph);
+        // reset the build config completely
+        copy.buildConfig = new BuildConfiguration();
+        copy.reversePostOrder = new HIRBlock[reversePostOrder.length];
+        copy.nodeToBlock = new NodeMap<>(graph);
+        EconomicMap<HIRBlock, HIRBlock> old2NewBlock = EconomicMap.create();
+        for (int i = 0; i < reversePostOrder.length; i++) {
+            HIRBlock original = reversePostOrder[i];
+            HIRBlock copyBlock = original instanceof HIRBlock.ModifiableBlock ? new HIRBlock.ModifiableBlock(original.getBeginNode(), copy)
+                            : new HIRBlock.UnmodifiableBlock(original.getBeginNode(), copy);
+            copyBlock.setId(original.getId());
+            copy.reversePostOrder[i] = copyBlock;
+            old2NewBlock.put(original, copyBlock);
+        }
+        for (Node mapped : nodeToBlock.getKeys()) {
+            copy.nodeToBlock.put(mapped, old2NewBlock.get(nodeToBlock.get(mapped)));
+        }
+
+        return copy;
+    }
+
     public interface RecursiveVisitor<V> {
         V enter(HIRBlock b);
 
@@ -121,6 +260,12 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
     }
 
     private static final MemUseTrackerKey CFG_MEMORY = DebugContext.memUseTracker("CFGComputation");
+    private static final TimerKey CFG_Timer = DebugContext.timer("CFGComputation");
+    private static final TimerKey CFG_Build = DebugContext.timer("CFGBuild");
+    private static final TimerKey CFG_Loops = DebugContext.timer("CFGLoops");
+    private static final TimerKey CFG_Dom = DebugContext.timer("CFGDom");
+    private static final TimerKey CFG_Freq = DebugContext.timer("CFGFreq");
+    private static final TimerKey CFG_PostDom = DebugContext.timer("CFGPostDom");
 
     public static ControlFlowGraphBuilder newBuilder(StructuredGraph structuredGraph) {
         return new ControlFlowGraphBuilder(structuredGraph);
@@ -143,48 +288,60 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
     @SuppressWarnings("try")
     static ControlFlowGraph compute(StructuredGraph graph, boolean modifiableBlocks, boolean connectBlocks, boolean computeFrequency, boolean computeLoops, boolean computeDominators,
                     boolean computePostdominators) {
-        try (DebugCloseable c = CFG_MEMORY.start(graph.getDebug())) {
-            ControlFlowGraph cfg = lookupCached(graph, modifiableBlocks);
-            if (cfg != null) {
-                if (cfg.buildConfig.notWeakerThan(connectBlocks, computeFrequency, computeLoops, computeDominators, computePostdominators)) {
-                    // the cached cfg contains all required data
-                    return cfg;
-                }
-            } else {
-                cfg = new ControlFlowGraph(graph);
-                cfg.identifyBlocks(modifiableBlocks);
-            }
-
-            BuildConfiguration buildConfig = cfg.buildConfig;
-
-            if (CFGOptions.DumpEndVersusExitLoopFrequencies.getValue(graph.getOptions())) {
-                // additional loop info for sink frequencies inside the loop body
-                cfg.computeLoopInformation();
-                cfg.computeDominators();
-            }
-
-            if (computeFrequency) {
-                cfg.computeFrequencies();
-            }
-
-            if (computeLoops) {
-                cfg.computeLoopInformation();
-            }
-            if (computeDominators) {
-                cfg.computeDominators();
-                assert cfg.verifyRPOInnerLoopsFirst();
-            }
-            if (computePostdominators) {
-                cfg.computePostdominators();
-            }
-
-            // there's not much to verify when connectBlocks == false
-            assert !(connectBlocks || computeLoops || computeDominators || computePostdominators) || CFGVerifier.verify(cfg);
-
-            buildConfig.connectBlocks |= connectBlocks;
-            graph.setLastCFG(cfg);
-            return cfg;
+        try (DebugCloseable c = CFG_MEMORY.start(graph.getDebug()); DebugCloseable a = CFG_Timer.start(graph.getDebug())) {
+            return computeImpl(graph, modifiableBlocks, connectBlocks, computeFrequency, computeLoops, computeDominators, computePostdominators);
         }
+    }
+
+    private static ControlFlowGraph computeImpl(StructuredGraph graph, boolean modifiableBlocks, boolean connectBlocks, boolean computeFrequency, boolean computeLoops, boolean computeDominators,
+                    boolean computePostdominators) {
+        final boolean cfgCachingEnabled = GraalOptions.CacheCompilerDataStructures.getValue(graph.getOptions());
+        ControlFlowGraph cfg = cfgCachingEnabled ? lookupCached(graph, modifiableBlocks) : null;
+        if (cfg != null) {
+            cfg.nodeToBlock.growToSize(graph.nodeIdCount());
+            if (cfg.buildConfig.notWeakerThan(connectBlocks, computeFrequency, computeLoops, computeDominators, computePostdominators)) {
+                // the cached cfg contains all required data
+                return cfg;
+            }
+        } else {
+            cfg = new ControlFlowGraph(graph);
+            /*
+             * With caching enabled, CFGs are always built with ModifiableBlocks, as this enables
+             * more re-use. Without caching, UnmodifiableBlocks can be used to reduce the memory
+             * footprint.
+             */
+            cfg.identifyBlocks(cfgCachingEnabled || modifiableBlocks);
+        }
+
+        BuildConfiguration buildConfig = cfg.buildConfig;
+
+        if (CFGOptions.DumpEndVersusExitLoopFrequencies.getValue(graph.getOptions())) {
+            // additional loop info for sink frequencies inside the loop body
+            cfg.computeLoopInformation();
+            cfg.computeDominators();
+        }
+
+        if (computeFrequency) {
+            cfg.computeFrequencies();
+        }
+
+        if (computeLoops) {
+            cfg.computeLoopInformation();
+        }
+        if (computeDominators) {
+            cfg.computeDominators();
+            assert cfg.verifyRPOInnerLoopsFirst();
+        }
+        if (computePostdominators) {
+            cfg.computePostdominators();
+        }
+
+        // there's not much to verify when connectBlocks == false
+        assert !(connectBlocks || computeLoops || computeDominators || computePostdominators) || CFGVerifier.verify(cfg);
+
+        buildConfig.connectBlocks |= connectBlocks;
+        graph.setLastCFG(cfg);
+        return cfg;
     }
 
     /**
@@ -196,9 +353,17 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         if (graph.isLastCFGValid()) {
             ControlFlowGraph lastCFG = graph.getLastCFG();
             assert lastCFG != null : "A valid lastCFG must not be null";
-            if (lastCFG.buildConfig.modifiableBlocks == modifiableBlocks) {
+            if (lastCFG.buildConfig.modifiableBlocks || !modifiableBlocks) {
                 return lastCFG;
             }
+        }
+        if (graph.getLastSchedule() != null && !graph.isAfterStage(GraphState.StageFlag.FINAL_SCHEDULE)) {
+            /*
+             * There is no up to date CFG. If there is a current schedule, its CFG must also be out
+             * of date. So invalidate the schedule. The only exception is during cleanup phases
+             * after final scheduling, where we don't want to destroy that schedule.
+             */
+            graph.clearLastSchedule();
         }
         return null;
     }
@@ -226,10 +391,17 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
     }
 
+    @SuppressWarnings("try")
     private void identifyBlocks(boolean makeModifiable) {
+        try (DebugCloseable a = CFG_Build.start(graph.getDebug())) {
+            identifyBlocksImpl(makeModifiable);
+        }
+    }
+
+    private void identifyBlocksImpl(boolean makeModifiable) {
         int numBlocks = 0;
         for (AbstractBeginNode begin : graph.getNodes(AbstractBeginNode.TYPE)) {
-            GraalError.guarantee(begin.predecessor() != null || (begin instanceof StartNode || begin instanceof AbstractMergeNode), "Disconnected control flow %s encountered", begin);
+            GraalError.guarantee(begin.predecessor() != null || (begin instanceof AbstractMergeNode || begin instanceof StartNode), "Disconnected control flow %s encountered", begin);
             HIRBlock block = makeModifiable ? new HIRBlock.ModifiableBlock(begin, this) : new HIRBlock.UnmodifiableBlock(begin, this);
             identifyBlock(block);
             numBlocks++;
@@ -240,6 +412,11 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
         reversePostOrder = ReversePostOrder.identifyBlocks(this, numBlocks);
         buildConfig.modifiableBlocks = makeModifiable;
+    }
+
+    @Override
+    public int getNumberOfLoops() {
+        return loops.size();
     }
 
     public double localLoopFrequency(LoopBeginNode lb) {
@@ -260,7 +437,7 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
      * will return the updated value. This is useful for phases to record temporary effects of
      * transformations on loop frequencies, without having to recompute a CFG.
      * </p>
-     *
+     * <p>
      * The updated frequency is a cached value local to this CFG. It is <em>not</em> persisted in
      * the IR graph. Newly computed {@link ControlFlowGraph} instances will recompute a frequency
      * from loop exit probabilities, they will not see this locally cached value. Persistent changes
@@ -272,45 +449,47 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
 
     /**
      * Debug only decorator for {@link RecursiveVisitor} to log all basic blocks how they are
-     * visited one by one.
+     * visited one by one. LoggingCFGDecoratorTest illustrates the usage of the decorator to debug
+     * iteration dependent dominator tree algorithms.
      */
-    public static class LoggingCFGDecorator implements ControlFlowGraph.RecursiveVisitor<HIRBlock> {
-        private final ControlFlowGraph.RecursiveVisitor<HIRBlock> visitor;
+    public static class LoggingCFGDecorator<L> implements ControlFlowGraph.RecursiveVisitor<L> {
+        private final ControlFlowGraph.RecursiveVisitor<L> visitor;
         private String indent = "";
+        private final PrintStream out;
 
-        public LoggingCFGDecorator(ControlFlowGraph.RecursiveVisitor<HIRBlock> visitor, ControlFlowGraph cfg) {
+        public LoggingCFGDecorator(PrintStream out, ControlFlowGraph.RecursiveVisitor<L> visitor, ControlFlowGraph cfg) {
             this.visitor = visitor;
-            TTY.printf("DomTree for %s%n", cfg.graph);
-            printDomTree(cfg.getStartBlock(), "");
+            this.out = out;
+            out.printf("DomTree for %s%n", cfg.graph);
+            printDomTree(out, cfg.getStartBlock(), "");
         }
 
-        private static void printDomTree(HIRBlock cur, String indent) {
-            TTY.printf("%s%s [dom %s, post dom %s]%n", indent, cur, cur.getDominator(), cur.getPostdominator());
+        private static void printDomTree(PrintStream out, HIRBlock cur, String indent) {
+            out.printf("%s%s [dom %s, post dom %s]%n", indent, cur, cur.getDominator(), cur.getPostdominator());
             HIRBlock dominated = cur.getFirstDominated();
             while (dominated != null) {
-                printDomTree(dominated, indent + "\t");
+                printDomTree(out, dominated, indent + "\t");
                 dominated = dominated.getDominatedSibling();
             }
         }
 
         @Override
-        public HIRBlock enter(HIRBlock b) {
-            TTY.printf("%sEnter block %s for %s%n", indent, b, visitor);
+        public L enter(HIRBlock b) {
+            out.printf("%sEnter block %s for %s%n", indent, b, visitor);
             indent += "\t";
             return visitor.enter(b);
         }
 
         @Override
-        public void exit(HIRBlock b, HIRBlock value) {
+        public void exit(HIRBlock b, L value) {
             indent = indent.substring(0, indent.length() - 1);
-            TTY.printf("%sExit block %s with value %s for %s%n", indent, b, value, visitor);
+            out.printf("%sExit block %s with value %s for %s%n", indent, b, value, visitor);
             visitor.exit(b, value);
         }
     }
 
     @SuppressWarnings("unchecked")
     public <V> void visitDominatorTreeDefault(RecursiveVisitor<V> visitor) {
-
         HIRBlock[] stack = new HIRBlock[maxDominatorDepth + 1];
         HIRBlock current = getStartBlock();
         int tos = 0;
@@ -550,7 +729,7 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
      * it is not an endless loop) {@link LoopExitNode}. For every path exiting a loop a
      * {@link LoopExitNode} is required. There is one exception to that rule:
      * {@link DeoptimizeNode}.
-     *
+     * <p>
      * Graal does not mandate that a {@link DeoptimizeNode} is preceded by a {@link LoopExitNode}.
      * In the following example
      *
@@ -561,7 +740,7 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
      *     }
      * }
      * </pre>
-     *
+     * <p>
      * the IR does not have a preceding loop exit node before the deopt node. However, for regular
      * control flow sinks (returns, throws, etc) like in the following example
      *
@@ -572,9 +751,9 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
      *     }
      * }
      * </pre>
-     *
+     * <p>
      * Graal IR creates a {@link LoopExitNode} before the {@link ReturnNode}.
-     *
+     * <p>
      * Because of the "imprecision" in the definition a regular basic block exiting a loop and a
      * "dominator tree" loop exit are not necessarily the same. If a path after a control flow split
      * unconditionally flows into a deopt it is a "dominator loop exit" while a regular loop exit
@@ -672,9 +851,9 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
     /**
      * Determine if sequential predecessor blocks of this block in a not-fully-canonicalized graph
      * exit a loop.
-     *
+     * <p>
      * Example: Sequential basic block: loop exit -> invoke -> killing begin -> loopend/exit
-     *
+     * <p>
      * These cases cause problems in the {@link #verifyRPOInnerLoopsFirst()} loop verification of
      * inner loop blocks because the granularity of loop ends and exits are not on block boundaries:
      * a loop exit block can also be a loop end to an outer loop, which makes verification that the
@@ -704,7 +883,14 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         return false;
     }
 
-    private void computeDominators() {
+    @SuppressWarnings("try")
+    public void computeDominators() {
+        try (DebugCloseable a = CFG_Dom.start(graph.getDebug())) {
+            computeDominatorsImpl();
+        }
+    }
+
+    private void computeDominatorsImpl() {
         if (buildConfig.dominatorsComputed) {
             return;
         }
@@ -748,6 +934,53 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
         this.maxDominatorDepth = curMaxDominatorDepth;
         calcDominatorRanges(getStartBlock(), reversePostOrder.length);
+    }
+
+    /**
+     * Marks blocks considered part of a fast path. LSRA uses this hint to avoid propagating spills
+     * required by other blocks into these blocks when profitable; spills required by the marked
+     * blocks themselves remain permitted.
+     */
+    public void markFastPathBlocks() {
+        BasicBlockSet visited = createBasicBlockSet();
+        for (HIRBlock block : reversePostOrder) {
+            if (isThreadedSwitchBlock(block)) {
+                block.markFastPathBlock();
+            }
+            if (isStubFastPathBlock(block)) {
+                markPredecessorPaths(block, visited);
+            }
+        }
+    }
+
+    private static void markPredecessorPaths(HIRBlock exitBlock, BasicBlockSet visited) {
+        ArrayList<HIRBlock> worklist = new ArrayList<>();
+        worklist.add(exitBlock);
+        while (!worklist.isEmpty()) {
+            HIRBlock block = worklist.removeLast();
+            if (visited.get(block)) {
+                continue;
+            }
+            visited.set(block);
+            block.markFastPathBlock();
+            for (int predecessorIndex = 0; predecessorIndex < block.getPredecessorCount(); predecessorIndex++) {
+                worklist.add(block.getPredecessorAt(predecessorIndex));
+            }
+        }
+    }
+
+    private static boolean isThreadedSwitchBlock(HIRBlock block) {
+        return (block.getBeginNode() instanceof LoopBeginNode loopBeginNode && loopBeginNode.mayEmitThreadedCode()) ||
+                        (block.getEndNode() instanceof IntegerSwitchNode integerSwitchNode && integerSwitchNode.mayEmitThreadedCode());
+    }
+
+    /**
+     * Determines whether {@code block} is the exit of a bytecode-handler stub fast path. Such a
+     * block returns the results of a {@link MultiReturnNode}; every predecessor-reachable block,
+     * including loop backedges, is part of a normal stub path and receives the fast-path hint.
+     */
+    private static boolean isStubFastPathBlock(HIRBlock block) {
+        return block.getEndNode() instanceof ReturnNode returnNode && returnNode.result() instanceof MultiReturnNode;
     }
 
     private static void calcDominatorRanges(HIRBlock block, int size) {
@@ -831,7 +1064,6 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         return commonDom;
     }
 
-    @Override
     public List<CFGLoop<HIRBlock>> getLoops() {
         return loops;
     }
@@ -850,10 +1082,11 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
             nodeToBlock.set(cur, block);
             FixedNode next = cur.next();
             assert next != null : cur;
-            if (next instanceof AbstractBeginNode) {
-                block.endNode = cur;
-                return;
-            } else if (next instanceof FixedWithNextNode) {
+            if (next instanceof FixedWithNextNode) {
+                if (next instanceof AbstractBeginNode) {
+                    block.endNode = cur;
+                    return;
+                }
                 cur = (FixedWithNextNode) next;
             } else {
                 nodeToBlock.set(next, block);
@@ -1069,9 +1302,29 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
     }
 
-    private void computeFrequenciesFromLocal() {
+    public void invalidateFrequencies() {
+        if (buildConfig.frequenciesComputed) {
+            buildConfig.frequenciesComputed = false;
+        }
+    }
+
+    public void resetLoopInformation() {
+        if (buildConfig.loopsComputed) {
+            buildConfig.loopsComputed = false;
+            /*
+             * The HIRBlock->loop association has to be broken up explicitly, because computing
+             * loops does not set HIRBlock->loop to null if it is not in a loop.
+             */
+            for (HIRBlock b : getBlocks()) {
+                b.loop = null;
+            }
+            loops = null;
+        }
+    }
+
+    private void computeFrequenciesFromLocal(boolean hasLoops) {
         for (HIRBlock block : reversePostOrder) {
-            perBasicBlockFrequencyAction(block, false);
+            perBasicBlockFrequencyAction(block, !hasLoops);
         }
     }
 
@@ -1124,6 +1377,13 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         b.setRelativeFrequency(relativeFrequency);
         if (computingLocalLoopFrequencies) {
             b.setFrequencySource(source);
+        }
+    }
+
+    @SuppressWarnings("try")
+    public void computeFrequencies() {
+        try (DebugCloseable a = CFG_Freq.start(graph.getDebug())) {
+            computeFrequenciesImpl();
         }
     }
 
@@ -1191,7 +1451,7 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
      *  already correct, local loop frequencies for the body of the loop.
      */
     //@formatter:on
-    private void computeFrequencies() {
+    private void computeFrequenciesImpl() {
         if (buildConfig.frequenciesComputed) {
             return;
         }
@@ -1204,16 +1464,17 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
          */
         localLoopFrequencyData = EconomicMap.create();
 
-        // pass 1 compute "local" loop frequencies, i.e., the actual frequency of each self
-        // contained loop, inner loops first, then outer loops
-        computeLocalLoopFrequencies();
+        if (graph.hasLoops()) {
+            // pass 1 compute "local" loop frequencies, i.e., the actual frequency of each self
+            // contained loop, inner loops first, then outer loops
+            computeLocalLoopFrequencies();
 
-        // reset everything again
-        resetBlockFrequencies();
-
+            // reset everything again
+            resetBlockFrequencies();
+        }
         // pass 2 propagate the outer frequencies into the inner ones multiplying the local loop
         // frequencies by the loop predecessor frequencies
-        computeFrequenciesFromLocal();
+        computeFrequenciesFromLocal(graph.hasLoops());
 
         if (Assertions.assertionsEnabled()) {
             for (HIRBlock block : reversePostOrder) {
@@ -1222,7 +1483,14 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
     }
 
-    private void computeLoopInformation() {
+    @SuppressWarnings("try")
+    public void computeLoopInformation() {
+        try (DebugCloseable a = CFG_Loops.start(graph.getDebug())) {
+            computeLoopInformationImpl();
+        }
+    }
+
+    private void computeLoopInformationImpl() {
         if (buildConfig.loopsComputed) {
             return;
         }
@@ -1322,7 +1590,14 @@ public final class ControlFlowGraph implements AbstractControlFlowGraph<HIRBlock
         }
     }
 
+    @SuppressWarnings("try")
     public void computePostdominators() {
+        try (DebugCloseable a = CFG_PostDom.start(graph.getDebug())) {
+            computePostdominatorsImpl();
+        }
+    }
+
+    private void computePostdominatorsImpl() {
         if (buildConfig.postdominatorsComputed) {
             return;
         }

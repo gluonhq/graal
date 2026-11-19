@@ -24,12 +24,12 @@
  */
 package com.oracle.svm.core.jfr;
 
-import java.util.List;
-
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.heap.GCCause;
+import com.oracle.svm.guest.staging.core.heap.GCCause;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.util.AbstractImageHeapList;
 
 public class JfrGCCauseSerializer implements JfrSerializer {
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -37,12 +37,14 @@ public class JfrGCCauseSerializer implements JfrSerializer {
     }
 
     @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
     public void write(JfrChunkWriter writer) {
         // GCCauses has null entries
-        List<GCCause> causes = GCCause.getGCCauses();
+        AbstractImageHeapList<GCCause> causes = GCCause.getGCCauses();
         int nonNullItems = 0;
-        for (GCCause cause : causes) {
-            if (cause != null) {
+
+        for (int i = 0; i < causes.size(); i++) {
+            if (causes.get(i) != null) {
                 nonNullItems++;
             }
         }
@@ -51,10 +53,10 @@ public class JfrGCCauseSerializer implements JfrSerializer {
 
         writer.writeCompressedLong(JfrType.GCCause.getId());
         writer.writeCompressedLong(nonNullItems);
-        for (GCCause cause : causes) {
-            if (cause != null) {
-                writer.writeCompressedLong(cause.getId());
-                writer.writeString(cause.getName());
+        for (int i = 0; i < causes.size(); i++) {
+            if (causes.get(i) != null) {
+                writer.writeCompressedLong(causes.get(i).getId());
+                writer.writeString(causes.get(i).getName());
             }
         }
     }

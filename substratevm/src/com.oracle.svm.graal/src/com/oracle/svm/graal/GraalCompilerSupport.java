@@ -24,8 +24,6 @@
  */
 package com.oracle.svm.graal;
 
-import static org.graalvm.word.LocationIdentity.ANY_LOCATION;
-
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -36,76 +34,42 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.Feature.DuringAnalysisAccess;
-import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.util.ImageHeapMap;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
 import com.oracle.svm.hosted.FeatureImpl.DuringAnalysisAccessImpl;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.core.gen.NodeMatchRules;
 import jdk.graal.compiler.core.match.MatchStatement;
-import jdk.graal.compiler.debug.DebugHandlersFactory;
+import jdk.graal.compiler.debug.DebugDumpHandlersFactory;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeClass;
-import jdk.graal.compiler.lir.CompositeValueClass;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.phases.LIRPhase;
 import jdk.graal.compiler.phases.BasePhase;
-import jdk.graal.compiler.serviceprovider.GraalServices;
 
 /**
  * Holds data that is pre-computed during native image generation and accessed at run time during a
  * Graal compilation.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public class GraalCompilerSupport {
 
-    public final EconomicMap<Class<?>, NodeClass<?>> nodeClasses = ImageHeapMap.create();
-    public final EconomicMap<Class<?>, LIRInstructionClass<?>> instructionClasses = ImageHeapMap.create();
-    public final EconomicMap<Class<?>, CompositeValueClass<?>> compositeValueClasses = ImageHeapMap.create();
+    public final EconomicMap<Class<?>, NodeClass<?>> nodeClasses = ImageHeapMap.create("nodeClasses");
+    public final EconomicMap<Class<?>, LIRInstructionClass<?>> instructionClasses = ImageHeapMap.create("instructionClasses");
     public HashMap<Class<? extends NodeMatchRules>, EconomicMap<Class<? extends Node>, List<MatchStatement>>> matchRuleRegistry;
 
     protected EconomicMap<Class<?>, BasePhase.BasePhaseStatistics> basePhaseStatistics;
     protected EconomicMap<Class<?>, LIRPhase.LIRPhaseStatistics> lirPhaseStatistics;
 
-    protected final List<DebugHandlersFactory> debugHandlersFactories = new ArrayList<>();
-
-    private static final CGlobalData<Pointer> nextIsolateId = CGlobalDataFactory.createWord((Pointer) WordFactory.unsigned(1L));
-
-    private volatile long isolateId = 0;
-
-    /**
-     * Gets an identifier for the current isolate that is guaranteed to be unique for the first
-     * {@code 2^64 - 1} isolates in the process.
-     *
-     * @return a non-zero value
-     */
-    public long getIsolateId() {
-        if (isolateId == 0) {
-            synchronized (this) {
-                if (isolateId == 0) {
-                    Pointer p = nextIsolateId.get();
-                    long value;
-                    long nextValue;
-                    do {
-                        value = p.readLong(0);
-                        nextValue = value + 1;
-                        if (nextValue == 0) {
-                            // Avoid setting id to reserved 0 value after long integer overflow
-                            nextValue = 1;
-                        }
-                    } while (p.compareAndSwapLong(0, value, nextValue, ANY_LOCATION) != value);
-                    isolateId = value;
-                }
-            }
-        }
-        return isolateId;
-    }
+    protected final List<DebugDumpHandlersFactory> debugHandlersFactories = new ArrayList<>();
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public GraalCompilerSupport() {
-        for (DebugHandlersFactory c : GraalServices.load(DebugHandlersFactory.class)) {
+        for (DebugDumpHandlersFactory c : DebugDumpHandlersFactory.LOADER) {
             debugHandlersFactories.add(c);
         }
     }
@@ -120,8 +84,8 @@ public class GraalCompilerSupport {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public static void allocatePhaseStatisticsCache() {
-        GraalCompilerSupport.get().basePhaseStatistics = ImageHeapMap.create();
-        GraalCompilerSupport.get().lirPhaseStatistics = ImageHeapMap.create();
+        GraalCompilerSupport.get().basePhaseStatistics = ImageHeapMap.create("basePhaseStatistics");
+        GraalCompilerSupport.get().lirPhaseStatistics = ImageHeapMap.create("lirPhaseStatistics");
     }
 
     /* Invoked once for every class that is reachable in the native image. */
@@ -159,7 +123,7 @@ public class GraalCompilerSupport {
         return lirPhaseStatistics;
     }
 
-    public List<DebugHandlersFactory> getDebugHandlersFactories() {
+    public List<DebugDumpHandlersFactory> getDebugHandlersFactories() {
         return debugHandlersFactories;
     }
 }

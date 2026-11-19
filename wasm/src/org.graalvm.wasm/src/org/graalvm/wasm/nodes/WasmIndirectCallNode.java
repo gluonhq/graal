@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,40 +40,67 @@
  */
 package org.graalvm.wasm.nodes;
 
-import com.oracle.truffle.api.CallTarget;
+import org.graalvm.wasm.WasmConstant;
+
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateInline;
-import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.NeverDefault;
-import com.oracle.truffle.api.dsl.NodeField;
 import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.RootNode;
 
-@GenerateUncached
 @GenerateInline(false)
-@NodeField(name = "bytecodeOffset", type = int.class)
-public abstract class WasmIndirectCallNode extends WasmCallNode {
+public abstract class WasmIndirectCallNode extends Node {
 
     static final int INLINE_CACHE_LIMIT = 5;
 
-    public abstract Object execute(CallTarget target, Object[] args);
+    @Child private WasmReturnCallNode returnCallNode;
 
-    @Override
-    public abstract int getBytecodeOffset();
-
-    @Specialization(guards = "target == cachedTarget", limit = "INLINE_CACHE_LIMIT")
-    final Object doCached(@SuppressWarnings("unused") CallTarget target, Object[] args,
-                    @Cached("target") CallTarget cachedTarget) {
-        return cachedTarget.call(this, args);
+    protected WasmIndirectCallNode() {
     }
 
-    @Specialization(replaces = "doCached")
-    final Object doIndirect(CallTarget target, Object[] args) {
-        return target.call(this, args);
+    public abstract Object execute(RootNode root, int bytecodeIndex, Object[] args);
+
+    @Specialization(guards = "root == cachedRoot", limit = "INLINE_CACHE_LIMIT")
+    final Object doCachedRoot(@SuppressWarnings("unused") RootNode root, int bytecodeIndex, Object[] args,
+                    @Cached(value = "root", adopt = false) RootNode cachedRoot) {
+        final Object result;
+        if (cachedRoot instanceof WasmFunctionRootNode wasmRoot) {
+            result = wasmRoot.call(this, bytecodeIndex, args);
+        } else {
+            result = cachedRoot.call(this, bytecodeIndex, args);
+        }
+        if (result == WasmConstant.RETURN_CALL_VALUE) {
+            return executeReturnCall(bytecodeIndex);
+        }
+        return result;
+    }
+
+    @Specialization(replaces = {"doCachedRoot"})
+    final Object doIndirect(RootNode root, int bytecodeIndex, Object[] args) {
+        final Object result;
+        if (root instanceof WasmFunctionRootNode wasmRoot) {
+            result = wasmRoot.call(this, bytecodeIndex, args);
+        } else {
+            result = root.call(this, bytecodeIndex, args);
+        }
+        if (result == WasmConstant.RETURN_CALL_VALUE) {
+            return executeReturnCall(bytecodeIndex);
+        }
+        return result;
+    }
+
+    private Object executeReturnCall(int bytecodeIndex) {
+        if (returnCallNode == null) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            returnCallNode = insert(WasmReturnCallNode.create());
+        }
+        return returnCallNode.call(bytecodeIndex);
     }
 
     @NeverDefault
-    public static WasmIndirectCallNode create(int bytecodeOffset) {
-        return WasmIndirectCallNodeGen.create(bytecodeOffset);
+    public static WasmIndirectCallNode create() {
+        return WasmIndirectCallNodeGen.create();
     }
-
 }

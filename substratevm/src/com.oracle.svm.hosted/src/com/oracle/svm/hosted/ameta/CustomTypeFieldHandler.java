@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,23 +29,20 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.graalvm.word.WordBase;
-
-import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisType;
-import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.svm.hosted.analysis.FieldValueComputer;
+import com.oracle.svm.util.GuestAccess;
 
-public abstract class CustomTypeFieldHandler {
-    protected final BigBang bb;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+public final class CustomTypeFieldHandler {
     private final AnalysisMetaAccess metaAccess;
     private final FieldValueInterceptionSupport fieldValueInterceptionSupport = FieldValueInterceptionSupport.singleton();
     private Set<AnalysisField> processedFields = ConcurrentHashMap.newKeySet();
 
-    public CustomTypeFieldHandler(BigBang bb, AnalysisMetaAccess metaAccess) {
-        this.bb = bb;
+    public CustomTypeFieldHandler(AnalysisMetaAccess metaAccess) {
         this.metaAccess = metaAccess;
     }
 
@@ -58,36 +55,32 @@ public abstract class CustomTypeFieldHandler {
          * types as allocated when the field is not yet accessed.
          */
         assert field.isAccessed();
-        if (fieldValueInterceptionSupport.hasFieldValueTransformer(field)) {
-            if (field.getJavaKind().isObject() && !fieldValueInterceptionSupport.isValueAvailable(field)) {
-                injectFieldTypes(field, List.of(field.getType()), true);
-            } else if (bb.trackPrimitiveValues() && field.getStorageKind().isPrimitive() && field instanceof PointsToAnalysisField ptaField) {
-                ptaField.saturatePrimitiveField();
-            }
+        if (fieldValueInterceptionSupport.hasFieldValueTransformer(field) && !fieldValueInterceptionSupport.isValueAvailable(field, null, !field.isStatic())) {
+            field.injectConservativeFieldValues();
         } else if (fieldValueInterceptionSupport.lookupFieldValueInterceptor(field) instanceof FieldValueComputer fieldValueComputer) {
             if (field.getStorageKind().isObject()) {
+                /* Instantiate the specified classes and summarize their permitted subtypes. */
                 List<AnalysisType> types = transformTypes(field, fieldValueComputer.types());
                 for (AnalysisType type : types) {
                     assert !type.isPrimitive() : type + " for " + field;
                     type.registerAsInstantiated("Is declared as the type of an unknown object field.");
                 }
-                injectFieldTypes(field, types, fieldValueComputer.canBeNull());
-            } else if (bb.trackPrimitiveValues() && field.getStorageKind().isPrimitive() && field instanceof PointsToAnalysisField ptaField) {
-                ptaField.saturatePrimitiveField();
+                field.injectConservativeFieldValues(types, fieldValueComputer.canBeNull());
+            } else {
+                field.injectConservativeFieldValues();
             }
         }
     }
 
-    public abstract void injectFieldTypes(AnalysisField aField, List<AnalysisType> customTypes, boolean canBeNull);
-
-    private List<AnalysisType> transformTypes(AnalysisField field, List<Class<?>> types) {
+    private List<AnalysisType> transformTypes(AnalysisField field, List<ResolvedJavaType> types) {
         List<AnalysisType> customTypes = new ArrayList<>();
         AnalysisType declaredType = field.getType();
+        AnalysisType wordBaseType = metaAccess.getUniverse().lookup(GuestAccess.elements().WordBase);
 
-        for (Class<?> customType : types) {
-            AnalysisType aCustomType = metaAccess.lookupJavaType(customType);
+        for (ResolvedJavaType customType : types) {
+            AnalysisType aCustomType = customType instanceof AnalysisType analysisType ? analysisType : metaAccess.getUniverse().lookup(customType);
 
-            assert !WordBase.class.isAssignableFrom(customType) : "Custom type must not be a subtype of WordBase: field: " + field + " | declared type: " + declaredType +
+            assert !wordBaseType.isAssignableFrom(aCustomType) : "Custom type must not be a subtype of WordBase: field: " + field + " | declared type: " + declaredType +
                             " | custom type: " + customType;
             assert declaredType.isAssignableFrom(aCustomType) : "Custom type must be a subtype of the declared type: field: " + field + " | declared type: " + declaredType +
                             " | custom type: " + customType;

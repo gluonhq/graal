@@ -24,22 +24,24 @@
  */
 package com.oracle.svm.core.option;
 
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.ServiceLoader;
-import java.util.Set;
+import com.oracle.svm.shared.option.APIOption;
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.collections.UnmodifiableEconomicSet;
 
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.shared.option.OptionUtils;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.options.OptionDescriptors;
+import jdk.graal.compiler.options.OptionsContainer;
 
 public enum GCOptionValue {
-    SERIAL("serial"),
-    EPSILON("epsilon"),
+    Serial("serial"),
+    Epsilon("epsilon"),
     G1("G1");
 
-    private static Set<String> supportedValues = null;
+    private static UnmodifiableEconomicSet<String> supportedValues = null;
 
     private final String optionValue;
 
@@ -52,10 +54,10 @@ public enum GCOptionValue {
     }
 
     @Fold
-    public static synchronized Set<String> possibleValues() {
+    public static synchronized UnmodifiableEconomicSet<String> possibleValues() {
         if (supportedValues == null) {
-            Set<String> values = new HashSet<>();
-            ServiceLoader<OptionDescriptors> optionDescriptors = ServiceLoader.load(OptionDescriptors.class);
+            EconomicSet<String> values = EconomicSet.create();
+            Iterable<OptionDescriptors> optionDescriptors = OptionsContainer.getDiscoverableOptions(GCOptionValue.class.getClassLoader());
             SubstrateOptionsParser.collectOptions(optionDescriptors, optionDescriptor -> {
                 for (APIOption annotation : OptionUtils.getAnnotationsByType(optionDescriptor, APIOption.class)) {
                     if (annotation.group().equals(SubstrateOptions.GCGroup.class)) {
@@ -63,7 +65,7 @@ public enum GCOptionValue {
                     }
                 }
             });
-            supportedValues = Collections.unmodifiableSet(values);
+            supportedValues = values;
         }
         return supportedValues;
     }

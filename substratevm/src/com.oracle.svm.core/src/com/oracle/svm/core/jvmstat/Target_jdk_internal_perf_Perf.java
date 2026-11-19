@@ -24,9 +24,8 @@
  */
 package com.oracle.svm.core.jvmstat;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
-
-import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
@@ -34,34 +33,43 @@ import com.oracle.svm.core.annotate.TargetClass;
 @TargetClass(className = "jdk.internal.perf.Perf")
 @SuppressWarnings({"unused", "static-method"})
 public final class Target_jdk_internal_perf_Perf {
+    /// Substitutes `attach` rather than `attach0` so the returned external buffer owns its cleaner.
+    /// The JDK's `attach` returns a duplicate and registers `CleanerAction` against that duplicate;
+    /// wrapping our buffer again would introduce a second cleanup path for the same mapping.
+    ///
+    /// Here slices and duplicates retain the buffer that owns the cleaner, so views keep the mapping
+    /// alive until explicit cleanup or until all views become unreachable. HotSpot instead watches
+    /// its returned duplicate, which a further view need not retain. `Unsafe.invokeCleaner` can
+    /// clean our owning buffer, whereas it rejects HotSpot's returned duplicate. Local perfdata
+    /// buffers have no unmapping cleaner and remain valid after detach.
     @Substitute
-    public ByteBuffer attach(int lvmid) {
-        return ImageSingletons.lookup(PerfDataSupport.class).attach(lvmid);
+    public ByteBuffer attach(int lvmid) throws IOException {
+        return PerfDataSupport.singleton().attach(lvmid);
     }
 
     @Substitute
     public void detach(ByteBuffer bb) {
-        ImageSingletons.lookup(PerfDataSupport.class).detach(bb);
+        PerfDataSupport.singleton().detach(bb);
     }
 
     @Substitute
     public long highResCounter() {
-        return ImageSingletons.lookup(PerfDataSupport.class).highResCounter();
+        return PerfDataSupport.singleton().highResCounter();
     }
 
     @Substitute
     public long highResFrequency() {
-        return ImageSingletons.lookup(PerfDataSupport.class).highResFrequency();
+        return PerfDataSupport.singleton().highResFrequency();
     }
 
     @Substitute
     public ByteBuffer createLong(String name, int variability, int units, long value) {
-        return ImageSingletons.lookup(PerfDataSupport.class).createLong(name, variability, units, value);
+        return PerfDataSupport.singleton().createLong(name, variability, units, value);
     }
 
     @Substitute
     public ByteBuffer createByteArray(String name, int variability, int units, byte[] value, int maxLength) {
-        return ImageSingletons.lookup(PerfDataSupport.class).createByteArray(name, variability, units, value, maxLength);
+        return PerfDataSupport.singleton().createByteArray(name, variability, units, value, maxLength);
     }
 
     @Substitute

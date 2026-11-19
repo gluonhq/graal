@@ -1,0 +1,83 @@
+/*
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.shared.singletons;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.util.function.BooleanSupplier;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.hosted.Feature;
+
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+
+/**
+ * Convenience annotation to automatically register a singleton instance of the annotated class in
+ * {@link ImageSingletons}.
+ *
+ * The singleton is allocated and registered in an internal hosted registration step before feature
+ * registration begins. In particular, this happens before any feature
+ * {@link Feature#isInConfiguration}, {@link Feature#getRequiredFeatures}, or
+ * {@link Feature#afterRegistration} logic runs. The order in which automatically registered image
+ * singletons are processed is not deterministic and cannot be influenced. This means that the
+ * constructor of the annotated class and any {@link #onlyWith} predicates must not rely on feature
+ * registration having started already, or other image singletons being present already.
+ *
+ * If both a class and a subclass are annotated with {@link AutomaticallyRegisteredImageSingleton}
+ * (and the subclass is not disabled by {@link #onlyWith}), exactly one singleton instance is
+ * created, and its class is the most specific enabled annotated class in that hierarchy.
+ * Registration keys are derived separately: explicit {@link #value()} keys declared on the selected
+ * class and on its annotated superclasses are inherited and all resolve to that selected instance.
+ * If no explicit key is declared anywhere in the annotated chain, only the selected class itself is
+ * used as the key; annotated superclasses are not implicitly added as fallback keys.
+ *
+ * The requirements and restrictions of {@link AutomaticallyRegisteredFeature} apply also to this
+ * annotation.
+ */
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.TYPE})
+@Platforms(Platform.HOSTED_ONLY.class)
+public @interface AutomaticallyRegisteredImageSingleton {
+
+    /**
+     * The keys under which the singleton is registered in {@link ImageSingletons}. If the selected
+     * class extends another annotated class, explicit keys from annotated superclasses are
+     * inherited. If no explicit keys are specified anywhere in the annotated chain, only the
+     * selected class itself is used as the key.
+     */
+    Class<?>[] value() default {};
+
+    /**
+     * Register only if all provided {@link BooleanSupplier} objects evaluate to true. If there are
+     * no suppliers, the singleton is registered unconditionally.
+     *
+     * The values of this attribute are not inherited; a subclass may have fewer restrictions.
+     */
+    Class<? extends BooleanSupplier>[] onlyWith() default {};
+}

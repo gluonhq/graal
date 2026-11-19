@@ -24,22 +24,22 @@
  */
 package com.oracle.svm.core.fieldvaluetransformer;
 
-import org.graalvm.nativeimage.hosted.FieldValueTransformer;
+import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.util.JVMCIFieldValueTransformer;
 
-import com.oracle.svm.core.config.ConfigurationValues;
-
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
-public final class ArrayIndexShiftFieldValueTransformer extends BoxingTransformer implements FieldValueTransformer {
-    private final Class<?> targetClass;
-
-    public ArrayIndexShiftFieldValueTransformer(Class<?> targetClass, JavaKind returnKind) {
-        super(returnKind);
-        this.targetClass = targetClass;
-    }
+/**
+ * Implements the field value transformation semantics of {@link Kind#ArrayIndexShift}.
+ */
+public record ArrayIndexShiftFieldValueTransformer(ResolvedJavaType targetClass, JavaKind returnKind) implements JVMCIFieldValueTransformer {
 
     @Override
-    public Object transform(Object receiver, Object originalValue) {
-        return box(ConfigurationValues.getObjectLayout().getArrayIndexShift(JavaKind.fromJavaClass(targetClass.getComponentType())));
+    public JavaConstant transform(JavaConstant receiver, JavaConstant originalValue) {
+        return FieldOffsetFieldValueTransformer.constant(returnKind, ObjectLayoutCompilerSupport.getArrayIndexShift(ObjectLayout.singleton(), targetClass.getComponentType().getJavaKind()));
     }
 }

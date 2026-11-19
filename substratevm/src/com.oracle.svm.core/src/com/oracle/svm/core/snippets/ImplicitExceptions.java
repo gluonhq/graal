@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.core.snippets;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.HAS_SIDE_EFFECT;
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
 
@@ -32,19 +32,21 @@ import java.lang.reflect.GenericSignatureFormatError;
 
 import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.FactoryMethodMarker;
-import com.oracle.svm.core.jdk.InternalVMMethod;
 import com.oracle.svm.core.jdk.StackTraceUtils;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.core.snippets.SnippetRuntime.SubstrateForeignCallDescriptor;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalInt;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.jdk.InternalVMMethod;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.VMError;
 
 /**
- * This class contains support methods to throw implicit exceptions of according to the
- * specification of Java bytecode.
+ * This class contains support methods to throw implicit exceptions according to the specification
+ * of Java bytecode.
  *
  * All methods in this class are an implementation detail that should not be observable by users,
  * therefore these methods are filtered in exception stack traces (see {@link StackTraceUtils}).
@@ -57,17 +59,17 @@ import com.oracle.svm.core.util.VMError;
 public class ImplicitExceptions {
     public static final String NO_STACK_MSG = "[no exception stack trace available because exception is thrown from code that must be allocation free]";
 
-    public static final NullPointerException CACHED_NULL_POINTER_EXCEPTION = new NullPointerException(NO_STACK_MSG);
-    public static final ArrayIndexOutOfBoundsException CACHED_OUT_OF_BOUNDS_EXCEPTION = new ArrayIndexOutOfBoundsException(NO_STACK_MSG);
-    public static final ClassCastException CACHED_CLASS_CAST_EXCEPTION = new ClassCastException(NO_STACK_MSG);
-    public static final ArrayStoreException CACHED_ARRAY_STORE_EXCEPTION = new ArrayStoreException(NO_STACK_MSG);
-    public static final IncompatibleClassChangeError CACHED_INCOMPATIBLE_CLASS_CHANGE_ERROR = new IncompatibleClassChangeError(NO_STACK_MSG);
-    public static final IllegalArgumentException CACHED_ILLEGAL_ARGUMENT_EXCEPTION = new IllegalArgumentException(NO_STACK_MSG);
-    public static final NegativeArraySizeException CACHED_NEGATIVE_ARRAY_SIZE_EXCEPTION = new NegativeArraySizeException(NO_STACK_MSG);
-    public static final ArithmeticException CACHED_ARITHMETIC_EXCEPTION = new ArithmeticException(NO_STACK_MSG);
-    public static final AssertionError CACHED_ASSERTION_ERROR = new AssertionError(NO_STACK_MSG);
-    public static final StackOverflowError CACHED_STACK_OVERFLOW_ERROR = new StackOverflowError(NO_STACK_MSG);
-    public static final IllegalMonitorStateException CACHED_ILLEGAL_MONITOR_STATE_EXCEPTION = new IllegalMonitorStateException(NO_STACK_MSG);
+    public static final NullPointerException CACHED_NULL_POINTER_EXCEPTION = PreallocatedExceptions.createNullPointerException(NO_STACK_MSG);
+    public static final ArrayIndexOutOfBoundsException CACHED_OUT_OF_BOUNDS_EXCEPTION = PreallocatedExceptions.createArrayIndexOutOfBoundsException(NO_STACK_MSG);
+    public static final ClassCastException CACHED_CLASS_CAST_EXCEPTION = PreallocatedExceptions.createClassCastException(NO_STACK_MSG);
+    public static final ArrayStoreException CACHED_ARRAY_STORE_EXCEPTION = PreallocatedExceptions.createArrayStoreException(NO_STACK_MSG);
+    public static final IncompatibleClassChangeError CACHED_INCOMPATIBLE_CLASS_CHANGE_ERROR = PreallocatedExceptions.createIncompatibleClassChangeError(NO_STACK_MSG);
+    public static final IllegalArgumentException CACHED_ILLEGAL_ARGUMENT_EXCEPTION = PreallocatedExceptions.createIllegalArgumentException(NO_STACK_MSG);
+    public static final NegativeArraySizeException CACHED_NEGATIVE_ARRAY_SIZE_EXCEPTION = PreallocatedExceptions.createNegativeArraySizeException(NO_STACK_MSG);
+    public static final ArithmeticException CACHED_ARITHMETIC_EXCEPTION = PreallocatedExceptions.createArithmeticException(NO_STACK_MSG);
+    public static final AssertionError CACHED_ASSERTION_ERROR = PreallocatedExceptions.createAssertionError(NO_STACK_MSG);
+    public static final StackOverflowError CACHED_STACK_OVERFLOW_ERROR = PreallocatedExceptions.createStackOverflowError(NO_STACK_MSG);
+    public static final IllegalMonitorStateException CACHED_ILLEGAL_MONITOR_STATE_EXCEPTION = PreallocatedExceptions.createIllegalMonitorStateException(NO_STACK_MSG);
 
     public static final SubstrateForeignCallDescriptor CREATE_NULL_POINTER_EXCEPTION = SnippetRuntime.findForeignCall(ImplicitExceptions.class, "createNullPointerException", HAS_SIDE_EFFECT);
     public static final SubstrateForeignCallDescriptor CREATE_OUT_OF_BOUNDS_EXCEPTION = SnippetRuntime.findForeignCall(ImplicitExceptions.class, "createOutOfBoundsException", HAS_SIDE_EFFECT);
@@ -207,7 +209,7 @@ public class ImplicitExceptions {
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static void vmErrorIfImplicitExceptionsAreFatal(boolean cachedException) {
-        if (cachedException && SubstrateDiagnostics.Options.implicitExceptionWithoutStacktraceIsFatal()) {
+        if (cachedException && SubstrateDiagnostics.Options.ImplicitExceptionWithoutStacktraceIsFatal.getValue()) {
             throw VMError.shouldNotReachHere("AssertionError without stack trace.");
         } else if ((implicitExceptionsAreFatal.get() > 0 || ExceptionUnwind.exceptionsAreFatal()) && !SubstrateDiagnostics.isFatalErrorHandlingThread()) {
             throw VMError.shouldNotReachHere("Implicit exception thrown in code where such exceptions are fatal errors");

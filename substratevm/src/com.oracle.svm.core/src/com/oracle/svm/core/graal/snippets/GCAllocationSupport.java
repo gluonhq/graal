@@ -24,9 +24,10 @@
  */
 package com.oracle.svm.core.graal.snippets;
 
-import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
-import jdk.graal.compiler.word.Word;
 import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
 
 /**
  * Used to abstract the GC-specific part of the allocation functionality, e.g., how does the TLAB
@@ -41,11 +42,9 @@ public interface GCAllocationSupport {
 
     ForeignCallDescriptor getNewPodInstanceStub();
 
-    boolean useTLAB();
-
     boolean shouldAllocateInTLAB(UnsignedWord size, boolean isArray);
 
-    Word getTLABInfo();
+    Word getThreadLocalData();
 
     int tlabTopOffset();
 

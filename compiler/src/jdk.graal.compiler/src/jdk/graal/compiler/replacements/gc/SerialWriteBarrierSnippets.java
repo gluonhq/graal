@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,6 +28,7 @@ import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.NOT_FREQUE
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 
 import org.graalvm.word.Pointer;
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.api.replacements.Snippet;
@@ -41,7 +42,7 @@ import jdk.graal.compiler.replacements.SnippetCounter;
 import jdk.graal.compiler.replacements.SnippetTemplate;
 import jdk.graal.compiler.replacements.Snippets;
 import jdk.graal.compiler.replacements.nodes.AssertionNode;
-import jdk.graal.compiler.word.Word;
+import jdk.graal.compiler.word.WordCastNode;
 
 public abstract class SerialWriteBarrierSnippets extends WriteBarrierSnippets implements Snippets {
     static class Counters {
@@ -63,7 +64,7 @@ public abstract class SerialWriteBarrierSnippets extends WriteBarrierSnippets im
 
     @Snippet
     public void serialPreciseWriteBarrier(Address address, @ConstantParameter Counters counters, @ConstantParameter boolean verifyOnly) {
-        serialWriteBarrier(Word.fromAddress(address), counters, verifyOnly);
+        serialWriteBarrier(WordCastNode.castToWord(address), counters, verifyOnly);
     }
 
     @Snippet
@@ -74,8 +75,9 @@ public abstract class SerialWriteBarrierSnippets extends WriteBarrierSnippets im
 
         int cardShift = cardTableShift();
         Word cardTableAddress = cardTableAddress();
-        Word start = cardTableAddress.add(getPointerToFirstArrayElement(address, length, elementStride).unsignedShiftRight(cardShift));
-        Word end = cardTableAddress.add(getPointerToLastArrayElement(address, length, elementStride).unsignedShiftRight(cardShift));
+        Word addr = WordCastNode.castToWord(address);
+        Word start = cardTableAddress.add(getPointerToFirstArrayElement(addr, length, elementStride).unsignedShiftRight(cardShift));
+        Word end = cardTableAddress.add(getPointerToLastArrayElement(addr, length, elementStride).unsignedShiftRight(cardShift));
 
         Word cur = start;
         do {
@@ -117,24 +119,24 @@ public abstract class SerialWriteBarrierSnippets extends WriteBarrierSnippets im
                         LoweringTool tool) {
             SnippetTemplate.Arguments args;
             if (barrier.usePrecise()) {
-                args = new SnippetTemplate.Arguments(preciseSnippet, barrier.graph().getGuardsStage(), tool.getLoweringStage());
+                args = new SnippetTemplate.Arguments(preciseSnippet, barrier.graph(), tool.getLoweringStage());
                 args.add("address", barrier.getAddress());
             } else {
-                args = new SnippetTemplate.Arguments(impreciseSnippet, barrier.graph().getGuardsStage(), tool.getLoweringStage());
+                args = new SnippetTemplate.Arguments(impreciseSnippet, barrier.graph(), tool.getLoweringStage());
                 OffsetAddressNode address = (OffsetAddressNode) barrier.getAddress();
                 args.add("object", address.getBase());
             }
-            args.addConst("counters", counters);
-            args.addConst("verifyOnly", barrier.getVerifyOnly());
+            args.add("counters", counters);
+            args.add("verifyOnly", barrier.isEliminated());
 
             templates.template(tool, barrier, args).instantiate(tool.getMetaAccess(), barrier, SnippetTemplate.DEFAULT_REPLACER, args);
         }
 
         public void lower(SnippetTemplate.AbstractTemplates templates, SnippetTemplate.SnippetInfo snippet, SerialArrayRangeWriteBarrierNode barrier, LoweringTool tool) {
-            SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(snippet, barrier.graph().getGuardsStage(), tool.getLoweringStage());
+            SnippetTemplate.Arguments args = new SnippetTemplate.Arguments(snippet, barrier.graph(), tool.getLoweringStage());
             args.add("address", barrier.getAddress());
             args.add("length", barrier.getLengthAsLong());
-            args.addConst("elementStride", barrier.getElementStride());
+            args.add("elementStride", barrier.getElementStride());
 
             templates.template(tool, barrier, args).instantiate(tool.getMetaAccess(), barrier, SnippetTemplate.DEFAULT_REPLACER, args);
         }

@@ -29,7 +29,7 @@ package com.oracle.svm.core.jfr.traceid;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
 
 import jdk.jfr.internal.Type;
 
@@ -45,23 +45,23 @@ public class JfrTraceId {
 
     @Uninterruptible(reason = "Epoch must not change.")
     public static void setUsedThisEpoch(Class<?> clazz) {
-        tag(clazz, JfrTraceIdEpoch.getInstance().thisEpochBit());
+        tag(clazz, JfrEpoch.getInstance().thisEpochBit());
     }
 
     @Uninterruptible(reason = "Epoch must not change.")
     public static void clearUsedPreviousEpoch(Class<?> clazz) {
-        clear(clazz, JfrTraceIdEpoch.getInstance().previousEpochBit());
+        clear(clazz, JfrEpoch.getInstance().previousEpochBit());
     }
 
     @Uninterruptible(reason = "Epoch must not change.")
     public static boolean isUsedPreviousEpoch(Class<?> clazz) {
-        long predicate = JfrTraceIdEpoch.getInstance().previousEpochBit();
+        long predicate = JfrEpoch.getInstance().previousEpochBit();
         return predicate(clazz, predicate);
     }
 
     @Uninterruptible(reason = "Epoch must not change.")
     public static boolean isUsedCurrentEpoch(Class<?> clazz) {
-        long predicate = JfrTraceIdEpoch.getInstance().thisEpochBit();
+        long predicate = JfrEpoch.getInstance().thisEpochBit();
         return predicate(clazz, predicate);
     }
 
@@ -76,7 +76,7 @@ public class JfrTraceId {
         return id >>> TRACE_ID_SHIFT;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = "Result is only valid until epoch changes.", callerMustBe = true)
     public static long load(Class<?> clazz) {
         assert clazz != null;
         JfrTraceId.setUsedThisEpoch(clazz);

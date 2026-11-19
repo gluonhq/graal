@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -44,7 +44,6 @@ import jdk.graal.compiler.nodes.ReturnNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.calc.AddNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
-import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.ClassTypeSequence;
@@ -179,14 +178,11 @@ public class OptimizationLogTest extends GraalCompilerTest {
      */
     private StructuredGraph parseGraph(String methodName, boolean enableOptimizationLog) {
         ResolvedJavaMethod method = getResolvedJavaMethod(methodName);
-        EconomicMap<OptionKey<?>, Object> extraOptions = EconomicMap.create();
         EconomicSet<DebugOptions.OptimizationLogTarget> optimizationLogTargets = EconomicSet.create();
         if (enableOptimizationLog) {
             optimizationLogTargets.add(DebugOptions.OptimizationLogTarget.Stdout);
         }
-        extraOptions.put(DebugOptions.OptimizationLog, optimizationLogTargets);
-        extraOptions.put(GraalOptions.TrackNodeSourcePosition, true);
-        OptionValues options = new OptionValues(getInitialOptions(), extraOptions);
+        OptionValues options = getInitialOptions().derive(DebugOptions.OptimizationLog, optimizationLogTargets).derive(GraalOptions.TrackNodeSourcePosition, true);
         DebugContext debugContext = getDebugContext(options, null, method);
         StructuredGraph.Builder builder = new StructuredGraph.Builder(options, debugContext, null).method(method).compilationId(getCompilationId(method));
         return parse(builder, getEagerGraphBuilderSuite());

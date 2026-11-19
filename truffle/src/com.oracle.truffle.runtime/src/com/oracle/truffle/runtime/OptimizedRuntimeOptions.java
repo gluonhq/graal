@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -158,23 +158,39 @@ public final class OptimizedRuntimeOptions {
     // TODO: GR-29949
     public static final OptionKey<Long> CompilerIdleDelay = new OptionKey<>(10000L);
 
+    @Option(help = "Before the Truffle runtime submits an OptimizedCallTarget for compilation, it checks for the compilation " +
+                    "activity mode in the host VM. If the activity mode indicates a full code cache, no new compilation " +
+                    "requests are submitted and the compilation queue is flushed. After 'StoppedCompilationRetryDelay' " +
+                    "milliseconds new compilations will be submitted again (which might trigger a sweep of the code " +
+                    "cache and a reset of the compilation activity mode in the host JVM). The option is only supported on " +
+                    "the HotSpot Truffle runtime. On runtimes which don't support it the option has no effect. default: 5000", //
+                    usageSyntax = "<ms>", category = OptionCategory.EXPERT) //
+    public static final OptionKey<Long> StoppedCompilationRetryDelay = new OptionKey<>(5000L);
+
     @Option(help = "Manually set the number of compiler threads. By default, the number of compiler threads is scaled with the number of available cores on the CPU.", usageSyntax = "[1, inf)", category = OptionCategory.EXPERT, //
                     stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //
     public static final OptionKey<Integer> CompilerThreads = new OptionKey<>(-1);
 
+    @Option(help = "Set the requested stack size of Truffle compiler threads. By default compiler threads use 640KB stack space. The requested size is rounded up to implementation-specific minima and page sizes as needed.", //
+                    usageSyntax = "[0, inf)B|KB|MB|GB", category = OptionCategory.EXPERT, stability = OptionStability.STABLE, sandbox = SandboxPolicy.UNTRUSTED) //
+    public static final OptionKey<Long> CompilerThreadStackSize = new OptionKey<>(640L * 1024L, createSizeInBytesType("engine.CompilerThreadStackSize", 0L));
+
     @Option(help = "Reduce or increase the compilation threshold depending on the size of the compilation queue (default: true).", usageSyntax = "true|false", category = OptionCategory.INTERNAL) //
     public static final OptionKey<Boolean> DynamicCompilationThresholds = new OptionKey<>(true);
 
-    @Option(help = "The desired maximum compilation queue load. When the load rises above this value, the compilation thresholds are increased. The load is scaled by the number of compiler threads.  (default: 10)", //
+    @Option(help = "The desired maximum compilation queue load. When the load rises above this value, the compilation thresholds are increased. The load is scaled by the number of compiler threads.  (default: 90)", //
                     usageSyntax = "[1, inf)", category = OptionCategory.INTERNAL) //
     public static final OptionKey<Integer> DynamicCompilationThresholdsMaxNormalLoad = new OptionKey<>(90);
 
-    @Option(help = "The desired minimum compilation queue load. When the load falls bellow this value, the compilation thresholds are decreased. The load is scaled by the number of compiler threads (default: 10).", //
-                    usageSyntax = "[1, inf)", category = OptionCategory.INTERNAL) //
-    public static final OptionKey<Integer> DynamicCompilationThresholdsMinNormalLoad = new OptionKey<>(10);
+    @Option(help = "The desired minimum compilation queue load. When the load falls below this value, the compilation thresholds are decreased. The load is scaled by the number of compiler threads (default: 0).", //
+                    usageSyntax = "[0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Integer> DynamicCompilationThresholdsMinNormalLoad = new OptionKey<>(0);
 
     @Option(help = "The minimal scale the compilation thresholds can be reduced to (default: 0.1).", usageSyntax = "[0.0, inf)", category = OptionCategory.INTERNAL) //
     public static final OptionKey<Double> DynamicCompilationThresholdsMinScale = new OptionKey<>(0.1);
+
+    @Option(help = "The slope used to increase compilation thresholds when compilation queue load is above DynamicCompilationThresholdsMaxNormalLoad (default: 0.09).", usageSyntax = "[0.0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Double> DynamicCompilationThresholdsHighLoadSlope = new OptionKey<>(0.09);
 
     @Option(help = "Delay, in milliseconds, after which the encoded graph cache is dropped when a Truffle compiler thread becomes idle (default: 10000).", //
                     usageSyntax = "<ms>", category = OptionCategory.EXPERT) //
@@ -195,6 +211,11 @@ public final class OptimizedRuntimeOptions {
                     "Might be reduced/increased when compilation load is low/high if DynamicCompilationThresholds is enabled. (default: 10000).", //
                     usageSyntax = "[1, inf)", category = OptionCategory.EXPERT) //
     public static final OptionKey<Integer> LastTierCompilationThreshold = new OptionKey<>(10000);
+
+    @Option(help = "Maximum number of successful compilations for a single call target before a permanent bailout. Exceeding the limit will result in a compilation failure with the appropriate reason and " + //
+                    "there will be no further attempts to compile the call target. (negative integer means no limit, default: 100)", //
+                    usageSyntax = "(-inf, inf)", category = OptionCategory.EXPERT) //
+    public static final OptionKey<Integer> MaximumCompilations = new OptionKey<>(100);
 
     @Option(help = "Minimum number of calls before a call target is compiled (default: 3).", usageSyntax = "[1, inf)", category = OptionCategory.EXPERT) //
     public static final OptionKey<Integer> MinInvokeThreshold = new OptionKey<>(3);
@@ -319,8 +340,87 @@ public final class OptimizedRuntimeOptions {
     @Option(help = "Traversing queue gives first tier compilations priority.", category = OptionCategory.INTERNAL) //
     public static final OptionKey<Boolean> TraversingQueueFirstTierPriority = new OptionKey<>(false);
 
+    @Option(help = "Controls how much of a priority should be given to compilations after invalidations (default: 1.0, no bonus).", usageSyntax = "[0.0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Double> TraversingQueueInvalidatedBonus = new OptionKey<>(1.0);
+
+    @Option(help = "Controls how much of a priority should be given to OSR compilations (default: 1.0, no bonus).", usageSyntax = "[0.0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Double> TraversingQueueOSRBonus = new OptionKey<>(1.0);
+
     @Option(help = "Traversing queue uses rate as priority for both tier. (default: true)", usageSyntax = "true|false", category = OptionCategory.INTERNAL) //
     public static final OptionKey<Boolean> TraversingQueueWeightingBothTiers = new OptionKey<>(true);
+
+    @Option(help = "Sets the time, in milliseconds, after which the impact of a compilation unit's observed execution rate is halved. (default: 300 ms)", usageSyntax = "[0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Long> TraversingQueueRateHalfLife = new OptionKey<>(300L);
+
+    @Option(help = "Maximum time in milliseconds a queued compilation task may stay without invocation activity before it is considered stale. " +
+                    "Set to 0 to disable. (default: 100)", usageSyntax = "[0, inf)", category = OptionCategory.INTERNAL) //
+    public static final OptionKey<Long> TraversingQueueStaleTaskDelay = new OptionKey<>(100L);
+
+    private enum SizeUnit {
+        GIGABYTE("GB", 1024L * 1024L * 1024L),
+        MEGABYTE("MB", 1024L * 1024L),
+        KILOBYTE("KB", 1024L),
+        BYTE("B", 1L);
+
+        private final String symbol;
+        private final long factor;
+
+        SizeUnit(String symbol, long factor) {
+            this.symbol = symbol;
+            this.factor = factor;
+        }
+    }
+
+    private static OptionType<Long> createSizeInBytesType(String optionName, long min) {
+        return new OptionType<>("sizeinbytes", new Function<String, Long>() {
+            @Override
+            public Long apply(String value) {
+                try {
+                    SizeUnit unit = null;
+                    for (SizeUnit candidate : SizeUnit.values()) {
+                        if (value.endsWith(candidate.symbol)) {
+                            unit = candidate;
+                            break;
+                        }
+                    }
+                    if (unit == null) {
+                        throw invalidValue(value);
+                    }
+                    long amount = Long.parseLong(value.substring(0, value.length() - unit.symbol.length()));
+                    if (amount < 0) {
+                        throw invalidValue(value);
+                    }
+                    long bytes = Math.multiplyExact(amount, unit.factor);
+                    if (bytes < min) {
+                        throw invalidRange(value);
+                    }
+                    return bytes;
+                } catch (NumberFormatException | ArithmeticException e) {
+                    throw invalidValue(value);
+                }
+            }
+
+            private IllegalArgumentException invalidValue(String value) {
+                throw new IllegalArgumentException("Invalid size of '" + value + "' specified for the '" + optionName + "' option. " +
+                                "A valid size consists of a non-negative integer value and a byte-based size unit. " +
+                                "For example '256KB' or '1MB'. Valid size units are 'B', 'KB', 'MB', and 'GB'.");
+            }
+
+            private IllegalArgumentException invalidRange(String value) {
+                throw new IllegalArgumentException("Invalid size of '" + value + "' specified for the '" + optionName + "' option. " +
+                                String.format("Valid size must be greater or equal to %s.", toUnitString(min)));
+            }
+
+            private String toUnitString(long value) {
+                for (SizeUnit unit : SizeUnit.values()) {
+                    if (value >= unit.factor && value % unit.factor == 0) {
+                        return (value / unit.factor) + unit.symbol;
+                    }
+                }
+                return value + SizeUnit.BYTE.symbol;
+            }
+        });
+    }
 
     public static OptionDescriptors getDescriptors() {
         return new OptimizedRuntimeOptionsOptionDescriptors();

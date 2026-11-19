@@ -33,7 +33,7 @@ import static jdk.graal.compiler.replacements.nodes.ExplodeLoopNode.explodeLoop;
 
 import org.graalvm.word.LocationIdentity;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.nodes.PrefetchAllocateNode;
 import jdk.graal.compiler.nodes.extended.MembarNode;
@@ -41,27 +41,30 @@ import jdk.graal.compiler.nodes.memory.address.OffsetAddressNode;
 import jdk.graal.compiler.replacements.SnippetCounter.Group;
 import jdk.graal.compiler.replacements.nodes.ExplodeLoopNode;
 import jdk.graal.compiler.replacements.nodes.ZeroMemoryNode;
-import jdk.graal.compiler.word.Word;
 
 /**
  * Snippets used for implementing NEW, ANEWARRAY and NEWARRAY.
  */
 public abstract class AllocationSnippets implements Snippets {
+    /** Whether {@link FillContent#WITH_GARBAGE_IF_ASSERTIONS_ENABLED} fills object bodies. */
+    public static final boolean GARBAGE_FILLING_ENABLED = ReplacementsUtil.REPLACEMENTS_ASSERTIONS_ENABLED;
+    public static final int GARBAGE_FILL_PATTERN = 0xfefefefe;
+
     protected Object allocateInstanceImpl(Word hub,
                     UnsignedWord size,
-                    boolean forceSlowPath,
+                    boolean useTLAB,
                     FillContent fillContents,
                     boolean emitMemoryBarrier,
                     boolean constantSize,
                     AllocationProfilingData profilingData,
                     boolean withException) {
         Object result;
-        Word tlabInfo = getTLABInfo();
-        Word top = readTlabTop(tlabInfo);
-        Word end = readTlabEnd(tlabInfo);
+        Word threadLocalData = getThreadLocalData();
+        Word top = readTlabTop(threadLocalData);
+        Word end = readTlabEnd(threadLocalData);
         Word newTop = top.add(size);
-        if (!forceSlowPath && useTLAB() && probability(FAST_PATH_PROBABILITY, shouldAllocateInTLAB(size, false)) && probability(FAST_PATH_PROBABILITY, newTop.belowOrEqual(end))) {
-            writeTlabTop(tlabInfo, newTop);
+        if (useTLAB && probability(FAST_PATH_PROBABILITY, shouldAllocateInTLAB(size, false)) && probability(FAST_PATH_PROBABILITY, newTop.belowOrEqual(end))) {
+            writeTlabTop(threadLocalData, newTop);
             emitPrefetchAllocate(newTop, false);
             result = formatObject(hub, size, top, fillContents, emitMemoryBarrier, constantSize, profilingData.snippetCounters);
         } else {
@@ -74,6 +77,7 @@ public abstract class AllocationSnippets implements Snippets {
 
     public Object allocateArrayImpl(Word hub,
                     int length,
+                    boolean useTLAB,
                     int arrayBaseOffset,
                     int log2ElementSize,
                     FillContent fillContents,
@@ -84,9 +88,9 @@ public abstract class AllocationSnippets implements Snippets {
                     boolean supportsOptimizedFilling,
                     AllocationProfilingData profilingData,
                     boolean withException) {
-        Word thread = getTLABInfo();
-        Word top = readTlabTop(thread);
-        Word end = readTlabEnd(thread);
+        Word threadLocalData = getThreadLocalData();
+        Word top = readTlabTop(threadLocalData);
+        Word end = readTlabEnd(threadLocalData);
         ReplacementsUtil.dynamicAssert(end.subtract(top).belowOrEqual(Integer.MAX_VALUE), "TLAB is too large");
 
         // A negative array length will result in an array size larger than the largest possible
@@ -95,8 +99,8 @@ public abstract class AllocationSnippets implements Snippets {
         Word newTop = top.add(allocationSize);
 
         Object result;
-        if (useTLAB() && probability(FAST_PATH_PROBABILITY, shouldAllocateInTLAB(allocationSize, true)) && probability(FAST_PATH_PROBABILITY, newTop.belowOrEqual(end))) {
-            writeTlabTop(thread, newTop);
+        if (useTLAB && probability(FAST_PATH_PROBABILITY, shouldAllocateInTLAB(allocationSize, true)) && probability(FAST_PATH_PROBABILITY, newTop.belowOrEqual(end))) {
+            writeTlabTop(threadLocalData, newTop);
             emitPrefetchAllocate(newTop, true);
             boolean useOptimizedFilling = !withException && supportsOptimizedFilling;
             result = formatArray(hub, allocationSize, length, top, fillContents, emitMemoryBarrier, fillStartOffset, maybeUnroll, supportsBulkZeroing, useOptimizedFilling,
@@ -120,7 +124,7 @@ public abstract class AllocationSnippets implements Snippets {
 
     protected UnsignedWord arrayAllocationSize(int length, int arrayBaseOffset, int log2ElementSize) {
         int alignment = objectAlignment();
-        return WordFactory.unsigned(arrayAllocationSize(length, arrayBaseOffset, log2ElementSize, alignment));
+        return Word.unsigned(arrayAllocationSize(length, arrayBaseOffset, log2ElementSize, alignment));
     }
 
     public static long arrayAllocationSize(int length, int arrayBaseOffset, int log2ElementSize, int alignment) {
@@ -172,7 +176,7 @@ public abstract class AllocationSnippets implements Snippets {
                     boolean supportsOptimizedFilling,
                     AllocationSnippetCounters snippetCounters) {
         ReplacementsUtil.dynamicAssert(endOffset.and(0x7).equal(0), "unaligned object size");
-        UnsignedWord offset = WordFactory.unsigned(startOffset);
+        UnsignedWord offset = Word.unsigned(startOffset);
         if (probability(SLOW_PATH_PROBABILITY, offset.and(0x7).notEqual(0))) {
             memory.writeInt(offset, (int) value, LocationIdentity.init());
             offset = offset.add(4);
@@ -258,7 +262,9 @@ public abstract class AllocationSnippets implements Snippets {
                     boolean manualUnroll,
                     boolean supportsOptimizedFilling,
                     AllocationSnippetCounters snippetCounters) {
-        fillMemory(0xfefefefefefefefeL, memory, startOffset, endOffset, isEndOffsetConstant, manualUnroll, false, supportsOptimizedFilling, snippetCounters);
+        long value = GARBAGE_FILL_PATTERN & 0xffffffffL;
+        value = (value << 32) | value;
+        fillMemory(value, memory, startOffset, endOffset, isEndOffsetConstant, manualUnroll, false, supportsOptimizedFilling, snippetCounters);
     }
 
     /**
@@ -310,7 +316,7 @@ public abstract class AllocationSnippets implements Snippets {
                     boolean supportsOptimizedFilling, AllocationSnippetCounters snippetCounters) {
         if (fillContents == FillContent.WITH_ZEROES) {
             zeroMemory(memory, startOffset, endOffset, isEndOffsetConstant, maybeUnroll, supportsBulkZeroing, supportsOptimizedFilling, snippetCounters);
-        } else if (ReplacementsUtil.REPLACEMENTS_ASSERTIONS_ENABLED && fillContents == FillContent.WITH_GARBAGE_IF_ASSERTIONS_ENABLED) {
+        } else if (GARBAGE_FILLING_ENABLED && fillContents == FillContent.WITH_GARBAGE_IF_ASSERTIONS_ENABLED) {
             fillWithGarbage(memory, startOffset, endOffset, isEndOffsetConstant, maybeUnroll, supportsOptimizedFilling, snippetCounters);
         }
     }
@@ -344,17 +350,15 @@ public abstract class AllocationSnippets implements Snippets {
 
     protected abstract int getPrefetchDistance();
 
-    public abstract boolean useTLAB();
-
     protected abstract boolean shouldAllocateInTLAB(UnsignedWord allocationSize, boolean isArray);
 
-    public abstract Word getTLABInfo();
+    public abstract Word getThreadLocalData();
 
-    public abstract Word readTlabTop(Word tlabInfo);
+    public abstract Word readTlabTop(Word threadLocalData);
 
-    public abstract Word readTlabEnd(Word tlabInfo);
+    public abstract Word readTlabEnd(Word threadLocalData);
 
-    public abstract void writeTlabTop(Word tlabInfo, Word newTop);
+    public abstract void writeTlabTop(Word threadLocalData, Word newTop);
 
     protected abstract int instanceHeaderSize();
 

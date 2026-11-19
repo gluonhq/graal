@@ -63,10 +63,9 @@ public class AllocationStageVerifier extends AllocationPhase {
     }
 
     protected void verifyInstruction(LIRInstruction inst) {
-        inst.visitEachInput(this::verifyOperands);
-        inst.visitEachOutput(this::verifyOperands);
-        inst.visitEachAlive(this::verifyOperands);
-        inst.visitEachTemp(this::verifyOperands);
+        // Allocation-stage verification is a single boundary check over operand buckets, so it
+        // uses the canonical forward operand walk.
+        inst.visitEachValueForward(this::verifyOperands);
     }
 
     /**

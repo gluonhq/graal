@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,21 +40,26 @@
  */
 package com.oracle.truffle.runtime;
 
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionValues;
+import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.SandboxPolicy;
 
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
-import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.impl.RuntimeCallTarget;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.TruffleSafepoint;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.impl.AbstractFastThreadLocal;
 import com.oracle.truffle.api.impl.Accessor.RuntimeSupport;
@@ -77,7 +82,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     }
 
     @Override
-    public RootCallTarget newCallTarget(CallTarget source, RootNode rootNode) {
+    public RuntimeCallTarget newCallTarget(CallTarget source, RootNode rootNode) {
         assert OptimizedRuntimeAccessor.NODES.getCallTargetWithoutInitialization(rootNode) == null : "CallTarget for root node already initialized.";
 
         CompilerAsserts.neverPartOfCompilation();
@@ -85,8 +90,22 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     }
 
     @Override
+    public long getCallTargetId(CallTarget target) {
+        if (target instanceof OptimizedCallTarget) {
+            return ((OptimizedCallTarget) target).id;
+        } else {
+            return 0;
+        }
+    }
+
+    @Override
     public boolean isLoaded(CallTarget callTarget) {
         return ((OptimizedCallTarget) callTarget).isLoaded();
+    }
+
+    @Override
+    public int getBytecodeIndex(FrameInstance frameInstance, Frame frame) {
+        return ((OptimizedFrameInstance) frameInstance).getBytecodeIndex(frame);
     }
 
     @Override
@@ -131,7 +150,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
             node = node.getParent();
         }
         if (parentNode instanceof RootNode) {
-            CallTarget target = ((RootNode) parentNode).getCallTarget();
+            CallTarget target = OptimizedRuntimeAccessor.NODES.getCallTargetWithoutInitialization((RootNode) parentNode);
             if (target instanceof OptimizedCallTarget) {
                 ((OptimizedCallTarget) target).onLoopCount(count);
             }
@@ -142,11 +161,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     public boolean pollBytecodeOSRBackEdge(BytecodeOSRNode osrNode) {
         CompilerAsserts.neverPartOfCompilation();
         TruffleSafepoint.poll((Node) osrNode);
-        BytecodeOSRMetadata osrMetadata = (BytecodeOSRMetadata) osrNode.getOSRMetadata();
-        if (osrMetadata == null) {
-            osrMetadata = initializeBytecodeOSRMetadata(osrNode);
-        }
-
+        BytecodeOSRMetadata osrMetadata = getOrInitializeOSRMetadata(osrNode);
         // metadata can be disabled during initialization (above) or dynamically after
         // failed compilation.
         if (osrMetadata.isDisabled()) {
@@ -156,6 +171,33 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
         }
     }
 
+    @Override
+    public boolean pollBytecodeOSRBackEdge(BytecodeOSRNode osrNode, int loopCountIncrement) {
+        CompilerAsserts.neverPartOfCompilation();
+        BytecodeOSRMetadata osrMetadata = getOrInitializeOSRMetadata(osrNode);
+        // metadata can be disabled during initialization (above) or dynamically after
+        // failed compilation.
+        if (osrMetadata.isDisabled()) {
+            return false;
+        } else {
+            return osrMetadata.incrementAndPoll(loopCountIncrement);
+        }
+    }
+
+    private static BytecodeOSRMetadata getOrInitializeOSRMetadata(BytecodeOSRNode osrNode) {
+        BytecodeOSRMetadata osrMetadata = (BytecodeOSRMetadata) osrNode.getOSRMetadata();
+        if (osrMetadata == null) {
+            osrMetadata = initializeBytecodeOSRMetadata(osrNode);
+        }
+        return osrMetadata;
+    }
+
+    /*
+     * While this method is not used for runtime compilation the TruffleBoundary is needed to
+     * support compilation in HostCompilerDirectives.inInterpreterFastPath and HostInlining
+     * semantics.
+     */
+    @TruffleBoundary
     private static BytecodeOSRMetadata initializeBytecodeOSRMetadata(BytecodeOSRNode osrNode) {
         Node node = (Node) osrNode;
         return node.atomic(() -> { // double checked locking
@@ -176,7 +218,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     }
 
     @Override
-    public Object tryBytecodeOSR(BytecodeOSRNode osrNode, int target, Object interpreterState, Runnable beforeTransfer, VirtualFrame parentFrame) {
+    public Object tryBytecodeOSR(BytecodeOSRNode osrNode, long target, Object interpreterState, Runnable beforeTransfer, VirtualFrame parentFrame) {
         CompilerAsserts.neverPartOfCompilation();
         BytecodeOSRMetadata osrMetadata = (BytecodeOSRMetadata) osrNode.getOSRMetadata();
         return osrMetadata.tryOSR(target, interpreterState, beforeTransfer, parentFrame);
@@ -190,18 +232,10 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
         }
     }
 
-    // Support for deprecated frame transfer: GR-38296
     @Override
-    public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, int bytecodeTarget) {
+    public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, long bytecodeTarget, Object targetMetadata) {
         BytecodeOSRMetadata osrMetadata = (BytecodeOSRMetadata) osrNode.getOSRMetadata();
-        BytecodeOSRMetadata.OsrEntryDescription targetMetadata = osrMetadata.getLazyState().get(bytecodeTarget);
-        osrMetadata.transferFrame((FrameWithoutBoxing) source, (FrameWithoutBoxing) target, bytecodeTarget, targetMetadata);
-    }
-
-    @Override
-    public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, int bytecodeTarget, Object targetMetadata) {
-        BytecodeOSRMetadata osrMetadata = (BytecodeOSRMetadata) osrNode.getOSRMetadata();
-        osrMetadata.transferFrame((FrameWithoutBoxing) source, (FrameWithoutBoxing) target, bytecodeTarget, targetMetadata);
+        osrMetadata.transferFrame((FrameWithoutBoxing) source, (FrameWithoutBoxing) target, targetMetadata);
     }
 
     @Override
@@ -222,8 +256,9 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
 
     @Override
     public boolean isGuestCallStackFrame(StackTraceElement e) {
-        return e.getMethodName().equals(OptimizedCallTarget.EXECUTE_ROOT_NODE_METHOD_NAME) && e.getClassName().equals(OptimizedCallTarget.class.getName());
-
+        String methodName = e.getMethodName();
+        String className = e.getClassName();
+        return className.equals(OptimizedCallTarget.class.getName()) && methodName.equals(OptimizedCallTarget.EXECUTE_ROOT_NODE_METHOD_NAME);
     }
 
     /**
@@ -263,7 +298,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     public Object callInlined(Node callNode, CallTarget target, Object... arguments) {
         final OptimizedCallTarget optimizedCallTarget = (OptimizedCallTarget) target;
         try {
-            return optimizedCallTarget.callInlined(callNode, arguments);
+            return optimizedCallTarget.callInlined(callNode, -1, arguments);
         } catch (Throwable t) {
             OptimizedRuntimeAccessor.LANGUAGE.addStackFrameInfo(callNode, null, t, null);
             throw OptimizedCallTarget.rethrow(t);
@@ -278,7 +313,7 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     @Override
     public Object callProfiled(CallTarget target, Object... arguments) {
         OptimizedCallTarget castTarget = (OptimizedCallTarget) target;
-        assert castTarget.isValidArgumentProfile(arguments) : "Invalid argument profile. callProfiled requires to explicity initialize the profile.";
+        assert castTarget.isValidArgumentProfile(arguments) : "Invalid argument profile. callProfiled requires to explicitly initialize the profile.";
         return castTarget.doInvoke(arguments);
     }
 
@@ -294,15 +329,8 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     }
 
     @Override
-    public void flushCompileQueue(Object runtimeData) {
-        EngineData engine = (EngineData) runtimeData;
-        BackgroundCompileQueue queue = OptimizedTruffleRuntime.getRuntime().getCompileQueue();
-        // compile queue might be null if no call target was yet created
-        if (queue != null) {
-            for (OptimizedCallTarget target : queue.getQueuedTargets(engine)) {
-                target.cancelCompilation("Polyglot engine was closed.");
-            }
-        }
+    public void shutdownCompilationForEngine(Object runtimeData) {
+        OptimizedTruffleRuntime.getRuntime().shutdownCompilationForEngine((EngineData) runtimeData);
     }
 
     @Override
@@ -331,8 +359,23 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     }
 
     @Override
+    public void onEnginePatchSuccess(Object runtimeData) {
+        ((EngineData) runtimeData).onEnginePatchSuccess();
+    }
+
+    @Override
     public boolean onEngineClosing(Object runtimeData) {
         return ((EngineData) runtimeData).onEngineClosing();
+    }
+
+    @Override
+    public boolean onStoreCache(Object runtimeData, Path targetPath, long cancelledWord) {
+        return ((EngineData) runtimeData).onStoreCache(targetPath, cancelledWord);
+    }
+
+    @Override
+    public ByteBuffer persistCache(Object runtimeData, Engine.CancellationCallback callback) {
+        return ((EngineData) runtimeData).persistCache(callback);
     }
 
     @Override
@@ -388,5 +431,20 @@ final class OptimizedRuntimeSupport extends RuntimeSupport {
     @Override
     public <T> ThreadLocal<T> createTerminatingThreadLocal(Supplier<T> initialValue, Consumer<T> onThreadTermination) {
         return OptimizedTruffleRuntime.createTerminatingThreadLocal(initialValue, onThreadTermination);
+    }
+
+    @Override
+    public void initializeInterpreterCallStackHeadRoom(Object engineData, long interpreterCallStackHeadRoom) {
+        ((EngineData) engineData).interpreterCallStackHeadRoom = interpreterCallStackHeadRoom;
+    }
+
+    @Override
+    public boolean supportsHeapMemoryLimits() {
+        return true;
+    }
+
+    @Override
+    public long getStackOverflowLimit() {
+        return OptimizedTruffleRuntime.getRuntime().getStackOverflowLimit();
     }
 }

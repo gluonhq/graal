@@ -34,7 +34,7 @@ import jdk.graal.compiler.debug.DebugCloseable;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.TimerKey;
 import jdk.graal.compiler.lir.gen.LIRGenerationResult;
-import jdk.graal.compiler.serviceprovider.GraalServices;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.vm.ci.code.TargetDescription;
 
 public class LIRPhaseSuite<C> extends LIRPhase<C> implements PhasePlan<LIRPhase<C>> {
@@ -105,10 +105,17 @@ public class LIRPhaseSuite<C> extends LIRPhase<C> implements PhasePlan<LIRPhase<
     @Override
     protected final void run(TargetDescription target, LIRGenerationResult lirGenRes, C context) {
         for (LIRPhase<C> phase : phases) {
-            // Notify the runtime that most objects allocated in previous LIR phase are dead and can
-            // be reclaimed. This will lower the chance of allocation failure in the next LIR phase.
-            try (DebugCloseable timer = LIRHintedGC.start(lirGenRes.getLIR().getDebug())) {
-                GraalServices.notifyLowMemoryPoint();
+            LibGraalSupport libgraal = LibGraalSupport.INSTANCE;
+            if (libgraal != null) {
+                /*
+                 * Notify libgraal runtime that most objects allocated in previous LIR phase are
+                 * dead and can be reclaimed. This will lower the chance of allocation failure in
+                 * the next LIR phase.
+                 */
+                try (DebugCloseable timer = LIRHintedGC.start(lirGenRes.getLIR().getDebug())) {
+                    libgraal.notifyLowMemoryPoint(false);
+                    libgraal.processReferences();
+                }
             }
             phase.apply(target, lirGenRes, context);
         }

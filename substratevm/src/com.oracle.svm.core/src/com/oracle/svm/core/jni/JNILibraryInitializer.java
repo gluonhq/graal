@@ -24,28 +24,27 @@
  */
 package com.oracle.svm.core.jni;
 
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.List;
+import java.util.function.Predicate;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Equivalence;
 import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
 import org.graalvm.nativeimage.c.type.VoidPointer;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
 import com.oracle.svm.core.jdk.NativeLibrarySupport;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
 import com.oracle.svm.core.jni.functions.JNIFunctionTables;
 import com.oracle.svm.core.jni.headers.JNIJavaVM;
 import com.oracle.svm.core.jni.headers.JNIVersion;
-import com.oracle.svm.core.util.ImageHeapMap;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.guest.staging.util.ImageHeapMap;
 
 interface JNIOnLoadFunctionPointer extends CFunctionPointer {
     @InvokeCFunctionPointer
@@ -54,45 +53,26 @@ interface JNIOnLoadFunctionPointer extends CFunctionPointer {
 
 public class JNILibraryInitializer implements NativeLibrarySupport.LibraryInitializer {
 
-    private final EconomicMap<String, CGlobalData<PointerBase>> onLoadCGlobalDataMap = ImageHeapMap.create(Equivalence.IDENTITY);
+    private final EconomicMap<String, CGlobalData<PointerBase>> onLoadCGlobalDataMap = ImageHeapMap.create(Equivalence.IDENTITY, "onLoadCGlobalDataMap");
+    private static final String JNI_ONLOAD = "JNI_OnLoad";
 
     public static String getOnLoadName(String libName, boolean isBuiltIn) {
-        String name = "JNI_OnLoad";
+        String name = JNI_ONLOAD;
         if (isBuiltIn) {
             return name + "_" + libName;
         }
         return name;
     }
 
-    private static void callOnLoadFunction(String libName, PointerBase onLoadFunction) {
-        if (onLoadFunction.isNonNull()) {
-            JNIOnLoadFunctionPointer onLoad = (JNIOnLoadFunctionPointer) onLoadFunction;
-            int expected = onLoad.invoke(JNIFunctionTables.singleton().getGlobalJavaVM(), WordFactory.nullPointer());
-            checkSupportedJNIVersion(libName, expected);
-        }
+    public static boolean isBuiltinOnLoadName(String symbol) {
+        return symbol.startsWith(JNI_ONLOAD + "_");
     }
 
-    private static void checkSupportedJNIVersion(String libName, int expected) {
-        if (!JNIVersion.isSupported(expected)) {
-            String message = "Unsupported JNI version 0x" + Integer.toHexString(expected) + ", required by " + libName;
-            throw new UnsatisfiedLinkError(message);
-        }
-    }
-
-    public boolean fillCGlobalDataMap(Collection<String> staticLibNames) {
-        List<String> libsWithOnLoad = Arrays.asList("net", "java", "nio", "zip", "sunec", "jaas", "sctp", "extnet",
-                        "j2gss", "j2pkcs11", "j2pcsc", "prefs", "verify", "awt", "awt_xawt", "awt_headless", "lcms",
-                        "fontmanager", "javajpeg", "mlib_image");
-        // TODO: This check should be removed when all static libs will have JNI_OnLoad function
-        ArrayList<String> localStaticLibNames = new ArrayList<>(staticLibNames);
-        localStaticLibNames.retainAll(libsWithOnLoad);
-        if (Platform.includedIn(Platform.WINDOWS.class)) {
-            /* libextnet on Windows (introduced in Java 19) does not contain an OnLoad method. */
-            localStaticLibNames.remove("extnet");
-        }
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public boolean fillCGlobalDataMap(Collection<String> staticLibNames, Predicate<String> shouldReferenceOnLoad) {
         boolean mapIsChanged = false;
-        for (String libName : localStaticLibNames) {
-            if (!onLoadCGlobalDataMap.containsKey(libName)) {
+        for (String libName : staticLibNames) {
+            if (!onLoadCGlobalDataMap.containsKey(libName) && shouldReferenceOnLoad.test(libName)) {
                 CGlobalData<PointerBase> onLoadCGlobalData = CGlobalDataFactory.forSymbol(getOnLoadName(libName, true), true);
                 onLoadCGlobalDataMap.put(libName, onLoadCGlobalData);
                 mapIsChanged = true;
@@ -103,36 +83,41 @@ public class JNILibraryInitializer implements NativeLibrarySupport.LibraryInitia
 
     @Override
     public boolean isBuiltinLibrary(String libName) {
-        if (PlatformNativeLibrarySupport.singleton().isBuiltinLibrary(libName)) {
-            return true;
-        }
         String onLoadName = getOnLoadName(libName, true);
         PointerBase onLoad = PlatformNativeLibrarySupport.singleton().findBuiltinSymbol(onLoadName);
         return onLoad.isNonNull();
     }
 
     @Override
-    public void initialize(PlatformNativeLibrarySupport.NativeLibrary lib) {
+    public int initialize(PlatformNativeLibrarySupport.NativeLibrary lib) {
         String libName = lib.getCanonicalIdentifier();
         PointerBase onLoadFunction;
         if (lib.isBuiltin()) {
             onLoadFunction = getOnLoadSymbolAddress(libName);
             if (onLoadFunction.isNull()) {
-                /*
-                 * If pointer for static library not found, try to initialize library as shared
-                 */
                 String symbolName = getOnLoadName(libName, true);
                 onLoadFunction = lib.findSymbol(symbolName);
+                if (onLoadFunction.isNull()) {
+                    throw new UnsatisfiedLinkError("Missing mandatory function for statically linked JNI library: " + symbolName);
+                }
             }
         } else {
             String symbolName = getOnLoadName(libName, false);
             onLoadFunction = lib.findSymbol(symbolName);
         }
-        callOnLoadFunction(libName, onLoadFunction);
+        if (onLoadFunction.isNonNull()) {
+            JNIOnLoadFunctionPointer onLoad = (JNIOnLoadFunctionPointer) onLoadFunction;
+            int expected = onLoad.invoke(JNIFunctionTables.singleton().getGlobalJavaVM(), Word.nullPointer());
+            if (!JNIVersion.isSupported(expected, lib.isBuiltin())) {
+                throw new UnsatisfiedLinkError("Unsupported JNI version 0x" + Integer.toHexString(expected) + ", required by " + libName);
+            }
+            return expected;
+        }
+        return JNIVersion.JNI_VERSION_1_1();
     }
 
     private PointerBase getOnLoadSymbolAddress(String libName) {
         CGlobalData<PointerBase> symbol = onLoadCGlobalDataMap.get(libName);
-        return symbol == null ? WordFactory.nullPointer() : symbol.get();
+        return symbol == null ? Word.nullPointer() : symbol.get();
     }
 }

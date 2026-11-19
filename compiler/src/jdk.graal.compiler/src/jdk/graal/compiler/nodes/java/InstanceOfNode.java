@@ -30,6 +30,7 @@ import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_8;
 
 import java.util.Objects;
 
+import jdk.graal.compiler.core.common.NativeImageSupport;
 import jdk.graal.compiler.core.common.type.ObjectStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampFactory;
@@ -83,7 +84,7 @@ public class InstanceOfNode extends UnaryOpLogicNode implements Lowerable {
         this.checkedStamp = checkedStamp;
         this.profile = profile;
         this.anchor = anchor;
-        assert (profile == null) || (anchor != null) : "profiles must be anchored";
+        assert NativeImageSupport.inBuildtimeCode() || (profile == null) || (anchor != null) : "profiles must be anchored";
         assert checkedStamp != null;
         assert type() != null;
     }
@@ -147,7 +148,10 @@ public class InstanceOfNode extends UnaryOpLogicNode implements Lowerable {
             return IsNullNode.create(object);
         } else {
             ObjectStamp meetStamp = (ObjectStamp) checkedStamp.meet(inputStamp);
-            if (Objects.equals(checkedStamp.type(), meetStamp.type()) && checkedStamp.isExactType() == meetStamp.isExactType() && checkedStamp.alwaysNull() == meetStamp.alwaysNull()) {
+            if (Objects.equals(checkedStamp.type(), meetStamp.type()) &&
+                            checkedStamp.isExactType() == meetStamp.isExactType() &&
+                            checkedStamp.alwaysNull() == meetStamp.alwaysNull() &&
+                            checkedStamp.isAlwaysArray() == meetStamp.isAlwaysArray()) {
                 assert checkedStamp.nonNull() != inputStamp.nonNull() : Assertions.errorMessage(checkedStamp, inputStamp, object);
                 // The only difference between the two stamps is their null-ness => simplify the
                 // check.
@@ -210,7 +214,7 @@ public class InstanceOfNode extends UnaryOpLogicNode implements Lowerable {
         this.profile = typeProfile;
         updateUsagesInterface(this.anchor, anchor);
         this.anchor = anchor;
-        assert (profile == null) || (anchor != null) : "profiles must be anchored";
+        assert NativeImageSupport.inBuildtimeCode() || (profile == null) || (anchor != null) : "profiles must be anchored";
     }
 
     public AnchoringNode getAnchor() {

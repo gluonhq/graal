@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,17 +35,24 @@ import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport.NativeLibrary;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 @AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public final class NativeLibrarySupport extends NativeLibraries {
     // Essentially a revised implementation of the relevant methods in OpenJDK's ClassLoader
 
     public interface LibraryInitializer {
         boolean isBuiltinLibrary(String name);
 
-        void initialize(NativeLibrary lib);
+        int initialize(NativeLibrary lib);
     }
 
     public static NativeLibrarySupport singleton() {
@@ -70,18 +77,57 @@ public final class NativeLibrarySupport extends NativeLibraries {
     }
 
     @Platforms(HOSTED_ONLY.class)
-    public void preregisterUninitializedBuiltinLibrary(String name) {
+    public void registerUninitializedBuiltinLibrary(String name) {
         knownLibraries.add(PlatformNativeLibrarySupport.singleton().createLibrary(name, true));
-    }
-
-    @Platforms(HOSTED_ONLY.class)
-    public boolean isPreregisteredBuiltinLibrary(String name) {
-        return knownLibraries.stream().anyMatch(l -> l.isBuiltin() && l.getCanonicalIdentifier().equals(name));
     }
 
     @Override
     protected boolean addLibrary(String canonical, boolean builtin) {
         return addLibrary(builtin, canonical, true);
+    }
+
+    @Override
+    protected boolean addLibrary(String canonical, boolean builtin, boolean initialize) {
+        return addLibrary(builtin, canonical, initialize);
+    }
+
+    /**
+     * Loads libjava before Java filesystem classes are initialized. Unlike
+     * {@link #loadLibraryRelative(String)}, this method must not use {@link java.io.File},
+     * {@link java.nio.file.Path}, or filesystem canonicalization.
+     */
+    NativeLibrary loadDynamicLibjava() {
+        String libName = System.mapLibraryName("java");
+        String runtimeLibraryPath = SystemPropertiesSupport.singleton().getBootLibraryPath();
+        if (runtimeLibraryPath != null) {
+            String canonical = SystemPropertiesSupport.joinPath(runtimeLibraryPath, libName);
+            if (addLibrary(canonical, false)) {
+                NativeLibrary lib = findLoadedLibrary(canonical);
+                if (lib != null) {
+                    VMError.guarantee(!lib.isBuiltin());
+                    return lib;
+                }
+            }
+        }
+        throw new UnsatisfiedLinkError("Can't load dynamically linked libjava, using runtime library path: " + runtimeLibraryPath);
+    }
+
+    void loadBuiltinLibjava() {
+        if (!addLibrary("java", true)) {
+            throw new UnsatisfiedLinkError("Can't load statically linked libjava.");
+        }
+    }
+
+    /**
+     * The map {@code LibraryInitializer#onLoadCGlobalDataMap} uses identity equivalence, so we can't just pass on the name argument.
+     */
+    int loadBuiltinLibrary(String name) {
+        for (NativeLibrary known : knownLibraries) {
+            if (name.equals(known.getCanonicalIdentifier())) {
+                return libraryInitializer.initialize(known);
+            }
+        }
+        throw VMError.shouldNotReachHere(String.format("Built-in library %s was not found.", name));
     }
 
     private boolean addLibrary(boolean asBuiltin, String canonical, boolean initialize) {
@@ -140,6 +186,29 @@ public final class NativeLibrarySupport extends NativeLibraries {
         }
     }
 
+    /**
+     * Returns the loaded library, or {@code null} if it is unknown, failed to load,
+     * or has not yet completed its load and initialization sequence.
+     */
+    private NativeLibrary findLoadedLibrary(String canonical) {
+        lock.lock();
+        try {
+            for (NativeLibrary loading : currentLoadContext) {
+                if (canonical.equals(loading.getCanonicalIdentifier())) {
+                    return null;
+                }
+            }
+            for (NativeLibrary known : knownLibraries) {
+                if (canonical.equals(known.getCanonicalIdentifier()) && known.isLoaded()) {
+                    return known;
+                }
+            }
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     @Override
     public PointerBase findSymbol(String name) {
         lock.lock();
@@ -150,8 +219,11 @@ public final class NativeLibrarySupport extends NativeLibraries {
         }
     }
 
-    public void registerInitializedBuiltinLibrary(String name) {
-        boolean success = addLibrary(true, name, false);
-        assert success;
+    /**
+     * Records a process-wide initialized library in this isolate without invoking its initialization
+     * function again. The library may have been built into the image or dynamically linked.
+     */
+    public void registerInitializedLibrary(String name) {
+        loadLibraryRelative(name, false);
     }
 }

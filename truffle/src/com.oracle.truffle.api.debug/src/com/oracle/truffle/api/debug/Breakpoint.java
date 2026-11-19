@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.api.debug;
 
+import java.io.IOException;
 import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.net.URI;
@@ -130,8 +131,8 @@ import com.oracle.truffle.api.source.SourceSection;
  * <p>
  * Example usage:
  *
- * {@snippet file="com/oracle/truffle/api/debug/Breakpoint.java"
- * region="BreakpointSnippets#example"}
+ * {@snippet file = "com/oracle/truffle/api/debug/Breakpoint.java" region =
+ * "BreakpointSnippets#example"}
  *
  * @since 0.9
  */
@@ -171,8 +172,6 @@ public class Breakpoint {
          * @since 19.0
          */
         EXCEPTION;
-
-        static final Kind[] VALUES = values();
     }
 
     private static final Breakpoint BUILDER_INSTANCE = new Breakpoint();
@@ -584,7 +583,7 @@ public class Breakpoint {
 
     // We resolve breakpoints only in sources that are executed.
     // This prevents from premature breakpoint resolution to too distant locations.
-    private class LocationsInExecutedSources implements LoadSourceSectionListener, ExecuteSourceListener {
+    private final class LocationsInExecutedSources implements LoadSourceSectionListener, ExecuteSourceListener {
 
         private final EconomicMap<Source, SourceSection> loadedSections = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
         private final EconomicSet<Source> executedSources = EconomicSet.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
@@ -1248,7 +1247,7 @@ public class Breakpoint {
         void breakpointResolved(Breakpoint breakpoint, SourceSection section);
     }
 
-    private class BreakpointNodeFactory implements ExecutionEventNodeFactory {
+    private final class BreakpointNodeFactory implements ExecutionEventNodeFactory {
 
         @Override
         public ExecutionEventNode create(EventContext context) {
@@ -1671,7 +1670,12 @@ public class Breakpoint {
                 conditionSnippet = insert(snippet);
                 notifyInserted(snippet);
             } else {
-                CallTarget callTarget = Debugger.ACCESSOR.parse(conditionSource, instrumentedNode, new String[0]);
+                CallTarget callTarget;
+                try {
+                    callTarget = breakpoint.debugger.getEnv().parse(conditionSource);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Error parsing condition.", e);
+                }
                 conditionCallNode = insert(Truffle.getRuntime().createDirectCallNode(callTarget));
             }
         }

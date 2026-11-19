@@ -1,0 +1,126 @@
+/*
+ * Copyright (c) 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.dsl.processor.bytecode.generator;
+
+import static com.oracle.truffle.dsl.processor.bytecode.generator.BytecodeRootNodeElement.SourceInfoTable.emitDecodeVarintEntry;
+import static com.oracle.truffle.dsl.processor.bytecode.generator.BytecodeRootNodeElement.SourceInfoTable.emitInitCompressedSourceIterationVariables;
+import static com.oracle.truffle.dsl.processor.generator.GeneratorUtils.createConstructorUsingFields;
+import static javax.lang.model.element.Modifier.FINAL;
+import static javax.lang.model.element.Modifier.PRIVATE;
+import static javax.lang.model.element.Modifier.STATIC;
+
+import java.util.Set;
+
+import javax.lang.model.element.ElementKind;
+
+import com.oracle.truffle.dsl.processor.generator.GeneratorUtils;
+import com.oracle.truffle.dsl.processor.java.model.CodeExecutableElement;
+import com.oracle.truffle.dsl.processor.java.model.CodeTree;
+import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
+import com.oracle.truffle.dsl.processor.java.model.CodeVariableElement;
+
+final class SourceInformationImplElement extends AbstractElement {
+
+    SourceInformationImplElement(BytecodeRootNodeElement parent) {
+        super(parent, Set.of(PRIVATE, STATIC, FINAL), ElementKind.CLASS, null, "SourceInformationImpl");
+        this.setSuperClass(types.SourceInformation);
+
+        this.add(new CodeVariableElement(Set.of(FINAL), parent.abstractBytecodeNode.asType(), "bytecode"));
+        this.add(new CodeVariableElement(Set.of(FINAL), type(int.class), "baseIndex"));
+
+        CodeExecutableElement constructor = this.add(createConstructorUsingFields(Set.of(), this, null));
+        CodeTree tree = constructor.getBodyTree();
+        CodeTreeBuilder b = constructor.createBuilder();
+        b.startStatement().startSuperCall().staticReference(parent.bytecodeRootNodesImpl.asType(), "VISIBLE_TOKEN").end().end();
+        b.tree(tree);
+        this.add(createGetStartBytecodeIndex());
+        this.add(createGetEndBytecodeIndex());
+        this.add(createGetSourceSection());
+    }
+
+    private CodeExecutableElement createGetStartBytecodeIndex() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.SourceInformation, "getStartBytecodeIndex");
+        CodeTreeBuilder b = ex.createBuilder();
+        if (model().enableCompressedSources) {
+            emitInitCompressedSourceIterationVariables(b, type(int.class), "sourceInfoIndex", "baseIndex + 1");
+            CodeTree decodedValue = emitDecodeVarintEntry(b, "bytecode.sourceInfo", "sourceInfoIndex", null);
+            b.startReturn().tree(decodedValue).end();
+        } else {
+            b.startReturn().tree(parent.sourceInfoTable.loadStartBci("bytecode.sourceInfo", "baseIndex")).end();
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createGetEndBytecodeIndex() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.SourceInformation, "getEndBytecodeIndex");
+        CodeTreeBuilder b = ex.createBuilder();
+        if (model().enableCompressedSources) {
+            emitInitCompressedSourceIterationVariables(b, type(int.class), "sourceInfoIndex", "baseIndex + 1");
+            b.declaration(type(int.class), "startBci", emitDecodeVarintEntry(b, "bytecode.sourceInfo", "sourceInfoIndex"));
+            CodeTree decodedValue = emitDecodeVarintEntry(b, "bytecode.sourceInfo", "sourceInfoIndex", null);
+            b.startReturn().string("startBci + ").tree(decodedValue).end();
+        } else {
+            b.startReturn().tree(parent.sourceInfoTable.loadEndBci("bytecode.sourceInfo", "baseIndex")).end();
+        }
+        return ex;
+    }
+
+    private CodeExecutableElement createGetSourceSection() {
+        CodeExecutableElement ex = GeneratorUtils.override(types.SourceInformation, "getSourceSection");
+        CodeTreeBuilder b = ex.createBuilder();
+        if (model().enableCompressedSources) {
+            emitInitCompressedSourceIterationVariables(b, type(int.class), "sourceInfoIndex", "baseIndex + 1");
+            emitDecodeVarintEntry(b, "bytecode.sourceInfo", "sourceInfoIndex");
+            emitDecodeVarintEntry(b, "bytecode.sourceInfo", "sourceInfoIndex");
+            b.startReturn().startStaticCall(parent.sourceInfoTable.createSourceSection);
+            b.string("bytecode.sources").string("bytecode.sourceInfo").string("sourceInfoIndex");
+            b.end(2);
+        } else {
+            b.startReturn().startStaticCall(parent.sourceInfoTable.createSourceSection);
+            b.string("bytecode.sources");
+            b.string("bytecode.sourceInfo");
+            b.string("baseIndex");
+            b.end(2);
+        }
+        return ex;
+    }
+
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,10 @@
  */
 package jdk.graal.compiler.lir.amd64;
 
-import static jdk.vm.ci.amd64.AMD64.r8;
-import static jdk.vm.ci.amd64.AMD64.r9;
-import static jdk.vm.ci.amd64.AMD64.rax;
-import static jdk.vm.ci.amd64.AMD64.rcx;
-import static jdk.vm.ci.amd64.AMD64.rdi;
-import static jdk.vm.ci.amd64.AMD64.rdx;
-import static jdk.vm.ci.amd64.AMD64.rsi;
-import static jdk.vm.ci.code.ValueUtil.asRegister;
-import static jdk.vm.ci.code.ValueUtil.isIllegal;
 import static jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64BinaryArithmetic.OR;
 import static jdk.graal.compiler.asm.amd64.AMD64Assembler.AMD64BinaryArithmetic.XOR;
+import static jdk.vm.ci.code.ValueUtil.asRegister;
+import static jdk.vm.ci.code.ValueUtil.isIllegal;
 
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -43,7 +36,7 @@ import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.asm.amd64.AMD64Address;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler;
 import jdk.graal.compiler.asm.amd64.AMD64Assembler.ConditionFlag;
-import jdk.graal.compiler.asm.amd64.AMD64Assembler.SSEOp;
+import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler;
 import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandSize;
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
 import jdk.graal.compiler.asm.amd64.AVXKind.AVXSize;
@@ -53,15 +46,12 @@ import jdk.graal.compiler.core.common.StrideUtil;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.lir.LIRInstructionClass;
-import jdk.graal.compiler.lir.LIRValueUtil;
 import jdk.graal.compiler.lir.Opcode;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.graal.compiler.lir.gen.LIRGeneratorTool;
-
 import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.code.TargetDescription;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.Value;
@@ -77,14 +67,6 @@ import jdk.vm.ci.meta.Value;
 public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
     public static final LIRInstructionClass<AMD64ArrayEqualsOp> TYPE = LIRInstructionClass.create(AMD64ArrayEqualsOp.class);
 
-    private static final Register REG_ARRAY_A = rsi;
-    private static final Register REG_OFFSET_A = rax;
-    private static final Register REG_ARRAY_B = rdi;
-    private static final Register REG_OFFSET_B = rcx;
-    private static final Register REG_MASK = r8;
-    private static final Register REG_LENGTH = rdx;
-    private static final Register REG_STRIDE = r9;
-
     private final JavaKind elementKind;
     private final int constLength;
     private final Stride argStrideA;
@@ -94,29 +76,46 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
     private final boolean canGenerateConstantLengthCompare;
 
     @Def({OperandFlag.REG}) private Value resultValue;
-    @Use({OperandFlag.REG}) private Value arrayAValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetAValue;
-    @Use({OperandFlag.REG}) private Value arrayBValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value arrayMaskValue;
-    @Use({OperandFlag.REG}) private Value lengthValue;
-    @Use({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStridesValue;
-
-    @Temp({OperandFlag.REG}) private Value arrayAValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetAValueTemp;
-    @Temp({OperandFlag.REG}) private Value arrayBValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value arrayMaskValueTemp;
-    @Temp({OperandFlag.REG}) private Value lengthValueTemp;
-    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStrideValueTemp;
+    @UseKill({OperandFlag.REG}) private Value arrayAValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetAValue;
+    @UseKill({OperandFlag.REG}) private Value arrayBValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value offsetBValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value arrayMaskValue;
+    @UseKill({OperandFlag.REG}) private Value lengthValue;
+    @UseKill({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value dynamicStridesValue;
 
     @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value tempXMM;
 
     @Temp({OperandFlag.REG}) private Value[] vectorTemp;
+    @Temp({OperandFlag.REG, OperandFlag.ILLEGAL}) private Value tempMask;
 
-    private AMD64ArrayEqualsOp(LIRGeneratorTool tool, JavaKind elementKind, Stride strideA, Stride strideB, Stride strideMask,
+    /**
+     * Compares array regions of length {@code length} in {@code arrayA} and {@code arrayB},
+     * starting at byte offset {@code offsetA} and {@code offsetB}, respectively. If
+     * {@code arrayMask} is not {@code null}, it is OR-ed with {@code arrayA} before comparison with
+     * {@code arrayB}.
+     *
+     * @param elementKind Array element kind. This is only relevant when comparing values of
+     *            {@link JavaKind#Float} or {@link JavaKind#Double}. In this case, all strides must
+     *            be equal to the element kind's {@link JavaKind#getByteCount() byte count}. If no
+     *            floating-point comparison should be done, this parameter should be set to
+     *            {@link JavaKind#Byte}.
+     * @param strideA element size of {@code arrayA}. May be {@code null} if {@code dynamicStrides}
+     *            is used.
+     * @param strideB element size of {@code arrayB}. May be {@code null} if {@code dynamicStrides}
+     *            is used.
+     * @param strideMask element size of {@code arrayMask}. May be {@code null} if
+     *            {@code dynamicStrides} is used.
+     * @param offsetA byte offset to be added to {@code arrayA}.
+     * @param offsetB byte offset to be added to {@code arrayB}.
+     * @param length length (number of array slots in respective array's stride) of the region to
+     *            compare.
+     * @param dynamicStrides dynamic stride dispatch as described in {@link StrideUtil}.
+     * @param extendMode integer extension mode for the array with the smaller element size.
+     */
+    public AMD64ArrayEqualsOp(LIRGeneratorTool tool, JavaKind elementKind, Stride strideA, Stride strideB, Stride strideMask,
                     EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
-                    Value result, Value arrayA, Value offsetA, Value arrayB, Value offsetB, Value mask, Value length, Value dynamicStrides,
+                    Value result, Value arrayA, Value offsetA, Value arrayB, Value offsetB, Value arrayMask, Value length, Value dynamicStrides,
                     AMD64MacroAssembler.ExtendMode extendMode, int constLength) {
         super(TYPE, tool, runtimeCheckedCPUFeatures, AVXSize.YMM);
         this.extendMode = extendMode;
@@ -135,13 +134,13 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         this.canGenerateConstantLengthCompare = canGenerateConstantLengthCompare(tool.target(), runtimeCheckedCPUFeatures, elementKind, strideA, strideB, constLength, dynamicStrides, vectorSize);
 
         this.resultValue = result;
-        this.arrayAValue = this.arrayAValueTemp = arrayA;
-        this.offsetAValue = this.offsetAValueTemp = offsetA;
-        this.arrayBValue = this.arrayBValueTemp = arrayB;
-        this.offsetBValue = this.offsetBValueTemp = offsetB;
-        this.arrayMaskValue = this.arrayMaskValueTemp = mask;
-        this.lengthValue = this.lengthValueTemp = length;
-        this.dynamicStridesValue = this.dynamicStrideValueTemp = dynamicStrides;
+        this.arrayAValue = arrayA;
+        this.offsetAValue = offsetA;
+        this.arrayBValue = arrayB;
+        this.offsetBValue = offsetB;
+        this.arrayMaskValue = arrayMask;
+        this.lengthValue = length;
+        this.dynamicStridesValue = dynamicStrides;
 
         if (elementKind == JavaKind.Float) {
             this.tempXMM = tool.newVariable(LIRKind.value(AMD64Kind.SINGLE));
@@ -161,102 +160,12 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         } else {
             this.vectorTemp = new Value[0];
         }
-    }
 
-    public static AMD64ArrayEqualsOp movParamsAndCreate(
-                    LIRGeneratorTool tool,
-                    EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
-                    Value result,
-                    Value arrayA, Value offsetA,
-                    Value arrayB, Value offsetB,
-                    Value mask,
-                    Value length,
-                    Value dynamicStrides,
-                    AMD64MacroAssembler.ExtendMode extendMode) {
-        return movParamsAndCreate(tool, null, null, null, null,
-                        runtimeCheckedCPUFeatures,
-                        result,
-                        arrayA, offsetA,
-                        arrayB, offsetB,
-                        mask,
-                        length,
-                        dynamicStrides,
-                        extendMode);
-    }
-
-    public static AMD64ArrayEqualsOp movParamsAndCreate(LIRGeneratorTool tool,
-                    Stride strideA, Stride strideB, Stride strideMask,
-                    EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
-                    Value result,
-                    Value arrayA, Value offsetA,
-                    Value arrayB, Value offsetB,
-                    Value mask,
-                    Value length,
-                    AMD64MacroAssembler.ExtendMode extendMode) {
-        return movParamsAndCreate(tool, null, strideA, strideB, strideMask, runtimeCheckedCPUFeatures,
-                        result,
-                        arrayA, offsetA,
-                        arrayB, offsetB,
-                        mask,
-                        length,
-                        null,
-                        extendMode);
-    }
-
-    /**
-     * Compares array regions of length {@code length} in {@code arrayA} and {@code arrayB},
-     * starting at byte offset {@code offsetA} and {@code offsetB}, respectively. If
-     * {@code arrayMask} is not {@code null}, it is OR-ed with {@code arrayA} before comparison with
-     * {@code arrayB}.
-     *
-     * @param elementKind Array element kind. This is only relevant when comparing values of
-     *            {@link JavaKind#Float} or {@link JavaKind#Double}. In this case, all strides must
-     *            be equal to the element kind's {@link JavaKind#getByteCount() byte count}. If no
-     *            floating-point comparison should be done, this parameter should be set to
-     *            {@link JavaKind#Byte}.
-     * @param strideA element size of {@code arrayA}. May be {@code null} if {@code dynamicStrides}
-     *            is used.
-     * @param strideB element size of {@code arrayB}. May be {@code null} if {@code dynamicStrides}
-     *            is used.
-     * @param strideMask element size of {@code mask}. May be {@code null} if {@code dynamicStrides}
-     *            is used.
-     * @param offsetA byte offset to be added to {@code arrayA}.
-     * @param offsetB byte offset to be added to {@code arrayB}.
-     * @param length length (number of array slots in respective array's stride) of the region to
-     *            compare.
-     * @param dynamicStrides dynamic stride dispatch as described in {@link StrideUtil}.
-     * @param extendMode integer extension mode for the array with the smaller element size.
-     */
-    public static AMD64ArrayEqualsOp movParamsAndCreate(LIRGeneratorTool tool,
-                    JavaKind elementKind,
-                    Stride strideA, Stride strideB, Stride strideMask,
-                    EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
-                    Value result,
-                    Value arrayA, Value offsetA,
-                    Value arrayB, Value offsetB, Value arrayMask, Value length, Value dynamicStrides,
-                    AMD64MacroAssembler.ExtendMode extendMode) {
-        RegisterValue regArrayA = REG_ARRAY_A.asValue(arrayA.getValueKind());
-        RegisterValue regOffsetA = REG_OFFSET_A.asValue(offsetA.getValueKind());
-        RegisterValue regArrayB = REG_ARRAY_B.asValue(arrayB.getValueKind());
-        RegisterValue regOffsetB = REG_OFFSET_B.asValue(offsetB.getValueKind());
-        Value regMask = arrayMask == null ? Value.ILLEGAL : REG_MASK.asValue(arrayMask.getValueKind());
-        RegisterValue regLength = REG_LENGTH.asValue(length.getValueKind());
-        Value regStride = dynamicStrides == null ? Value.ILLEGAL : REG_STRIDE.asValue(dynamicStrides.getValueKind());
-
-        tool.emitConvertNullToZero(regArrayA, arrayA);
-        tool.emitConvertNullToZero(regArrayB, arrayB);
-        tool.emitMove(regLength, length);
-        tool.emitMove(regOffsetA, offsetA);
-        tool.emitMove(regOffsetB, offsetB);
-        if (arrayMask != null) {
-            tool.emitMove((RegisterValue) regMask, arrayMask);
+        if (supports(tool.target(), runtimeCheckedCPUFeatures, AMD64BaseAssembler.FULL_AVX512_FEATURES)) {
+            this.tempMask = tool.newVariable(LIRKind.value(AMD64Kind.MASK64));
+        } else {
+            this.tempMask = Value.ILLEGAL;
         }
-        if (dynamicStrides != null) {
-            tool.emitMove((RegisterValue) regStride, dynamicStrides);
-        }
-        return new AMD64ArrayEqualsOp(tool, elementKind == null ? JavaKind.Byte : elementKind, strideA, strideB, strideMask,
-                        runtimeCheckedCPUFeatures, result, regArrayA, regOffsetA, regArrayB, regOffsetB, regMask, regLength, regStride,
-                        extendMode, LIRValueUtil.isJavaConstant(length) ? LIRValueUtil.asJavaConstant(length).asInt() : -1);
     }
 
     private static boolean canGenerateConstantLengthCompare(TargetDescription target, EnumSet<CPUFeature> runtimeCheckedCPUFeatures,
@@ -306,7 +215,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
             emitConstantLengthArrayCompareBytes(masm, result);
         } else {
             Register length = asRegister(lengthValue);
-            Register tmp = asRegister(offsetAValueTemp);
+            Register tmp = asRegister(offsetAValue);
             if (withDynamicStrides()) {
                 assert elementKind.isNumericInteger();
                 Label[] variants = new Label[9];
@@ -479,9 +388,9 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         return vSize.getBytes() >> maxStride.log2;
     }
 
-    private static void emitVectorCmp(AMD64MacroAssembler masm, Register vector1, Register vector2, AVXSize size) {
+    private void emitVectorCmp(AMD64MacroAssembler masm, Register vector1, Register vector2, AVXSize size) {
         masm.pxor(size, vector1, vector2);
-        masm.ptest(size, vector1, vector1);
+        emitPtest(masm, size, tempMask, vector1, vector1);
     }
 
     /**
@@ -505,7 +414,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         Label loopCheck = new Label();
         Label nanCheck = new Label();
 
-        Register temp = asRegister(offsetAValueTemp);
+        Register temp = asRegister(offsetAValue);
 
         masm.andl(result, elementsPerVector - 1); // tail count
         masm.andlAndJcc(length, ~(elementsPerVector - 1), ConditionFlag.Zero, compareTail, false);
@@ -561,9 +470,9 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
             if (withMask()) {
                 masm.orq(temp, new AMD64Address(mask, result, strideMask, -VECTOR_SIZE));
             }
-            masm.cmpqAndJcc(temp, new AMD64Address(arrayB, result, strideB, -VECTOR_SIZE), ConditionFlag.NotEqual, falseLabel, true);
+            masm.cmpqAndJcc(temp, new AMD64Address(arrayB, result, strideB, -VECTOR_SIZE), ConditionFlag.NotEqual, falseLabel, false);
         }
-        masm.jmpb(trueLabel);
+        masm.jmp(trueLabel);
 
         masm.bind(compareTail);
         masm.movl(length, result);
@@ -579,7 +488,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         Label compare2Bytes = new Label();
         Label compare1Byte = new Label();
 
-        Register temp = asRegister(offsetAValueTemp);
+        Register temp = asRegister(offsetAValue);
 
         if (strideA.value <= 4) {
             // Compare trailing 4 bytes, if any.
@@ -587,9 +496,9 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
             masm.movl(temp, new AMD64Address(arrayA, 0));
             if (elementKind == JavaKind.Float) {
                 assert !withMask();
-                masm.cmplAndJcc(temp, new AMD64Address(arrayB, 0), ConditionFlag.Equal, trueLabel, true);
+                masm.cmplAndJcc(temp, new AMD64Address(arrayB, 0), ConditionFlag.Equal, trueLabel, false);
                 emitFloatCompare(masm, strideA, strideB, arrayA, arrayB, Register.None, 0, falseLabel, true);
-                masm.jmpb(trueLabel);
+                masm.jmp(trueLabel);
             } else {
                 if (withMask()) {
                     masm.orl(temp, new AMD64Address(mask, 0));
@@ -652,8 +561,8 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
 
         int elementsPerLoopIteration = 2;
 
-        Register tmp1 = asRegister(offsetAValueTemp);
-        Register tmp2 = asRegister(offsetBValueTemp);
+        Register tmp1 = asRegister(offsetAValue);
+        Register tmp2 = asRegister(offsetBValue);
 
         masm.andl(result, elementsPerLoopIteration - 1); // tail count
         masm.andlAndJcc(length, ~(elementsPerLoopIteration - 1), ConditionFlag.Zero, compareTail, true);
@@ -709,7 +618,11 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
         } else {
             masm.movdbl(tempXMMReg, src);
         }
-        SSEOp.UCOMIS.emit(masm, elementKind == JavaKind.Float ? OperandSize.PS : OperandSize.PD, tempXMMReg, tempXMMReg);
+        if (elementKind == JavaKind.Float) {
+            masm.ucomiss(tempXMMReg, tempXMMReg);
+        } else {
+            masm.ucomisd(tempXMMReg, tempXMMReg);
+        }
         masm.jcc(ConditionFlag.NoParity, branchIfNonNaN);
     }
 
@@ -727,7 +640,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
 
         if (!skipBitwiseCompare) {
             // Bitwise compare
-            Register temp = asRegister(offsetAValueTemp);
+            Register temp = asRegister(offsetAValue);
 
             if (elementKind == JavaKind.Float) {
                 masm.movl(temp, address1);
@@ -751,7 +664,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
                     Stride strideA, Stride strideB, Register arrayA, Register arrayB, Register index, int offset, Label falseLabel, int range) {
         assert elementKind.isNumericFloat();
         Label loop = new Label();
-        Register i = asRegister(offsetBValueTemp);
+        Register i = asRegister(offsetBValue);
 
         masm.movq(i, range);
         masm.negq(i);
@@ -833,7 +746,7 @@ public final class AMD64ArrayEqualsOp extends AMD64ComplexVectorOp {
                 asm.por(vSize, vector1, vector3);
             }
             asm.xorq(arrayA, arrayA);
-            asm.ptest(vSize, vector1, vector1);
+            emitPtest(asm, vSize, tempMask, vector1, vector1);
             asm.cmovl(AMD64Assembler.ConditionFlag.NotZero, result, arrayA);
         }
     }

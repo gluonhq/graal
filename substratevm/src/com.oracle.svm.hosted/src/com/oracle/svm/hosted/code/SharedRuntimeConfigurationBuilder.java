@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,11 +29,9 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.function.Function;
 
-import org.graalvm.nativeimage.ImageSingletons;
-
 import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.GraalConfiguration;
 import com.oracle.svm.core.graal.code.SubstrateBackend;
 import com.oracle.svm.core.graal.code.SubstratePlatformConfigurationProvider;
@@ -51,8 +49,7 @@ import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.core.common.spi.ConstantFieldProvider;
 import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
 import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
-import jdk.graal.compiler.debug.DebugHandlersFactory;
-import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
+import jdk.graal.compiler.debug.DebugDumpHandlersFactory;
 import jdk.graal.compiler.nodes.spi.LoopsDataProvider;
 import jdk.graal.compiler.nodes.spi.LoweringProvider;
 import jdk.graal.compiler.nodes.spi.PlatformConfigurationProvider;
@@ -61,7 +58,6 @@ import jdk.graal.compiler.nodes.spi.StampProvider;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.graal.compiler.printer.GraalDebugHandlersFactory;
-import jdk.graal.compiler.serviceprovider.GraalServices;
 import jdk.graal.compiler.word.WordTypes;
 import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.code.RegisterConfig;
@@ -74,19 +70,16 @@ public abstract class SharedRuntimeConfigurationBuilder {
     protected final UniverseMetaAccess metaAccess;
     protected final Function<Providers, SubstrateBackend> backendProvider;
     protected final ClassInitializationSupport classInitializationSupport;
-    protected final LoopsDataProvider originalLoopsDataProvider;
     protected final SubstratePlatformConfigurationProvider platformConfig;
     protected final SnippetReflectionProvider snippetReflection;
 
     public SharedRuntimeConfigurationBuilder(OptionValues options, SVMHost hostVM, UniverseMetaAccess metaAccess, Function<Providers, SubstrateBackend> backendProvider,
-                    ClassInitializationSupport classInitializationSupport, LoopsDataProvider originalLoopsDataProvider,
-                    SubstratePlatformConfigurationProvider platformConfig, SnippetReflectionProvider snippetReflection) {
+                    ClassInitializationSupport classInitializationSupport, SubstratePlatformConfigurationProvider platformConfig, SnippetReflectionProvider snippetReflection) {
         this.options = options;
         this.hostVM = hostVM;
         this.metaAccess = metaAccess;
         this.backendProvider = backendProvider;
         this.classInitializationSupport = classInitializationSupport;
-        this.originalLoopsDataProvider = originalLoopsDataProvider;
         this.platformConfig = platformConfig;
         this.snippetReflection = snippetReflection;
     }
@@ -102,12 +95,13 @@ public abstract class SharedRuntimeConfigurationBuilder {
 
         ConstantFieldProvider constantFieldProvider = createConstantFieldProvider();
 
+        SubstrateTarget target = SubstrateTarget.singleton();
         for (ConfigKind config : ConfigKind.values()) {
-            registerConfigs.put(config, ImageSingletons.lookup(SubstrateRegisterConfigFactory.class).newRegisterFactory(config, metaAccess, ConfigurationValues.getTarget(),
+            registerConfigs.put(config, SubstrateRegisterConfigFactory.singleton().newRegisterFactory(config, metaAccess, target,
                             SubstrateOptions.PreserveFramePointer.getValue()));
         }
 
-        WordTypes wordTypes = new SubstrateWordTypes(metaAccess, ConfigurationValues.getWordKind());
+        WordTypes wordTypes = new SubstrateWordTypes(metaAccess, target.wordJavaKind);
 
         ForeignCallsProvider foreignCalls = createForeignCallsProvider(registerConfigs.get(ConfigKind.NORMAL));
 
@@ -117,35 +111,30 @@ public abstract class SharedRuntimeConfigurationBuilder {
 
         LoweringProvider lowerer = createLoweringProvider(foreignCalls, metaAccessExtensionProvider);
 
-        LoopsDataProvider loopsDataProvider = originalLoopsDataProvider;
+        LoopsDataProvider loopsDataProvider = GraalConfiguration.runtimeInstance().createLoopsDataProvider();
 
-        /*
-         * To simplify future merging of IdentityHashCodeProvider into ConstantReflectionProvider,
-         * all of our implementation classes are already merged.
-         */
-        IdentityHashCodeProvider identityHashCodeProvider = (IdentityHashCodeProvider) constantReflection;
-
-        Providers p = createProviders(null, constantReflection, constantFieldProvider, foreignCalls, lowerer, null, stampProvider, snippetReflection, platformConfig, metaAccessExtensionProvider,
-                        wordTypes, loopsDataProvider, identityHashCodeProvider);
+        Providers providers = createProviders(null, constantReflection, constantFieldProvider, foreignCalls, lowerer, null, stampProvider, snippetReflection, platformConfig,
+                        metaAccessExtensionProvider,
+                        wordTypes, loopsDataProvider);
 
         /*
          * Use the snippet reflection provider during image building replacement. It will be
          * replaced by the GraalGraphObjectReplacer for run time compilation.
          */
-        Replacements replacements = createReplacements(p);
-        p = (Providers) replacements.getProviders();
+        Replacements replacements = createReplacements(providers);
+        providers = (Providers) replacements.getProviders();
 
         EnumMap<ConfigKind, SubstrateBackend> backends = new EnumMap<>(ConfigKind.class);
         for (ConfigKind config : ConfigKind.values()) {
             CodeCacheProvider codeCacheProvider = createCodeCacheProvider(registerConfigs.get(config));
 
             Providers newProviders = createProviders(codeCacheProvider, constantReflection, constantFieldProvider, foreignCalls, lowerer, replacements, stampProvider,
-                            snippetReflection, platformConfig, metaAccessExtensionProvider, wordTypes, loopsDataProvider, identityHashCodeProvider);
+                            snippetReflection, platformConfig, metaAccessExtensionProvider, wordTypes, loopsDataProvider);
             backends.put(config, GraalConfiguration.runtimeInstance().createBackend(newProviders));
         }
 
-        List<DebugHandlersFactory> handlers = new ArrayList<>();
-        for (DebugHandlersFactory factory : GraalServices.load(DebugHandlersFactory.class)) {
+        List<DebugDumpHandlersFactory> handlers = new ArrayList<>();
+        for (DebugDumpHandlersFactory factory : DebugDumpHandlersFactory.LOADER) {
             if (factory instanceof GraalDebugHandlersFactory) {
                 handlers.add(new GraalDebugHandlersFactory(snippetReflection));
             } else {
@@ -153,14 +142,13 @@ public abstract class SharedRuntimeConfigurationBuilder {
             }
         }
 
-        return new RuntimeConfiguration(p, backends, handlers);
+        return new RuntimeConfiguration(providers, backends, handlers);
     }
 
     protected abstract Providers createProviders(CodeCacheProvider codeCache, ConstantReflectionProvider constantReflection, ConstantFieldProvider constantFieldProvider,
                     ForeignCallsProvider foreignCalls,
                     LoweringProvider lowerer, Replacements replacements, StampProvider stampProvider, SnippetReflectionProvider reflectionProvider,
-                    PlatformConfigurationProvider platformConfigurationProvider, MetaAccessExtensionProvider metaAccessExtensionProvider, WordTypes wordTypes, LoopsDataProvider loopsDataProvider,
-                    IdentityHashCodeProvider identityHashCodeProvider);
+                    PlatformConfigurationProvider platformConfigurationProvider, MetaAccessExtensionProvider metaAccessExtensionProvider, WordTypes wordTypes, LoopsDataProvider loopsDataProvider);
 
     protected abstract ConstantReflectionProvider createConstantReflectionProvider();
 
@@ -176,7 +164,7 @@ public abstract class SharedRuntimeConfigurationBuilder {
 
     protected abstract LoweringProvider createLoweringProvider(ForeignCallsProvider foreignCalls, MetaAccessExtensionProvider metaAccessExtensionProvider);
 
-    protected abstract Replacements createReplacements(Providers p);
+    protected abstract Replacements createReplacements(Providers providers);
 
     protected abstract CodeCacheProvider createCodeCacheProvider(RegisterConfig registerConfig);
 }

@@ -31,6 +31,10 @@ import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.profiles.BranchProfile;
 
+/**
+ * Lightweight Truffle interop wrapper that exposes a Java array as a readable foreign array. Used
+ * throughout Espresso when array-shaped results need to cross an interop boundary.
+ */
 @ExportLibrary(InteropLibrary.class)
 public final class KeysArray<T> implements TruffleObject {
     @CompilationFinal(dimensions = 1) private final T[] keys;

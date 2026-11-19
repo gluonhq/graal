@@ -30,7 +30,6 @@ import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.jfr.HasJfrSupport;
 import com.oracle.svm.core.jfr.JfrEvent;
@@ -40,8 +39,12 @@ import com.oracle.svm.core.jfr.JfrNativeEventWriterDataAccess;
 import com.oracle.svm.core.jfr.SubstrateJVM;
 import com.oracle.svm.core.thread.PlatformThreads;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalLong;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalLong;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 
 public class JfrAllocationEvents {
     private static final FastThreadLocalLong lastThreadAllocatedBytes = FastThreadLocalFactory.createLong("JfrAllocationEvents.lastThreadAllocatedBytes");
@@ -52,48 +55,75 @@ public class JfrAllocationEvents {
         }
     }
 
-    public static void emit(long startTicks, DynamicHub hub, UnsignedWord allocationSize, UnsignedWord tlabSize) {
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/memAllocator.cpp#L209-L220")
+    @AlwaysInline("Keep allocation event checks inline in allocation slow paths.")
+    @Uninterruptible(reason = "Emits a JFR event from the uninterruptible allocation slowpath.", callerMustBe = true)
+    public static void emit(long startTicks, DynamicHub hub, UnsignedWord allocationSize, UnsignedWord tlabSize, boolean allocatedOutsideTlab) {
         if (HasJfrSupport.get()) {
-            emitObjectAllocationInNewTLAB(startTicks, hub, allocationSize, tlabSize);
-            emitObjectAllocationSample(startTicks, hub);
+            if (allocatedOutsideTlab) {
+                if (JfrEvent.ObjectAllocationOutsideTLAB.shouldEmit()) {
+                    emitObjectAllocationOutsideTLAB(startTicks, hub, allocationSize);
+                }
+            } else if (tlabSize.notEqual(0) && JfrEvent.ObjectAllocationInNewTLAB.shouldEmit()) {
+                emitObjectAllocationInNewTLAB(startTicks, hub, allocationSize, tlabSize);
+            }
+            if (JfrEvent.ObjectAllocationSample.shouldEmit()) {
+                emitObjectAllocationSample(startTicks, hub);
+            }
         }
     }
 
+    @NeverInline("Keep event writing out of allocation slow paths.")
     @Uninterruptible(reason = "Accesses a JFR buffer.")
     private static void emitObjectAllocationInNewTLAB(long startTicks, DynamicHub hub, UnsignedWord allocationSize, UnsignedWord tlabSize) {
-        if (JfrEvent.ObjectAllocationInNewTLAB.shouldEmit()) {
-            JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
-            JfrNativeEventWriterDataAccess.initializeThreadLocalNativeBuffer(data);
+        assert startTicks != 0;
+        JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
+        JfrNativeEventWriterDataAccess.initializeThreadLocalNativeBuffer(data);
 
-            JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.ObjectAllocationInNewTLAB);
-            JfrNativeEventWriter.putLong(data, startTicks);
-            JfrNativeEventWriter.putEventThread(data);
-            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.ObjectAllocationInNewTLAB, 0));
-            JfrNativeEventWriter.putClass(data, DynamicHub.toClass(hub));
-            JfrNativeEventWriter.putLong(data, allocationSize.rawValue());
-            JfrNativeEventWriter.putLong(data, tlabSize.rawValue());
-            JfrNativeEventWriter.endSmallEvent(data);
-        }
+        JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.ObjectAllocationInNewTLAB);
+        JfrNativeEventWriter.putLong(data, startTicks);
+        JfrNativeEventWriter.putEventThread(data);
+        JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.ObjectAllocationInNewTLAB));
+        JfrNativeEventWriter.putClass(data, DynamicHub.toClass(hub));
+        JfrNativeEventWriter.putLong(data, allocationSize.rawValue());
+        JfrNativeEventWriter.putLong(data, tlabSize.rawValue());
+        JfrNativeEventWriter.endSmallEvent(data);
     }
 
+    @NeverInline("Keep event writing out of allocation slow paths.")
+    @Uninterruptible(reason = "Accesses a JFR buffer.")
+    private static void emitObjectAllocationOutsideTLAB(long startTicks, DynamicHub hub, UnsignedWord allocationSize) {
+        assert startTicks != 0;
+        JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
+        JfrNativeEventWriterDataAccess.initializeThreadLocalNativeBuffer(data);
+
+        JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.ObjectAllocationOutsideTLAB);
+        JfrNativeEventWriter.putLong(data, startTicks);
+        JfrNativeEventWriter.putEventThread(data);
+        JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.ObjectAllocationOutsideTLAB));
+        JfrNativeEventWriter.putClass(data, DynamicHub.toClass(hub));
+        JfrNativeEventWriter.putLong(data, allocationSize.rawValue());
+        JfrNativeEventWriter.endSmallEvent(data);
+    }
+
+    @NeverInline("Keep event writing out of allocation slow paths.")
     @Uninterruptible(reason = "Accesses a JFR buffer.")
     private static void emitObjectAllocationSample(long startTicks, DynamicHub hub) {
-        if (JfrEvent.ObjectAllocationSample.shouldEmit()) {
-            long threadAllocatedBytes = PlatformThreads.getThreadAllocatedBytes();
-            long weight = threadAllocatedBytes - lastThreadAllocatedBytes.get();
-            assert weight > 0;
+        assert startTicks != 0;
+        long threadAllocatedBytes = PlatformThreads.getThreadAllocatedBytes();
+        long weight = threadAllocatedBytes - lastThreadAllocatedBytes.get();
+        assert weight > 0;
 
-            JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
-            JfrNativeEventWriterDataAccess.initializeThreadLocalNativeBuffer(data);
-            JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.ObjectAllocationSample);
-            JfrNativeEventWriter.putLong(data, startTicks);
-            JfrNativeEventWriter.putEventThread(data);
-            JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.ObjectAllocationSample, 0));
-            JfrNativeEventWriter.putClass(data, DynamicHub.toClass(hub));
-            JfrNativeEventWriter.putLong(data, weight);
-            JfrNativeEventWriter.endSmallEvent(data);
+        JfrNativeEventWriterData data = StackValue.get(JfrNativeEventWriterData.class);
+        JfrNativeEventWriterDataAccess.initializeThreadLocalNativeBuffer(data);
+        JfrNativeEventWriter.beginSmallEvent(data, JfrEvent.ObjectAllocationSample);
+        JfrNativeEventWriter.putLong(data, startTicks);
+        JfrNativeEventWriter.putEventThread(data);
+        JfrNativeEventWriter.putLong(data, SubstrateJVM.get().getStackTraceId(JfrEvent.ObjectAllocationSample));
+        JfrNativeEventWriter.putClass(data, DynamicHub.toClass(hub));
+        JfrNativeEventWriter.putLong(data, weight);
+        JfrNativeEventWriter.endSmallEvent(data);
 
-            lastThreadAllocatedBytes.set(threadAllocatedBytes);
-        }
+        lastThreadAllocatedBytes.set(threadAllocatedBytes);
     }
 }

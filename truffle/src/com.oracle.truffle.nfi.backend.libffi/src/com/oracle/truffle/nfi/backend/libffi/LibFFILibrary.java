@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,7 +41,6 @@
 package com.oracle.truffle.nfi.backend.libffi;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -113,7 +112,7 @@ final class LibFFILibrary implements TruffleObject {
     @ExportMessage
     Object readMember(String symbol,
                     @Cached InlinedBranchProfile exception,
-                    @Bind("$node") Node node) throws UnknownIdentifierException {
+                    @Bind Node node) throws UnknownIdentifierException {
         try {
             return LibFFIContext.get(node).lookupSymbol(this, symbol);
         } catch (NFIUnsatisfiedLinkError ex) {
@@ -124,14 +123,14 @@ final class LibFFILibrary implements TruffleObject {
 
     @ExportMessage
     @SuppressWarnings("static-method")
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @ExportMessage
     @SuppressWarnings("static-method")
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return LibFFILanguage.class;
+    String getLanguageId() {
+        return LibFFILanguage.ID;
     }
 
     @ExportMessage

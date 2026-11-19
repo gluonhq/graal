@@ -45,6 +45,8 @@ public class LowTierLoweringPhase extends LoweringPhase {
     public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
         return NotApplicable.ifAny(
                         super.notApplicableTo(graphState),
-                        NotApplicable.ifApplied(this, StageFlag.LOW_TIER_LOWERING, graphState));
+                        NotApplicable.ifApplied(this, StageFlag.LOW_TIER_LOWERING, graphState),
+                        NotApplicable.unlessRunAfter(this, StageFlag.MID_TIER_LOWERING, graphState),
+                        NotApplicable.unlessRunAfter(this, StageFlag.FSA, graphState));
     }
 }

@@ -29,16 +29,17 @@ import java.util.function.Supplier;
 
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.core.graal.isolated.ClientIsolateThread;
+import com.oracle.svm.core.graal.isolated.CompilerHandle;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileClient;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileContext;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.graal.isolated.ClientHandle;
-import com.oracle.svm.graal.isolated.ClientIsolateThread;
-import com.oracle.svm.graal.isolated.CompilerHandle;
 import com.oracle.svm.graal.isolated.ImageHeapObjects;
 import com.oracle.svm.graal.isolated.ImageHeapRef;
 import com.oracle.svm.graal.isolated.IsolatedCodeInstallBridge;
-import com.oracle.svm.graal.isolated.IsolatedCompileClient;
-import com.oracle.svm.graal.isolated.IsolatedCompileContext;
 import com.oracle.svm.graal.isolated.IsolatedHandles;
 import com.oracle.svm.graal.isolated.IsolatedObjectConstant;
 import com.oracle.svm.truffle.api.SubstrateCompilableTruffleAST;
@@ -153,7 +154,8 @@ public final class IsolatedTruffleRuntimeSupport {
         return false;
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.VoidExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static void log0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<String> id, ClientHandle<SubstrateCompilableTruffleAST> ast, ClientHandle<String> msg) {
 
         SubstrateTruffleRuntime runtime = (SubstrateTruffleRuntime) SubstrateTruffleRuntime.getRuntime();
@@ -171,7 +173,8 @@ public final class IsolatedTruffleRuntimeSupport {
         return TriState.UNDEFINED;
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.BooleanExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static boolean isSuppressedFailure0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<SubstrateCompilableTruffleAST> ast,
                     CompilerHandle<Supplier<String>> serializedExceptionHandle) {
         Supplier<String> serializedException = new IsolatedStringSupplier(serializedExceptionHandle);

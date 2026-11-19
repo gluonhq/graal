@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,7 +39,6 @@ import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ReturnNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.spi.NodeWithState;
 import jdk.graal.compiler.phases.Phase;
 import jdk.graal.compiler.phases.util.Providers;
@@ -108,24 +107,33 @@ public final class TruffleSafepointInsertionPhase extends Phase {
             }
         }
         for (LoopBeginNode loopBeginNode : graph.getNodes(LoopBeginNode.TYPE)) {
-            for (LoopEndNode loopEndNode : loopBeginNode.loopEnds()) {
-                if (loopEndNode.canGuestSafepoint()) {
-                    try (DebugCloseable s = loopEndNode.withNodeSourcePosition()) {
-                        insertSafepoint(graph, loopEndNode);
+            if (loopBeginNode.getGuestLoopBeginSafepointState().canSafepoint()) {
+                try (DebugCloseable s = loopBeginNode.withNodeSourcePosition()) {
+                    insertSafepointAtLoopBegin(graph, loopBeginNode);
+                }
+            } else {
+                for (LoopEndNode loopEndNode : loopBeginNode.loopEnds()) {
+                    if (loopEndNode.getGuestSafepointState().canSafepoint()) {
+                        try (DebugCloseable s = loopEndNode.withNodeSourcePosition()) {
+                            insertSafepoint(graph, loopEndNode);
+                        }
                     }
                 }
             }
         }
 
-        for (MethodCallTargetNode callTarget : graph.getNodes(MethodCallTargetNode.TYPE)) {
-            try (DebugCloseable s = callTarget.withNodeSourcePosition()) {
-                insertSafepoint(graph, (FixedNode) callTarget.invoke());
-            }
-        }
+    }
+
+    private void insertSafepointAtLoopBegin(StructuredGraph graph, LoopBeginNode loopBeginNode) {
+        graph.addAfterFixed(loopBeginNode, graph.add(new TruffleSafepointNode(createSafepointLocation(graph, loopBeginNode))));
     }
 
     private void insertSafepoint(StructuredGraph graph, FixedNode returnNode) {
-        ConstantNode node = findTruffleNode(returnNode);
+        graph.addBeforeFixed(returnNode, graph.add(new TruffleSafepointNode(createSafepointLocation(graph, returnNode))));
+    }
+
+    private ConstantNode createSafepointLocation(StructuredGraph graph, Node insertionPoint) {
+        ConstantNode node = findTruffleNode(insertionPoint);
         if (node == null) {
             // we did not found a truffle node in any frame state so we need to use the root node of
             // the compilation unit
@@ -137,8 +145,7 @@ public final class TruffleSafepointInsertionPhase extends Phase {
 
         assert node.asJavaConstant() != null : "must be a java constant";
         assert nodeType.isAssignableFrom(node.stamp(NodeView.DEFAULT).javaType(providers.getMetaAccess())) : "must be a truffle node";
-        node = graph.addOrUnique(node);
-        graph.addBeforeFixed(returnNode, graph.add(new TruffleSafepointNode(node)));
+        return graph.addOrUnique(node);
     }
 
     private ConstantNode findTruffleNode(Node node) {

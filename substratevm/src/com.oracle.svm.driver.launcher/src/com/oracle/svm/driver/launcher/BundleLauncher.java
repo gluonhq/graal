@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -91,7 +91,8 @@ public class BundleLauncher {
     }
 
     public static void main(String[] args) {
-        bundleFilePath = Paths.get(BundleLauncher.class.getProtectionDomain().getCodeSource().getLocation().getPath());
+        String bundleLauncherPath = BundleLauncher.class.getProtectionDomain().getCodeSource().getLocation().getPath();
+        bundleFilePath = Paths.get(isWindows() ? bundleLauncherPath.substring(1) : bundleLauncherPath);
         bundleName = bundleFilePath.getFileName().toString().replace(BUNDLE_FILE_EXTENSION, "");
         agentOutputDir = bundleFilePath.getParent().resolve(Paths.get(bundleName + ".output", "launcher"));
         unpackBundle();
@@ -125,8 +126,8 @@ public class BundleLauncher {
                             .sorted()
                             .toList();
             showMessage("Executing [");
-            showMessage(String.join(" \\\n", environmentList));
-            showMessage(String.join(" \\\n", pb.command()));
+            showMessage(String.join(" \\" + System.lineSeparator(), environmentList));
+            showMessage(String.join(" \\" + System.lineSeparator(), pb.command()));
             showMessage("]");
         }
 
@@ -179,8 +180,8 @@ public class BundleLauncher {
 
         List<String> classpath = new ArrayList<>();
         if (Files.isDirectory(classPathDir)) {
-            try (Stream<Path> walk = Files.walk(classPathDir, 1)) {
-                walk.filter(path -> path.toString().endsWith(".jar") || Files.isDirectory(path))
+            try {
+                BundleLauncherUtil.getPathEntries(rootDir, classPathDir).stream()
                                 .map(path -> useContainer() ? Paths.get("/").resolve(rootDir.relativize(path)) : path)
                                 .map(Path::toString)
                                 .forEach(classpath::add);
@@ -194,8 +195,8 @@ public class BundleLauncher {
 
         List<String> modulePath = new ArrayList<>();
         if (Files.isDirectory(modulePathDir)) {
-            try (Stream<Path> walk = Files.walk(modulePathDir, 1)) {
-                walk.filter(path -> (Files.isDirectory(path) && !path.equals(modulePathDir)) || path.toString().endsWith(".jar"))
+            try {
+                BundleLauncherUtil.getPathEntries(rootDir, modulePathDir).stream()
                                 .map(path -> useContainer() ? Paths.get("/").resolve(rootDir.relativize(path)) : path)
                                 .map(Path::toString)
                                 .forEach(modulePath::add);
@@ -342,6 +343,10 @@ public class BundleLauncher {
         return getJavaHomeExecutable(binJava);
     }
 
+    private static boolean isWindows() {
+        return System.getProperty("os.name").contains("Windows");
+    }
+
     private static Path getJavaHomeExecutable(Path executable) {
         String javaHome = System.getenv("JAVA_HOME");
         if (javaHome == null) {
@@ -358,7 +363,7 @@ public class BundleLauncher {
     }
 
     private static Path getNativeImageExecutable() {
-        Path binNativeImage = Paths.get("bin", System.getProperty("os.name").contains("Windows") ? "native-image.exe" : "native-image");
+        Path binNativeImage = Paths.get("bin", isWindows() ? "native-image.exe" : "native-image");
         if (Files.isExecutable(buildTimeJavaHome.resolve(binNativeImage))) {
             return buildTimeJavaHome.resolve(binNativeImage);
         }
@@ -403,7 +408,7 @@ public class BundleLauncher {
             }
         } catch (IOException e) {
             showMessage("Could not recursively delete path: " + toDelete);
-            e.printStackTrace();
+            e.printStackTrace(System.out);
         }
     }
 
@@ -413,11 +418,15 @@ public class BundleLauncher {
             inputDir = rootDir.resolve("input");
 
             try (JarFile archive = new JarFile(bundleFilePath.toFile())) {
+                Path normalizedRootDir = rootDir.toAbsolutePath().normalize();
                 Enumeration<JarEntry> jarEntries = archive.entries();
                 while (jarEntries.hasMoreElements() && !deleteBundleRoot.get()) {
                     JarEntry jarEntry = jarEntries.nextElement();
-                    Path bundleEntry = rootDir.resolve(jarEntry.getName());
+                    Path bundleEntry = rootDir.resolve(BundleLauncherUtil.materializePortablePath(jarEntry.getName())).toAbsolutePath().normalize();
                     try {
+                        if (!bundleEntry.startsWith(normalizedRootDir)) {
+                            throw new Error("Bundle entry '" + jarEntry.getName() + "' resolves outside of " + normalizedRootDir);
+                        }
                         Path bundleFileParent = bundleEntry.getParent();
                         if (bundleFileParent != null) {
                             Files.createDirectories(bundleFileParent);

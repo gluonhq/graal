@@ -27,27 +27,39 @@ package com.oracle.svm.core.meta;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
-import com.oracle.svm.core.util.VMError;
-
-final class SubstrateObjectConstantEquality implements ObjectConstantEquality {
-    @Override
-    public boolean test(SubstrateObjectConstant x, SubstrateObjectConstant y) {
-        if (x == y) {
-            return true;
-        } else if (x instanceof DirectSubstrateObjectConstant && y instanceof DirectSubstrateObjectConstant) {
-            return ((DirectSubstrateObjectConstant) x).getObject() == ((DirectSubstrateObjectConstant) y).getObject();
-        }
-        throw VMError.shouldNotReachHere("Unknown object constants: " + x + " and " + y);
-    }
-}
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 @AutomaticallyRegisteredFeature
 final class SubstrateObjectConstantEqualityFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void duringSetup(DuringSetupAccess access) {
         if (!ImageSingletons.contains(ObjectConstantEquality.class)) {
             ImageSingletons.add(ObjectConstantEquality.class, new SubstrateObjectConstantEquality());
         }
+    }
+}
+
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+final class SubstrateObjectConstantEquality implements ObjectConstantEquality {
+
+    @Override
+    public boolean test(SubstrateObjectConstant x, SubstrateObjectConstant y) {
+        if (x.identicalTo(y)) {
+            return true;
+        } else if (x instanceof DirectSubstrateObjectConstant && y instanceof DirectSubstrateObjectConstant) {
+            return ((DirectSubstrateObjectConstant) x).getObject() == ((DirectSubstrateObjectConstant) y).getObject();
+        }
+        throw VMError.shouldNotReachHere("Unknown object constants: " + x + " and " + y);
     }
 }

@@ -25,7 +25,7 @@
 
 package com.oracle.svm.core.posix.linux;
 
-import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
@@ -35,25 +35,30 @@ import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.posix.PosixSubstrateSigprofHandler;
 import com.oracle.svm.core.posix.PosixUtils;
 import com.oracle.svm.core.posix.headers.Signal;
 import com.oracle.svm.core.posix.headers.linux.LinuxTime;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalWord;
-import com.oracle.svm.core.util.TimeUtils;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalWord;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.TimeUtils;
+import org.graalvm.word.impl.Word;
 
 /**
  * Linux supports both types of timers (see {@link PosixSubstrateSigprofHandler}). We use the
  * per-thread timer as it increases the number of recorded samples and provides more reliable
  * sampling.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class LinuxSubstrateSigprofHandler extends PosixSubstrateSigprofHandler {
 
     /*
@@ -87,9 +92,9 @@ public final class LinuxSubstrateSigprofHandler extends PosixSubstrateSigprofHan
 
         Signal.sigevent sigevent = StackValue.get(Signal.sigevent.class);
         sigevent.sigev_notify(Signal.SIGEV_SIGNAL());
-        sigevent.sigev_signo(Signal.SIGPROF());
+        sigevent.sigev_signo(Signal.SignalEnum.SIGPROF.getCValue());
         WordPointer timerPointer = StackValue.get(WordPointer.class);
-        timerPointer.write(WordFactory.zero());
+        timerPointer.write(Word.zero());
 
         int status = LinuxTime.NoTransitions.timer_create(LinuxTime.CLOCK_MONOTONIC(), sigevent, timerPointer);
         PosixUtils.checkStatusIs0(status, "timer_create(clockid, sevp, timerid): wrong arguments.");
@@ -118,31 +123,31 @@ public final class LinuxSubstrateSigprofHandler extends PosixSubstrateSigprofHan
         newTimerSpec.it_interval().set_tv_sec(ns / TimeUtils.nanosPerSecond);
         newTimerSpec.it_interval().set_tv_nsec(ns % TimeUtils.nanosPerSecond);
 
-        int status = LinuxTime.NoTransitions.timer_settime(getSamplerTimerId(thread), 0, newTimerSpec, WordFactory.nullPointer());
+        int status = LinuxTime.NoTransitions.timer_settime(getSamplerTimerId(thread), 0, newTimerSpec, Word.nullPointer());
         PosixUtils.checkStatusIs0(status, "timer_settime(timerid, flags, newTimerSpec, oldValue): wrong arguments.");
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static boolean hasSamplerTimerId(IsolateThread thread) {
         assert CurrentIsolate.getCurrentThread() == thread || VMOperation.isInProgressAtSafepoint();
-        return samplerTimerId.get(thread).and(WordFactory.unsigned(MARKER)).notEqual(0);
+        return samplerTimerId.get(thread).and(Word.unsigned(MARKER)).notEqual(0);
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static UnsignedWord getSamplerTimerId(IsolateThread thread) {
         assert hasSamplerTimerId(thread);
-        return samplerTimerId.get(thread).and(WordFactory.unsigned(~MARKER));
+        return samplerTimerId.get(thread).and(Word.unsigned(~MARKER));
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static void setSamplerTimerId(IsolateThread thread, UnsignedWord timerId) {
-        assert !hasSamplerTimerId(thread) && timerId.and(WordFactory.unsigned(MARKER)).equal(0);
-        samplerTimerId.set(thread, timerId.or(WordFactory.unsigned(MARKER)));
+        assert !hasSamplerTimerId(thread) && timerId.and(Word.unsigned(MARKER)).equal(0);
+        samplerTimerId.set(thread, timerId.or(Word.unsigned(MARKER)));
     }
 
     @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     private static void clearSamplerTimerId(IsolateThread thread) {
         assert hasSamplerTimerId(thread);
-        samplerTimerId.set(thread, WordFactory.zero());
+        samplerTimerId.set(thread, Word.zero());
     }
 }

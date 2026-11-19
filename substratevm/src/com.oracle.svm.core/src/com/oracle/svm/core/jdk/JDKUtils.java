@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,16 +24,31 @@
  */
 package com.oracle.svm.core.jdk;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.util.VMError;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.internal.loader.BuiltinClassLoader;
 
 public final class JDKUtils {
+    /// Suppresses built-in loader names in printed stack traces while retaining their metadata.
+    /// Module version formatting stays unchanged so basic images do not retain the JDK's module layer helpers.
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+36/src/java.base/share/classes/java/lang/StackTraceElement.java#L466-L492")
+    public static void suppressBuiltinClassLoaderName(StackTraceElement element, ClassLoader classLoader) {
+        if (classLoader instanceof BuiltinClassLoader) {
+            SubstrateUtil.cast(element, Target_java_lang_StackTraceElement.class).format |= Target_java_lang_StackTraceElement.builtinClassLoader;
+        }
+    }
 
     /**
      * Returns the raw error message stored in {@link Throwable} and returned by default from
      * {@link Throwable#getMessage}. This method ignores possible overrides of
      * {@link Throwable#getMessage} and is therefore guaranteed to be allocation free.
      */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static String getRawMessage(Throwable ex) {
         return SubstrateUtil.cast(ex, Target_java_lang_Throwable.class).detailMessage;
     }
@@ -43,6 +58,7 @@ public final class JDKUtils {
      * {@link Throwable#getCause}. This method ignores possible overrides of
      * {@link Throwable#getCause} and is therefore guaranteed to be allocation free.
      */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static Throwable getRawCause(Throwable ex) {
         Throwable cause = SubstrateUtil.cast(ex, Target_java_lang_Throwable.class).cause;
         return cause == ex ? null : cause;
@@ -52,6 +68,7 @@ public final class JDKUtils {
      * Gets the materialized {@link StackTraceElement} array stored in a {@link Throwable} object.
      * Must only be called if {@link #isStackTraceValid} returns (or would return) {@code true}.
      */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static StackTraceElement[] getRawStackTrace(Throwable ex) {
         VMError.guarantee(isStackTraceValid(ex));
         return SubstrateUtil.cast(ex, Target_java_lang_Throwable.class).stackTrace;
@@ -62,17 +79,18 @@ public final class JDKUtils {
      * {@link Throwable} object is valid. If not, {@link #getBacktrace} must be used to access the
      * Java stack trace frames.
      */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isStackTraceValid(Throwable ex) {
         StackTraceElement[] stackTrace = SubstrateUtil.cast(ex, Target_java_lang_Throwable.class).stackTrace;
         return stackTrace != Target_java_lang_Throwable.UNASSIGNED_STACK && stackTrace != null;
     }
 
     /**
-     * Gets the internal backtrace of a {@link Throwable} object. Must only be called if
-     * {@link #isStackTraceValid} returns (or would return) {@code false}.
+     * Gets the internal backtrace of a {@link Throwable} object. Only returns a non-null value if
+     * {@link #isStackTraceValid} would return {@code false}.
      */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static Object getBacktrace(Throwable ex) {
-        VMError.guarantee(!isStackTraceValid(ex));
         return SubstrateUtil.cast(ex, Target_java_lang_Throwable.class).backtrace;
     }
 }

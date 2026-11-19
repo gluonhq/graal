@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -78,9 +79,13 @@ public final class DAPTester {
     }
 
     public static DAPTester start(boolean suspend, Consumer<Context> prolog, List<URI> sourcePath) throws IOException {
+        return start(suspend, prolog, sourcePath, Collections.emptyMap());
+    }
+
+    public static DAPTester start(boolean suspend, Consumer<Context> prolog, List<URI> sourcePath, Map<String, String> options) throws IOException {
         final ProxyOutputStream err = new ProxyOutputStream(System.err);
         Engine engine = Engine.newBuilder().err(err).build();
-        Context context = Context.newBuilder().engine(engine).allowAllAccess(true).build();
+        Context context = Context.newBuilder().engine(engine).options(options).allowAllAccess(true).build();
         Runnable runProlog;
         if (prolog != null) {
             runProlog = () -> prolog.accept(context);
@@ -123,6 +128,10 @@ public final class DAPTester {
     }
 
     public Future<Value> eval(Source source) {
+        return eval(source, true);
+    }
+
+    public Future<Value> eval(Source source, boolean logException) {
         lastValue = CompletableFuture.supplyAsync(() -> {
             try {
                 return context.eval(source);
@@ -131,7 +140,9 @@ public final class DAPTester {
                 // We might never check the future
                 // if we're blocked by waiting for an expected output,
                 // which does not come due to the exception.
-                t.printStackTrace(System.err);
+                if (logException) {
+                    t.printStackTrace(System.err);
+                }
                 throw t;
             }
         }, executor);
@@ -149,7 +160,7 @@ public final class DAPTester {
         return new String(readMessageBytes(handler.getInputStream()));
     }
 
-    private static byte[] readMessageBytes(InputStream in) throws IOException {
+    static byte[] readMessageBytes(InputStream in) throws IOException {
         StringBuilder line = new StringBuilder();
         int contentLength = -1;
         while (true) {
@@ -169,7 +180,7 @@ public final class DAPTester {
                 } else {
                     // Two consecutive newlines start the message content
                     if (contentLength < 0) {
-                        throw new IOException("Error while processing an incomming message: Missing header " + CONTENT_LENGTH_HEADER + " in input.");
+                        throw new IOException("Error while processing an incoming message: Missing header " + CONTENT_LENGTH_HEADER + " in input.");
                     } else {
                         // Read the message
                         byte[] buffer = new byte[contentLength];

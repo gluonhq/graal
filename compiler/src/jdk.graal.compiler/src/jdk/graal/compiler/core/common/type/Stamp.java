@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -172,6 +172,33 @@ public abstract class Stamp implements SpeculationContextObject {
      */
     public boolean isNonObjectPointerStamp() {
         return isPointerStamp() && !isObjectStamp();
+    }
+
+    /**
+     * Tests whether this stamp represents an array type without any additional knowledge about
+     * nullness or its component type. Normally such stamps are only possible at places where
+     * control flow merges array types that have their least common ancestor in
+     * {@link java.lang.Object}.
+     *
+     * An example of such a stamp can be seen in the following code
+     *
+     * <pre>
+     * void foo(boolean a, int[] iA, byte[] bA) {
+     *     Object o = null;
+     *     if (a) {
+     *         o = iA;
+     *     } else {
+     *         o = bA;
+     *     }
+     *     use(o); // potentially null, always array stamp without a concrete type
+     * }
+     * </pre>
+     */
+    public boolean isBottomArrayType() {
+        if (this instanceof AbstractObjectStamp o) {
+            return o.isAlwaysArray() && o.type() == null;
+        }
+        return false;
     }
 
     /**

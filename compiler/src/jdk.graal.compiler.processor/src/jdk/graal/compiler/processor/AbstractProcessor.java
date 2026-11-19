@@ -28,7 +28,7 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -80,9 +80,13 @@ public abstract class AbstractProcessor extends javax.annotation.processing.Abst
         return doProcess(annotations, roundEnv);
     }
 
+    /**
+     * Implementations should claim their annotations by returning {@code true} to avoid extra
+     * annotation processing work.
+     */
     protected abstract boolean doProcess(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv);
 
-    private final Map<String, TypeElement> types = new HashMap<>();
+    private final Map<String, TypeElement> types = new LinkedHashMap<>();
 
     /**
      * Gets the {@link TypeMirror} for a given class name.
@@ -263,7 +267,7 @@ public abstract class AbstractProcessor extends javax.annotation.processing.Abst
         }
 
         if (valueMethod == null) {
-            return null;
+            throw new NoSuchElementException(annotation.getAnnotationType() + " has no element named " + name);
         }
 
         AnnotationValue value = annotation.getElementValues().get(valueMethod);
@@ -288,11 +292,8 @@ public abstract class AbstractProcessor extends javax.annotation.processing.Abst
     public static <T> List<T> getAnnotationValueList(AnnotationMirror annotation, String name, Class<T> componentType) {
         List<? extends AnnotationValue> values = getAnnotationValue(annotation, name, List.class);
         List<T> result = new ArrayList<>();
-
-        if (values != null) {
-            for (AnnotationValue value : values) {
-                result.add(componentType.cast(value.getValue()));
-            }
+        for (AnnotationValue value : values) {
+            result.add(componentType.cast(value.getValue()));
         }
         return result;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,6 +33,45 @@
 
 #define BitsPerByte 8
 
+#define SVM_JMM_VERSION_4 0x20040000
+
+/*
+ * Prefix of HotSpot's JmmInterface used by management_ext's JNI_OnLoad. Native Image does not
+ * implement the remaining JMM operations.
+ */
+typedef struct {
+    void* reserved1;
+    void* reserved2;
+    jint (JNICALL *GetVersion)(JNIEnv* env);
+} SVMJmmInterface;
+
+static jint JNICALL svm_jmm_get_version(JNIEnv* env) {
+    (void) env;
+    return SVM_JMM_VERSION_4;
+}
+
+static const SVMJmmInterface svm_jmm_interface = {
+    NULL,
+    NULL,
+    svm_jmm_get_version
+};
+
+JNIEXPORT void* JNICALL JVM_GetManagement(jint version) {
+    /* GR-80030: Implement the complete JMM interface. */
+    return version == SVM_JMM_VERSION_4 ? (void*) &svm_jmm_interface : NULL;
+}
+
+void* __svm_find_builtin_symbol(const char* name);
+
+#if defined(_MSC_VER)
+  #pragma comment(linker, "/alternatename:__svm_find_builtin_symbol=__svm_find_builtin_symbol_default")
+#endif
+
+void* __svm_find_builtin_symbol_default(const char* name) {
+    (void) name;
+    return NULL;
+}
+
 #ifdef JNI_VERSION_9
     #define JVM_INTERFACE_VERSION 6
 #else
@@ -48,6 +87,21 @@ jlong jlong_from(DWORD high, DWORD low) {
 
 JNIEXPORT int JNICALL JVM_GetInterfaceVersion() {
     return JVM_INTERFACE_VERSION;
+}
+
+/* Declaration only. Implemented via JVM_FindClassFromBootLoader_default */
+JNIEXPORT void JNICALL JVM_FindClassFromBootLoader(JNIEnv *env, char *fqn);
+
+#if defined(_MSC_VER)
+  #if defined(_M_IX86)
+    #pragma comment(linker, "/alternatename:_JVM_FindClassFromBootLoader=_JVM_FindClassFromBootLoader_default")
+  #elif defined(_M_X64) || defined(_M_ARM64)
+    #pragma comment(linker, "/alternatename:JVM_FindClassFromBootLoader=JVM_FindClassFromBootLoader_default")
+  #endif
+#endif
+
+JNIEXPORT void JNICALL JVM_FindClassFromBootLoader_default(JNIEnv *env, char *fqn) {
+    (*env)->FatalError(env, "JVM_FindClassFromBootLoader called: Unimplemented");
 }
 
 jlong as_long(LARGE_INTEGER x) {
@@ -181,6 +235,49 @@ JNIEXPORT jlong JNICALL Java_jdk_internal_misc_VM_getNanoTimeAdjustment(void *en
     return JVM_GetNanoTimeAdjustment(env, ignored, offset_secs);
 }
 
+/* Used by Java_jdk_internal_loader_NativeLibraries_load when validating JNI_OnLoad. */
+JNIEXPORT jboolean JNICALL JVM_IsSupportedJNIVersion(jint version) {
+    return version == JNI_VERSION_24 ||
+           version == JNI_VERSION_21 ||
+           version == JNI_VERSION_20 ||
+           version == JNI_VERSION_19 ||
+           version == JNI_VERSION_10 ||
+           version == JNI_VERSION_9 ||
+           version == JNI_VERSION_1_8 ||
+           version == JNI_VERSION_1_6 ||
+           version == JNI_VERSION_1_4 ||
+           version == JNI_VERSION_1_2 ||
+           version == JNI_VERSION_1_1;
+}
+
+/* Used by Java_jdk_internal_loader_NativeLibraries_load. */
+// TODO GR-76023: add and handle second function parameter throwException
+JNIEXPORT void* JNICALL JVM_LoadLibrary(const char* name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    return (void*) LoadLibraryA(name);
+}
+
+/* Used by Java_jdk_internal_loader_NativeLibraries_load. */
+JNIEXPORT void JNICALL JVM_UnloadLibrary(void* handle) {
+    if (handle != NULL) {
+        FreeLibrary((HMODULE) handle);
+    }
+}
+
+/* Java_jdk_internal_loader_NativeLibraries_findBuiltinLib calls findJniFunction which uses JVM_FindLibraryEntry. */
+JNIEXPORT void* JNICALL JVM_FindLibraryEntry(void* handle, const char* name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    void* result = __svm_find_builtin_symbol(name);
+    if (result != NULL) {
+        return result;
+    }
+    return (void*) GetProcAddress((HMODULE) handle, name);
+}
+
 JNIEXPORT void JNICALL JVM_BeforeHalt() {
 }
 
@@ -248,12 +345,13 @@ JNIEXPORT jobject JNICALL JVM_DoPrivileged(JNIEnv *env, jclass cls, jobject acti
 }
 
 JNIEXPORT jstring JNICALL JVM_GetTemporaryDirectory(JNIEnv *env) {
-    // see os_windows.cpp line 1367
-    static char path_buf[MAX_PATH];
-    if (GetTempPath(MAX_PATH, path_buf) <= 0) {
-        path_buf[0] = '\0';
+    // see os::get_temp_directory() in os_windows.cpp
+    WCHAR path_buf[MAX_PATH + 1];
+    DWORD len = GetTempPathW(MAX_PATH + 1, path_buf);
+    if (len == 0 || len > MAX_PATH + 1) {
+        return (*env)->NewString(env, NULL, 0); // empty on error/overflow
     }
-    return (*env)->NewStringUTF(env, path_buf);
+    return (*env)->NewString(env, path_buf, len);
 }
 
 jboolean VerifyFixClassname(char *utf_name) {
@@ -266,11 +364,11 @@ jboolean VerifyClassname(char *utf_name, jboolean arrayAllowed) {
     abort();
 }
 
-int jio_vfprintf(FILE* f, const char *fmt, va_list args) {
+JNIEXPORT int jio_vfprintf(FILE* f, const char *fmt, va_list args) {
   return vfprintf(f, fmt, args);
 }
 
-int jio_vsnprintf(char *str, size_t count, const char *fmt, va_list args) {
+JNIEXPORT int jio_vsnprintf(char *str, size_t count, const char *fmt, va_list args) {
   int result;
 
   if ((intptr_t)count <= 0) return -1;
@@ -344,3 +442,14 @@ JNIEXPORT void * JNICALL JVM_RegisterSignal(jint sig, void *handler) {
       return oldHandler;
   }
 }
+
+#ifdef JNI_VERSION_24
+
+JNIEXPORT jboolean JNICALL JVM_IsStaticallyLinked(void) {
+    // This is a workaround based on the fact that currently the only user of interest is libawt,
+    // which is always known to be dynamically linked. This assumption can break with every JDK update.
+    // A more thorough solution is to move this method into the libjvm shim library (GR-58067).
+    return JNI_FALSE;
+}
+
+#endif

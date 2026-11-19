@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -36,6 +36,7 @@ import jdk.graal.compiler.core.common.SpectrePHTMitigations;
 import jdk.graal.compiler.core.common.type.IntegerStamp;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.Position;
 import jdk.graal.compiler.nodeinfo.InputType;
@@ -50,15 +51,16 @@ import jdk.graal.compiler.nodes.PiNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.extended.MultiGuardNode;
+import jdk.graal.compiler.nodes.extended.SpeculationFenceNode;
 import jdk.graal.compiler.nodes.memory.FixedAccessNode;
 import jdk.graal.compiler.nodes.memory.MemoryAccess;
+import jdk.graal.compiler.nodes.spi.TrackedUnsafeAccess;
 import jdk.graal.compiler.phases.Phase;
 import jdk.vm.ci.meta.DeoptimizationReason;
 
 /**
- * This phase sets the {@linkplain AbstractBeginNode#setHasSpeculationFence() speculation fence}
- * flag on {@linkplain AbstractBeginNode begin nodes} in order to mitigate speculative execution
- * attacks.
+ * This phase inserts {@link SpeculationFenceNode speculation fence nodes} after
+ * {@link AbstractBeginNode begin nodes} in order to mitigate speculative execution attacks.
  */
 public class InsertGuardFencesPhase extends Phase {
 
@@ -73,11 +75,12 @@ public class InsertGuardFencesPhase extends Phase {
         if (mitigations == SpectrePHTMitigations.None || mitigations == SpectrePHTMitigations.AllTargets) {
             return;
         }
+        verifyNoTrackedUnsafeAccessNodes(graph);
         ControlFlowGraph cfg = ControlFlowGraph.newBuilder(graph).connectBlocks(true).computeFrequency(true).build();
         for (AbstractBeginNode beginNode : graph.getNodes(AbstractBeginNode.TYPE)) {
             if (hasPotentialUnsafeAccess(cfg, beginNode)) {
                 graph.getDebug().log(DebugContext.VERBOSE_LEVEL, "Adding speculation fence at %s because of unguarded fixed access", beginNode);
-                beginNode.setHasSpeculationFence();
+                addSpeculationFence(beginNode);
                 continue;
             }
             if (hasGuardUsages(beginNode)) {
@@ -98,11 +101,39 @@ public class InsertGuardFencesPhase extends Phase {
                 } else {
                     graph.getDebug().log(DebugContext.VERBOSE_LEVEL, "Adding speculation fence at %s", beginNode);
                 }
-                beginNode.setHasSpeculationFence();
+                addSpeculationFence(beginNode);
             } else {
                 graph.getDebug().log(DebugContext.DETAILED_LEVEL, "No guards on %s", beginNode);
             }
         }
+    }
+
+    private static void addSpeculationFence(AbstractBeginNode beginNode) {
+        if (!(beginNode.next() instanceof SpeculationFenceNode)) {
+            beginNode.graph().addAfterFixed(beginNode, beginNode.graph().add(SpeculationFenceNode.forBlockEntry()));
+        }
+    }
+
+    /**
+     * This phase only inspects the lowered node shapes it understands: unguarded
+     * {@link FixedAccessNode FixedAccessNodes} in the CFG plus guard usages on the lowered access
+     * users. If a {@link TrackedUnsafeAccess} survives until this point, that access has escaped
+     * the lowering pipeline that this phase relies on and could silently miss fence insertion, so
+     * fail fast instead of proceeding with incomplete coverage.
+     */
+    private static void verifyNoTrackedUnsafeAccessNodes(StructuredGraph graph) {
+        List<String> offenders = null;
+        for (Node node : graph.getNodes()) {
+            if (node instanceof TrackedUnsafeAccess) {
+                if (offenders == null) {
+                    offenders = new ArrayList<>();
+                }
+                offenders.add(node.toString());
+            }
+        }
+        GraalError.guarantee(offenders == null,
+                        "TrackedUnsafeAccess nodes must be lowered before InsertGuardFencesPhase, found: %s",
+                        offenders);
     }
 
     /**

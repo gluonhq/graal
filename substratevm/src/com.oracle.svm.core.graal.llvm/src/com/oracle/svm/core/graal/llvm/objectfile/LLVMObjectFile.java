@@ -44,7 +44,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import jdk.graal.compiler.debug.DebugContext;
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.objectfile.BasicProgbitsSectionImpl;
@@ -54,13 +54,15 @@ import com.oracle.objectfile.LayoutDecision;
 import com.oracle.objectfile.LayoutDecisionMap;
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.objectfile.SymbolTable;
-import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.BatchExecutor;
 import com.oracle.svm.core.graal.llvm.util.LLVMIRBuilder;
 import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.shadowed.org.bytedeco.llvm.LLVM.LLVMValueRef;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.debug.DebugContext;
 
 /**
  * Represents an object file emitted using LLVM.
@@ -83,7 +85,7 @@ public class LLVMObjectFile extends ObjectFile {
 
     private final List<LLVMDataSectionPart> dataSectionParts = new ArrayList<>();
 
-    public static Map<String, String> sectionToFirstSymbol = new HashMap<>();
+    static final Map<String, String> sectionToFirstSymbol = new HashMap<>();
 
     public LLVMObjectFile(int pageSize, Path tempDir, BigBang bb) {
         super(pageSize);
@@ -140,7 +142,7 @@ public class LLVMObjectFile extends ObjectFile {
 
     @Override
     public int getWordSizeInBytes() {
-        return FrameAccess.wordSize();
+        return SubstrateTarget.getWordSize();
     }
 
     @Override
@@ -150,7 +152,7 @@ public class LLVMObjectFile extends ObjectFile {
 
     @Override
     public Set<Segment> getSegments() {
-        return new HashSet<>();
+        return new HashSet<>(); // noEconomicSet(streaming)
     }
 
     @Override
@@ -159,13 +161,13 @@ public class LLVMObjectFile extends ObjectFile {
     }
 
     @Override
-    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal) {
+    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal, boolean isExported) {
         SymbolTable symtab = getOrCreateSymbolTable();
-        return symtab.newDefinedEntry(name, (Section) baseSection, position, size, isGlobal, isCode);
+        return symtab.newDefinedEntry(name, (Section) baseSection, position, size, isGlobal, isCode, isExported);
     }
 
     @Override
-    public Symbol createUndefinedSymbol(String name, int size, boolean isCode) {
+    public Symbol createUndefinedSymbol(String name, boolean isCode) {
         SymbolTable symtab = getOrCreateSymbolTable();
         return symtab.newUndefinedEntry(name, isCode);
     }
@@ -181,7 +183,6 @@ public class LLVMObjectFile extends ObjectFile {
     }
 
     @Override
-    @SuppressWarnings("try")
     public final void write(DebugContext context, Path outputFile) throws IOException {
         List<Element> sortedObjectFileElements = new ArrayList<>();
         bake(sortedObjectFileElements);
@@ -199,6 +200,8 @@ public class LLVMObjectFile extends ObjectFile {
     }
 
     private void initializeAllSectionParts(List<ObjectFile.Element> sortedObjectFileElements) {
+        sectionToFirstSymbol.clear();
+        dataSectionParts.clear();
         int id = 0;
 
         for (Element e : sortedObjectFileElements) {
@@ -234,16 +237,29 @@ public class LLVMObjectFile extends ObjectFile {
 
                     for (int i = 0; i < valueArray.length; i += (batchSize / Long.BYTES)) {
                         LLVMValueRef[] batchContent = Arrays.copyOfRange(valueArray, i, Math.min(valueArray.length, i + (batchSize / Long.BYTES)));
-                        int finalI = i;
+                        int batchOffset = i * Long.BYTES;
+                        long batchEnd = Math.min(content.length, batchOffset + batchSize);
+                        boolean isLastBatch = batchEnd == content.length;
                         List<Integer> batchRelocOffsets = section.getRelocations().keySet().stream()
-                                        .filter(relocOffset -> relocOffset >= finalI * Long.BYTES && relocOffset < finalI * Long.BYTES + batchSize)
+                                        .filter(relocOffset -> relocOffset >= batchOffset && relocOffset < batchEnd)
                                         .collect(Collectors.toList());
-                        LLVMDataSectionPart sectionPart = new LLVMDataSectionPart(id, i * Long.BYTES, getPageSize(), e, batchContent, batchRelocOffsets, i == 0 ? symbols : null);
+                        List<LLVMSymtab.Entry> batchSymbols = symbols == null ? null
+                                        : symbols.stream()
+                                                        .filter(symbol -> symbol.getDefinedOffset() >= batchOffset &&
+                                                                        (symbol.getDefinedOffset() < batchEnd || (isLastBatch && symbol.getDefinedOffset() == batchEnd)))
+                                                        .collect(Collectors.toList());
+                        LLVMDataSectionPart sectionPart = new LLVMDataSectionPart(id, batchOffset, getPageSize(), e, batchContent,
+                                        batchRelocOffsets, batchSymbols);
+                        sectionPart.declareBaseSymbol();
                         dataSectionParts.add(sectionPart);
                         id++;
                     }
                 }
             }
+        }
+
+        for (LLVMDataSectionPart sectionPart : dataSectionParts) {
+            sectionPart.computeBitcode();
         }
     }
 
@@ -258,7 +274,7 @@ public class LLVMObjectFile extends ObjectFile {
     }
 
     private void compileBitcodeBatches(BatchExecutor executor, DebugContext context, int numBatches) {
-        executor.forEach(numBatches, batchId -> (debugContextInner) -> {
+        executor.forEach(numBatches, batchId -> _ -> {
             llvmCompile(context, getCompiledBitcodeFilename(batchId), getBitcodeFilename(batchId), basePath, (s -> s));
         });
     }
@@ -332,7 +348,7 @@ public class LLVMObjectFile extends ObjectFile {
             // (e.g. SHT, PHT) must be decided before content, and we need to give a size so that
             // that nextAvailableOffset remains defined.
             // So, our size comes first.
-            HashSet<BuildDependency> dependencies = new HashSet<>();
+            EconomicSet<BuildDependency> dependencies = EconomicSet.create(2);
 
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             LayoutDecision ourOffset = decisions.get(this).getDecision(LayoutDecision.Kind.OFFSET);

@@ -1,10 +1,25 @@
 {
-  "resources":{
-      "includes":[
-          {
-              "pattern": "^resource-file.txt$"
-          }
-      ]
-  },
+  "globs":[
+      {
+          "module": "jdk.dynalink",
+          "glob": "module-info.class"
+      },
+      {
+          "module": "java.base",
+          "glob": "module-info.class"
+      },
+      {
+          "module": "moduletests.hello.app",
+          "glob": "resource-file.txt"
+      },
+      {
+          "module": "moduletests.hello.app",
+          "glob": "META-INF/native-image-module-tests/misc-resource.txt"
+      },
+      {
+          "module": "moduletests.hello.lib_\u00fc",
+          "glob": "resource-file.txt"
+      }
+  ],
   "bundles":[]
 }

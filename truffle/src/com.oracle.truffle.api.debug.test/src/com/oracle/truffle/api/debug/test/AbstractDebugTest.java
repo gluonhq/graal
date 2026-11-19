@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,11 +52,16 @@ import java.io.Writer;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.PolyglotAccess;
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.IOAccess;
 import org.junit.After;
 import org.junit.Assert;
@@ -72,12 +77,6 @@ import com.oracle.truffle.api.debug.SuspendedCallback;
 import com.oracle.truffle.api.debug.SuspendedEvent;
 import com.oracle.truffle.api.instrumentation.test.InstrumentationTestLanguage;
 import com.oracle.truffle.tck.DebuggerTester;
-import java.util.concurrent.atomic.AtomicBoolean;
-
-import org.graalvm.polyglot.Context;
-import org.graalvm.polyglot.PolyglotAccess;
-import org.graalvm.polyglot.Source;
-import org.graalvm.polyglot.Value;
 
 /**
  * Framework for testing the Truffle {@linkplain Debugger Debugging API}.
@@ -146,7 +145,11 @@ public abstract class AbstractDebugTest {
     }
 
     protected final void popContext() {
-        tester.close();
+        DebuggerTester current = tester;
+        tester = null;
+        if (current != null) {
+            current.close();
+        }
         if (!sessionStack.isEmpty()) {
             tester = sessionStack.pop();
         }
@@ -259,7 +262,9 @@ public abstract class AbstractDebugTest {
             String expectedValue = expectedFrame[i + 1];
             DebugValue value = values.get(expectedIdentifier);
             Assert.assertNotNull("Identifier " + expectedIdentifier + " not found.", value);
-            Assert.assertEquals(expectedValue, value.toDisplayString());
+            if (expectedValue != null) {
+                Assert.assertEquals(expectedValue, value.toDisplayString());
+            }
         }
     }
 

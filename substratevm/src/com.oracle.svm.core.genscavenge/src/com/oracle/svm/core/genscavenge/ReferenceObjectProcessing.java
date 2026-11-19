@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import static com.oracle.svm.core.heap.ReferenceInternals.getReferentFieldAddress;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.SLOW_PATH_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 
@@ -33,19 +35,21 @@ import java.lang.ref.SoftReference;
 
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.config.ObjectLayout;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.heap.ObjectHeader;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.ObjectHeader;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
 import com.oracle.svm.core.heap.ReferenceInternals;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.UnsignedUtils;
 
 /** Discovers and handles {@link Reference} objects during garbage collection. */
 final class ReferenceObjectProcessing {
@@ -58,9 +62,6 @@ final class ReferenceObjectProcessing {
      */
     private static UnsignedWord maxSoftRefAccessIntervalMs = UnsignedUtils.MAX_VALUE;
 
-    /** Treat all soft references as weak, typically to reclaim space when low on memory. */
-    private static boolean softReferencesAreWeak = false;
-
     /**
      * The first timestamp that was set as {@link SoftReference} clock, for examining references
      * that were created earlier than that.
@@ -70,20 +71,21 @@ final class ReferenceObjectProcessing {
     private ReferenceObjectProcessing() { // all static
     }
 
-    /*
-     * Enables (or disables) reclaiming all objects that are softly reachable only, typically as a
-     * last resort to avoid running out of memory.
+    /**
+     * Whether to treat all soft references as weak, typically as a last resort to reclaim extra
+     * objects when running out of memory.
      */
-    public static void setSoftReferencesAreWeak(boolean enabled) {
-        assert VMOperation.isGCInProgress();
-        softReferencesAreWeak = enabled;
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private static boolean areAllSoftReferencesWeak() {
+        return GCImpl.getGCImpl().isOutOfMemoryCollection();
     }
 
     @AlwaysInline("GC performance")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void discoverIfReference(Object object, ObjectReferenceVisitor refVisitor) {
         assert object != null;
-        DynamicHub hub = KnownIntrinsics.readHub(object);
+        DynamicHub hub = DynamicHubIntrinsics.readHub(object);
         if (probability(SLOW_PATH_PROBABILITY, hub.isReferenceInstanceClass())) {
             discover(object, refVisitor);
         }
@@ -109,8 +111,8 @@ final class ReferenceObjectProcessing {
              */
             return;
         }
-        if (Heap.getHeap().isInImageHeap(referentAddr)) {
-            // Referents in the image heap cannot be moved or reclaimed, no need to look closer.
+        if (isNeverReclaimed(referentAddr)) {
+            // Referents in memory spaces that are not reclaimed do not need to be processed.
             return;
         }
         if (maybeUpdateForwardedReference(dr, referentAddr)) {
@@ -119,23 +121,24 @@ final class ReferenceObjectProcessing {
             // promoted object.
             return;
         }
-        Object refObject = referentAddr.toObject();
+        Object refObject = referentAddr.toObjectNonNull();
         if (willSurviveThisCollection(refObject)) {
             // Either an object that got promoted without being moved or an object in the old gen.
-            RememberedSet.get().dirtyCardIfNecessary(dr, refObject);
+            RememberedSet.get().dirtyCardIfNecessaryInGC(dr, refObject, getReferentFieldAddress(dr));
             return;
         }
-        if (!softReferencesAreWeak && dr instanceof SoftReference) {
+        if (!areAllSoftReferencesWeak() && dr instanceof SoftReference) {
             long clock = ReferenceInternals.getSoftReferenceClock();
             long timestamp = ReferenceInternals.getSoftReferenceTimestamp((SoftReference<?>) dr);
             if (timestamp == 0) { // created or last accessed before the clock was initialized
                 timestamp = initialSoftRefClock;
             }
-            UnsignedWord elapsed = WordFactory.unsigned(clock - timestamp);
+            UnsignedWord elapsed = Word.unsigned(clock - timestamp);
             if (elapsed.belowThan(maxSoftRefAccessIntervalMs)) {
                 // Important: we need to pass the reference object as holder so that the remembered
                 // set can be updated accordingly!
-                refVisitor.visitObjectReference(ReferenceInternals.getReferentFieldAddress(dr), true, dr);
+                int referenceSize = ObjectLayout.singleton().getReferenceSize();
+                refVisitor.visitObjectReferences(ReferenceInternals.getReferentFieldAddress(dr), true, referenceSize, dr, 1);
                 return; // referent will survive
             }
         }
@@ -183,10 +186,10 @@ final class ReferenceObjectProcessing {
         return pendingHead;
     }
 
-    static void afterCollection(UnsignedWord freeBytes) {
+    static void afterCollection(UnsignedWord headroomBytes) {
         assert rememberedRefsList == null;
-        UnsignedWord unused = freeBytes.unsignedDivide(1024 * 1024 /* MB */);
-        maxSoftRefAccessIntervalMs = unused.multiply(SerialGCOptions.SoftRefLRUPolicyMSPerMB.getValue());
+        UnsignedWord headroomMB = headroomBytes.unsignedDivide(1024 * 1024 /* MB */);
+        maxSoftRefAccessIntervalMs = headroomMB.multiply(SubstrateGCOptions.SoftRefLRUPolicyMSPerMB.getValue());
         ReferenceInternals.updateSoftReferenceClock();
         if (initialSoftRefClock == 0) {
             initialSoftRefClock = ReferenceInternals.getSoftReferenceClock();
@@ -200,9 +203,10 @@ final class ReferenceObjectProcessing {
      */
     private static boolean processRememberedRef(Reference<?> dr) {
         Pointer refPointer = ReferenceInternals.getReferentPointer(dr);
-        assert !HeapImpl.getHeapImpl().isInImageHeap(refPointer) : "Image heap referent: should not have been discovered";
+        assert !isNeverReclaimed(refPointer) : "Never-reclaimed referent: should not have been discovered";
 
         if (SerialGCOptions.useCompactingOldGen() && GCImpl.getGCImpl().isCompleteCollection()) {
+            // References have already been fixed up or nulled if the referent did not survive.
             assert refPointer.isNull() || !ObjectHeaderImpl.isPointerToForwardedObject(refPointer);
             return refPointer.isNonNull();
         }
@@ -211,9 +215,9 @@ final class ReferenceObjectProcessing {
         if (maybeUpdateForwardedReference(dr, refPointer)) {
             return true;
         }
-        Object refObject = refPointer.toObject();
+        Object refObject = refPointer.toObjectNonNull();
         if (willSurviveThisCollection(refObject)) {
-            RememberedSet.get().dirtyCardIfNecessary(dr, refObject);
+            RememberedSet.get().dirtyCardIfNecessaryInGC(dr, refObject, getReferentFieldAddress(dr));
             return true;
         }
         /*
@@ -228,9 +232,14 @@ final class ReferenceObjectProcessing {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private static boolean isNeverReclaimed(Pointer ptr) {
+        return Heap.getHeap().isInImageHeap(ptr) || (Metaspace.isSupported() && Metaspace.singleton().isInAddressSpace(ptr));
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static boolean maybeUpdateForwardedReference(Reference<?> dr, Pointer referentAddr) {
         ObjectHeaderImpl ohi = ObjectHeaderImpl.getObjectHeaderImpl();
-        UnsignedWord header = ObjectHeader.readHeaderFromPointer(referentAddr);
+        UnsignedWord header = ohi.readHeaderFromPointer(referentAddr);
         if (ObjectHeaderImpl.isForwardedHeader(header)) {
             Object forwardedObj = ohi.getForwardedObject(referentAddr);
             ReferenceInternals.setReferent(dr, forwardedObj);
@@ -241,14 +250,20 @@ final class ReferenceObjectProcessing {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static boolean willSurviveThisCollection(Object obj) {
+        if (ObjectHeaderImpl.isMarked(obj)) {
+            // Note that marking is also used in copying collections in chunks with pinned objects.
+            return true;
+        }
         if (SerialGCOptions.useCompactingOldGen() && GCImpl.getGCImpl().isCompleteCollection()) {
-            return ObjectHeaderImpl.isMarked(obj);
+            // Note that when processing for enqueuing, mark status of objects is already cleared.
+            return false;
         }
         HeapChunk.Header<?> chunk = HeapChunk.getEnclosingHeapChunk(obj);
         Space space = HeapChunk.getSpace(chunk);
         return space.isToSpace() || space.isCompactingOldSpace();
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static void updateForwardedRefs() {
         assert SerialGCOptions.useCompactingOldGen();
 
@@ -261,7 +276,8 @@ final class ReferenceObjectProcessing {
 
             Pointer refPointer = ReferenceInternals.getReferentPointer(current);
             if (!maybeUpdateForwardedReference(current, refPointer)) {
-                UnsignedWord header = ObjectHeader.readHeaderFromPointer(refPointer);
+                ObjectHeader oh = Heap.getHeap().getObjectHeader();
+                UnsignedWord header = oh.readHeaderFromPointer(refPointer);
                 if (!ObjectHeaderImpl.isMarkedHeader(header)) {
                     ReferenceInternals.setReferent(current, null);
                 }

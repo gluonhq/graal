@@ -40,9 +40,10 @@ import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugi
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.tiers.Suites;
 import jdk.graal.compiler.phases.util.Providers;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
-public interface InternalFeature extends Feature {
-
+public interface InternalFeature extends InternalFeatureBridge {
     /**
      * Called to register foreign calls.
      *
@@ -95,8 +96,9 @@ public interface InternalFeature extends Feature {
      * @param suites The Graal compilation suites to add to.
      * @param hosted True if registering for ahead-of-time compilation, false if registering for
      *            runtime compilation.
+     * @param fallback True if registering for fallback compilation, false otherwise.
      */
-    default void registerGraalPhases(Providers providers, Suites suites, boolean hosted) {
+    default void registerGraalPhases(Providers providers, Suites suites, boolean hosted, boolean fallback) {
     }
 
     /**
@@ -120,7 +122,7 @@ public interface InternalFeature extends Feature {
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    interface AfterAbstractImageCreationAccess extends FeatureAccess {
+    interface AfterAbstractImageCreationAccess extends Feature.FeatureAccess, JVMCIFeatureAccess.FeatureAccess {
     }
 
     /**
@@ -133,5 +135,14 @@ public interface InternalFeature extends Feature {
      * @since 24.2
      */
     default void afterAbstractImageCreation(AfterAbstractImageCreationAccess access) {
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    interface InternalFeatureAccess extends Feature.FeatureAccess, JVMCIFeatureAccess.FeatureAccess {
+        @Override
+        ResolvedJavaType findTypeByName(String className);
+
+        @Override
+        MetaAccessProvider getMetaAccess();
     }
 }

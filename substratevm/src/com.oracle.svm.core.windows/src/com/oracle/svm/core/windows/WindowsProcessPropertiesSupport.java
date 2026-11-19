@@ -36,12 +36,16 @@ import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.impl.ProcessPropertiesSupport;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.BaseProcessPropertiesSupport;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.core.windows.headers.LibLoaderAPI;
 import com.oracle.svm.core.windows.headers.Process;
 import com.oracle.svm.core.windows.headers.WinBase;
@@ -49,11 +53,12 @@ import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
 import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
 
 @AutomaticallyRegisteredImageSingleton(ProcessPropertiesSupport.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class WindowsProcessPropertiesSupport extends BaseProcessPropertiesSupport {
 
     @Override
     public String getExecutableName() {
-        return getModulePath(LibLoaderAPI.GetModuleHandleA(WordFactory.nullPointer()));
+        return getModulePath(LibLoaderAPI.GetModuleHandleA(Word.nullPointer()));
     }
 
     @Override
@@ -104,7 +109,7 @@ public class WindowsProcessPropertiesSupport extends BaseProcessPropertiesSuppor
     @Override
     public String getObjectFile(String symbol) {
         try (CTypeConversion.CCharPointerHolder symbolHolder = CTypeConversion.toCString(symbol)) {
-            WinBase.HMODULE builtinHandle = LibLoaderAPI.GetModuleHandleA(WordFactory.nullPointer());
+            WinBase.HMODULE builtinHandle = LibLoaderAPI.GetModuleHandleA(Word.nullPointer());
             PointerBase symbolAddress = LibLoaderAPI.GetProcAddress(builtinHandle, symbolHolder.get());
             if (symbolAddress.isNonNull()) {
                 return getObjectFile(symbolAddress);
@@ -130,11 +135,6 @@ public class WindowsProcessPropertiesSupport extends BaseProcessPropertiesSuppor
             return null;
         }
         return WindowsSystemPropertiesSupport.toJavaString(path, length);
-    }
-
-    @Override
-    public String setLocale(String category, String locale) {
-        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override

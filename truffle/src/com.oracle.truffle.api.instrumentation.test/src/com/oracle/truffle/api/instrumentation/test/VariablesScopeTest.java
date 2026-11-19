@@ -194,7 +194,7 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
         return INTEROP.isNull(object);
     }
 
-    private static class ILScopeTester implements TestScopeInstrument.Tester {
+    private static final class ILScopeTester implements TestScopeInstrument.Tester {
 
         public void doTestScope(TruffleInstrument.Env env, Node node, VirtualFrame frame, boolean nodeEnter) throws Exception {
             assertTrue(NodeLibrary.getUncached().hasScope(node, null));
@@ -261,7 +261,7 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
         }
     }
 
-    private static class DefaultScopeTester implements TestScopeInstrument.Tester {
+    private static final class DefaultScopeTester implements TestScopeInstrument.Tester {
 
         private final StringBuilder visitedLocations = new StringBuilder();
 
@@ -450,9 +450,11 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
         }
     }
 
-    @TruffleLanguage.Registration(name = "", id = "test-custom-variables-scope-language", contextPolicy = ContextPolicy.SHARED)
+    @TruffleLanguage.Registration(name = "", id = CustomScopeLanguage.ID, contextPolicy = ContextPolicy.SHARED)
     @ProvidedTags({StandardTags.StatementTag.class, StandardTags.RootTag.class})
     public static class CustomScopeLanguage extends TruffleLanguage<Env> {
+
+        static final String ID = "test-custom-variables-scope-language";
 
         @Override
         protected Env createContext(Env env) {
@@ -474,14 +476,14 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
 
             @ExportMessage
             @SuppressWarnings("static-method")
-            boolean hasLanguage() {
+            boolean hasLanguageId() {
                 return true;
             }
 
             @ExportMessage
             @SuppressWarnings("static-method")
-            Class<? extends TruffleLanguage<?>> getLanguage() {
-                return CustomScopeLanguage.class;
+            String getLanguageId() {
+                return CustomScopeLanguage.ID;
             }
 
             @ExportMessage
@@ -620,7 +622,7 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
         }
     }
 
-    private static class CustomScopeTester implements TestScopeInstrument.Tester {
+    private static final class CustomScopeTester implements TestScopeInstrument.Tester {
 
         @Override
         public void doTestScope(TruffleInstrument.Env env, Node node, VirtualFrame frame, boolean nodeEnter) {
@@ -690,14 +692,14 @@ public class VariablesScopeTest extends AbstractInstrumentationTest {
 
         @ExportMessage
         @SuppressWarnings("static-method")
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
         @SuppressWarnings("static-method")
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return CustomScopeLanguage.class;
+        String getLanguageId() {
+            return CustomScopeLanguage.ID;
         }
 
         @ExportMessage

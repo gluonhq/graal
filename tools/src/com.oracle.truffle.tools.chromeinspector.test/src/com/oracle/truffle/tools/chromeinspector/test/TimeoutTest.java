@@ -50,7 +50,7 @@ public class TimeoutTest {
         Source source = Source.newBuilder(InstrumentationTestLanguage.ID, code, "TestFile").build();
         String sourceURI = InspectorTester.getStringURI(source.getURI());
         int codeLength = code.length();
-        InspectorTester tester = InspectorTester.start(new InspectorTester.Options(true).setSuspensionTimeout(1000L));
+        InspectorTester tester = InspectorTester.start(new InspectorTester.Options(true).setSuspensionTimeout(1L));
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         tester.setErr(output);
         tester.eval(source);
@@ -77,7 +77,7 @@ public class TimeoutTest {
         // Do not resume, the suspension timeout breaks it
         tester.finish();
         String errMessage = new String(output.toByteArray());
-        assertEquals("Timeout of 1000ms as specified via '--inspect.SuspensionTimeout' was reached. The debugger session is disconnected." + System.lineSeparator(), errMessage);
+        assertEquals("Timeout of 1ms as specified via '--inspect.SuspensionTimeout' was reached. The debugger session is disconnected." + System.lineSeparator(), errMessage);
     }
 
     @Test
@@ -87,7 +87,7 @@ public class TimeoutTest {
         InstrumentationTestLanguage.envConfig = Collections.singletonMap("initSource", source);
         String sourceURI = InspectorTester.getStringURI(source.getURI());
         int codeLength = code.length();
-        InspectorTester tester = InspectorTester.start(new InspectorTester.Options(true, false, true).setSuspensionTimeout(1000L));
+        InspectorTester tester = InspectorTester.start(new InspectorTester.Options(true, false, true).setSuspensionTimeout(1L));
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         tester.setErr(output);
         tester.eval(source);
@@ -114,7 +114,7 @@ public class TimeoutTest {
         // Do not resume, the suspension timeout breaks it
         tester.finish();
         String errMessage = new String(output.toByteArray());
-        assertEquals("Timeout of 1000ms as specified via '--inspect.SuspensionTimeout' was reached. The debugger session is disconnected." + System.lineSeparator(), errMessage);
+        assertEquals("Timeout of 1ms as specified via '--inspect.SuspensionTimeout' was reached. The debugger session is disconnected." + System.lineSeparator(), errMessage);
     }
     // @formatter:on
 }

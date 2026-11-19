@@ -24,9 +24,12 @@
  */
 package com.oracle.svm.core.graal.amd64;
 
+import com.oracle.svm.core.SubstrateOptions;
+
 import jdk.graal.compiler.core.amd64.AMD64SuitesCreator;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.java.GraphBuilderPhase;
+import jdk.graal.compiler.lir.dfa.MarkBasePointersPhase;
 import jdk.graal.compiler.lir.phases.LIRSuites;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import jdk.graal.compiler.options.OptionValues;
@@ -46,9 +49,14 @@ public class AMD64SubstrateSuitesCreator extends AMD64SuitesCreator {
     @Override
     public LIRSuites createLIRSuites(OptionValues options) {
         LIRSuites lirSuites = super.createLIRSuites(options);
-        /* Enable support for methods that need a frame pointer for stack unwinding purposes. */
-        lirSuites.getPreAllocationOptimizationStage().appendPhase(new FramePointerPhase());
-        lirSuites.getFinalCodeAnalysisStage().appendPhase(new VerifyFramePointerPhase());
+        if (SubstrateOptions.useFramePointerPhase()) {
+            // Used on Windows for unwind info for supported methods.
+            // Enabled on other platforms only if explicitly requested.
+            lirSuites.getPreAllocationOptimizationStage().appendPhase(new FramePointerPhase());
+            lirSuites.getFinalCodeAnalysisStage().appendPhase(new VerifyFramePointerPhase());
+        }
+        // Derived pointers aren't supported
+        lirSuites.getAllocationStage().findPhase(MarkBasePointersPhase.class).remove();
         return lirSuites;
     }
 }

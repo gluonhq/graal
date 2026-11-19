@@ -215,7 +215,7 @@ public class NotReadableValuesTest {
             }
 
             @Override
-            protected boolean hasLanguage() {
+            protected boolean hasLanguageId() {
                 // Provides the ProxyLanguage by default.
                 return true;
             }
@@ -277,7 +277,7 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class MetaObject extends ProxyInteropObject {
+        private static final class MetaObject extends ProxyInteropObject {
 
             @Override
             protected boolean isMetaObject() {
@@ -335,13 +335,13 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class ArrayValue extends ProxyInteropObject {
+        private static final class ArrayValue extends ProxyInteropObject {
 
             private static final long LENGTH = 6;
             private static final Set<Long> NOT_READABLE = new HashSet<>(Arrays.asList(new Long[]{2L, 3L}));
 
             @Override
-            protected boolean hasLanguage() {
+            protected boolean hasLanguageId() {
                 // Provides the ProxyLanguage by default.
                 return true;
             }

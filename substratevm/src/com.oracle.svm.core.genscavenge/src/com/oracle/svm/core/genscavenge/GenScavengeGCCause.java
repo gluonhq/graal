@@ -24,12 +24,31 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import com.oracle.svm.core.heap.GCCause;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.guest.staging.core.heap.GCCause;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 
-final class GenScavengeGCCause extends GCCause {
-    public static final GCCause OnAllocation = new GenScavengeGCCause("Collect on allocation", 10);
+public final class GenScavengeGCCause extends GCCause {
+    public static final GCCause OnAllocation = new GenScavengeGCCause("Collect on allocation", 15, false);
 
-    private GenScavengeGCCause(String name, int id) {
-        super(name, id);
+    private GenScavengeGCCause(String name, int id, boolean completeCollection) {
+        super(name, id, completeCollection);
+    }
+}
+
+/**
+ * For layered builds we must eagerly register all GCCauses in the initial layer.
+ */
+@AutomaticallyRegisteredFeature
+class GenScavengeGCCauseRegistration implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.buildingInitialLayer();
+    }
+
+    @Override
+    public void duringSetup(DuringSetupAccess access) {
+        GCCause.registerGCCause(GenScavengeGCCause.OnAllocation);
     }
 }

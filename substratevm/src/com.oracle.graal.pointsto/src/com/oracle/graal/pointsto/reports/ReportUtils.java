@@ -36,7 +36,6 @@ import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.function.Consumer;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
@@ -50,6 +49,7 @@ import com.oracle.graal.pointsto.meta.InvokeInfo;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import org.graalvm.collections.EconomicSet;
 
 public class ReportUtils {
 
@@ -58,18 +58,36 @@ public class ReportUtils {
     public static final String CHILD = "\u251c\u2500\u2500 "; // "|-- "
     public static final String LAST_CHILD = "\u2514\u2500\u2500 "; // "`-- "
 
-    public static final Comparator<ResolvedJavaMethod> methodComparator = Comparator.comparing(m -> m.format("%H.%n(%P):%R"));
-    static final Comparator<AnalysisField> fieldComparator = Comparator.comparing(f -> f.format("%H.%n"));
-    static final Comparator<InvokeInfo> invokeInfoBCIComparator = Comparator.comparing(i -> i.getPosition().getBCI());
-    static final Comparator<InvokeInfo> invokeInfoComparator = invokeInfoBCIComparator.thenComparing(i -> comparingMethodNames(i.getTargetMethod()));
-    static final Comparator<BytecodePosition> positionMethodComparator = Comparator.comparing(pos -> pos.getMethod().format("%H.%n(%P):%R"));
-    static final Comparator<BytecodePosition> positionComparator = positionMethodComparator.thenComparing(pos -> pos.getBCI());
-    static final Comparator<Object> reasonComparator = (o1, o2) -> {
-        if (o1 instanceof BytecodePosition p1 && o2 instanceof BytecodePosition p2) {
-            return positionComparator.compare(p1, p2);
-        }
-        return o1.toString().compareTo(o2.toString());
-    };
+    public static Comparator<ResolvedJavaMethod> methodComparator() {
+        return Comparators.METHOD_COMPARATOR;
+    }
+
+    static Comparator<AnalysisField> fieldComparator() {
+        return Comparators.FIELD_COMPARATOR;
+    }
+
+    static Comparator<InvokeInfo> invokeInfoComparator() {
+        return Comparators.INVOKE_INFO_COMPARATOR;
+    }
+
+    static Comparator<Object> reasonComparator() {
+        return Comparators.REASON_COMPARATOR;
+    }
+
+    private static final class Comparators {
+        static final Comparator<ResolvedJavaMethod> METHOD_COMPARATOR = Comparator.comparing(m -> m.format("%H.%n(%P):%R"));
+        static final Comparator<AnalysisField> FIELD_COMPARATOR = Comparator.comparing(f -> f.format("%H.%n"));
+        private static final Comparator<InvokeInfo> INVOKE_INFO_BCI_COMPARATOR = Comparator.comparing(i -> i.getPosition().getBCI());
+        static final Comparator<InvokeInfo> INVOKE_INFO_COMPARATOR = INVOKE_INFO_BCI_COMPARATOR.thenComparing(i -> comparingMethodNames(i.getTargetMethod()));
+        private static final Comparator<BytecodePosition> POSITION_METHOD_COMPARATOR = Comparator.comparing(pos -> pos.getMethod().format("%H.%n(%P):%R"));
+        private static final Comparator<BytecodePosition> POSITION_COMPARATOR = POSITION_METHOD_COMPARATOR.thenComparing(pos -> pos.getBCI());
+        static final Comparator<Object> REASON_COMPARATOR = (o1, o2) -> {
+            if (o1 instanceof BytecodePosition p1 && o2 instanceof BytecodePosition p2) {
+                return POSITION_COMPARATOR.compare(p1, p2);
+            }
+            return o1.toString().compareTo(o2.toString());
+        };
+    }
 
     /**
      *
@@ -298,22 +316,22 @@ public class ReportUtils {
     public static String typePropagationTrace(PointsToAnalysis bb, TypeFlow<?> flow, AnalysisType type, String indent) {
         if (bb.trackTypeFlowInputs()) {
             StringBuilder msg = new StringBuilder(String.format("Propagation trace through type flows for type %s: %n", type.toJavaName()));
-            followInput(flow, type, indent, new HashSet<>(), msg);
+            followInput(bb, flow, type, indent, EconomicSet.create(), msg);
             return msg.toString();
         } else {
             return String.format("To print the propagation trace through type flows for type %s set the -H:+TrackInputFlows option. %n", type.toJavaName());
         }
     }
 
-    private static void followInput(TypeFlow<?> flow, AnalysisType type, String indent, HashSet<TypeFlow<?>> seen, StringBuilder msg) {
+    private static void followInput(PointsToAnalysis bb, TypeFlow<?> flow, AnalysisType type, String indent, EconomicSet<TypeFlow<?>> seen, StringBuilder msg) {
         seen.add(flow);
         if (flow instanceof AllInstantiatedTypeFlow) {
             msg.append(String.format("AllInstantiated(%s)%n", flow.getDeclaredType().toJavaName(true)));
         } else {
             msg.append(String.format("%sat %s: %s%n", indent, flow.formatSource(), flow.format(false, false)));
             for (TypeFlow<?> input : flow.getInputs()) {
-                if (!seen.contains(input) && input.getState().containsType(type)) {
-                    followInput(input, type, indent, seen, msg);
+                if (!seen.contains(input) && input.getOutputState(bb).containsType(type)) {
+                    followInput(bb, input, type, indent, seen, msg);
                     break;
                 }
             }

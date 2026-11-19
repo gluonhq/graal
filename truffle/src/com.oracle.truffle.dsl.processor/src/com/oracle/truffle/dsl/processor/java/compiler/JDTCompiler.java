@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,6 +42,7 @@ package com.oracle.truffle.dsl.processor.java.compiler;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.File;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -130,11 +131,12 @@ public class JDTCompiler extends AbstractCompiler {
 
     /**
      * Returns true if and only if the used version of ECJ has the <a
-     * href=https://github.com/eclipse-jdt/eclipse.jdt.core/issues/1752>static member inheritace
-     * bug</a>.
+     * href=https://github.com/eclipse-jdt/eclipse.jdt.core/issues/1752>static member inheritance
+     * bug</a>. ECJ 3.45 changed {@code getAllMembers(...)} to include inherited static members
+     * again, so the workaround is only needed for 3.34 .. 3.44.
      */
     private boolean hasStaticMemberInheritanceBug() {
-        return (compilerMajorVersion > 3 || (compilerMajorVersion == 3 && compilerMinorVersion >= 34));
+        return compilerMajorVersion == 3 && compilerMinorVersion >= 34 && compilerMinorVersion < 45;
     }
 
     private List<? extends Element> getAllMembers(ProcessingEnvironment environment, TypeElement type) {
@@ -423,6 +425,36 @@ public class JDTCompiler extends AbstractCompiler {
             return true;
         } else {
             return false;
+        }
+    }
+
+    @Override
+    public File getEnclosingSourceFile(ProcessingEnvironment processingEnv, Element element) {
+
+        boolean isIde = false;
+        Class<?> c = processingEnv.getClass();
+        while (c != Object.class) {
+            if (c.getSimpleName().equals("IdeProcessingEnvImpl")) {
+                isIde = true;
+                break;
+            }
+            c = c.getSuperclass();
+        }
+
+        try {
+            if (isIde) {
+                // the getEnclosingIFile is only available in the IDE
+                Object iFile = method(processingEnv, "getEnclosingIFile", new Class<?>[]{Element.class},
+                                element);
+                return (File) method(method(iFile, "getRawLocation"), "toFile");
+            } else {
+                // in IDE, this only returns the project-relative path
+                Object binding = field(element, "_binding");
+                char[] fileName = (char[]) field(binding, "fileName");
+                return new File(new String(fileName));
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new UnsupportedOperationException(e);
         }
     }
 }

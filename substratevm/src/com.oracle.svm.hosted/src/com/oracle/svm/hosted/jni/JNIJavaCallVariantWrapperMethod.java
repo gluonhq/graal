@@ -24,24 +24,27 @@
  */
 package com.oracle.svm.hosted.jni;
 
+import java.lang.reflect.Executable;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.impl.InternalPlatform;
 import org.graalvm.word.LocationIdentity;
 
 import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.graal.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
 import com.oracle.svm.core.graal.nodes.CInterfaceReadNode;
 import com.oracle.svm.core.graal.nodes.ReadCallerStackPointerNode;
 import com.oracle.svm.core.graal.nodes.VaListInitializationNode;
 import com.oracle.svm.core.graal.nodes.VaListNextArgNode;
 import com.oracle.svm.core.jni.CallVariant;
 import com.oracle.svm.core.jni.JNIJavaCallVariantWrapperHolder;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.nodes.SubstrateIndirectCallTargetNode;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.code.EntryPointCallStubMethod;
 
 import jdk.graal.compiler.core.common.calc.FloatConvert;
@@ -56,7 +59,6 @@ import jdk.graal.compiler.nodes.CallTargetNode;
 import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
-import jdk.graal.compiler.nodes.IndirectCallTargetNode;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.StructuredGraph;
@@ -82,9 +84,10 @@ public class JNIJavaCallVariantWrapperMethod extends EntryPointCallStubMethod {
     private final Signature callWrapperSignature;
     private final CallVariant callVariant;
     private final boolean nonVirtual;
+    private final Executable member;
 
-    public JNIJavaCallVariantWrapperMethod(ResolvedSignature<ResolvedJavaType> callWrapperSignature, CallVariant callVariant, boolean nonVirtual, MetaAccessProvider originalMetaAccess,
-                    WordTypes wordTypes) {
+    public JNIJavaCallVariantWrapperMethod(Executable member, ResolvedSignature<ResolvedJavaType> callWrapperSignature, CallVariant callVariant, boolean nonVirtual,
+                    MetaAccessProvider originalMetaAccess, WordTypes wordTypes) {
         super(createName(callWrapperSignature, callVariant, nonVirtual),
                         originalMetaAccess.lookupJavaType(JNIJavaCallVariantWrapperHolder.class),
                         createSignature(callWrapperSignature, callVariant, nonVirtual, originalMetaAccess, wordTypes),
@@ -92,6 +95,7 @@ public class JNIJavaCallVariantWrapperMethod extends EntryPointCallStubMethod {
         this.callWrapperSignature = callWrapperSignature;
         this.callVariant = callVariant;
         this.nonVirtual = nonVirtual;
+        this.member = member;
     }
 
     private static String createName(ResolvedSignature<ResolvedJavaType> targetSignature, CallVariant callVariant, boolean nonVirtual) {
@@ -166,7 +170,7 @@ public class JNIJavaCallVariantWrapperMethod extends EntryPointCallStubMethod {
         ValueNode formerPendingException = kit.invokeGetAndClearPendingException();
 
         StampPair returnStamp = StampFactory.forDeclaredType(kit.getAssumptions(), invokeSignature.getReturnType(), false);
-        CallTargetNode callTarget = new IndirectCallTargetNode(callAddress, args.toArray(ValueNode[]::new), returnStamp, invokeSignature.toParameterTypes(null),
+        CallTargetNode callTarget = new SubstrateIndirectCallTargetNode(callAddress, args.toArray(ValueNode[]::new), returnStamp, invokeSignature.toParameterTypes(null),
                         null, SubstrateCallingConventionKind.Java.toType(true), InvokeKind.Static);
 
         int invokeBci = kit.bci();
@@ -212,7 +216,7 @@ public class JNIJavaCallVariantWrapperMethod extends EntryPointCallStubMethod {
         // iOS CallVariant.VARARGS stores values as an array on the stack
         if (callVariant == CallVariant.ARRAY ||
                         (Platform.includedIn(Platform.DARWIN_AARCH64.class) && (callVariant == CallVariant.VARARGS || callVariant == CallVariant.VA_LIST)) ||
-                        (Platform.includedIn(Platform.WINDOWS.class) && callVariant == CallVariant.VA_LIST)) {
+                        (Platform.includedIn(InternalPlatform.WINDOWS_BASE.class) && callVariant == CallVariant.VA_LIST)) {
             ValueNode array;
             if (callVariant == CallVariant.VARARGS) {
                 array = kit.append(new ReadCallerStackPointerNode());
@@ -281,5 +285,9 @@ public class JNIJavaCallVariantWrapperMethod extends EntryPointCallStubMethod {
             throw VMError.unsupportedFeature("Call variant: " + callVariant);
         }
         return args;
+    }
+
+    public Executable getMember() {
+        return member;
     }
 }

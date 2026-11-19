@@ -1,0 +1,5 @@
+[[rule]]
+files = ["CEntryPointCallStubMethod.java", "UninterruptibleAnnotationChecker.java"]
+all = [
+    "christian.haeubl@oracle.com"
+]

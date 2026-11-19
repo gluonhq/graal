@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -105,7 +105,6 @@ public class TruffleToTruffleCallExceptionHandlerTest extends PartialEvaluationT
     }
 
     @Test
-    @SuppressWarnings("try")
     public void testNeverSeenExceptionHandlerSkipped() {
         /*
          * We disable truffle AST inlining to not inline the callee
@@ -117,7 +116,6 @@ public class TruffleToTruffleCallExceptionHandlerTest extends PartialEvaluationT
     }
 
     @Test
-    @SuppressWarnings("try")
     public void testExceptionOnceCompileExceptionHandler() {
         preventProfileCalls = true;
         try {
@@ -132,7 +130,7 @@ public class TruffleToTruffleCallExceptionHandlerTest extends PartialEvaluationT
              * the partial evaluator will compile the exception handler edge
              */
             try {
-                compilables.callerWithException.callDirect(null, new Object());
+                compilables.callerWithException.callDirect(null, -1, new Object[]{new Object()});
                 Assert.fail();
             } catch (Throwable t) {
                 Assert.assertTrue(t instanceof RuntimeException);

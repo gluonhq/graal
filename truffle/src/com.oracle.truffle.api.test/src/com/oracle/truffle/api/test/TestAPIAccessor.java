@@ -46,6 +46,10 @@ public final class TestAPIAccessor extends Accessor {
 
     private static final TestAPIAccessor API = new TestAPIAccessor();
 
+    public static final HostSupport HOST = API.hostSupport();
+    public static final EngineSupport ENGINE = API.engineSupport();
+    public static final PolyglotIsolateSupport ISOLATE = API.polyglotIsolateSupport();
+
     public static Accessor.EngineSupport engineAccess() {
         return API.engineSupport();
     }

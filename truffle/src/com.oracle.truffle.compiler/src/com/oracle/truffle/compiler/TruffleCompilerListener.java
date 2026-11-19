@@ -71,6 +71,13 @@ public interface TruffleCompilerListener {
      */
     interface CompilationResultInfo {
         /**
+         * Gets the ID of the compilation.
+         */
+        default long getCompilationId() {
+            return -1;
+        }
+
+        /**
          * Gets the size of the machine code generated.
          */
         int getTargetCodeSize();
@@ -148,30 +155,6 @@ public interface TruffleCompilerListener {
      * @param tier Which compilation tier was the compilation
      */
     default void onSuccess(TruffleCompilable compilable, TruffleCompilationTask task, GraphInfo graph, CompilationResultInfo compilationResultInfo, int tier) {
-    }
-
-    /**
-     * Notifies this object when compilation of {@code compilable} fails.
-     * <p>
-     * GR-54187: Remove in graalvm-25.1
-     * </p>
-     *
-     * @param compilable the Truffle AST whose compilation failed
-     * @param reason the reason compilation failed
-     * @param bailout specifies whether the failure was a bailout or an error in the compiler. A
-     *            bailout means the compiler aborted the compilation based on some of property of
-     *            {@code target} (e.g., too big). A non-bailout means an unexpected error in the
-     *            compiler itself.
-     * @param permanentBailout specifies if a bailout is due to a condition that probably won't
-     *            change if the {@code target} is compiled again. This value is meaningless if
-     *            {@code bailout == false}.
-     * @param tier Which compilation tier was the compilation
-     * @deprecated use
-     *             {@link #onFailure(TruffleCompilable, String, boolean, boolean, int, Supplier)}
-     */
-    @Deprecated(since = "24.1")
-    default void onFailure(TruffleCompilable compilable, String reason, boolean bailout, boolean permanentBailout, int tier) {
-        onFailure(compilable, reason, bailout, permanentBailout, tier, null);
     }
 
     /**

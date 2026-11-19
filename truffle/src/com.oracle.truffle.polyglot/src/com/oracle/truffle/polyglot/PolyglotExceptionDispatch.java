@@ -108,6 +108,11 @@ final class PolyglotExceptionDispatch extends AbstractExceptionDispatch {
     }
 
     @Override
+    public String toString(Object receiver) {
+        return ((PolyglotExceptionImpl) receiver).toStringImpl();
+    }
+
+    @Override
     public StackTraceElement[] getStackTrace(Object receiver) {
         return ((PolyglotExceptionImpl) receiver).getStackTrace();
     }
@@ -115,6 +120,11 @@ final class PolyglotExceptionDispatch extends AbstractExceptionDispatch {
     @Override
     public String getMessage(Object receiver) {
         return ((PolyglotExceptionImpl) receiver).getMessage();
+    }
+
+    @Override
+    public Object getCauseImpl(Object receiver) {
+        return ((PolyglotExceptionImpl) receiver).getCause();
     }
 
     @Override

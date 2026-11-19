@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,7 +26,6 @@ package com.oracle.graal.pointsto.flow;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
-import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
@@ -37,7 +36,7 @@ import jdk.vm.ci.code.BytecodePosition;
  */
 public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
 
-    protected StoreFieldTypeFlow(BytecodePosition storeLocation, AnalysisField field) {
+    protected StoreFieldTypeFlow(BytecodePosition storeLocation, PointsToAnalysisField field) {
         super(storeLocation, field);
     }
 
@@ -45,8 +44,11 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
         super(original, methodFlows);
     }
 
+    /**
+     * Filters the incoming type state using the declared type.
+     */
     @Override
-    public TypeState filter(PointsToAnalysis bb, TypeState newState) {
+    protected TypeState processInputState(PointsToAnalysis bb, TypeState newState) {
         /*
          * If the type flow constraints are relaxed filter the stored value using the field's
          * declared type.
@@ -62,7 +64,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
         /** The flow of the input value. */
         private final TypeFlow<?> valueFlow;
 
-        StoreStaticFieldTypeFlow(BytecodePosition storeLocation, AnalysisField field, TypeFlow<?> valueFlow, FieldTypeFlow fieldFlow) {
+        StoreStaticFieldTypeFlow(BytecodePosition storeLocation, PointsToAnalysisField field, TypeFlow<?> valueFlow, FieldTypeFlow fieldFlow) {
             super(storeLocation, field);
             this.valueFlow = valueFlow;
             this.fieldFlow = fieldFlow;
@@ -92,7 +94,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
 
         @Override
         public String toString() {
-            return "StoreStaticFieldTypeFlow<" + getState() + ">";
+            return "StoreStaticFieldTypeFlow<" + getStateDescription() + ">";
         }
 
     }
@@ -100,10 +102,10 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
     /**
      * The state of the StoreFieldTypeFlow reflects the state of the stored value. The
      * StoreFieldTypeFlow is an observer of the receiver flow, i.e. flow modeling the receiver
-     * object of the store operation..
+     * object of the store operation.
      *
      * Every time the state of the receiver flow changes the corresponding field flows are added as
-     * uses to the store field flow. Thus the stored value is propagated to the store field flow
+     * uses to the store field flow. Thus, the stored value is propagated to the store field flow
      * into the field flows.
      */
     public static class StoreInstanceFieldTypeFlow extends StoreFieldTypeFlow {
@@ -116,11 +118,11 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
 
         private boolean isContextInsensitive;
 
-        public StoreInstanceFieldTypeFlow(BytecodePosition storeLocation, AnalysisField field, TypeFlow<?> objectFlow) {
+        public StoreInstanceFieldTypeFlow(BytecodePosition storeLocation, PointsToAnalysisField field, TypeFlow<?> objectFlow) {
             this(storeLocation, field, null, objectFlow);
         }
 
-        public StoreInstanceFieldTypeFlow(BytecodePosition storeLocation, AnalysisField field, TypeFlow<?> valueFlow, TypeFlow<?> objectFlow) {
+        public StoreInstanceFieldTypeFlow(BytecodePosition storeLocation, PointsToAnalysisField field, TypeFlow<?> valueFlow, TypeFlow<?> objectFlow) {
             super(storeLocation, field);
             this.valueFlow = valueFlow;
             this.objectFlow = objectFlow;
@@ -175,6 +177,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
 
         @Override
         public void onObservedSaturated(PointsToAnalysis bb, TypeFlow<?> observed) {
+            assert bb.getExtensionPolicy().isFieldClosed(field);
             /*
              * When receiver flow saturates swap in the saturated store type flow. When the store
              * itself saturates it propagates the saturation state to the uses/observers and unlinks
@@ -189,7 +192,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
             valueFlow.removeUse(this);
 
             /* Link the saturated store. */
-            StoreFieldTypeFlow contextInsensitiveStore = ((PointsToAnalysisField) field).initAndGetContextInsensitiveStore(bb, source);
+            StoreFieldTypeFlow contextInsensitiveStore = field.initAndGetContextInsensitiveStore(bb, source);
             /*
              * Link the value flow to the saturated store. The receiver is already set in the
              * saturated store.
@@ -199,7 +202,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
 
         @Override
         public String toString() {
-            return "StoreInstanceFieldTypeFlow<" + getState() + ">";
+            return "StoreInstanceFieldTypeFlow<" + getStateDescription() + ">";
         }
     }
 }

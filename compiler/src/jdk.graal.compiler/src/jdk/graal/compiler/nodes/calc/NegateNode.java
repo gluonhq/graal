@@ -73,7 +73,11 @@ public class NegateNode extends UnaryArithmeticNode<Neg> implements NarrowableAr
 
     @Override
     public ValueNode canonical(CanonicalizerTool tool, ValueNode forValue) {
-        ValueNode synonym = findSynonym(forValue, getOp(forValue));
+        ValueNode ret = super.canonical(tool, forValue);
+        if (ret != this) {
+            return ret;
+        }
+        ValueNode synonym = findSynonym(forValue, NodeView.DEFAULT);
         if (synonym != null) {
             return synonym;
         }
@@ -100,7 +104,7 @@ public class NegateNode extends UnaryArithmeticNode<Neg> implements NarrowableAr
             RightShiftNode shift = (RightShiftNode) forValue;
             Stamp stamp = forValue.stamp(view);
             if (shift.getY().isConstant() && stamp instanceof IntegerStamp) {
-                int shiftAmount = shift.getY().asJavaConstant().asInt();
+                int shiftAmount = shift.getConstantShiftAmount();
                 if (shiftAmount == ((IntegerStamp) stamp).getBits() - 1) {
                     return UnsignedRightShiftNode.create(shift.getX(), shift.getY(), view);
                 }

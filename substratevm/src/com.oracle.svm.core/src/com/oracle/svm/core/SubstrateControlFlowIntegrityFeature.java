@@ -26,13 +26,14 @@ package com.oracle.svm.core;
 
 import org.graalvm.nativeimage.ImageSingletons;
 
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 
 @AutomaticallyRegisteredFeature
 public class SubstrateControlFlowIntegrityFeature implements InternalFeature {
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
+        SubstrateControlFlowIntegrity.validateConfiguration(SubstrateControlFlowIntegrity.Options.CFI.getValue(), true);
         ImageSingletons.add(SubstrateControlFlowIntegrity.class, new SubstrateControlFlowIntegrity());
     }
 }

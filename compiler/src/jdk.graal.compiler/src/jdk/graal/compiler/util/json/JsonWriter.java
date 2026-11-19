@@ -326,7 +326,8 @@ public class JsonWriter implements AutoCloseable {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             // Escaping rules according to https://www.ietf.org/rfc/rfc4627.txt section 2.5
-            if (c == '"' || c == '\\' || c == '/') {
+            // except for '/' because it is unnecessarily verbose.
+            if (c == '"' || c == '\\') {
                 escapeSequence(sb, c);
             } else if (c == '\b') {
                 escapeSequence(sb, 'b');
@@ -356,19 +357,27 @@ public class JsonWriter implements AutoCloseable {
      * @see #unindent()
      */
     public JsonWriter newline() throws IOException {
-        StringBuilder builder = new StringBuilder(1 + 2 * indentation);
-        builder.append("\n");
-        for (int i = 0; i < indentation; ++i) {
-            builder.append("  ");
-        }
-        writer.write(builder.toString());
+        writer.write('\n');
+        appendIndentation();
+        return this;
+    }
+
+    /**
+     * Appends <code>2 * indentation</code> whitespaces. This call is used to print objects that
+     * start indented.
+     *
+     * @see #indent()
+     * @see #unindent()
+     */
+    public JsonWriter appendIndentation() throws IOException {
+        writer.write("  ".repeat(indentation));
         return this;
     }
 
     /**
      * Increases the current indentation level by one. This does not print any character to the
      * writer directly, but modifies how many indents will be printed at the next call to
-     * {@link #newline()}.
+     * {@link #newline()} or {@link #appendIndentation()}.
      */
     public JsonWriter indent() {
         indentation++;
@@ -378,7 +387,7 @@ public class JsonWriter implements AutoCloseable {
     /**
      * Decreases the current indentation level by one. This does not print any character to the
      * writer directly, but modifies how many indents will be printed at the next call to
-     * {@link #newline()}.
+     * {@link #newline()} or {@link #appendIndentation()}.
      */
     public JsonWriter unindent() {
         assert indentation > 0 : "Json indentation underflowed";

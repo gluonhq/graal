@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,18 +29,77 @@
  */
 package com.oracle.truffle.llvm.toolchain.launchers;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Optional;
+
+import org.graalvm.nativeimage.ProcessProperties;
+
+import com.oracle.truffle.llvm.toolchain.launchers.AbstractToolchainWrapper.ToolchainWrapperConfig;
 import com.oracle.truffle.llvm.toolchain.launchers.common.Driver;
 
-import java.nio.file.Path;
+public final class BinUtil extends Driver {
 
-public final class BinUtil extends AbstractBinUtil {
+    public BinUtil(String exe) {
+        super(exe);
+    }
 
     public static void main(String[] args) {
-        new BinUtil().run(args);
+        ToolchainWrapperConfig config = AbstractToolchainWrapper.getConfig();
+
+        String toolName;
+        if (config != null) {
+            toolName = config.toolName();
+        } else {
+            // this is the boostrap toolchain...
+            toolName = System.getProperty("org.graalvm.launcher.executablename");
+
+            // ... or a legacy GraalVM
+            if (toolName == null) {
+                toolName = ProcessProperties.getArgumentVectorProgramName();
+            }
+
+            Path toolPath = Paths.get(toolName).getFileName();
+            if (toolPath != null) {
+                toolName = toolPath.toString();
+            }
+        }
+
+        if (!toolName.startsWith("llvm-")) {
+            toolName = "llvm-" + toolName;
+        }
+
+        final Path toolPath = Driver.getLLVMBinDir().resolve(toolName);
+        new BinUtil(Objects.toString(toolPath.getFileName(), "")).runTool(toolPath, args);
     }
 
-    @Override
-    protected Path getTargetPath(String binUtilName) {
-        return Driver.getLLVMBinDir().resolve(binUtilName);
+    public void runTool(Path toolPath, String[] args) {
+        ArrayList<String> utilArgs = new ArrayList<>(args.length + 1);
+        utilArgs.add(toolPath.toString());
+        if (args.length > 0) {
+            utilArgs.addAll(Arrays.asList(args));
+        }
+        ProcessBuilder pb = new ProcessBuilder(utilArgs).redirectError(ProcessBuilder.Redirect.INHERIT).redirectInput(ProcessBuilder.Redirect.INHERIT).redirectOutput(ProcessBuilder.Redirect.INHERIT);
+        Process p = null;
+        try {
+            p = pb.start();
+            p.waitFor();
+            System.exit(p.exitValue());
+        } catch (IOException e) {
+            log("Error: %s", e.getMessage());
+            printMissingToolMessage(Optional.ofNullable(toolPath.getParent()).map(Path::getParent).map(Path::toString).orElse("<invalid>"));
+            System.exit(1);
+        } catch (InterruptedException e) {
+            if (p != null) {
+                p.destroyForcibly();
+            }
+            log("Error: Subprocess interrupted: %s", e.getMessage());
+            System.exit(1);
+        }
     }
+
 }

@@ -27,9 +27,9 @@ package com.oracle.svm.core.genscavenge;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
-import com.oracle.svm.core.heap.RuntimeCodeInfoGCSupport;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.heap.RuntimeCodeInfoGCSupport;
 
 public class RuntimeCodeInfoGCSupportImpl extends RuntimeCodeInfoGCSupport {
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -39,7 +39,7 @@ public class RuntimeCodeInfoGCSupportImpl extends RuntimeCodeInfoGCSupport {
     @Override
     @Uninterruptible(reason = "Called when installing code.", callerMustBe = true)
     public void registerObjectFields(CodeInfo codeInfo) {
-        // nothing to do (all runtime compiled code gets processed at every GC)
+        // nothing to do (all runtime-installed code gets processed at every GC)
     }
 
     @Override

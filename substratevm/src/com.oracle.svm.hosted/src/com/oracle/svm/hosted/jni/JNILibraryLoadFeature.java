@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,30 +24,296 @@
  */
 package com.oracle.svm.hosted.jni;
 
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.SequencedSet;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.hosted.Feature;
 
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.objectfile.ObjectFile;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.core.jdk.JNIPlatformNativeLibrarySupport;
 import com.oracle.svm.core.jdk.NativeLibrarySupport;
 import com.oracle.svm.core.jni.JNILibraryInitializer;
+import com.oracle.svm.core.jni.access.JNINativeLinkage;
+import com.oracle.svm.hosted.FeatureImpl.AfterAnalysisAccessImpl;
+import com.oracle.svm.hosted.FeatureImpl.BeforeImageWriteAccessImpl;
+import com.oracle.svm.hosted.analysis.Inflation;
 import com.oracle.svm.hosted.c.NativeLibraries;
+import com.oracle.svm.hosted.c.codegen.CCompilerInvoker;
+import com.oracle.svm.hosted.c.codegen.CSourceCodeWriter;
+import com.oracle.svm.hosted.jdk.JNIRegistrationSupport;
+import com.oracle.svm.hosted.substitute.AnnotationSubstitutionProcessor;
+import com.oracle.svm.hosted.substitute.SubstitutionMethod;
+import com.oracle.svm.hosted.substitute.SubstitutionType;
+import com.oracle.svm.shared.singletons.ImageSingletonLoader;
+import com.oracle.svm.shared.singletons.ImageSingletonWriter;
+import com.oracle.svm.shared.singletons.LayeredPersistFlags;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.LayeredCallbacksSingletonTrait;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacksSupplier;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = JNILibraryLoadFeature.LayeredCallbacks.class, other = PartiallyLayerAware.class)
 public class JNILibraryLoadFeature implements Feature {
 
+    private static final String AOT_OWNED_NATIVE_SYMBOLS = "aotOwnedNativeSymbols";
+
     private final JNILibraryInitializer jniLibraryInitializer = new JNILibraryInitializer();
+    private JNILibraryLinkagePlan linkagePlan;
+    private final Set<String> aotOwnedNativeSymbols = new HashSet<>();
+    private final SortedSet<String> missingBuiltinOnLoadSymbols = new TreeSet<>();
+
+    public static JNILibraryLoadFeature singleton() {
+        return ImageSingletons.lookup(JNILibraryLoadFeature.class);
+    }
 
     @Override
     public void duringSetup(DuringSetupAccess access) {
         NativeLibrarySupport.singleton().registerLibraryInitializer(jniLibraryInitializer);
+        linkagePlan = new JNILibraryLinkagePlan();
+        ImageSingletons.add(JNILibraryLinkagePlan.class, linkagePlan);
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        JNIPlatformNativeLibrarySupport platformNativeLibrarySupport = JNIPlatformNativeLibrarySupport.singleton();
+        linkagePlan.prepareBeforeAnalysis();
+        platformNativeLibrarySupport.setLibjavaSymbols(linkagePlan.getBuiltinSymbols("java"));
     }
 
     @Override
     public void duringAnalysis(DuringAnalysisAccess access) {
-        NativeLibraries nativeLibraries = NativeLibraries.singleton();
-        List<String> staticLibNames = nativeLibraries.getJniStaticLibraries();
-        boolean isChanged = jniLibraryInitializer.fillCGlobalDataMap(staticLibNames);
+        List<String> reachableStaticLibraries = linkagePlan.getReachableStaticLibraryNames();
+        boolean isChanged = jniLibraryInitializer.fillCGlobalDataMap(reachableStaticLibraries, this::shouldReferenceBuiltinOnLoad);
         if (isChanged) {
             access.requireAnalysisIteration();
         }
+    }
+
+    private boolean shouldReferenceBuiltinOnLoad(String library) {
+        String onLoadSymbol = JNILibraryInitializer.getOnLoadName(library, true);
+        if (linkagePlan.getBuiltinSymbols(library).contains(onLoadSymbol)) {
+            return true;
+        }
+        if (ClassRegistries.respectClassLoader()) {
+            /*
+             * The JDK identifies a built-in library by its OnLoad symbol. Generate a no-op
+             * implementation when an explicitly registered static JNI library does not provide
+             * one itself.
+             */
+            missingBuiltinOnLoadSymbols.add(onLoadSymbol);
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void afterAnalysis(AfterAnalysisAccess access) {
+        JNIRegistrationSupport registrationSupport = JNIRegistrationSupport.singleton();
+        registrationSupport.markPreviousLayerLibrariesReachable();
+        linkagePlan.prepareAfterAnalysis();
+
+        if (!ClassRegistries.respectClassLoader()) {
+            return;
+        }
+
+        JNIPlatformNativeLibrarySupport platformNativeLibrarySupport = JNIPlatformNativeLibrarySupport.singleton();
+        AfterAnalysisAccessImpl accessImpl = (AfterAnalysisAccessImpl) access;
+        AnnotationSubstitutionProcessor substitutions = ((Inflation) accessImpl.getBigBang()).getAnnotationSubstitutionProcessor();
+        /*
+         * Reachable classes are owned by AOT image code. Since a native library can only be loaded
+         * by one class loader, collect their builtin symbols so runtime-loaded classes cannot claim
+         * them.
+         */
+        for (AnalysisType type : accessImpl.getUniverse().getTypes()) {
+            if (!type.isReachable()) {
+                continue;
+            }
+            collectAOTOwnedNativeSymbols(type.getWrapped(), platformNativeLibrarySupport);
+        }
+
+        /* Deleted types need not be present in the analysis universe. */
+        for (ResolvedJavaType type : substitutions.getDeletedTypes()) {
+            collectAOTOwnedNativeSymbols(type, platformNativeLibrarySupport);
+        }
+
+        /* Deleted methods can belong to types that are not present in the analysis universe. */
+        for (ResolvedJavaMethod method : substitutions.getDeletedMethods()) {
+            collectAOTOwnedNativeSymbol(method, platformNativeLibrarySupport);
+        }
+    }
+
+    @Override
+    public void beforeImageWrite(BeforeImageWriteAccess access) {
+        if (!ClassRegistries.respectClassLoader()) {
+            return;
+        }
+
+        NativeLibraries nativeLibraries = NativeLibraries.singleton();
+        SequencedSet<String> staticBuiltinSymbols = collectBuiltinSymbolsForRuntimeLookup(linkagePlan.getReachableStaticLibraryNames());
+
+        if (staticBuiltinSymbols.isEmpty() && missingBuiltinOnLoadSymbols.isEmpty()) {
+            return;
+        }
+
+        ((BeforeImageWriteAccessImpl) access).registerLinkerInvocationTransformer(linkerInvocation -> {
+            Path sourceFile = writeStaticBuiltinSymbolTable(linkerInvocation.getTempDirectory(), staticBuiltinSymbols);
+            Path objectFile = compileStaticBuiltinSymbolTable(sourceFile, linkerInvocation.getTempDirectory());
+            linkerInvocation.addInputFile(firstStaticLibraryIndex(linkerInvocation.getInputFiles(), nativeLibraries.getStaticLibraries()), objectFile);
+            return linkerInvocation;
+        });
+    }
+
+    private static int firstStaticLibraryIndex(List<Path> inputFiles, Collection<Path> staticLibraries) {
+        for (int i = 0; i < inputFiles.size(); i++) {
+            if (staticLibraries.contains(inputFiles.get(i))) {
+                return i;
+            }
+        }
+        return inputFiles.size();
+    }
+
+    private void collectAOTOwnedNativeSymbols(ResolvedJavaType type, JNIPlatformNativeLibrarySupport platformNativeLibrarySupport) {
+        ResolvedJavaType originalType = type;
+        if (originalType instanceof SubstitutionType substitutionType) {
+            originalType = substitutionType.getOriginal();
+        }
+
+        for (ResolvedJavaMethod method : originalType.getDeclaredMethods(false)) {
+            collectAOTOwnedNativeSymbol(method, platformNativeLibrarySupport);
+        }
+    }
+
+    private void collectAOTOwnedNativeSymbol(ResolvedJavaMethod method, JNIPlatformNativeLibrarySupport platformNativeLibrarySupport) {
+        ResolvedJavaMethod originalMethod = method;
+        if (originalMethod instanceof SubstitutionMethod substitutionMethod) {
+            originalMethod = substitutionMethod.getOriginal();
+        }
+
+        if (!originalMethod.isNative()) {
+            return;
+        }
+
+        String declaringClass = originalMethod.getDeclaringClass().getName();
+        String name = originalMethod.getName();
+        String descriptor = originalMethod.getSignature().toMethodDescriptor();
+
+        String shortName = JNINativeLinkage.getShortSymbol(declaringClass, name);
+        if (platformNativeLibrarySupport.isBuiltinNative(shortName)) {
+            aotOwnedNativeSymbols.add(shortName);
+        }
+        String longName = JNINativeLinkage.getLongSymbol(declaringClass, name, descriptor);
+        if (platformNativeLibrarySupport.isBuiltinNative(longName)) {
+            aotOwnedNativeSymbols.add(longName);
+        }
+    }
+
+    private SequencedSet<String> collectBuiltinSymbolsForRuntimeLookup(Collection<String> staticLibNames) {
+        SequencedSet<String> staticBuiltinSymbols = new LinkedHashSet<>();
+        for (String libName : staticLibNames) {
+            staticBuiltinSymbols.addAll(linkagePlan.getBuiltinSymbols(libName));
+        }
+        if (RuntimeClassLoading.isSupported()) {
+            // Remove function symbols whose declaring classes are owned by the AOT image layers.
+            staticBuiltinSymbols.removeAll(aotOwnedNativeSymbols);
+        } else {
+            /*
+             * Without runtime class loading, all builtin native method calls are AOT owned. The
+             * JNI_OnLoad_<library> symbols remain in the table so System.loadLibrary can identify builtin
+             * libraries.
+             */
+            staticBuiltinSymbols.removeIf(symbol -> !JNILibraryInitializer.isBuiltinOnLoadName(symbol));
+        }
+        return staticBuiltinSymbols;
+    }
+
+    static class LayeredCallbacks extends SingletonLayeredCallbacksSupplier {
+        @Override
+        public LayeredCallbacksSingletonTrait getLayeredCallbacksTrait() {
+            return new LayeredCallbacksSingletonTrait(new SingletonLayeredCallbacks<JNILibraryLoadFeature>() {
+                @Override
+                public LayeredPersistFlags doPersist(ImageSingletonWriter writer, JNILibraryLoadFeature singleton) {
+                    writer.writeStringList(AOT_OWNED_NATIVE_SYMBOLS, singleton.aotOwnedNativeSymbols.stream().sorted().toList());
+                    return LayeredPersistFlags.CALLBACK_ON_REGISTRATION;
+                }
+
+                @Override
+                public void onSingletonRegistration(ImageSingletonLoader loader, JNILibraryLoadFeature singleton) {
+                    singleton.aotOwnedNativeSymbols.addAll(loader.readStringList(AOT_OWNED_NATIVE_SYMBOLS));
+                }
+            });
+        }
+    }
+
+    private Path writeStaticBuiltinSymbolTable(Path tempDirectory, SequencedSet<String> staticBuiltinSymbols) {
+        CSourceCodeWriter writer = new CSourceCodeWriter(tempDirectory);
+        writer.includeFiles(List.of("<stddef.h>", "<string.h>"));
+        writer.appendln();
+
+        for (String symbolName : staticBuiltinSymbols) {
+            writer.appendln("extern void " + symbolName + "(void);");
+        }
+
+        for (String symbolName : missingBuiltinOnLoadSymbols) {
+            writer.appendln();
+            writer.appendln("int " + symbolName + "(void *vm, void *reserved) {");
+            writer.appendln("    (void) vm;");
+            writer.appendln("    (void) reserved;");
+            writer.appendln("    return 0x00010008;");
+            writer.appendln("}");
+        }
+        staticBuiltinSymbols.addAll(missingBuiltinOnLoadSymbols);
+
+        writer.appendln();
+        writer.appendln("typedef struct {");
+        writer.appendln("    const char *name;");
+        writer.appendln("    void *address;");
+        // GR-76022: turn this into a hash table
+        writer.appendln("} svm_builtin_symbol_t;");
+        writer.appendln();
+
+        writer.appendln("static const svm_builtin_symbol_t svm_builtin_symbols[] = {");
+        for (String symbolName : staticBuiltinSymbols) {
+            writer.appendln("    { \"" + symbolName + "\", (void *) " + symbolName + " },");
+        }
+        writer.appendln("};");
+        writer.appendln();
+
+        writer.appendln("void *__svm_find_builtin_symbol(const char *name) {");
+        writer.appendln("    for (size_t i = 0; i < sizeof(svm_builtin_symbols) / sizeof(svm_builtin_symbols[0]); i++) {");
+        writer.appendln("        if (strcmp(name, svm_builtin_symbols[i].name) == 0) {");
+        writer.appendln("            return svm_builtin_symbols[i].address;");
+        writer.appendln("        }");
+        writer.appendln("    }");
+        writer.appendln("    return NULL;");
+        writer.appendln("}");
+
+        return writer.writeFile("svm_builtin_symbols.c");
+    }
+
+    private static Path compileStaticBuiltinSymbolTable(Path sourceFile, Path tempDirectory) {
+        String objectFileName = "svm_builtin_symbols" + ObjectFile.getFilenameSuffix();
+        Path objectFile = tempDirectory.resolve(objectFileName);
+        List<String> compileOptions = Platform.includedIn(Platform.WINDOWS.class) ? List.of("/c", "/Fo" + objectFile) : List.of("-fPIC", "-c");
+        ImageSingletons.lookup(CCompilerInvoker.class).compileAndParseError(false, compileOptions, sourceFile, objectFile, (command, source, line) -> {
+            throw new RuntimeException("Unable to compile " + source + " with " + command.command() + ": " + line);
+        });
+        return objectFile;
     }
 }

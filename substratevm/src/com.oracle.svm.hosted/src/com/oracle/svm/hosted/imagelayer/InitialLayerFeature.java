@@ -1,0 +1,234 @@
+/*
+ * Copyright (c) 2025, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted.imagelayer;
+
+import static com.oracle.svm.sdk.staging.layeredimage.LayeredCompilationBehavior.Behavior.PINNED_TO_INITIAL_LAYER;
+
+import java.util.function.Consumer;
+
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.UnmanagedMemory;
+import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.impl.RuntimeStateTrimConfig;
+
+import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.core.FutureDefaultsOptions;
+import com.oracle.svm.core.MemoryWalker;
+import com.oracle.svm.core.OS;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.bootstrap.BootstrapMethodInfo;
+import com.oracle.svm.core.c.enums.CEnumArrayLookup;
+import com.oracle.svm.core.c.enums.CEnumMapLookup;
+import com.oracle.svm.core.c.enums.CEnumNoLookup;
+import com.oracle.svm.core.classinitialization.ClassInitializationInfo;
+import com.oracle.svm.core.code.FrameSourceInfo;
+import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.graal.snippets.NonSnippetLowerings;
+import com.oracle.svm.core.heap.CodeReferenceMapEncoder;
+import com.oracle.svm.core.heap.InstanceReferenceMapEncoder;
+import com.oracle.svm.core.heap.Pod;
+import com.oracle.svm.core.heap.ReferenceMapEncoder;
+import com.oracle.svm.guest.staging.core.heap.ReferenceMapIndex;
+import com.oracle.svm.core.heap.SmallestPossibleObject;
+import com.oracle.svm.core.heap.SubstrateReferenceMap;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.jdk.Resources;
+import com.oracle.svm.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.core.jdk.localization.bundles.DelayedBundle;
+import com.oracle.svm.core.jdk.localization.bundles.ExtractedBundle;
+import com.oracle.svm.core.jni.JNITestingBackdoor;
+import com.oracle.svm.core.jni.headers.JNIFunctionPointerTypes;
+import com.oracle.svm.core.jvmstat.PerfUnit;
+import com.oracle.svm.core.jvmstat.PerfVariability;
+import com.oracle.svm.core.log.DebugLog;
+import com.oracle.svm.core.os.RawFileOperationSupport;
+import com.oracle.svm.core.stringformat.StringFormat;
+import com.oracle.svm.core.stringformat.StringFormatPhase;
+import com.oracle.svm.core.thread.SafepointCheckCounter;
+import com.oracle.svm.core.util.ByteArrayReader;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointSetup;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.thread.OSThreadHandle;
+import com.oracle.svm.guest.staging.option.RuntimeOptionValues;
+import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
+import com.oracle.svm.hosted.jdk.localization.LocalizationFeature;
+import com.oracle.svm.sdk.staging.hosted.layeredimage.LayeredCompilationSupport;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.internal.misc.Unsafe;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+@AutomaticallyRegisteredFeature
+public class InitialLayerFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(Feature.IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.buildingInitialLayer();
+    }
+
+    @Override
+    public void duringSetup(DuringSetupAccess a) {
+        DuringSetupAccessImpl access = (DuringSetupAccessImpl) a;
+        /*
+         * Make sure that critical VM components are included in the base layer by registering
+         * runtime APIs as entry points. Although the types below are part of java.base, so they
+         * would anyway be included in every base layer created with module=java.base, this ensures
+         * that the base layer is usable regardless of the class inclusion policy.
+         */
+        var compilationSupport = LayeredCompilationSupport.singleton();
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(Unsafe.class, "getUnsafe"), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(Unsafe.class, "allocateInstance", Class.class), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(Runtime.class, "getRuntime"), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(Runtime.class, "gc"), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(Class.class, "getResource", String.class), PINNED_TO_INITIAL_LAYER);
+        Class<?> runtimeOptionSupportImpl = ReflectionUtil.lookupClass("com.oracle.svm.guest.staging.option.RuntimeOptionsSupportImpl");
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(runtimeOptionSupportImpl, "get", String.class), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(OptionKey.class, "getValue", OptionValues.class), PINNED_TO_INITIAL_LAYER);
+        compilationSupport.registerCompilationBehavior(ReflectionUtil.lookupMethod(RuntimeStateTrimConfig.Builder.class, "build"), PINNED_TO_INITIAL_LAYER);
+
+        AnalysisMetaAccess metaAccess = access.getMetaAccess();
+        access.getUniverse().lookup(GuestAccess.elements().Uninterruptible).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(UninterruptibleUtils.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.CodeUtil.class).registerAsReachable("Core type");
+        access.getUniverse().lookup(getProxyClass(GuestAccess.elements().Uninterruptible)).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(BootstrapMethodInfo.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(BootstrapMethodInfo.ExceptionWrapper.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(UnmanagedMemory.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(UnmanagedMemoryUtil.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(OSThreadHandle.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.jdk.Util_java_lang_reflect_Array")).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.hub.DynamicHub$ClassRedefinedCountAccessors")).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.hub.DynamicHub$EnumConstantsSupplier")).registerAsReachable("Core type");
+        if (Platform.includedIn(Platform.LINUX.class) || Platform.includedIn(Platform.DARWIN.class)) {
+            metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.posix.headers.Pthread$pthread_t")).registerAsReachable("Core type");
+        }
+        metaAccess.lookupJavaType(ByteArrayReader.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReferenceMapEncoder.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReferenceMapEncoder.Input.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReferenceMapEncoder.OffsetIterator.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReferenceMapIndex.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(JNITestingBackdoor.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ClassInitializationInfo.TestingBackdoor.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(SafepointCheckCounter.TestingBackdoor.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(MemoryWalker.ImageHeapRegionVisitor.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(KnownIntrinsics.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(FrameSourceInfo.MethodFlags.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(FutureDefaultsOptions.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(NonSnippetLowerings.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(RawFileOperationSupport.FileCreationMode.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(SmallestPossibleObject.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(Pod.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(Pod.Builder.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.jdk.AtomicFieldUpdaterAccessCheck")).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(OS.class).registerAsReachable("Core type");
+        metaAccess.lookupJavaType(ReflectionUtil.lookupClass("com.oracle.svm.core.genscavenge.HeapImpl$ClassListBuilderVisitor")).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(CodeReferenceMapEncoder.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(SubstrateReferenceMap.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(SubstrateReferenceMap.SubstrateReferenceMapOffsetIterator.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(InstanceReferenceMapEncoder.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(SubstrateOptions.OptimizationLevel.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(Resources.RequestedPattern.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(DebugLog.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(RuntimeCodeInfoMemory.SizeCounters.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(CEnumArrayLookup.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(CEnumMapLookup.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(CEnumNoLookup.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(PerfVariability.class).registerAsInstantiated("Core type");
+        metaAccess.lookupJavaType(PerfUnit.class).registerAsInstantiated("Core type");
+        if (LocalizationFeature.Options.LocalizationSubstituteLoadLookup.getValue()) {
+            metaAccess.lookupJavaType(ExtractedBundle.class).registerAsInstantiated("Core type");
+            metaAccess.lookupJavaType(DelayedBundle.class).registerAsInstantiated("Core type");
+        }
+
+        registerAllTypes(metaAccess.lookupJavaType(JNIFunctionPointerTypes.class), t -> t.registerAsReachable("Core type"));
+        registerAllTypes(metaAccess.lookupJavaType(CEntryPointOptions.class), t -> t.registerAsReachable("Core type"));
+
+        pinDeclaredMethodsToInitialLayer(metaAccess.lookupJavaType(CEntryPointSetup.class));
+        if (StringFormatPhase.Options.IntrinsifyStringFormat.getValue()) {
+            /*
+             * Compile the four methods called by StringFormatPhase in the initial layer.
+             * Register them as analysis roots so their parameter analysis uses the declared
+             * types instead of only the inputs supplied by initial-layer callers. Later
+             * layers reuse these methods and can introduce calls with different inputs.
+             */
+            for (AnalysisMethod method : metaAccess.lookupJavaType(StringFormat.class).getDeclaredMethods(false)) {
+                if (!method.isPrivate() && (method.getName().equals("format") || method.getName().equals("formatWithFormatterFallback"))) {
+                    method.setPinnedToInitialLayer();
+                }
+            }
+        }
+    }
+
+    private static ResolvedJavaType getProxyClass(ResolvedJavaType uninterruptibleType) {
+        GuestAccess access = GuestAccess.get();
+        MetaAccessProvider metaAccess = access.getProviders().getMetaAccess();
+        ConstantReflectionProvider constantReflection = access.getProviders().getConstantReflection();
+
+        ResolvedJavaMethod getProxyClassMethod = JVMCIReflectionUtil.getUniqueDeclaredMethod(metaAccess, access.elements.java_lang_reflect_Proxy, "getProxyClass", ClassLoader.class, Class[].class);
+        ResolvedJavaMethod appClassLoaderMethod = JVMCIReflectionUtil.getUniqueDeclaredMethod(metaAccess, access.elements.jdk_internal_loader_ClassLoaders, "appClassLoader");
+
+        JavaConstant appClassLoader = access.invoke(appClassLoaderMethod, null);
+        JavaConstant uninterruptible = constantReflection.asJavaClass(uninterruptibleType);
+        JavaConstant interfaces = access.asArrayConstant(access.elements.java_lang_Class, uninterruptible);
+
+        JavaConstant proxyClass = access.invoke(getProxyClassMethod, null, appClassLoader, interfaces);
+        return constantReflection.asJavaType(proxyClass);
+    }
+
+    public static void registerAllTypes(AnalysisType type, Consumer<AnalysisType> registration) {
+        registration.accept(type);
+        for (AnalysisType nestedType : type.getDeclaredTypes()) {
+            registerAllTypes(nestedType, registration);
+        }
+    }
+
+    private static void pinDeclaredMethodsToInitialLayer(AnalysisType type) {
+        for (AnalysisMethod method : type.getDeclaredMethods(false)) {
+            method.setPinnedToInitialLayer();
+        }
+        for (AnalysisType nestedType : type.getDeclaredTypes()) {
+            pinDeclaredMethodsToInitialLayer(nestedType);
+        }
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        // GR-71504 automatically detect accesses to fields of application layer only singletons
+        access.registerAsUnsafeAccessed(ReflectionUtil.lookupField(RuntimeOptionValues.class, "v"));
+    }
+}

@@ -28,7 +28,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -47,9 +46,9 @@ import com.oracle.objectfile.StringTable;
 import com.oracle.objectfile.SymbolTable;
 import com.oracle.objectfile.io.AssemblyBuffer;
 import com.oracle.objectfile.io.OutputAssembler;
-import com.oracle.objectfile.macho.MachOObjectFile.LinkEditSegment64Command;
 import com.oracle.objectfile.macho.MachOObjectFile.MachOSection;
 import com.oracle.objectfile.macho.MachOObjectFile.Segment64Command;
+import org.graalvm.collections.EconomicSet;
 
 public final class MachOSymtab extends MachOObjectFile.LinkEditElement implements SymbolTable {
 
@@ -326,7 +325,7 @@ public final class MachOSymtab extends MachOObjectFile.LinkEditElement implement
 
     @Override
     public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
-        HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+        EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
         // our content depends on strtab content
         LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
         LayoutDecision strtabContent = decisions.get(strtab).getDecision(LayoutDecision.Kind.CONTENT);
@@ -413,13 +412,13 @@ public final class MachOSymtab extends MachOObjectFile.LinkEditElement implement
     @SuppressWarnings({"unused", "static-method"})
     private boolean isDynamic() {
         /*
-         * FIXME: this method exists to allow the Dysymtab to identify a *subset* of symbols that
-         * are dynamic. Then we need to do this test per-symbol (in getOrDecideContent) and this
-         * method will go away. Currently it's unimplemented. Note that getOwner().hasVaddrSpace()
-         * is probably not the right test, since even Mach-O relocatable files have a vaddrspace
-         * (although in yet another dubious state of affairs, hasVaddrSpace() returns false for
-         * relocatable files at present -- as if they were ELF relocatable files, which don't use
-         * the vaddr space).
+         * This method exists to allow the Dysymtab to identify a subset of symbols that are
+         * dynamic. Then we need to do this test per-symbol (in getOrDecideContent) and this method
+         * will go away. Until then, LC_DYSYMTAB cannot distinguish only the dynamic subset of
+         * symbols. Note that getOwner().hasVaddrSpace() is
+         * probably not the right test, since even Mach-O relocatable files have a vaddrspace
+         * (although hasVaddrSpace() returns false for relocatable files at present -- as if they
+         * were ELF relocatable files, which don't use the vaddr space).
          */
         return true;
     }
@@ -464,7 +463,7 @@ public final class MachOSymtab extends MachOObjectFile.LinkEditElement implement
     }
 
     @Override
-    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode) {
+    public Symbol newDefinedEntry(String name, Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode, boolean isExported) {
         return addEntry(new Entry(name, referencedSection, referencedOffset, isGlobal, isCode));
     }
 
@@ -491,11 +490,7 @@ public final class MachOSymtab extends MachOObjectFile.LinkEditElement implement
 
     @Override
     public boolean isLoadable() {
-        /*
-         * HACK: We're loadable iff we're in a LinkEditSegment64Command. If we're in a regular
-         * segment, we're a plain old static symtab. FIXME: record this by some nicer means.
-         */
-        return segment instanceof LinkEditSegment64Command;
+        return segment.isLinkEditSegment();
     }
 
     public int indexOf(Symbol sym) {

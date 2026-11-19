@@ -31,7 +31,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.function.Consumer;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.code.SourceMapping;
@@ -473,13 +473,17 @@ public final class CompilationResultFrameTree {
             this.debug = debug;
         }
 
-        @SuppressWarnings("try")
         public CallNode build(CompilationResult compilationResult) {
-            try (DebugContext.Scope s = debug.scope("FrameTree.Builder", compilationResult)) {
-                debug.log(DebugContext.VERBOSE_LEVEL, "Building FrameTree for %s", compilationResult);
-
+            try (DebugContext.Scope _ = debug.scope("FrameTree.Builder", compilationResult)) {
+                if (debug.isLogEnabled()) {
+                    debug.log(DebugContext.VERBOSE_LEVEL, "Building FrameTree for %s", compilationResult);
+                }
                 List<Infopoint> infopoints = compilationResult.getInfopoints();
-                List<SourceMapping> sourceMappings = compilationResult.getSourceMappings();
+                /*
+                 * Source mappings may have been released after compilation when this builder uses
+                 * only infopoints. Do not access them unless they are selected as an input.
+                 */
+                List<SourceMapping> sourceMappings = useSourceMappings ? compilationResult.getSourceMappings() : List.of();
                 List<SourcePositionSupplier> sourcePosData = new ArrayList<>(infopoints.size() + sourceMappings.size());
                 InfopointSourceWrapper infopointForRoot = null;
                 for (Infopoint infopoint : infopoints) {
@@ -488,7 +492,9 @@ public final class CompilationResultFrameTree {
                         sourcePosData.add(wrapper);
                         infopointForRoot = wrapper;
                     } else {
-                        debug.log(DebugContext.DETAILED_LEVEL, " Discard Infopoint %s", infopoint);
+                        if (debug.isLogEnabled(DebugContext.DETAILED_LEVEL)) {
+                            debug.log(" Discard Infopoint %s", infopoint);
+                        }
                     }
                 }
                 if (useSourceMappings) {
@@ -611,7 +617,9 @@ public final class CompilationResultFrameTree {
                 SourcePositionSupplier rightPos = sourcePosData.get(indexRight);
 
                 if (overlappingSourcePosition(leftPos, rightPos)) {
-                    debug.log(DebugContext.DETAILED_LEVEL, "Handle Overlapping SourcePositions: %s | %s", leftPos, rightPos);
+                    if (debug.isLogEnabled(DebugContext.DETAILED_LEVEL)) {
+                        debug.log("Handle Overlapping SourcePositions: %s | %s", leftPos, rightPos);
+                    }
 
                     /* Handle infopoint overlapping */
                     if (leftPos instanceof InfopointSourceWrapper && rightPos instanceof InfopointSourceWrapper) {
@@ -735,7 +743,7 @@ public final class CompilationResultFrameTree {
             if (node.getStartPos() > node.getEndPos()) {
                 printer.accept("Error: Node startPos > endPos: ");
                 printer.accept(node.toString());
-                printer.accept("\n");
+                printer.accept(System.lineSeparator());
                 issues += 1;
             }
             if (node.nextSibling != null) {
@@ -744,7 +752,7 @@ public final class CompilationResultFrameTree {
                     printer.accept(node.toString());
                     printer.accept(" with ");
                     printer.accept(node.nextSibling.toString());
-                    printer.accept("\n");
+                    printer.accept(System.lineSeparator());
                     issues += 1;
                 }
             }
@@ -754,9 +762,9 @@ public final class CompilationResultFrameTree {
 
     public static void dump(FrameNode node, Consumer<String> printer, boolean onlyCallTree, boolean showInfopoints, int maxDepth) {
         if (node != null) {
-            printer.accept("\n");
+            printer.accept(System.lineSeparator());
             node.visit(new FrameTreeDumper(printer, onlyCallTree, showInfopoints, maxDepth), 0);
-            printer.accept("\n");
+            printer.accept(System.lineSeparator());
         }
     }
 
@@ -791,7 +799,7 @@ public final class CompilationResultFrameTree {
             indent(level);
             printer.accept(node.toString());
             if (showSourcePos) {
-                printer.accept("\n");
+                printer.accept(System.lineSeparator());
                 indent(level);
                 printer.accept(" sourcePos: " + node.sourcePos.toString());
             } else {
@@ -802,7 +810,7 @@ public final class CompilationResultFrameTree {
                 printer.accept(" locals: ");
                 printer.accept(node.getLocalsStr());
             }
-            printer.accept("\n");
+            printer.accept(System.lineSeparator());
             node.visitChildren(this, level + 1);
         }
     }

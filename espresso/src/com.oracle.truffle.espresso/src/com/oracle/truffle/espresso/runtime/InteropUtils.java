@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -64,39 +64,6 @@ public class InteropUtils {
         return klass == meta.java_lang_Byte || klass == meta.java_lang_Short || klass == meta.java_lang_Float;
     }
 
-    public static Object unwrap(EspressoLanguage language, StaticObject object, Meta meta) {
-        if (meta.isBoxed(object.getKlass())) {
-            return meta.unboxGuest(object);
-        }
-        if (object.isForeignObject()) {
-            return object.rawForeignObject(language);
-        }
-        // We need to unwrap foreign exceptions which are stored in guest throwable backtrace.
-        // They only exist if polyglot is in use though.
-        if (meta.polyglot == null || StaticObject.isNull(object)) {
-            return object;
-        }
-        if (meta.java_lang_Throwable.isAssignableFrom(object.getKlass())) {
-            return unwrapForeignException(object, meta);
-        }
-        return object;
-    }
-
-    private static Object unwrapForeignException(StaticObject object, Meta meta) {
-        assert meta.java_lang_Throwable.isAssignableFrom(object.getKlass());
-        if (meta.HIDDEN_FRAMES.getHiddenObject(object) == VM.StackTrace.FOREIGN_MARKER_STACK_TRACE) {
-            return meta.java_lang_Throwable_backtrace.getObject(object).rawForeignObject(meta.getLanguage());
-        }
-        return object;
-    }
-
-    public static Object unwrap(EspressoLanguage language, Object object, Meta meta) {
-        if (object instanceof StaticObject) {
-            return unwrap(language, (StaticObject) object, meta);
-        }
-        return object;
-    }
-
     public static boolean isForeignException(EspressoException e) {
         assert e != null;
         StaticObject guestException = e.getGuestException();
@@ -107,7 +74,7 @@ public class InteropUtils {
         if (guestException.getKlass() == meta.polyglot.ForeignException) {
             return true;
         }
-        Object stack = meta.HIDDEN_FRAMES.getHiddenObject(guestException);
+        Object stack = meta.java_lang_Throwable_0frames.getHiddenObject(guestException);
         return stack == VM.StackTrace.FOREIGN_MARKER_STACK_TRACE;
     }
 

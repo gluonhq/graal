@@ -43,11 +43,7 @@ import jdk.graal.compiler.serviceprovider.GlobalAtomicLong;
 import jdk.graal.compiler.serviceprovider.GraalServices;
 import jdk.graal.compiler.serviceprovider.IsolateUtil;
 import jdk.graal.compiler.serviceprovider.ServiceProvider;
-import jdk.graal.compiler.word.Word;
-
-import jdk.vm.ci.common.NativeImageReinitialize;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
-import jdk.vm.ci.services.Services;
 
 @ServiceProvider(TTYStreamProvider.class)
 public class HotSpotTTYStreamProvider implements TTYStreamProvider {
@@ -71,13 +67,13 @@ public class HotSpotTTYStreamProvider implements TTYStreamProvider {
     }
 
     static {
-        Word.ensureInitialized();
+        /* Calling this method ensures that the static initializer has been executed. */
     }
 
     /**
      * Gets a pointer to a global word initialized to 0.
      */
-    private static final GlobalAtomicLong BARRIER = new GlobalAtomicLong(0L);
+    private static final GlobalAtomicLong BARRIER = new GlobalAtomicLong("BARRIER", 0L);
 
     /**
      * Executes {@code action}. {@link #BARRIER} is used to ensure the action is executed exactly
@@ -138,7 +134,7 @@ public class HotSpotTTYStreamProvider implements TTYStreamProvider {
                 name = name.replace("%I", IsolateUtil.getIsolateID(true));
             }
             if (name.contains("%t")) {
-                name = name.replace("%t", String.valueOf(System.currentTimeMillis()));
+                name = name.replace("%t", String.valueOf(GraalServices.milliTimeStamp()));
             }
 
             for (String subst : new String[]{"%o", "%e"}) {
@@ -157,7 +153,7 @@ public class HotSpotTTYStreamProvider implements TTYStreamProvider {
          * initialization.
          */
         class DelayedOutputStream extends OutputStream {
-            @NativeImageReinitialize private volatile OutputStream lazy;
+            private volatile OutputStream lazy;
 
             private OutputStream lazy() {
                 if (lazy == null) {
@@ -225,7 +221,7 @@ public class HotSpotTTYStreamProvider implements TTYStreamProvider {
                 if (inputArguments != null) {
                     ps.println("VM Arguments: " + String.join(" ", inputArguments));
                 }
-                String cmd = Services.getSavedProperty("sun.java.command");
+                String cmd = GraalServices.getSavedProperty("sun.java.command");
                 if (cmd != null) {
                     ps.println("sun.java.command=" + cmd);
                 }

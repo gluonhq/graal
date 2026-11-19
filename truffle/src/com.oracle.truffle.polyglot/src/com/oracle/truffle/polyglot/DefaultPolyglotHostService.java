@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -76,7 +76,11 @@ class DefaultPolyglotHostService extends AbstractPolyglotHostService {
 
     @Override
     public RuntimeException hostToGuestException(AbstractHostLanguageService host, Throwable throwable) {
-        assert !host.isHostException(throwable);
+        assert !EngineAccessor.isHostException(throwable);
         return host.toHostException(PolyglotFastThreadLocals.getLanguageContext(null, computeLanguageIndexFromStaticIndex(HOST_LANGUAGE_INDEX, LANGUAGE_CONTEXT_OFFSET)), throwable);
+    }
+
+    @Override
+    public void notifyPolyglotThreadStart(Object contextReceiver, Thread threadToStart) {
     }
 }

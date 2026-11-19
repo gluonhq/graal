@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,22 +40,22 @@
  */
 package com.oracle.truffle.regex.tregex.string;
 
+import com.oracle.truffle.api.strings.TruffleString;
 import com.oracle.truffle.regex.tregex.buffer.ByteArrayBuffer;
-import com.oracle.truffle.regex.tregex.string.Encodings.Encoding;
 
 public final class StringBufferUTF8 extends ByteArrayBuffer implements AbstractStringBuffer {
-
-    public StringBufferUTF8() {
-        this(16);
-    }
 
     public StringBufferUTF8(int capacity) {
         super(capacity);
     }
 
+    public StringBufferUTF8(StringBufferUTF8 copy) {
+        super(copy);
+    }
+
     @Override
     public Encoding getEncoding() {
-        return Encodings.UTF_8;
+        return Encoding.UTF_8;
     }
 
     @Override
@@ -153,7 +153,27 @@ public final class StringBufferUTF8 extends ByteArrayBuffer implements AbstractS
     }
 
     @Override
-    public StringUTF8 materialize() {
-        return new StringUTF8(toArray());
+    public AbstractStringBuffer copy() {
+        return new StringBufferUTF8(this);
+    }
+
+    @Override
+    public long prefixHash(int maxLength) {
+        int prefixLength = Math.min(length(), maxLength);
+        long hash = prefixLength;
+        for (int i = 0; i < prefixLength; i++) {
+            hash = Long.rotateLeft(hash, 5) ^ Byte.toUnsignedInt(buf[i]);
+        }
+        return hash;
+    }
+
+    @Override
+    public TruffleString asTString() {
+        return TruffleString.fromByteArrayUncached(toArray(), 0, length(), TruffleString.Encoding.UTF_8, false);
+    }
+
+    @Override
+    public TruffleString.WithMask asTStringMask(TruffleString pattern) {
+        return TruffleString.WithMask.createUncached(pattern, toArray(), TruffleString.Encoding.UTF_8);
     }
 }

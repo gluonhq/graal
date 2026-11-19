@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2017, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -25,25 +25,20 @@
  */
 package jdk.graal.compiler.phases.common;
 
-import java.util.Optional;
-
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampFactory;
 import jdk.graal.compiler.graph.Node;
-import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.PrefetchAllocateNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.extended.JavaReadNode;
 import jdk.graal.compiler.nodes.memory.AbstractWriteNode;
-import jdk.graal.compiler.nodes.memory.FloatingReadNode;
 import jdk.graal.compiler.nodes.memory.ReadNode;
 import jdk.graal.compiler.nodes.memory.address.AddressNode;
 import jdk.graal.compiler.nodes.memory.address.OffsetAddressNode;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.util.GraphUtil;
-
 import jdk.vm.ci.meta.JavaKind;
 
 /**
@@ -65,11 +60,6 @@ public class AddressLoweringByUsePhase extends AddressLoweringPhase {
     }
 
     @Override
-    public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
-        return ALWAYS_APPLICABLE;
-    }
-
-    @Override
     protected void run(StructuredGraph graph, CoreProviders providers) {
         // first replace address nodes hanging off known usages
         for (Node node : graph.getNodes()) {
@@ -85,11 +75,6 @@ public class AddressLoweringByUsePhase extends AddressLoweringPhase {
                 Stamp stamp = javaReadNode.stamp(NodeView.DEFAULT);
                 address = javaReadNode.getAddress();
                 lowered = lowering.lower(javaReadNode, stamp, address);
-            } else if (node instanceof FloatingReadNode) {
-                FloatingReadNode floatingReadNode = (FloatingReadNode) node;
-                Stamp stamp = floatingReadNode.getAccessStamp(NodeView.DEFAULT);
-                address = floatingReadNode.getAddress();
-                lowered = lowering.lower(floatingReadNode, stamp, address);
             } else if (node instanceof AbstractWriteNode) {
                 AbstractWriteNode abstractWriteNode = (AbstractWriteNode) node;
                 Stamp stamp = abstractWriteNode.value().stamp(NodeView.DEFAULT);

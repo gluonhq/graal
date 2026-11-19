@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,8 +27,10 @@ package jdk.graal.compiler.hotspot.stubs;
 import static jdk.graal.compiler.core.GraalCompiler.emitFrontEnd;
 import static jdk.graal.compiler.core.common.GraalOptions.RegisterPressure;
 import static jdk.graal.compiler.debug.DebugOptions.DebugStubsAndSnippets;
+import static jdk.graal.compiler.debug.DebugOptions.OptimizationLog;
 import static jdk.graal.compiler.util.CollectionsUtil.allMatch;
 
+import java.util.List;
 import java.util.ListIterator;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,11 +41,13 @@ import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.core.CompilationPrinter;
 import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.core.phases.EconomyHighTier;
+import jdk.graal.compiler.core.phases.EconomyMarkFixReadsPhase;
 import jdk.graal.compiler.core.target.Backend;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.DebugContext.Builder;
 import jdk.graal.compiler.debug.DebugContext.Description;
-import jdk.graal.compiler.debug.DebugOptions;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.hotspot.HotSpotCompiledCodeBuilder;
 import jdk.graal.compiler.hotspot.HotSpotForeignCallLinkage;
 import jdk.graal.compiler.hotspot.HotSpotHostBackend;
@@ -57,6 +61,7 @@ import jdk.graal.compiler.lir.profiling.MoveProfilingPhase;
 import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.OptimisticOptimizations;
@@ -66,6 +71,7 @@ import jdk.graal.compiler.phases.common.DisableOverflownCountedLoopsPhase;
 import jdk.graal.compiler.phases.tiers.HighTierContext;
 import jdk.graal.compiler.phases.tiers.Suites;
 import jdk.graal.compiler.printer.GraalDebugHandlersFactory;
+import jdk.vm.ci.code.CallingConvention;
 import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.code.Register;
@@ -73,9 +79,10 @@ import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.code.site.Call;
 import jdk.vm.ci.code.site.ConstantReference;
 import jdk.vm.ci.code.site.DataPatch;
+import jdk.vm.ci.code.site.ExceptionHandler;
 import jdk.vm.ci.code.site.Infopoint;
 import jdk.vm.ci.hotspot.HotSpotCompiledCode;
-import jdk.vm.ci.hotspot.HotSpotMetaspaceConstant;
+import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.DefaultProfilingInfo;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.TriState;
@@ -129,6 +136,14 @@ public abstract class Stub {
         return destroyedCallerRegisters;
     }
 
+    /**
+     * Gets additional values returned by this stub. The default implementation returns an empty
+     * array, indicating that there are no additional return values.
+     */
+    public AllocatableValue[] getAdditionalReturns(@SuppressWarnings("unused") CallingConvention callingConvention) {
+        return AllocatableValue.NONE;
+    }
+
     protected final OptionValues options;
     protected final HotSpotProviders providers;
 
@@ -139,10 +154,11 @@ public abstract class Stub {
      */
     public Stub(OptionValues options, HotSpotProviders providers, HotSpotForeignCallLinkage linkage) {
         this.linkage = linkage;
+
         // The RegisterPressure flag can be ignored by a compilation that runs out of registers, so
         // the stub compilation must ignore the flag so that all allocatable registers are saved.
-        this.options = new OptionValues(options, GraalOptions.TraceInlining, GraalOptions.TraceInliningForStubsAndSnippets.getValue(options), RegisterPressure, null,
-                        DebugOptions.OptimizationLog, null);
+        // Also, disable the optimization log for stubs.
+        this.options = options.derive(GraalOptions.TraceInlining, GraalOptions.TraceInliningForStubsAndSnippets.getValue(options)).derive(RegisterPressure, null).derive(OptimizationLog, null);
         this.providers = providers;
     }
 
@@ -158,11 +174,24 @@ public abstract class Stub {
     }
 
     /**
-     * Gets the graph that from which the code for this stub will be compiled.
+     * Gets the graph from which the code for this stub will be compiled.
      *
      * @param compilationId unique compilation id for the stub
      */
     protected abstract StructuredGraph getGraph(DebugContext debug, CompilationIdentifier compilationId);
+
+    /**
+     * Calls {@link #getGraph} for the side effect of registering the types used in the graph with
+     * SymbolicSnippetEncoder.snippetTypes.
+     */
+    @LibGraalSupport.HostedOnly
+    public final void findTypesInGraph() {
+        try (DebugContext debug = DebugContext.disabled(options)) {
+            Stub stub = linkage.getStub();
+            CompilationIdentifier compilationId = new StubCompilationIdentifier(stub);
+            stub.getGraph(debug, compilationId);
+        }
+    }
 
     @Override
     public String toString() {
@@ -207,7 +236,7 @@ public abstract class Stub {
                                     DebugContext.Activation a = debug.activate()) {
                         assert destroyedCallerRegisters != null;
                         HotSpotCompiledCode compiledCode = HotSpotCompiledCodeBuilder.createCompiledCode(codeCache, null, null, compResult, options);
-                        code = codeCache.installCode(null, compiledCode, null, null, false);
+                        code = codeCache.installCode(null, compiledCode, null, null, false, false);
                     } catch (Throwable e) {
                         throw debug.handle(e);
                     }
@@ -227,7 +256,7 @@ public abstract class Stub {
         CompilationResult compResult = new CompilationResult(compilationId, toString());
 
         // Stubs cannot be recompiled so they cannot be compiled with assumptions
-        assert graph.getAssumptions() == null;
+        GraalError.guarantee(graph.getAssumptions() == null, "%s has assumptions: %s", this, graph.getAssumptions());
 
         if (!(graph.start() instanceof StubStartNode)) {
             StubStartNode newStart = graph.add(new StubStartNode(Stub.this));
@@ -240,7 +269,7 @@ public abstract class Stub {
             emitFrontEnd(providers, backend, graph, providers.getSuites().getDefaultGraphBuilderSuite(), OptimisticOptimizations.ALL, DefaultProfilingInfo.get(TriState.UNKNOWN), suites);
             LIRSuites lirSuites = createLIRSuites();
             backend.emitBackEnd(graph, Stub.this, getInstalledCodeOwner(), compResult, CompilationResultBuilderFactory.Default, null, getRegisterConfig(), lirSuites);
-            assert checkStubInvariants(compResult);
+            checkStubInvariants(compResult);
         } catch (Throwable e) {
             throw debug.handle(e);
         }
@@ -254,43 +283,28 @@ public abstract class Stub {
     /**
      * Checks the conditions a compilation must satisfy to be installed as a RuntimeStub.
      */
-    private boolean checkStubInvariants(CompilationResult compResult) {
-        assert compResult.getExceptionHandlers().isEmpty() : this;
+    private void checkStubInvariants(CompilationResult compResult) {
+        List<ExceptionHandler> handlers = compResult.getExceptionHandlers();
+        GraalError.guarantee(handlers.isEmpty(), "%s has exception handlers: %s", this, handlers);
 
         // Stubs cannot be recompiled so they cannot be compiled with
         // assumptions and there is no point in recording evol_method dependencies
-        assert compResult.getAssumptions() == null : "stubs should not use assumptions: " + this;
+        GraalError.guarantee(compResult.getAssumptions() == null, "stubs should not use assumptions: %s", this);
 
         for (DataPatch data : compResult.getDataPatches()) {
-            if (data.reference instanceof ConstantReference) {
-                ConstantReference ref = (ConstantReference) data.reference;
-                if (ref.getConstant() instanceof HotSpotMetaspaceConstant) {
-                    HotSpotMetaspaceConstant c = (HotSpotMetaspaceConstant) ref.getConstant();
-                    if (c.asResolvedJavaType() != null && c.asResolvedJavaType().getName().equals("[I")) {
-                        // special handling for NewArrayStub
-                        // embedding the type '[I' is safe, since it is never unloaded
-                        continue;
-                    }
-                }
-            }
-
-            checkSafeDataReference(data);
+            GraalError.guarantee(!(data.reference instanceof ConstantReference), "%s cannot have embedded object or metadata constant: %s", this, data.reference);
         }
         for (Infopoint infopoint : compResult.getInfopoints()) {
-            assert infopoint instanceof Call : this + " cannot have non-call infopoint: " + infopoint;
+            GraalError.guarantee(infopoint instanceof Call, "%s cannot have non-call infopoint: %s", this, infopoint);
             Call call = (Call) infopoint;
-            assert call.target instanceof HotSpotForeignCallLinkage : this + " cannot have non runtime call: " + call.target;
+            GraalError.guarantee(call.target instanceof HotSpotForeignCallLinkage, "%s cannot have non runtime call: %s", this, call.target);
             HotSpotForeignCallLinkage callLinkage = (HotSpotForeignCallLinkage) call.target;
-            assert !callLinkage.isCompiledStub() || callLinkage.getDescriptor().equals(HotSpotHostBackend.DEOPT_BLOB_UNCOMMON_TRAP) : this + " cannot call compiled stub " + callLinkage;
+            GraalError.guarantee(!callLinkage.isCompiledStub() || callLinkage.getDescriptor().equals(HotSpotHostBackend.DEOPT_BLOB_UNCOMMON_TRAP),
+                            "%s cannot call compiled stub ", this, callLinkage);
         }
-        return true;
     }
 
-    protected void checkSafeDataReference(DataPatch data) {
-        assert !(data.reference instanceof ConstantReference) : this + " cannot have embedded object or metadata constant: " + data.reference;
-    }
-
-    private static class EmptyHighTier extends BasePhase<HighTierContext> {
+    private static final class EmptyHighTier extends BasePhase<HighTierContext> {
         @Override
         public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
             return ALWAYS_APPLICABLE;
@@ -311,11 +325,16 @@ public abstract class Stub {
     }
 
     protected Suites createSuites() {
-        Suites defaultSuites = providers.getSuites().getDefaultSuites(options, providers.getLowerer().getTarget().arch).copy();
+        Suites original = providers.getSuites().getDefaultSuites(options, providers.getLowerer().getTarget().arch);
+        Suites defaultSuites = original.copy();
 
         PhaseSuite<HighTierContext> emptyHighTier = new PhaseSuite<>();
+
         emptyHighTier.appendPhase(new DisableOverflownCountedLoopsPhase());
         emptyHighTier.appendPhase(new EmptyHighTier());
+        if (original.getHighTier() instanceof EconomyHighTier) {
+            emptyHighTier.appendPhase(EconomyMarkFixReadsPhase.SINGLETON);
+        }
 
         defaultSuites.getMidTier().removeSubTypePhases(Speculative.class);
         defaultSuites.getLowTier().removeSubTypePhases(Speculative.class);

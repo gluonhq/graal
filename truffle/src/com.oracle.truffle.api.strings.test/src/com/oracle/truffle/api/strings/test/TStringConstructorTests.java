@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -48,6 +48,7 @@ import static com.oracle.truffle.api.strings.TruffleString.fromIntArrayUTF32Unca
 import static com.oracle.truffle.api.strings.TruffleString.fromLongUncached;
 import static com.oracle.truffle.api.strings.TruffleString.fromNativePointerUncached;
 
+import java.lang.ref.Reference;
 import java.nio.ByteOrder;
 
 import org.graalvm.shadowed.org.jcodings.Encoding;
@@ -86,8 +87,30 @@ public class TStringConstructorTests extends TStringTestBase {
     @Test
     public void testFromLong() throws Exception {
         forAllEncodings((TruffleString.Encoding encoding) -> {
-            for (long l : new long[]{Long.MIN_VALUE, Long.MIN_VALUE + 1, ((long) Integer.MIN_VALUE) - 1, Integer.MIN_VALUE, Integer.MIN_VALUE + 1, Short.MIN_VALUE, -12345, -1, 0,
-                            1, 12345, Short.MAX_VALUE, Integer.MAX_VALUE - 1, Integer.MAX_VALUE, ((long) Integer.MAX_VALUE) + 1, Long.MAX_VALUE - 1, Long.MAX_VALUE}) {
+            var testValues = new long[]{
+                            Long.MIN_VALUE,
+                            Long.MIN_VALUE + 1L,
+                            Integer.MIN_VALUE - 1L,
+                            Integer.MIN_VALUE,
+                            Integer.MIN_VALUE + 1L,
+                            Short.MIN_VALUE,
+                            -12345,
+                            -100,
+                            -10,
+                            -1,
+                            0,
+                            1,
+                            10,
+                            100,
+                            12345,
+                            3101342585L, // hashCode() == 0
+                            Short.MAX_VALUE,
+                            Integer.MAX_VALUE - 1L,
+                            Integer.MAX_VALUE,
+                            Integer.MAX_VALUE + 1L,
+                            Long.MAX_VALUE - 1L,
+                            Long.MAX_VALUE};
+            for (long l : testValues) {
                 if (isAsciiCompatible(encoding)) {
                     TruffleString eager = fromLongUncached(l, encoding, false);
                     Assert.assertEquals(l, eager.parseLongUncached());
@@ -98,12 +121,49 @@ public class TStringConstructorTests extends TStringTestBase {
                         Assert.assertEquals(l, eager.parseIntUncached());
                         Assert.assertEquals(l, lazy.parseIntUncached());
                     }
+
+                    String javaString = Long.toString(l);
+                    Assert.assertEquals(maskZero(javaString.hashCode()), eager.hashCodeUncached(encoding));
+                    Assert.assertEquals(maskZero(javaString.hashCode()), lazy.hashCodeUncached(encoding));
+                    TruffleString expectedString = TruffleString.fromJavaStringUncached(javaString, encoding);
+                    Assert.assertEquals(maskZero(javaString.hashCode()), expectedString.hashCodeUncached(encoding));
+                    Assert.assertEquals(javaString.hashCode(), expectedString.toJavaStringUncached().hashCode());
+                    Assert.assertEquals(eager, expectedString);
+                    Assert.assertEquals(lazy, expectedString);
+                    Assert.assertEquals(javaString.length(), eager.byteLength(TruffleString.Encoding.US_ASCII));
+                    Assert.assertEquals(javaString.length(), lazy.byteLength(TruffleString.Encoding.US_ASCII));
                 } else {
                     expectUnsupportedOperationException(() -> fromLongUncached(l, encoding, false));
                     expectUnsupportedOperationException(() -> fromLongUncached(l, encoding, true));
                 }
             }
         });
+    }
+
+    static int maskZero(int hash) {
+        if (hash == 0) {
+            return -1;
+        }
+        return hash;
+    }
+
+    @Test
+    public void testGetInternalNativePointer() {
+        byte[] array = {'a', 'b', 'c'};
+        PointerObject pointerObject = PointerObject.create(array);
+        long rawPointer = pointerObject.asPointer();
+        try {
+            TruffleString nativeString = fromNativePointerUncached(pointerObject, 0, array.length, TruffleString.Encoding.UTF_8, false);
+            Assert.assertSame(pointerObject, nativeString.getInternalNativePointerUncached(TruffleString.Encoding.UTF_8));
+
+            TruffleString rawNativeString = fromNativePointerUncached(rawPointer, 0, array.length, TruffleString.Encoding.UTF_8, false);
+            Assert.assertEquals(Long.valueOf(rawPointer), rawNativeString.getInternalNativePointerUncached(TruffleString.Encoding.UTF_8));
+
+            MutableTruffleString rawMutableNativeString = MutableTruffleString.fromNativePointerUncached(rawPointer, 0, array.length, TruffleString.Encoding.UTF_8, false);
+            Assert.assertEquals(Long.valueOf(rawPointer), rawMutableNativeString.getInternalNativePointerUncached(TruffleString.Encoding.UTF_8));
+        } finally {
+            Reference.reachabilityFence(pointerObject);
+        }
     }
 
     @Test
@@ -134,7 +194,7 @@ public class TStringConstructorTests extends TStringTestBase {
                         Assert.assertEquals(i, s.codePointAtByteIndexUncached(byteIndex(i, encoding), encoding, TruffleString.ErrorHandling.BEST_EFFORT));
                         Assert.assertEquals(i, s.codePointAtIndexUncached(i, encoding, TruffleString.ErrorHandling.BEST_EFFORT));
                         Assert.assertTrue(it.hasNext());
-                        Assert.assertEquals(i, it.nextUncached());
+                        Assert.assertEquals(i, it.nextUncached(encoding));
                         Assert.assertEquals(i, s.indexOfCodePointUncached(i, 0, 128, encoding));
                         Assert.assertEquals(i, s.indexOfStringUncached(fromCodePointUncached(i, encoding), 0, 128, encoding));
                     }
@@ -253,7 +313,7 @@ public class TStringConstructorTests extends TStringTestBase {
                             Assert.assertTrue(s.regionEqualByteIndexUncached(byteIndices[i], substring, 0, substring.byteLength(encoding), encoding));
                         }
                         Assert.assertTrue(it.hasNext());
-                        Assert.assertEquals(codepoints[i], it.nextUncached());
+                        Assert.assertEquals(codepoints[i], it.nextUncached(encoding));
                     }
                 }
             }
@@ -265,5 +325,14 @@ public class TStringConstructorTests extends TStringTestBase {
         for (int i = 0; i < array.length; i++) {
             Assert.assertEquals(array[i], internalByteArray.getArray()[internalByteArray.getOffset() + i]);
         }
+    }
+
+    @Test
+    public void testFromCompactUTF32SurrogatePair() {
+        byte[] array = {0, (byte) 0xd8, 0, (byte) 0xdc};
+        TruffleString s = TruffleString.fromByteArrayWithCompactionUTF32Uncached(array, 0, 4, TruffleString.CompactionLevel.S2, false);
+        Assert.assertFalse(s.isValidUncached(TruffleString.Encoding.UTF_32));
+        TruffleString s2 = TruffleString.fromNativePointerWithCompactionUTF32Uncached(PointerObject.create(array), 0, 4, TruffleString.CompactionLevel.S2, false);
+        Assert.assertFalse(s2.isValidUncached(TruffleString.Encoding.UTF_32));
     }
 }

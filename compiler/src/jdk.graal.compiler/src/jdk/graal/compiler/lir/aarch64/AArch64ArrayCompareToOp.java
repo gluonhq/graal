@@ -68,10 +68,8 @@ public final class AArch64ArrayCompareToOp extends AArch64ComplexVectorOp {
 
     @Alive({REG}) protected Value array1Value;
     @Alive({REG}) protected Value array2Value;
-    @Use({REG}) protected Value length1Value;
-    @Use({REG}) protected Value length2Value;
-    @Temp({REG}) protected Value length1ValueTemp;
-    @Temp({REG}) protected Value length2ValueTemp;
+    @UseKill({REG}) protected Value length1Value;
+    @UseKill({REG}) protected Value length2Value;
 
     @Temp({REG}) protected Value[] temp;
     @Temp({REG}) protected AllocatableValue[] vectorTemp;
@@ -95,14 +93,8 @@ public final class AArch64ArrayCompareToOp extends AArch64ComplexVectorOp {
         this.resultValue = result;
         this.array1Value = arrayA;
         this.array2Value = arrayB;
-
-        /*
-         * The length values are inputs but are also killed like temporaries so need both Use and
-         * Temp annotations, which will only work with fixed registers.
-         */
-
-        this.length1Value = length1ValueTemp = lengthA;
-        this.length2Value = length2ValueTemp = lengthB;
+        this.length1Value = lengthA;
+        this.length2Value = lengthB;
 
         temp = allocateTempRegisters(tool, 6);
         vectorTemp = allocateVectorRegisters(tool, 5);

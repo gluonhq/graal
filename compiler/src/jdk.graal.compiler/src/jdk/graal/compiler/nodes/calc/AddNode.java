@@ -58,6 +58,10 @@ public class AddNode extends BinaryArithmeticNode<Add> implements NarrowableArit
         super(c, getArithmeticOpTable(x).getAdd(), x, y);
     }
 
+    protected AddNode(NodeClass<? extends AddNode> c, Stamp betterStartStamp, ValueNode x, ValueNode y) {
+        super(c, betterStartStamp, x, y);
+    }
+
     public static ValueNode create(ValueNode x, ValueNode y, NodeView view) {
         BinaryOp<Add> op = ArithmeticOpTable.forStamp(x.stamp(view)).getAdd();
         Stamp stamp = op.foldStamp(x.stamp(view), y.stamp(view));
@@ -207,11 +211,11 @@ public class AddNode extends BinaryArithmeticNode<Add> implements NarrowableArit
         }
         if (forX instanceof NotNode notY && notY.getValue() == forY) {
             // ~y + y => -1
-            return ConstantNode.forIntegerStamp(forX.stamp(view), -1);
+            return BinaryArithmeticNode.createIntegerConstant(forX.stamp(view), -1);
         }
         if (forY instanceof NotNode notX && forX == notX.getValue()) {
             // x + ~x => -1
-            return ConstantNode.forIntegerStamp(forX.stamp(view), -1);
+            return BinaryArithmeticNode.createIntegerConstant(forX.stamp(view), -1);
         }
         if (self == null) {
             self = (AddNode) new AddNode(forX, forY).maybeCommuteInputs();

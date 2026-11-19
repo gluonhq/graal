@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,7 +41,9 @@
 package org.graalvm.collections;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /**
  * Memory efficient map data structure that dynamically changes its representation depending on the
@@ -76,6 +78,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
      *
      * @return the previous value associated with {@code key}, or {@code null} if there was no
      *         mapping for {@code key}.
+     * @throws UnsupportedOperationException if {@code key == null}
      * @since 19.0
      */
     V put(K key, V value);
@@ -84,12 +87,13 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
      * If the specified key is not already associated with a value (or is mapped to {@code null})
      * associates it with the given value and returns {@code null}, else returns the current value.
      *
-     * @param key key with which the specified value is to be associated
+     * @param key non-null key with which the specified value is to be associated
      * @param value value to be associated with the specified key
      *
      * @return the previous value associated with the specified key, or {@code null} if there was no
      *         mapping for the key. (A {@code null} return can also indicate that the map previously
      *         associated {@code null} with the key, if the implementation supports null values.)
+     * @throws UnsupportedOperationException if {@code key == null}
      *
      * @since 20.2
      */
@@ -103,7 +107,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
     }
 
     /**
-     * Copies all of the mappings from {@code other} to this map.
+     * Copies all the mappings from {@code other} to this map.
      *
      * @since 19.0
      */
@@ -115,7 +119,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
     }
 
     /**
-     * Copies all of the mappings from {@code other} to this map.
+     * Copies all the mappings from {@code other} to this map.
      *
      * @since 19.0
      */
@@ -127,7 +131,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
     }
 
     /**
-     * Removes all of the mappings from this map. The map will be empty after this call returns.
+     * Removes all the mappings from this map. The map will be empty after this call returns.
      *
      * @since 19.0
      */
@@ -161,6 +165,16 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
     void replaceAll(BiFunction<? super K, ? super V, ? extends V> function);
 
     /**
+     * Trims any implementation-specific storage so it does not retain unused capacity. This method
+     * does not change the mappings in this map. Implementations that do not retain trimmable
+     * storage may leave this method as a no-op.
+     *
+     * @since 25.1
+     */
+    default void trimToSize() {
+    }
+
+    /**
      * Creates a new map that guarantees insertion order on the key set with the default
      * {@link Equivalence#DEFAULT} comparison strategy for keys.
      *
@@ -188,7 +202,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
      * @since 19.0
      */
     static <K, V> EconomicMap<K, V> create(Equivalence strategy) {
-        return EconomicMapImpl.create(strategy, false);
+        return EconomicMapImpl.create(strategy);
     }
 
     /**
@@ -209,7 +223,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
      * @since 19.0
      */
     static <K, V> EconomicMap<K, V> create(Equivalence strategy, UnmodifiableEconomicMap<K, V> m) {
-        return EconomicMapImpl.create(strategy, m, false);
+        return EconomicMapImpl.create(strategy, m);
     }
 
     /**
@@ -219,7 +233,7 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
      * @since 19.0
      */
     static <K, V> EconomicMap<K, V> create(Equivalence strategy, int initialCapacity) {
-        return EconomicMapImpl.create(strategy, initialCapacity, false);
+        return EconomicMapImpl.create(strategy, initialCapacity);
     }
 
     /**
@@ -281,4 +295,31 @@ public interface EconomicMap<K, V> extends UnmodifiableEconomicMap<K, V> {
         map.put(key2, value2);
         return map;
     }
+
+    /**
+     * If the specified key is not already associated with a value (or is mapped to {@code null}),
+     * attempts to compute its value using the given mapping function and enters it into this map
+     * unless {@code null}. A {@code null} result does not add or replace a mapping.
+     * <p>
+     * The mapping function must not modify this map, or affect key hash code or equivalence during
+     * computation. Implementations are not required to detect such changes.
+     *
+     * @param key non-null key with which the specified value is to be associated
+     * @param mappingFunction the mapping function to compute a value
+     * @return the current (existing or computed) value associated with
+     *         the specified key, or null if the computed value is null
+     * @since 25.1
+     */
+    default V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
+        Objects.requireNonNull(mappingFunction);
+        V value = get(key);
+        if (value == null) {
+            value = mappingFunction.apply(key);
+            if (value != null) {
+                put(key, value);
+            }
+        }
+        return value;
+    }
+
 }

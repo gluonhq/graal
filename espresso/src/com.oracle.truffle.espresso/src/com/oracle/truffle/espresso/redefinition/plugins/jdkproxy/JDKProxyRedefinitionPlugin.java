@@ -61,7 +61,7 @@ public final class JDKProxyRedefinitionPlugin extends InternalRedefinitionPlugin
 
             Klass[] proxyInterfaces = new Klass[interfaces.length(language)];
             for (int i = 0; i < proxyInterfaces.length; i++) {
-                proxyInterfaces[i] = (Klass) meta.HIDDEN_MIRROR_KLASS.getHiddenObject(interfaces.get(language, i));
+                proxyInterfaces[i] = (Klass) meta.java_lang_Class_0klass.getHiddenObject(interfaces.get(language, i));
             }
             // cache proxy arguments under each interface, so that
             // when they change we can re-generate the proxy bytes
@@ -101,7 +101,7 @@ public final class JDKProxyRedefinitionPlugin extends InternalRedefinitionPlugin
     public boolean shouldRerunClassInitializer(ObjectKlass klass, boolean changed) {
         // changed Dynamic Proxy classes have cached Method references
         // in static fields, so always re-run the static initializer
-        return changed && getContext().getMeta().java_lang_reflect_Proxy.isAssignable(klass);
+        return changed && getContext().getMeta().java_lang_reflect_Proxy.isAssignableFrom(klass);
     }
 
     private final class ProxyCache {

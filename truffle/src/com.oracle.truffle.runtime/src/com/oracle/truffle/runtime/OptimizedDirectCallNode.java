@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,6 +47,7 @@ import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.HostCompilerDirectives;
 import com.oracle.truffle.api.nodes.DirectCallNode;
 import com.oracle.truffle.api.nodes.NodeInfo;
+import com.oracle.truffle.api.nodes.RootNode;
 
 /**
  * A call node with a constant {@link CallTarget} that can be optimized by Graal.
@@ -56,10 +57,6 @@ import com.oracle.truffle.api.nodes.NodeInfo;
 @NodeInfo
 public final class OptimizedDirectCallNode extends DirectCallNode {
 
-    /*
-     * Reflectively read by the Truffle compiler. See KnownTruffleTypes.
-     */
-    private int callCount;
     /*
      * Reflectively read by the Truffle compiler. See KnownTruffleTypes.
      */
@@ -84,22 +81,42 @@ public final class OptimizedDirectCallNode extends DirectCallNode {
     @Override
     public Object call(Object... arguments) {
         OptimizedCallTarget target = getCurrentCallTarget();
-        if (CompilerDirectives.hasNextTier()) {
-            incrementCallCount();
-        }
         if (HostCompilerDirectives.inInterpreterFastPath()) {
             target = onInterpreterCall(target);
         }
         try {
-            return target.callDirect(this, arguments);
+            return target.callDirect(this, -1, arguments);
         } catch (Throwable t) {
-            throw handleException(t);
+            throw handleException(t, -1);
         }
     }
 
-    private RuntimeException handleException(Throwable t) {
+    @Override
+    public Object call(int bytecodeIndex, Object[] arguments) {
+        OptimizedCallTarget target = getCurrentCallTarget();
+        if (HostCompilerDirectives.inInterpreterFastPath()) {
+            target = onInterpreterCall(target);
+        }
+        try {
+            return target.callDirect(this, bytecodeIndex, arguments);
+        } catch (Throwable t) {
+            throw handleException(t, bytecodeIndex);
+        }
+    }
+
+    @Override
+    public Object call(Class<? extends RootNode> rootType, int bytecodeIndex, Object[] arguments) {
+        OptimizedCallTarget target = getCurrentCallTarget();
+        if (HostCompilerDirectives.inInterpreterFastPath()) {
+            target = onInterpreterCall(target);
+        }
+        RootNode root = rootType.cast(target.getRootNode());
+        return target.callRoot(this, bytecodeIndex, root, arguments);
+    }
+
+    private RuntimeException handleException(Throwable t, int bytecodeIndex) {
         Throwable profiled = profileExceptionType(t);
-        OptimizedRuntimeAccessor.LANGUAGE.addStackFrameInfo(this, null, profiled, null);
+        OptimizedRuntimeAccessor.LANGUAGE.addStackFrameInfo(this, null, profiled, null, bytecodeIndex);
         throw OptimizedCallTarget.rethrow(profiled);
     }
 
@@ -148,10 +165,6 @@ public final class OptimizedDirectCallNode extends DirectCallNode {
         return getCallTarget().getRootNode().isCloningAllowed();
     }
 
-    public int getCallCount() {
-        return callCount;
-    }
-
     @Override
     public OptimizedCallTarget getCurrentCallTarget() {
         return currentCallTarget;
@@ -187,11 +200,6 @@ public final class OptimizedDirectCallNode extends DirectCallNode {
             return getCurrentCallTarget();
         }
         return target;
-    }
-
-    private void incrementCallCount() {
-        int calls = this.callCount;
-        this.callCount = calls == Integer.MAX_VALUE ? calls : ++calls;
     }
 
     /** Used by the splitting strategy to install new targets. */

@@ -27,12 +27,14 @@ package com.oracle.svm.graal.isolated;
 import org.graalvm.nativeimage.c.struct.RawField;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.PointerBase;
+import org.graalvm.word.impl.Word;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
 
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileClient;
 import com.oracle.svm.core.meta.DirectSubstrateObjectConstant;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.graal.meta.SubstrateMemoryAccessProviderImpl;
 
 import jdk.vm.ci.meta.Constant;
@@ -114,11 +116,11 @@ final class ConstantDataConverter {
             rawBits = IsolatedHandles.nullHandle();
             data.setCompressed(SubstrateObjectConstant.isCompressed(constant));
         } else if (kind.isNumericInteger()) {
-            rawBits = WordFactory.signed(constant.asLong());
+            rawBits = Word.signed(constant.asLong());
         } else if (kind == JavaKind.Float) {
-            rawBits = WordFactory.unsigned(Float.floatToRawIntBits(constant.asFloat()));
+            rawBits = Word.unsigned(Float.floatToRawIntBits(constant.asFloat()));
         } else if (kind == JavaKind.Double) {
-            rawBits = WordFactory.unsigned(Double.doubleToRawLongBits(constant.asDouble()));
+            rawBits = Word.unsigned(Double.doubleToRawLongBits(constant.asDouble()));
         } else {
             throw VMError.shouldNotReachHere("unsupported constant kind: " + kind);
         }

@@ -30,7 +30,7 @@ import org.graalvm.nativeimage.impl.RuntimeProxyCreationSupport;
 
 public interface DynamicProxyRegistry extends RuntimeProxyCreationSupport {
 
-    Class<?> getProxyClass(ClassLoader loader, Class<?>... interfaces);
+    Class<?> getProxyClass(ClassLoader loader, boolean nullIfMissing, Class<?>... interfaces);
 
     @Platforms(Platform.HOSTED_ONLY.class)
     Class<?> getProxyClassHosted(Class<?>... interfaces);

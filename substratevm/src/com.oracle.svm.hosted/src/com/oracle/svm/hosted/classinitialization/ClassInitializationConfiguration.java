@@ -52,12 +52,17 @@ import com.oracle.svm.core.util.UserError;
  *
  * Every node tracks a list of reasons for the set configuration. This list helps the users debug
  * conflicts in the configuration.
+ *
+ * A {@code strict} configuration, as specified by {@link InitializationNode#strict}, defines
+ * whether an initialization kind, as specified by {@link InitializationNode#kind}, was explicitly
+ * configured for the corresponding type. A {@code non-strict} configuration is a configuration
+ * inherited from a parent package configuration.
  */
 final class ClassInitializationConfiguration {
     private static final String ROOT_QUALIFIER = "";
     private static final int MAX_NUMBER_OF_REASONS = 10;
 
-    private InitializationNode root = new InitializationNode("", null, null, false);
+    private final InitializationNode root = new InitializationNode("", null, null, false);
 
     public synchronized void insert(String classOrPackage, InitKind kind, String reason, boolean strict) {
         assert kind != null;
@@ -74,7 +79,7 @@ final class ClassInitializationConfiguration {
         if (initializationNode == null) {
             return null;
         }
-        return String.join(" and ", initializationNode.reasons);
+        return String.join(" and ", initializationNode.sortedReasons());
     }
 
     private static List<String> qualifierList(String classOrPackage) {
@@ -101,7 +106,7 @@ final class ClassInitializationConfiguration {
             } else {
                 if (node.strict) {
                     throw UserError.abort("Incompatible change of initialization policy for %s: trying to change %s %s to %s %s",
-                                    qualifiedName(node), node.kind, String.join(" and ", node.reasons), kind, reason);
+                                    qualifiedName(node), node.kind, String.join(" and ", node.sortedReasons()), kind, reason);
                 } else {
                     node.kind = node.kind.max(kind);
                 }
@@ -161,10 +166,37 @@ final class ClassInitializationConfiguration {
     }
 }
 
+/**
+ * A node in a tree that models class/package initialization policy for Native Image. Each node
+ * corresponds to one qualifier (a path segment in a fully qualified name) and can hold an explicit
+ * initialization policy along with why it was chosen.
+ */
 final class InitializationNode {
+    /**
+     * The simple name for this tree level (e.g., "", "com", "oracle", "svm", "hosted" or
+     * "MyClass"). The root uses the empty string "".
+     */
     final String qualifier;
+
+    /**
+     * Whether the node's initialization policy (kind) was explicitly configured at this exact node
+     * (strict = true) versus inherited from an ancestor package (strict = false). This affects
+     * conflict handling: explicit (strict) settings cannot be overridden; attempts to change them
+     * will abort with a user error.
+     */
     boolean strict;
+
+    /**
+     * The initialization policy (InitKind) applied at this node, or null if nothing was set here.
+     * Effective policy for a class is determined by the longest matching path with a non-null kind
+     * (inheritance from parent nodes).
+     */
     InitKind kind;
+
+    /**
+     * Strings explaining why this policy was applied (e.g., command-line options or feature
+     * decisions). It's used for diagnostics (e.g., in error messages and reporting).
+     */
     final EconomicSet<String> reasons = EconomicSet.create();
 
     final InitializationNode parent;
@@ -176,5 +208,14 @@ final class InitializationNode {
         this.kind = kind;
         this.strict = strict;
         this.reasons.addAll(Arrays.asList(reasons));
+    }
+
+    /**
+     * Reasons are not sorted by default, which would make the reports unstable.
+     */
+    String[] sortedReasons() {
+        String[] array = reasons.toArray(new String[reasons.size()]);
+        Arrays.sort(array);
+        return array;
     }
 }

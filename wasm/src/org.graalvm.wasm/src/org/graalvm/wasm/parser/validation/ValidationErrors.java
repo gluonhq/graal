@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,40 +41,19 @@
 
 package org.graalvm.wasm.parser.validation;
 
-import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
-import org.graalvm.wasm.WasmType;
-
 import java.util.StringJoiner;
 
-public class ValidationErrors {
-    private static String getValueTypeString(byte valueType) {
-        switch (valueType) {
-            case WasmType.VOID_TYPE:
-                return "";
-            case WasmType.I32_TYPE:
-                return "i32";
-            case WasmType.I64_TYPE:
-                return "i64";
-            case WasmType.F32_TYPE:
-                return "f32";
-            case WasmType.F64_TYPE:
-                return "f64";
-            case WasmType.V128_TYPE:
-                return "v128";
-            case WasmType.FUNCREF_TYPE:
-                return "funcref";
-            case WasmType.EXTERNREF_TYPE:
-                return "externref";
-        }
-        return "unknown";
-    }
+import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.exception.Failure;
+import org.graalvm.wasm.exception.WasmException;
 
-    private static String getValueTypesString(byte[] valueTypes) {
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+
+public class ValidationErrors {
+    private static String getValueTypesString(int[] valueTypes) {
         StringJoiner stringJoiner = new StringJoiner(",");
-        for (byte valueType : valueTypes) {
-            stringJoiner.add(getValueTypeString(valueType));
+        for (int valueType : valueTypes) {
+            stringJoiner.add(WasmType.toString(valueType));
         }
         return stringJoiner.toString();
     }
@@ -84,51 +63,82 @@ public class ValidationErrors {
     }
 
     @TruffleBoundary
-    public static WasmException createTypeMismatch(byte expectedType, byte actualType) {
-        String expectedTypeString = getValueTypeString(expectedType);
-        String actualTypeString = getValueTypeString(actualType);
+    public static WasmException createTypeMismatch(int expectedType, int actualType) {
+        String expectedTypeString = WasmType.toString(expectedType);
+        String actualTypeString = WasmType.toString(actualType);
         return create("Expected type [%s], but got [%s].", expectedTypeString, actualTypeString);
     }
 
     @TruffleBoundary
-    public static WasmException createResultTypesMismatch(byte[] expectedTypes, byte[] actualTypes) {
+    public static WasmException createExpectedReferenceTypeMismatch(int actualType) {
+        String actualTypeString = WasmType.toString(actualType);
+        return create("Expected type [%s], but got [%s].", "<reftype>", actualTypeString);
+    }
+
+    @TruffleBoundary
+    public static WasmException createResultTypesMismatch(int[] expectedTypes, int[] actualTypes) {
         String expectedTypesString = getValueTypesString(expectedTypes);
         String actualTypesString = getValueTypesString(actualTypes);
         return create("Expected result types [%s], but got [%s].", expectedTypesString, actualTypesString);
     }
 
     @TruffleBoundary
-    public static WasmException createLabelTypesMismatch(byte[] expectedTypes, byte[] actualTypes) {
+    public static WasmException createLabelTypesMismatch(int[] expectedTypes, int[] actualTypes) {
         String expectedTypesString = getValueTypesString(expectedTypes);
         String actualTypesString = getValueTypesString(actualTypes);
         return create("Inconsistent label types. Expected [%s], but got [%s].", expectedTypesString, actualTypesString);
     }
 
     @TruffleBoundary
-    public static WasmException createParamTypesMismatch(byte[] expectedTypes, byte[] actualTypes) {
+    public static WasmException createParamTypesMismatch(int[] expectedTypes, int[] actualTypes) {
         String expectedTypesString = getValueTypesString(expectedTypes);
         String actualTypesString = getValueTypesString(actualTypes);
         return create("Expected param types [%s], but got [%s].", expectedTypesString, actualTypesString);
     }
 
     @TruffleBoundary
-    public static WasmException createMissingLabel(int expected, int max) {
-        return WasmException.format(Failure.UNKNOWN_LABEL, "Unknown branch label %d (max %d).", expected, max);
+    public static WasmException createMissingLabel(int label, int max) {
+        return WasmException.format(Failure.UNKNOWN_LABEL, "Unknown branch label %d (max %d).", label, max);
     }
 
     @TruffleBoundary
-    public static WasmException createMissingFunctionType(int expected, int max) {
-        return WasmException.format(Failure.UNKNOWN_TYPE, "Function type variable %d out of range. (max %d)", expected, max);
+    public static WasmException createMissingType(int typeIndex) {
+        return WasmException.format(Failure.UNKNOWN_TYPE, "Type variable %d out of range.", typeIndex);
     }
 
     @TruffleBoundary
-    public static WasmException createExpectedAnyOnEmptyStack() {
-        return WasmException.create(Failure.TYPE_MISMATCH, "Expected type [any], but got [].");
+    public static WasmException createMissingType(int typeIndex, int max) {
+        return WasmException.format(Failure.UNKNOWN_TYPE, "Type variable %d out of range. (max %d)", typeIndex, max);
     }
 
     @TruffleBoundary
-    public static WasmException createExpectedTypeOnEmptyStack(byte expectedType) {
-        String expectedTypeString = getValueTypeString(expectedType);
+    public static WasmException createExpectedArrayType(int typeIndex) {
+        return WasmException.format(Failure.TYPE_MISMATCH, "Type %d is not an array type", typeIndex);
+    }
+
+    @TruffleBoundary
+    public static WasmException createExpectedStructType(int typeIndex) {
+        return WasmException.format(Failure.TYPE_MISMATCH, "Type %d is not a struct type", typeIndex);
+    }
+
+    @TruffleBoundary
+    public static WasmException createExpectedFunctionType(int typeIndex) {
+        return WasmException.format(Failure.TYPE_MISMATCH, "Type %d is not a function type", typeIndex);
+    }
+
+    @TruffleBoundary
+    public static WasmException createExpectedTopOnEmptyStack() {
+        return WasmException.create(Failure.TYPE_MISMATCH, "Expected type [top], but got [].");
+    }
+
+    @TruffleBoundary
+    public static WasmException createExpectedTypeOnEmptyStack(int expectedType) {
+        String expectedTypeString = WasmType.toString(expectedType);
         return create("Expected type [%s], but got [].", expectedTypeString, "");
+    }
+
+    @TruffleBoundary
+    public static WasmException createExpectedReferenceTypeOnEmptyStack() {
+        return create("Expected type [%s], but got [].", "<reftype>", "");
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,24 +32,28 @@ import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.Isolates;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.headers.LibC;
 import com.oracle.svm.core.jdk.JNIPlatformNativeLibrarySupport;
 import com.oracle.svm.core.jdk.Jvm;
 import com.oracle.svm.core.jdk.NativeLibrarySupport;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
-import com.oracle.svm.core.log.Log;
 import com.oracle.svm.core.posix.headers.Dlfcn;
 import com.oracle.svm.core.posix.headers.Resource;
 import com.oracle.svm.core.posix.headers.Time;
 import com.oracle.svm.core.posix.headers.darwin.DarwinSyslimits;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 @AutomaticallyRegisteredFeature
 class PosixNativeLibraryFeature implements InternalFeature {
@@ -57,14 +61,11 @@ class PosixNativeLibraryFeature implements InternalFeature {
     public void afterRegistration(AfterRegistrationAccess access) {
         PosixNativeLibrarySupport.initialize();
     }
-
-    @Override
-    public void duringSetup(DuringSetupAccess access) {
-        NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary("extnet");
-    }
 }
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
+    public static final String PLM_PROPERTY_NAME = "jdk.lang.Process.launchMechanism";
 
     @Platforms(Platform.HOSTED_ONLY.class)
     private PosixNativeLibrarySupport() {
@@ -75,7 +76,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
     }
 
     @Override
-    public boolean initializeBuiltinLibraries() {
+    public boolean initializeLibrariesDuringIsolateInit() {
         if (Isolates.isCurrentFirst()) { // raise process fd limit to hard max if possible
             Resource.rlimit rlp = UnsafeStackValue.get(Resource.rlimit.class);
             if (Resource.getrlimit(Resource.RLIMIT_NOFILE(), rlp) == 0) {
@@ -83,7 +84,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
                 if (Platform.includedIn(Platform.DARWIN.class)) {
                     // On Darwin, getrlimit may return RLIM_INFINITY for rlim_max, but then OPEN_MAX
                     // must be used for setrlimit or it will fail with errno EINVAL.
-                    newValue = WordFactory.unsigned(DarwinSyslimits.OPEN_MAX());
+                    newValue = Word.unsigned(DarwinSyslimits.OPEN_MAX());
                 }
                 rlp.set_rlim_cur(newValue);
                 if (Resource.setrlimit(Resource.RLIMIT_NOFILE(), rlp) != 0) {
@@ -96,14 +97,19 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
 
         if (Platform.includedIn(InternalPlatform.PLATFORM_JNI.class)) {
             try {
-                loadJavaLibrary();
+                loadLibjava();
                 loadNetLibrary();
-                /*
-                 * The JDK uses posix_spawn on the Mac to launch executables. This requires a
-                 * separate process "jspawnhelper" which we don't want to have to rely on. Force the
-                 * use of FORK on Linux and Mac.
-                 */
-                System.setProperty("jdk.lang.Process.launchMechanism", "FORK");
+
+                String launchMechanism = System.getProperty(PLM_PROPERTY_NAME);
+
+                if (launchMechanism == null) {
+                    /*
+                     * The JDK uses posix_spawn on the Mac to launch executables. This requires a
+                     * separate process "jspawnhelper" which we don't want to have to rely on. Force
+                     * the use of FORK on Linux and Mac.
+                     */
+                    System.setProperty(PLM_PROPERTY_NAME, "FORK");
+                }
 
                 /*
                  * Work around a bug in fork() on Darwin by eagerly calling localtime_r to make sure
@@ -114,7 +120,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
                  */
                 if (Platform.includedIn(Platform.DARWIN.class)) {
                     Time.timeval tv = UnsafeStackValue.get(Time.timeval.class);
-                    Time.NoTransitions.gettimeofday(tv, WordFactory.nullPointer());
+                    Time.NoTransitions.gettimeofday(tv, Word.nullPointer());
                     Time.tm tm = UnsafeStackValue.get(Time.tm.class);
                     Time.NoTransitions.localtime_r(tv.addressOftv_sec(), tm);
                 }
@@ -128,11 +134,12 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
     }
 
     @Override
-    protected void loadJavaLibrary() {
-        super.loadJavaLibrary();
+    protected void loadLibjava() {
+        super.loadLibjava();
         Target_java_io_UnixFileSystem_JNI.initIDs();
     }
 
+    @SuppressWarnings("restricted")
     private static void loadNetLibrary() {
         if (Isolates.isCurrentFirst()) {
             /*
@@ -142,7 +149,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
              */
             System.loadLibrary("net");
         } else {
-            NativeLibrarySupport.singleton().registerInitializedBuiltinLibrary("net");
+            NativeLibrarySupport.singleton().registerInitializedLibrary("net");
         }
     }
 
@@ -162,7 +169,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
 
         private final String canonicalIdentifier;
         private final boolean builtin;
-        private PointerBase dlhandle = WordFactory.nullPointer();
+        private PointerBase dlhandle = Word.nullPointer();
         private boolean loaded = false;
 
         PosixNativeLibrary(String canonicalIdentifier, boolean builtin) {
@@ -195,7 +202,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
             }
             assert dlhandle.isNonNull();
             if (PosixUtils.dlclose(dlhandle)) {
-                dlhandle = WordFactory.nullPointer();
+                dlhandle = Word.nullPointer();
                 return true;
             } else {
                 return false;
@@ -203,7 +210,7 @@ final class PosixNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
         }
 
         private boolean doLoad() {
-            // Make sure the jvm.lib is available for linking
+            // Make sure the Native Image replacement JVM library is available for linking.
             // Need a better place to put this.
             if (Platform.includedIn(Platform.LINUX.class) ||
                             Platform.includedIn(Platform.DARWIN.class)) {

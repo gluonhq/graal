@@ -26,27 +26,33 @@
 
 package com.oracle.graal.pointsto.standalone.test;
 
+import static org.junit.Assert.assertTrue;
+
 import org.junit.Test;
 
-/**
- * This test can test 2 facts for standalone pointsto analysis:
- * <ol>
- * <li>The clinit method is taken as analysis target instead of being executed to initialize the
- * class.</li>
- * <li>The static final field is not taken as final in the analysis, i.e. it is not considered as
- * constant at analysis time.</li>
- * </ol>
- */
-public class ConstantFieldTest {
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.standalone.test.classes.ConstantFieldCase;
 
+/**
+ * Verifies standalone handling of static final fields whose declaring class can be initialized
+ * eagerly during analysis.
+ */
+public class ConstantFieldTest extends StandaloneAnalysisTest {
+
+    /**
+     * The fixture is initialized eagerly, so the class initializer is not modeled as a reachable
+     * runtime method and the static final field can be folded while preserving reachability triggered
+     * by the folded value.
+     */
     @Test
-    public void testConstantField() throws NoSuchMethodException, NoSuchFieldException {
-        PointstoAnalyzerTester tester = new PointstoAnalyzerTester(ConstantFieldCase.class);
-        tester.setAnalysisArguments(tester.getTestClassName(),
-                        "-H:AnalysisTargetAppCP=" + tester.getTestClassJar());
-        tester.setExpectedReachableMethods(ConstantFieldCase.ConstantType.class.getDeclaredMethod("foo"));
-        tester.setExpectedReachableClinits(ConstantFieldCase.class);
-        tester.setExpectedReachableFields(ConstantFieldCase.class.getDeclaredField("constantField"));
-        tester.runAnalysisAndAssert();
+    public void testConstantField() {
+        runAnalysis(ConstantFieldCase.class);
+        assertReachable(findMethod(ConstantFieldCase.ConstantType.class, "foo"));
+        AnalysisField constantField = findField(ConstantFieldCase.class, "constantField");
+        AnalysisType constantFieldCase = findClass(ConstantFieldCase.class);
+        assertNotReachable(findClassInitializer(ConstantFieldCase.class));
+        assertTrue("The declaring class should be initialized under unified standalone semantics.", constantFieldCase.isInitialized());
+        assertTrue("The constant field should be folded under unified standalone semantics.", constantField.isFolded());
     }
 }

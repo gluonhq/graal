@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,19 +40,22 @@
  */
 package com.oracle.truffle.api.impl;
 
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionValues;
+import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.SandboxPolicy;
 
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.BlockNode;
 import com.oracle.truffle.api.nodes.BlockNode.ElementExecutor;
@@ -84,8 +87,17 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public RootCallTarget newCallTarget(CallTarget sourceCallTarget, RootNode rootNode) {
+        public RuntimeCallTarget newCallTarget(CallTarget sourceCallTarget, RootNode rootNode) {
             return new DefaultCallTarget(rootNode);
+        }
+
+        @Override
+        public long getCallTargetId(CallTarget target) {
+            if (target instanceof DefaultCallTarget) {
+                return ((DefaultCallTarget) target).id;
+            } else {
+                return 0;
+            }
         }
 
         @Override
@@ -96,6 +108,11 @@ final class DefaultRuntimeAccessor extends Accessor {
         @Override
         public boolean isLoaded(CallTarget callTarget) {
             return ((DefaultCallTarget) callTarget).isLoaded();
+        }
+
+        @Override
+        public int getBytecodeIndex(FrameInstance frameInstance, Frame frame) {
+            return ((DefaultTruffleRuntime.DefaultFrameInstance) frameInstance).getBytecodeIndex(frame);
         }
 
         @Override
@@ -131,7 +148,12 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public Object tryBytecodeOSR(BytecodeOSRNode osrNode, int target, Object interpreterState, Runnable beforeTransfer, VirtualFrame parentFrame) {
+        public boolean pollBytecodeOSRBackEdge(BytecodeOSRNode osrNode, int count) {
+            return false;
+        }
+
+        @Override
+        public Object tryBytecodeOSR(BytecodeOSRNode osrNode, long target, Object interpreterState, Runnable beforeTransfer, VirtualFrame parentFrame) {
             return null;
         }
 
@@ -141,13 +163,7 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        // Support for deprecated frame transfer: GR-38296
-        public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, int bytecodeTarget) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, int bytecodeTarget, Object targetMetadata) {
+        public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, long bytecodeTarget, Object targetMetadata) {
             throw new UnsupportedOperationException();
         }
 
@@ -164,7 +180,8 @@ final class DefaultRuntimeAccessor extends Accessor {
         @Override
         public boolean isGuestCallStackFrame(StackTraceElement e) {
             String methodName = e.getMethodName();
-            return (methodName.equals(DefaultCallTarget.CALL_BOUNDARY_METHOD)) && e.getClassName().equals(DefaultCallTarget.class.getName());
+            String className = e.getClassName();
+            return className.equals(DefaultCallTarget.class.getName()) && methodName.equals(DefaultCallTarget.CALL_BOUNDARY_METHOD);
         }
 
         @Override
@@ -203,7 +220,7 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public void flushCompileQueue(Object runtimeData) {
+        public void shutdownCompilationForEngine(Object runtimeData) {
             // default runtime has no compile queue.
         }
 
@@ -243,8 +260,23 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
+        public void onEnginePatchSuccess(Object runtimeData) {
+
+        }
+
+        @Override
         public boolean onEngineClosing(Object runtimeData) {
             return false;
+        }
+
+        @Override
+        public boolean onStoreCache(Object runtimeData, Path targetPath, long cancelledWord) {
+            throw new UnsupportedOperationException("Persisting an engine is not supported with the Truffle fallback runtime. It is only supported on native-image hosts.");
+        }
+
+        @Override
+        public ByteBuffer persistCache(Object runtimeData, Engine.CancellationCallback callback) {
+            throw new UnsupportedOperationException("Persisting an engine is not supported with the Truffle fallback runtime. It is only supported on native-image hosts.");
         }
 
         @Override
@@ -288,8 +320,24 @@ final class DefaultRuntimeAccessor extends Accessor {
 
         @Override
         public <T> ThreadLocal<T> createTerminatingThreadLocal(Supplier<T> initialValue, Consumer<T> onThreadTermination) {
-            return ThreadLocal.withInitial(initialValue);
+            return DefaultTruffleRuntime.createTerminatingThreadLocal(initialValue, onThreadTermination);
         }
+
+        @Override
+        public void initializeInterpreterCallStackHeadRoom(Object engineData, long interpreterCallStackHeadRoom) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean supportsHeapMemoryLimits() {
+            return false;
+        }
+
+        @Override
+        public long getStackOverflowLimit() {
+            return DefaultTruffleRuntime.getStackOverflowLimit();
+        }
+
     }
 
 }

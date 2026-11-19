@@ -1,0 +1,466 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted.imagelayer;
+
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.DYNAMIC_HUB;
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.ENUM;
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.METHOD_TYPE;
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.STRING;
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.UNDEFINED_CONSTANT_ID;
+import static com.oracle.svm.hosted.imagelayer.SVMImageLayerSnapshotUtil.UNDEFINED_FIELD_INDEX;
+import static com.oracle.svm.hosted.imagelayer.SnapshotWriters.initInts;
+import static com.oracle.svm.hosted.imagelayer.SnapshotWriters.initSortedArray;
+
+import java.lang.invoke.MethodType;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.IntFunction;
+
+import org.graalvm.nativeimage.impl.CEntryPointLiteralCodePointer;
+import org.graalvm.word.WordBase;
+
+import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.heap.ImageHeap;
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapInstance;
+import com.oracle.graal.pointsto.heap.ImageHeapObjectArray;
+import com.oracle.graal.pointsto.heap.ImageHeapPrimitiveArray;
+import com.oracle.graal.pointsto.heap.ImageHeapRelocatableConstant;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.AnalysisUniverse;
+import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.graal.pointsto.util.AnalysisFuture;
+import com.oracle.svm.core.annotate.Delete;
+import com.oracle.svm.core.graal.code.CGlobalDataBasePointer;
+import com.oracle.svm.guest.staging.meta.MethodOffset;
+import com.oracle.svm.guest.staging.meta.MethodPointer;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocal;
+import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.hosted.annotation.CustomSubstitutionType;
+import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.hosted.image.NativeImageHeap;
+import com.oracle.svm.hosted.image.NativeImageHeap.ObjectInfo;
+import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.hosted.meta.PatchedWordConstant;
+import com.oracle.svm.hosted.reflect.proxy.ProxyRenamingSubstitutionProcessor;
+import com.oracle.svm.hosted.snapshot.c.CEntryPointLiteralReferenceData;
+import com.oracle.svm.hosted.snapshot.constant.ConstantReferenceData;
+import com.oracle.svm.hosted.snapshot.constant.PersistedConstantData;
+import com.oracle.svm.hosted.snapshot.constant.PersistedConstantData.ObjectValue;
+import com.oracle.svm.hosted.snapshot.constant.RelinkingData;
+import com.oracle.svm.hosted.snapshot.constant.RelinkingData.EnumConstant;
+import com.oracle.svm.hosted.snapshot.constant.RelinkingData.FieldConstant;
+import com.oracle.svm.hosted.snapshot.constant.RelinkingData.MethodTypeConstant;
+import com.oracle.svm.hosted.snapshot.constant.RelinkingData.StringConstant;
+import com.oracle.svm.hosted.snapshot.layer.SharedLayerSnapshotData;
+import com.oracle.svm.hosted.snapshot.util.SnapshotStructList;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.OriginalClassProvider;
+
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.PrimitiveConstant;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+
+final class SVMImageConstantSnapshotWriter {
+    private final SVMImageLayerSnapshotUtil imageLayerSnapshotUtil;
+    private final NativeImageHeap nativeImageHeap;
+    private final AnalysisUniverse aUniverse;
+    private final IdentityHashMap<String, String> internedStringsIdentityMap;
+    private final GuestAccess guestAccess;
+    private final ResolvedJavaMethod classGetClassLoader;
+    private final ResolvedJavaMethod classLoaderGetName;
+    private final Map<ClassIdentity, Integer> classIdentityHashCodes = new HashMap<>();
+    private Map<ImageHeapConstant, ConstantParent> constantsMap;
+    private boolean constantsWritten;
+
+    private record ConstantParent(int constantId, int index) {
+        static final ConstantParent NONE = new ConstantParent(UNDEFINED_CONSTANT_ID, UNDEFINED_FIELD_INDEX);
+        static final ConstantParent UNMATERIALIZED = new ConstantParent(UNDEFINED_CONSTANT_ID, UNDEFINED_FIELD_INDEX);
+    }
+
+    private record ClassIdentity(String loaderName, String className) {
+    }
+
+    SVMImageConstantSnapshotWriter(SVMImageLayerSnapshotUtil imageLayerSnapshotUtil, NativeImageHeap nativeImageHeap, AnalysisUniverse aUniverse,
+                    IdentityHashMap<String, String> internedStringsIdentityMap) {
+        this.imageLayerSnapshotUtil = imageLayerSnapshotUtil;
+        this.nativeImageHeap = nativeImageHeap;
+        this.aUniverse = aUniverse;
+        this.internedStringsIdentityMap = internedStringsIdentityMap;
+        this.guestAccess = GuestAccess.get();
+        this.classGetClassLoader = guestAccess.lookupMethod(guestAccess.elements.java_lang_Class, "getClassLoader");
+        this.classLoaderGetName = guestAccess.lookupMethod(guestAccess.lookupBootClassLoaderType("java.lang.ClassLoader"), "getName");
+    }
+
+    void collectConstants(ImageHeap imageHeap, Collection<ImageHeapConstant> constantsToPersist) {
+        List<ImageHeapConstant> constantsToScan = new ArrayList<>();
+        imageHeap.getReachableObjects().values().forEach(constantsToScan::addAll);
+        constantsMap = HashMap.newHashMap(constantsToScan.size() + constantsToPersist.size());
+        constantsToScan.forEach(c -> constantsMap.put(c, ConstantParent.NONE));
+        /*
+         * Some child constants of reachable constants are not reachable because they are only used
+         * in snippets, but still need to be persisted.
+         */
+        while (!constantsToScan.isEmpty()) {
+            List<ImageHeapConstant> discoveredConstants = new ArrayList<>();
+            constantsToScan.forEach(con -> scanConstantReferencedObjects(con, discoveredConstants));
+            constantsToScan = discoveredConstants;
+        }
+        /* Preserve full data for constants already found by the normal scan. */
+        constantsToPersist.forEach(constant -> constantsMap.putIfAbsent(constant, ConstantParent.UNMATERIALIZED));
+    }
+
+    void writeConstants(SharedLayerSnapshotData.Writer snapshotWriter) {
+        @SuppressWarnings({"unchecked", "cast"})
+        Entry<ImageHeapConstant, ConstantParent>[] constantsToPersist = (Entry<ImageHeapConstant, ConstantParent>[]) constantsMap.entrySet().stream()
+                        .sorted(Comparator.comparingInt(a -> ImageHeapConstant.getConstantID(a.getKey())))
+                        .toArray(Entry[]::new);
+        Set<Integer> constantsToRelink = new HashSet<>(); // noEconomicSet(streaming)
+        initSortedArray(snapshotWriter::initConstants, constantsToPersist,
+                        (entry, builderSupplier) -> persistConstant(entry.getKey(), entry.getValue(), builderSupplier.get(), constantsToRelink));
+        initInts(snapshotWriter::initConstantsToRelink, constantsToRelink.stream().mapToInt(i -> i).sorted());
+        constantsWritten = true;
+    }
+
+    List<WriteLayerArchiveSupport.ClassIdentityHashCode> getClassIdentityHashCodes() {
+        assert constantsWritten : "Class identity hash codes are collected while writing constants";
+        return classIdentityHashCodes.entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey(Comparator.comparing(ClassIdentity::loaderName).thenComparing(ClassIdentity::className)))
+                        .map(entry -> new WriteLayerArchiveSupport.ClassIdentityHashCode(entry.getValue(), entry.getKey().loaderName(), entry.getKey().className()))
+                        .toList();
+    }
+
+    void writeConstant(JavaConstant constant, ConstantReferenceData.Writer builder) {
+        if (constant == null) {
+            return;
+        }
+        if (!maybeWriteConstant(constant, builder)) {
+            throw VMError.shouldNotReachHere("Unexpected constant: " + constant);
+        }
+    }
+
+    private void persistConstant(ImageHeapConstant imageHeapConstant, ConstantParent parent, PersistedConstantData.Writer builder, Set<Integer> constantsToRelink) {
+        ObjectInfo objectInfo = nativeImageHeap.getConstantInfo(imageHeapConstant);
+        builder.setObjectOffset((objectInfo == null) ? -1 : objectInfo.getOffset());
+
+        int id = ImageHeapConstant.getConstantID(imageHeapConstant);
+        builder.setId(id);
+        AnalysisType type = imageHeapConstant.getType();
+        AnalysisError.guarantee(type.isTrackedAcrossLayers(), "Type %s from constant %s should have been marked as trackedAcrossLayers, but was not", type, imageHeapConstant);
+        builder.setTypeId(type.getId());
+
+        ConstantReflectionProvider constantReflection = aUniverse.getBigbang().getConstantReflectionProvider();
+        int identityHashCode = constantReflection.identityHashCode(imageHeapConstant);
+        builder.setIdentityHashCode(identityHashCode);
+        boolean unmaterialized = parent == ConstantParent.UNMATERIALIZED;
+
+        switch (imageHeapConstant) {
+            case ImageHeapInstance imageHeapInstance -> {
+                builder.initObject().setInstance();
+                if (unmaterialized) {
+                    persistUnmaterializedObjectData(builder.getObject(), imageHeapInstance.getType().getInstanceFields(true).length);
+                } else {
+                    persistConstantObjectData(builder.getObject(), imageHeapInstance::getFieldValue, imageHeapInstance.getFieldValuesSize());
+                }
+                persistConstantRelinkingInfo(builder, imageHeapConstant, constantsToRelink, aUniverse.getBigbang(), identityHashCode);
+            }
+            case ImageHeapObjectArray imageHeapObjectArray -> {
+                builder.initObject().setObjectArray();
+                if (unmaterialized) {
+                    persistUnmaterializedObjectData(builder.getObject(), imageHeapObjectArray.getLength());
+                } else {
+                    persistConstantObjectData(builder.getObject(), imageHeapObjectArray::getElement, imageHeapObjectArray.getLength());
+                }
+            }
+            case ImageHeapPrimitiveArray imageHeapPrimitiveArray ->
+                SnapshotPrimitiveArrays.write(builder.initPrimitiveData(), imageHeapPrimitiveArray.getType().getComponentType().getJavaKind(), imageHeapPrimitiveArray.getArray());
+            case ImageHeapRelocatableConstant relocatableConstant ->
+                builder.initRelocatable().setKey(relocatableConstant.getConstantData().key);
+            default -> throw AnalysisError.shouldNotReachHere("Unexpected constant type " + imageHeapConstant);
+        }
+
+        if (!constantsToRelink.contains(id) && parent != ConstantParent.NONE && parent != ConstantParent.UNMATERIALIZED) {
+            builder.setParentConstantId(parent.constantId);
+            assert parent.index != UNDEFINED_FIELD_INDEX : "Tried to persist child constant %s from parent constant %d, but got index %d".formatted(imageHeapConstant, parent.constantId, parent.index);
+            builder.setParentIndex(parent.index);
+        }
+    }
+
+    private static void persistUnmaterializedObjectData(ObjectValue.Writer builder, int size) {
+        SnapshotStructList.Writer<ConstantReferenceData.Writer> refsBuilder = builder.initData(size);
+        for (int i = 0; i < size; i++) {
+            refsBuilder.get(i).setNotMaterialized();
+        }
+    }
+
+    private void persistConstantRelinkingInfo(PersistedConstantData.Writer builder, ImageHeapConstant imageHeapConstant, Set<Integer> constantsToRelink, BigBang bb, int identityHashCode) {
+        AnalysisType type = imageHeapConstant.getType();
+        JavaConstant hostedObject = imageHeapConstant.getHostedObject();
+        boolean simulated = hostedObject == null;
+        builder.setIsSimulated(simulated);
+        if (!simulated) {
+            RelinkingData.Writer relinkingBuilder = builder.getObject().getRelinking();
+            int id = ImageHeapConstant.getConstantID(imageHeapConstant);
+            boolean tryStaticFinalFieldRelink = true;
+            if (aUniverse.lookup(DYNAMIC_HUB).equals(type)) {
+                AnalysisType constantType = (AnalysisType) bb.getConstantReflectionProvider().asJavaType(hostedObject);
+                relinkingBuilder.initClassConstant().setTypeId(constantType.getId());
+                recordClassIdentityHashCode(constantType, identityHashCode);
+                constantsToRelink.add(id);
+                tryStaticFinalFieldRelink = false;
+            } else if (aUniverse.lookup(STRING).equals(type)) {
+                StringConstant.Writer stringConstantBuilder = relinkingBuilder.initStringConstant();
+                String value = bb.getSnippetReflectionProvider().asObject(String.class, hostedObject);
+                if (internedStringsIdentityMap.containsKey(value)) {
+                    /*
+                     * Interned strings must be relinked.
+                     */
+                    stringConstantBuilder.setValue(value);
+                    constantsToRelink.add(id);
+                    tryStaticFinalFieldRelink = false;
+                }
+            } else if (aUniverse.lookup(METHOD_TYPE).equals(type)) {
+                MethodTypeConstant.Writer methodTypeBuilder = relinkingBuilder.initMethodTypeConstant();
+                MethodType methodType = bb.getSnippetReflectionProvider().asObject(MethodType.class, hostedObject);
+                AnalysisType returnType = bb.getMetaAccess().lookupJavaType(methodType.returnType());
+                methodTypeBuilder.setReturnTypeId(returnType.getId());
+                Class<?>[] parameterTypes = methodType.parameterArray();
+                var parameterTypeIdsBuilder = methodTypeBuilder.initParameterTypeIds(parameterTypes.length);
+                for (int i = 0; i < parameterTypes.length; i++) {
+                    AnalysisType parameterType = bb.getMetaAccess().lookupJavaType(parameterTypes[i]);
+                    parameterTypeIdsBuilder.set(i, parameterType.getId());
+                }
+                constantsToRelink.add(id);
+                tryStaticFinalFieldRelink = false;
+            } else if (aUniverse.lookup(ENUM).isAssignableFrom(type)) {
+                EnumConstant.Writer enumBuilder = relinkingBuilder.initEnumConstant();
+                Enum<?> value = bb.getSnippetReflectionProvider().asObject(Enum.class, hostedObject);
+                enumBuilder.setEnumClass(value.getDeclaringClass().getName());
+                enumBuilder.setEnumName(value.name());
+                constantsToRelink.add(id);
+                tryStaticFinalFieldRelink = false;
+            }
+            if (tryStaticFinalFieldRelink && shouldRelinkConstant(imageHeapConstant) && imageHeapConstant.getOrigin() != null) {
+                AnalysisField field = imageHeapConstant.getOrigin();
+                if (shouldRelinkField(field)) {
+                    FieldConstant.Writer fieldConstantBuilder = relinkingBuilder.initFieldConstant();
+                    fieldConstantBuilder.setOriginFieldId(field.getId());
+                    fieldConstantBuilder.setRequiresLateLoading(requiresLateLoading(imageHeapConstant, field));
+                }
+            }
+        }
+    }
+
+    private void recordClassIdentityHashCode(AnalysisType type, int identityHashCode) {
+        if (type.toJavaName(true).contains(SVMImageLayerSnapshotUtil.GENERATED_SERIALIZATION)) {
+            return;
+        }
+        AnalysisType componentType = type;
+        int arrayRank = 0;
+        while (componentType.isArray()) {
+            componentType = componentType.getComponentType();
+            arrayRank++;
+        }
+        if (componentType.isHidden()) {
+            /* The JVM computes stable hashes for hidden classes and their arrays. */
+            return;
+        }
+        String loaderName = classIdentityHashCodeLoaderName(type);
+        String className;
+        if (ProxyRenamingSubstitutionProcessor.isProxyType(componentType)) {
+            className = interfaceKey(componentType);
+            if (arrayRank != 0) {
+                className += "@array:" + arrayRank;
+            }
+        } else {
+            className = type.toClassName().replace('.', '/');
+        }
+        ClassIdentity key = new ClassIdentity(loaderName, className);
+        Integer previous = classIdentityHashCodes.putIfAbsent(key, identityHashCode);
+        VMError.guarantee(previous == null || previous == identityHashCode, "Classes with the same name and class-loader name have different identity hash codes: %s", key);
+    }
+
+    private String classIdentityHashCodeLoaderName(AnalysisType type) {
+        JavaConstant classConstant = guestAccess.getProviders().getConstantReflection().asJavaClass(OriginalClassProvider.getOriginalType(type));
+        JavaConstant classLoader = guestAccess.invoke(classGetClassLoader, classConstant);
+        if (classLoader.isNull()) {
+            return "bootstrap";
+        }
+        /* Match HotSpot's ClassLoaderData::loader_name(), including whitespace-only names. */
+        String name = guestAccess.asHostString(guestAccess.invoke(classLoaderGetName, classLoader));
+        return name == null || name.isEmpty() ? guestAccess.getProviders().getMetaAccess().lookupJavaType(classLoader).toClassName() : name;
+    }
+
+    private static String interfaceKey(AnalysisType type) {
+        return "@interfaces:" + String.join(";", Arrays.stream(type.getInterfaces()).map(AnalysisType::toJavaName).map(name -> name.replace('.', '/')).toList());
+    }
+
+    private boolean shouldRelinkConstant(ImageHeapConstant heapConstant) {
+        /*
+         * FastThreadLocals need to be registered by the object replacer and relinking constants
+         * from the CrossLayerRegistry would skip the custom code associated.
+         */
+        Object o = aUniverse.getHostedValuesProvider().asObject(Object.class, heapConstant.getHostedObject());
+        return !(o instanceof FastThreadLocal) && !CrossLayerConstantRegistryFeature.singleton().isConstantRegistered(o);
+    }
+
+    private static boolean shouldRelinkField(AnalysisField field) {
+        return !GuestAnnotationAccess.isAnnotationPresent(field, Delete.class) &&
+                        ClassInitializationSupport.singleton().maybeInitializeAtBuildTime(field.getDeclaringClass()) &&
+                        field.isStatic() && field.isFinal() && field.isTrackedAcrossLayers() && field.installableInLayer();
+    }
+
+    private static boolean requiresLateLoading(ImageHeapConstant imageHeapConstant, AnalysisField field) {
+        /*
+         * CustomSubstitutionTypes need to be loaded after the substitution are installed.
+         *
+         * Intercepted fields need to be loaded after the interceptor is installed.
+         */
+        return imageHeapConstant.getType().getWrapped() instanceof CustomSubstitutionType ||
+                        FieldValueInterceptionSupport.hasFieldValueInterceptor(field);
+    }
+
+    private void persistConstantObjectData(ObjectValue.Writer builder, IntFunction<Object> valuesFunction, int size) {
+        SnapshotStructList.Writer<ConstantReferenceData.Writer> refsBuilder = builder.initData(size);
+        for (int i = 0; i < size; ++i) {
+            Object object = valuesFunction.apply(i);
+            ConstantReferenceData.Writer referenceBuilder = refsBuilder.get(i);
+            if (delegateProcessing(referenceBuilder, object)) {
+                /* The object was already persisted */
+                continue;
+            }
+            if (object instanceof JavaConstant javaConstant && maybeWriteConstant(javaConstant, referenceBuilder)) {
+                continue;
+            }
+            AnalysisError.guarantee(object instanceof AnalysisFuture<?>, "Unexpected constant %s", object);
+            referenceBuilder.setNotMaterialized();
+        }
+    }
+
+    private boolean maybeWriteConstant(JavaConstant constant, ConstantReferenceData.Writer builder) {
+        if (constant instanceof ImageHeapConstant imageHeapConstant) {
+            assert constantsMap.containsKey(imageHeapConstant) : imageHeapConstant;
+            var objectConstantBuilder = builder.initObjectConstant();
+            objectConstantBuilder.setConstantId(ImageHeapConstant.getConstantID(imageHeapConstant));
+        } else if (constant instanceof PrimitiveConstant primitiveConstant) {
+            var primitiveValueBuilder = builder.initPrimitiveValue();
+            primitiveValueBuilder.setTypeChar(NumUtil.safeToUByte(primitiveConstant.getJavaKind().getTypeChar()));
+            primitiveValueBuilder.setRawValue(primitiveConstant.getRawValue());
+        } else if (constant.equals(JavaConstant.NULL_POINTER)) {
+            builder.setNullPointer();
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean delegateProcessing(ConstantReferenceData.Writer builder, Object constant) {
+        if (constant instanceof PatchedWordConstant patchedWordConstant) {
+            WordBase word = patchedWordConstant.getWord();
+            if (word instanceof MethodRef methodRef) {
+                AnalysisMethod method = getRelocatableConstantMethod(methodRef);
+                switch (methodRef) {
+                    case MethodOffset _ -> builder.initMethodOffset().setMethodId(method.getId());
+                    case MethodPointer methodPointer -> {
+                        ConstantReferenceData.MethodPointer.Writer methodPointerBuilder = builder.initMethodPointer();
+                        methodPointerBuilder.setMethodId(method.getId());
+                        methodPointerBuilder.setPermitsRewriteToPLT(methodPointer.permitsRewriteToPLT());
+                    }
+                    default -> throw VMError.shouldNotReachHere("Unsupported method ref: " + methodRef);
+                }
+                return true;
+            } else if (word instanceof CEntryPointLiteralCodePointer codePointer) {
+                CEntryPointLiteralReferenceData.Writer codePointerBuilder = builder.initCEntryPointLiteralCodePointer();
+                codePointerBuilder.setMethodName(codePointer.methodName);
+                codePointerBuilder.setDefiningClass(codePointer.definingClass.getName());
+                codePointerBuilder.initParameterNames(codePointer.parameterTypes.length);
+                for (int i = 0; i < codePointer.parameterTypes.length; i++) {
+                    codePointerBuilder.getParameterNames().set(i, codePointer.parameterTypes[i].getName());
+                }
+                return true;
+            } else if (word instanceof CGlobalDataBasePointer) {
+                builder.setCGlobalDataBasePointer();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void scanConstantReferencedObjects(ImageHeapConstant constant, Collection<ImageHeapConstant> discoveredConstants) {
+        if (Objects.requireNonNull(constant) instanceof ImageHeapInstance instance) {
+            scanConstantReferencedObjects(constant, instance::getFieldValue, instance.getFieldValuesSize(), discoveredConstants);
+        } else if (constant instanceof ImageHeapObjectArray objArray) {
+            scanConstantReferencedObjects(constant, objArray::getElement, objArray.getLength(), discoveredConstants);
+        }
+    }
+
+    private void scanConstantReferencedObjects(ImageHeapConstant constant, IntFunction<Object> referencedObjectFunction, int size, Collection<ImageHeapConstant> discoveredConstants) {
+        for (int i = 0; i < size; i++) {
+            AnalysisType parentType = constant.getType();
+            Object obj = referencedObjectFunction.apply(i);
+            if (obj instanceof ImageHeapConstant childConstant && !constantsMap.containsKey(childConstant)) {
+                /*
+                 * Some constants are not in imageHeap#reachableObjects, but are still created in
+                 * reachable constants. They can be created in the extension image, but should not
+                 * be used.
+                 */
+                Set<Integer> relinkedFields = imageLayerSnapshotUtil.getRelinkedFields(parentType, aUniverse);
+                ConstantParent parent = relinkedFields.contains(i) ? new ConstantParent(ImageHeapConstant.getConstantID(constant), i) : ConstantParent.NONE;
+
+                discoveredConstants.add(childConstant);
+                constantsMap.put(childConstant, parent);
+            } else if (obj instanceof MethodRef methodRef) {
+                getRelocatableConstantMethod(methodRef).registerAsTrackedAcrossLayers("In method ref");
+            }
+        }
+    }
+
+    private static AnalysisMethod getRelocatableConstantMethod(MethodRef methodRef) {
+        ResolvedJavaMethod method = MethodRefSupport.getMethod(methodRef);
+        if (method instanceof HostedMethod hostedMethod) {
+            return hostedMethod.wrapped;
+        } else {
+            return (AnalysisMethod) method;
+        }
+    }
+}

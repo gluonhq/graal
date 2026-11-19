@@ -28,15 +28,16 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import com.oracle.svm.core.graal.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
 import com.oracle.svm.core.graal.meta.SubstrateLoweringProvider;
 import com.oracle.svm.core.graal.nodes.DeoptEntryNode;
 import com.oracle.svm.core.nodes.CFunctionCaptureNode;
 import com.oracle.svm.core.nodes.CFunctionEpilogueNode;
 import com.oracle.svm.core.nodes.CFunctionPrologueNode;
+import com.oracle.svm.core.nodes.SubstrateIndirectCallTargetNode;
 import com.oracle.svm.core.nodes.SubstrateMethodCallTargetNode;
 import com.oracle.svm.core.thread.VMThreads.StatusSupport;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
@@ -54,7 +55,6 @@ import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FrameState;
-import jdk.graal.compiler.nodes.IndirectCallTargetNode;
 import jdk.graal.compiler.nodes.InvokeNode;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
 import jdk.graal.compiler.nodes.MergeNode;
@@ -79,6 +79,7 @@ import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.java.StoreIndexedNode;
 import jdk.graal.compiler.phases.common.inlining.InliningUtil;
 import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.replacements.DefaultJavaLoweringProvider;
 import jdk.graal.compiler.replacements.GraphKit;
 import jdk.vm.ci.code.BytecodeFrame;
 import jdk.vm.ci.code.CallingConvention;
@@ -194,7 +195,9 @@ public class SubstrateGraphKit extends GraphKit {
 
         boolean emitTransition = StatusSupport.isValidStatus(newThreadStatus);
         if (emitTransition) {
-            append(new CFunctionPrologueNode(newThreadStatus));
+            CFunctionPrologueNode prolog = new CFunctionPrologueNode(newThreadStatus);
+            append(prolog);
+            prolog.setStateAfter(frameState.create(bci(), prolog));
         }
 
         /*
@@ -237,7 +240,7 @@ public class SubstrateGraphKit extends GraphKit {
 
         // Sign or zero extend to get a clean int value. If a boolean result is expected, the int
         // value is coerced to true or false.
-        return getLoweringProvider().implicitLoadConvertWithBooleanCoercionIfNecessary(getGraph(), asKind(returnType), result);
+        return DefaultJavaLoweringProvider.implicitUnsafePrimitiveLoadConvert(asKind(returnType), result);
     }
 
     public InvokeNode createIndirectCall(ValueNode targetAddress, List<ValueNode> args, Signature signature, SubstrateCallingConventionKind callKind) {
@@ -259,7 +262,7 @@ public class SubstrateGraphKit extends GraphKit {
 
         int bci = bci();
         CallTargetNode callTarget = getGraph().add(
-                        new IndirectCallTargetNode(targetAddress, args.toArray(new ValueNode[args.size()]), StampPair.createSingle(returnStamp), parameterTypes, null,
+                        new SubstrateIndirectCallTargetNode(targetAddress, args.toArray(new ValueNode[args.size()]), StampPair.createSingle(returnStamp), parameterTypes, null,
                                         convention, InvokeKind.Static));
         InvokeNode invoke = append(new InvokeNode(callTarget, bci));
 

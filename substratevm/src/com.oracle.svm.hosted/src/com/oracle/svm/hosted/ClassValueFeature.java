@@ -24,21 +24,24 @@
  */
 package com.oracle.svm.hosted;
 
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.oracle.graal.pointsto.ObjectScanner.OtherReason;
+import com.oracle.graal.pointsto.ObjectScanner.ScanReason;
 import com.oracle.graal.pointsto.meta.AnalysisType;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.ClassValueSupport;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.util.OriginalClassProvider;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * This feature reads ClassValues created by the hosted environment and stores them into the image.
+ * See {@link ClassValueSupport}.
  */
 @AutomaticallyRegisteredFeature
 public final class ClassValueFeature implements InternalFeature {
@@ -50,7 +53,7 @@ public final class ClassValueFeature implements InternalFeature {
          * hosted environment into the substrate world.
          */
         Map<ClassValue<?>, Map<Class<?>, Object>> values = ClassValueSupport.getValues();
-        ((FeatureImpl.DuringSetupAccessImpl) access).registerObjectReachableCallback(ClassValue.class, (a1, obj, reason) -> values.computeIfAbsent(obj, k -> new ConcurrentHashMap<>()));
+        access.registerObjectReachabilityHandler(obj -> values.computeIfAbsent(obj, _ -> new ConcurrentHashMap<>()), ClassValue.class);
     }
 
     private static final java.lang.reflect.Field IDENTITY = ReflectionUtil.lookupField(ClassValue.class, "identity");
@@ -67,7 +70,7 @@ public final class ClassValueFeature implements InternalFeature {
         FeatureImpl.DuringAnalysisAccessImpl impl = (FeatureImpl.DuringAnalysisAccessImpl) access;
         List<AnalysisType> types = impl.getUniverse().getTypes();
 
-        Set<Object> mapsToRescan = new HashSet<>();
+        EconomicSet<Object> mapsToRescan = EconomicSet.create();
         try {
             for (AnalysisType t : types) {
                 if (!t.isReachable()) {
@@ -84,7 +87,7 @@ public final class ClassValueFeature implements InternalFeature {
                  * classValueMap will contain a map of all user ClassValue objects which have a
                  * value for the class.
                  */
-                var clazz = t.getJavaClass();
+                var clazz = OriginalClassProvider.getJavaClass(t);
                 var classValueMap = (Map<?, ?>) CLASS_VALUE_MAP.get(clazz);
                 if (classValueMap == null) {
                     continue;
@@ -113,6 +116,11 @@ public final class ClassValueFeature implements InternalFeature {
             throw VMError.shouldNotReachHere(ex);
         }
 
-        mapsToRescan.forEach(impl::rescanObject);
+        int numTypes = impl.getUniverse().getTypes().size();
+        ScanReason reason = new OtherReason("Manual rescan triggered from " + ClassValueFeature.class);
+        mapsToRescan.forEach(obj -> impl.rescanObject(obj, reason));
+        if (numTypes != impl.getUniverse().getTypes().size()) {
+            access.requireAnalysisIteration();
+        }
     }
 }

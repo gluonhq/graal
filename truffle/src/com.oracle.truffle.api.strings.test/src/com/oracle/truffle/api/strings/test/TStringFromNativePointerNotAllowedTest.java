@@ -55,7 +55,6 @@ import org.junit.runners.Parameterized.Parameters;
 
 import com.oracle.truffle.api.strings.MutableTruffleString;
 import com.oracle.truffle.api.strings.TruffleString;
-import com.oracle.truffle.api.strings.bench.TStringTestDummyLanguage;
 
 @RunWith(Parameterized.class)
 public class TStringFromNativePointerNotAllowedTest {
@@ -70,8 +69,14 @@ public class TStringFromNativePointerNotAllowedTest {
 
     @AfterClass
     public static void tearDown() {
-        context.leave();
-        context.close();
+        if (context != null) {
+            try {
+                context.leave();
+                context.close();
+            } finally {
+                context = null;
+            }
+        }
     }
 
     @Parameter public TruffleString.FromNativePointerNode node;

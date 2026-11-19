@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,34 +33,34 @@ import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.CPUFeatureAccessImpl;
-import com.oracle.svm.core.ReservedRegisters;
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.jdk.JVMCISubstitutions;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.nodes.spi.LoweringProvider;
+import jdk.graal.compiler.vector.architecture.VectorLoweringProvider;
+import jdk.graal.compiler.vector.architecture.amd64.VectorAMD64;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Architecture;
 
+/**
+ * This singleton should be converted to a multi layer singleton or an application layer only
+ * singleton. It is currently too strict, as different CPUFeatures are allowed in different layers,
+ * but at runtime, all the CPUFeatures used during all builds need to be supported.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = CPUFeatureAccessImpl.LayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class AMD64CPUFeatureAccess extends CPUFeatureAccessImpl {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public AMD64CPUFeatureAccess(EnumSet<?> buildtimeCPUFeatures, int[] offsets, byte[] errorMessageBytes, byte[] buildtimeFeatureMaskBytes) {
         super(buildtimeCPUFeatures, offsets, errorMessageBytes, buildtimeFeatureMaskBytes);
-    }
-
-    /**
-     * We include all flags that enable AMD64 CPU instructions as we want best possible performance
-     * for the code.
-     *
-     * @return All the flags that enable AMD64 CPU instructions.
-     */
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public static EnumSet<AMD64.Flag> allAMD64Flags() {
-        return EnumSet.of(AMD64.Flag.UseCountLeadingZerosInstruction, AMD64.Flag.UseCountTrailingZerosInstruction);
     }
 
     @Override
@@ -98,33 +98,21 @@ public class AMD64CPUFeatureAccess extends CPUFeatureAccessImpl {
         AMD64LibCHelper.checkCPUFeaturesOrExit(BUILDTIME_CPU_FEATURE_MASK.get(), IMAGE_CPU_FEATURE_ERROR_MSG.get());
     }
 
-    /**
-     * Returns {@code true} if the CPU feature set will be updated for JIT compilations. As a
-     * consequence, the size of {@link AMD64#XMM} registers is different AOT vs JIT.
-     *
-     * Updating CPU features in only enabled if {@linkplain SubstrateOptions#SpawnIsolates isolates
-     * are enabled}. There is not a fundamental problem. The only reason for this restriction is
-     * that with isolates we have a {@linkplain ReservedRegisters#getHeapBaseRegister() heap base
-     * register} which makes dynamic CPU feature checks simple because they do not require an
-     * intermediate register for testing the
-     * {@linkplain com.oracle.svm.core.cpufeature.RuntimeCPUFeatureCheckImpl cpu feature mask}.
-     */
-    public static boolean canUpdateCPUFeatures() {
-        return SubstrateOptions.SpawnIsolates.getValue();
-    }
-
     @Override
-    public void enableFeatures(Architecture runtimeArchitecture) {
-        if (!canUpdateCPUFeatures()) {
-            return;
-        }
+    public void enableFeatures(Architecture runtimeArchitecture, LoweringProvider runtimeLowerer) {
         // update cpu features
         AMD64 architecture = (AMD64) runtimeArchitecture;
         EnumSet<AMD64.CPUFeature> features = determineHostCPUFeatures();
         architecture.getFeatures().addAll(features);
 
         // update largest storable kind
-        AMD64Kind largestStorableKind = (new AMD64(features, architecture.getFlags())).getLargestStorableKind(AMD64.XMM);
+        AMD64Kind largestStorableKind = new AMD64(features).getLargestStorableKind(AMD64.XMM);
         JVMCISubstitutions.updateLargestStorableKind(architecture, largestStorableKind);
+        AMD64Kind largestStorableMaskKind = new AMD64(features).getLargestStorableKind(AMD64.MASK);
+        JVMCISubstitutions.updateLargestStorableMaskKind(architecture, largestStorableMaskKind);
+
+        // update vector architecture
+        VectorAMD64 initialVectorArch = (VectorAMD64) ((VectorLoweringProvider) runtimeLowerer).getVectorArchitecture();
+        initialVectorArch.updateForRuntimeArchitecture((AMD64) runtimeArchitecture);
     }
 }

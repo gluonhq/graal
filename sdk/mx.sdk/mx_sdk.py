@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -39,17 +39,23 @@
 # SOFTWARE.
 #
 
-from __future__ import print_function
 import os
 
 import mx
 import mx_gate
 import mx_sdk_vm
 import mx_sdk_vm_impl
+import mx_sdk_vm_ng
 import pathlib
 import mx_sdk_benchmark # pylint: disable=unused-import
 import mx_sdk_clangformat # pylint: disable=unused-import
+import mx_run_jdk_test # pylint: disable=unused-import
+import argparse
 import datetime
+import re
+import shutil
+import tempfile
+from typing import Iterable, Tuple
 from mx_bisect import define_bisect_default_build_steps
 from mx_bisect_strategy import BuildStepsGraalVMStrategy
 
@@ -91,9 +97,9 @@ def build_oracle_compliant_javadoc_args(suite, product_name, feature_name):
     else:
         revision = None
         copyright_year = datetime.datetime.now().year
-    return ['--arg', '@-header', '--arg', '<b>%s %s Java API Reference<br>%s</b><br>%s' % (product_name, feature_name, version, revision),
-            '--arg', '@-bottom', '--arg', '<center>Copyright &copy; 2012, %s, Oracle and/or its affiliates. All rights reserved.</center>' % (copyright_year),
-            '--arg', '@-windowtitle', '--arg', '%s %s Java API Reference' % (product_name, feature_name)]
+    return ['--arg', '@-header', '--arg', f'<b>{product_name} {feature_name} Java API Reference<br>{version}</b><br>{revision}',
+            '--arg', '@-bottom', '--arg', f'<center>Copyright &copy; 2012, {copyright_year}, Oracle and/or its affiliates. All rights reserved.</center>',
+            '--arg', '@-windowtitle', '--arg', f'{product_name} {feature_name} Java API Reference']
 
 
 def javadoc(args):
@@ -103,9 +109,13 @@ def javadoc(args):
         'org.graalvm.polyglot.tck',
         'org.graalvm.sdk',
         'org.graalvm.shadowed.org.jline.reader',
+        'org.graalvm.shadowed.org.jline.reader.impl',
         'org.graalvm.shadowed.org.jline.reader.impl.completer',
         'org.graalvm.shadowed.org.jline.reader.impl.history',
+        'org.graalvm.shadowed.org.jline.terminal',
         'org.graalvm.shadowed.org.jline.terminal.impl',
+        'org.graalvm.shadowed.org.jline.terminal.impl.exec',
+        'org.graalvm.shadowed.org.jline.builtins',
         'org.graalvm.shadowed.org.jline.utils',
     ]
     mx.javadoc(['--unified', '--disallow-all-warnings', '--exclude-packages', ','.join(excludedPackages)] + extraArgs + args)
@@ -133,7 +143,7 @@ graalvm_sdk_component = mx_sdk_vm.GraalVmJreComponent(
 )
 mx_sdk_vm.register_graalvm_component(graalvm_sdk_component)
 
-# SDK modules included the compiler is included
+# SDK modules included if the compiler (jargraal) is included
 graal_sdk_compiler_component = mx_sdk_vm.GraalVmJreComponent(
     suite=_suite,
     name='Graal SDK Compiler',
@@ -143,7 +153,7 @@ graal_sdk_compiler_component = mx_sdk_vm.GraalVmJreComponent(
     third_party_license_files=[],
     dependencies=[],
     jar_distributions=[],
-    boot_jars=['sdk:WORD', 'sdk:COLLECTIONS'],
+    boot_jars=['sdk:WORD', 'sdk:COLLECTIONS', 'sdk:NATIVEIMAGE'],
     stability="supported",
 )
 mx_sdk_vm.register_graalvm_component(graal_sdk_compiler_component)
@@ -158,7 +168,7 @@ graalvm_sdk_native_image_component = mx_sdk_vm.GraalVmJreComponent(
     third_party_license_files=[],
     dependencies=['sdkc'],
     jar_distributions=[],
-    boot_jars=['sdk:NATIVEIMAGE'],
+    boot_jars=['sdk:NATIVEIMAGE', 'sdk:NATIVEIMAGE_LIBGRAAL', 'sdk:WEBIMAGE_PREVIEW'],
     stability="supported",
 )
 mx_sdk_vm.register_graalvm_component(graalvm_sdk_native_image_component)
@@ -181,8 +191,6 @@ mx_sdk_vm.register_graalvm_component(mx_sdk_vm.GraalVmJreComponent(
     suite=_suite,
     name='LLVM.org toolchain',
     short_name='llp',
-    installable=True,
-    installable_id='llvm-toolchain',
     dir_name='llvm',
     license_files=[],
     third_party_license_files=['3rd_party_license_llvm-toolchain.txt'],
@@ -193,10 +201,29 @@ mx_sdk_vm.register_graalvm_component(mx_sdk_vm.GraalVmJreComponent(
 
 def mx_register_dynamic_suite_constituents(register_project, register_distribution):
     mx_sdk_vm_impl.mx_register_dynamic_suite_constituents(register_project, register_distribution)
+    mx_sdk_vm_ng.mx_register_dynamic_suite_constituents(register_project, register_distribution)
+
+def _uses_nativebridge_processor(dist):
+    for dep in dist.deps:
+        if dep.name.startswith('NATIVEBRIDGE_PROCESSOR'):
+            return True
+    truffle_dsl_processors = set()
+    def visit(dep, edge):
+        if dep is not dist and dep.isJavaProject():
+            for ap in dep.annotation_processors():
+                if ap.name.startswith('NATIVEBRIDGE_PROCESSOR'):
+                    truffle_dsl_processors.add(ap)
+    dist.walk_deps(visit=visit)
+    return len(truffle_dsl_processors) != 0
 
 
 def mx_post_parse_cmd_line(args):
     mx_sdk_vm_impl.mx_post_parse_cmd_line(args)
+    mx_sdk_benchmark.register_graalvm_vms()
+    for d in mx.dependencies():
+        if d.isJARDistribution():
+            if _uses_nativebridge_processor(d):
+                d.set_archiveparticipant(NativeBridgeArchiveParticipant())
 
 
 mx.update_commands(_suite, {
@@ -217,6 +244,7 @@ GraalVmTruffleComponent = mx_sdk_vm.GraalVmTruffleComponent
 GraalVmLanguage = mx_sdk_vm.GraalVmLanguage
 GraalVmTool = mx_sdk_vm.GraalVmTool
 GraalVMSvmMacro = mx_sdk_vm.GraalVMSvmMacro
+GraalVmSvmTool = mx_sdk_vm.GraalVmSvmTool
 GraalVmJdkComponent = mx_sdk_vm.GraalVmJdkComponent
 GraalVmJreComponent = mx_sdk_vm.GraalVmJreComponent
 GraalVmJvmciComponent = mx_sdk_vm.GraalVmJvmciComponent
@@ -257,17 +285,143 @@ def jlink_new_jdk(jdk, dst_jdk_dir, module_dists, ignore_dists,
                                    use_upgrade_module_path=use_upgrade_module_path,
                                    default_to_jvmci=default_to_jvmci)
 
+
+def create_jsonschema_validator(schema_path):
+    """Create and return a jsonschema Validator for the schema at the given file path. Abort on missing jsonschema or invalid schema."""
+    import json
+    try:
+        with open(schema_path, encoding="utf-8") as f:
+            schema = json.load(f)
+    except json.JSONDecodeError as e:
+        mx.abort(f'Failed to parse JSON in schema file "{schema_path}" at line {e.lineno}, column {e.colno}: {e.msg}')
+    except OSError as e:
+        mx.abort(f'I/O error when opening schema file "{schema_path}": {e}')
+
+    try:
+        import jsonschema  # type: ignore
+    except ImportError as e:
+        mx.abort(
+            'Python module "jsonschema" is required to validate reachability metadata but was not found. '
+            'Install it with: \n\npython3 -m pip install --user jsonschema \n\n or \n\npip3 install jsonschema\n\n'
+            f'Original error: {e}')
+    try:
+        if hasattr(jsonschema, 'Draft202012Validator'):
+            return jsonschema.Draft202012Validator(schema)  # type: ignore[attr-defined]
+        else:
+            return jsonschema.Draft7Validator(schema)  # type: ignore
+    except (jsonschema.exceptions.SchemaError, TypeError) as e:
+        mx.abort(f'Invalid reachability metadata schema: {e}')
+
+
+def validate_json_file_with_validator(validator, file_path):
+    """Validates a JSON file against the provided Validator. Returns a list of detailed error strings; empty if valid."""
+    import json
+    try:
+        with open(file_path, encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        mx.abort(f'Invalid JSON syntax at line {e.lineno}, column {e.colno}: {e.msg}')
+    except OSError as e:
+        mx.abort(f'I/O error: {e}')
+
+    # Use jsonschema's ValidationError string representation to produce messages in the form:
+    # Failed validating '<validator>' in schema[...] :
+    #     { ... failing subschema ... }
+    #
+    # On instance[...] :
+    #     <offending instance>
+    errors = []
+    for err in validator.iter_errors(data):
+        errors.append(str(err))
+    return errors
+
+
+def validate_dir_files_with_file_schema_pairs(schemas_dir: str, dir_with_json: str, json_and_schema_file_pairs: Iterable[Tuple[str, str]]) -> None:
+    """
+    Validate JSON files in a directory against corresponding JSON Schemas.
+
+    This scans the given directory for each JSON filename listed in json_and_schema_file_pairs.
+    For every file that exists, it validates the file against the associated schema located in
+    the Native Image docs assets directory. Validation uses a pre-built jsonschema.Validator
+    per schema to ensure consistent behavior and error reporting.
+
+    Parameters:
+    - schema_dir: Directory containing all schemas for a project.
+    - dir_with_json: Directory path containing JSON files to validate.
+    - json_and_schema_file_pairs: Iterable of (json_filename, schema_filename) pairs.
+
+    Behavior:
+    - Logs each validation attempt.
+    - Accumulates all validation errors across files.
+    - Calls mx.abort with a detailed message if any error is found; otherwise returns None.
+    """
+    # Build validators for all known schema files using CE helper to ensure uniform behavior and error reporting.
+    validators = {}
+    for _, schema_file in json_and_schema_file_pairs:
+        schema_path = os.path.join(schemas_dir, schema_file)
+        validators[schema_file] = create_jsonschema_validator(schema_path)
+
+    validation_errors_by_file = {}
+    for json_filename, schema_file in json_and_schema_file_pairs:
+        json_path = os.path.join(dir_with_json, json_filename)
+        if os.path.exists(json_path):
+            mx.log(f'Validating {json_path} against {schema_file}...')
+            errs = validate_json_file_with_validator(validators[schema_file], json_path)
+            if errs:
+                validation_errors_by_file[(json_path, schema_file)] = errs
+
+    if validation_errors_by_file:
+        sections = []
+        for (json_path, schema_file), errs in validation_errors_by_file.items():
+            header = (
+                "-------------------------------------------------------------------------------\n"
+                f"File:   {json_path}\n"
+                f"Schema: {schema_file}\n"
+                "-------------------------------------------------------------------------------"
+            )
+            sections.append(header + "\n\n" + "\n\n".join(errs))
+        msg = "Unable to validate JSON file(s) against the schema:\n\n" + "\n\n".join(sections)
+        mx.abort(msg)
+    # Validate any present config files
+    validation_errors = []
+    for json_filename, schema_file in json_and_schema_file_pairs:
+        json_path = os.path.join(dir_with_json, json_filename)
+        if os.path.exists(json_path):
+            mx.log(f'Validating {json_path} against {schema_file}...')
+            errs = validate_json_file_with_validator(validators[schema_file], json_path)
+            validation_errors.extend(errs)
+
+    if validation_errors:
+        mx.abort('Unable to validate JSON file against the schema:\n\n' + '\n\n'.join(validation_errors))
+
+
 class GraalVMJDKConfig(mx.JDKConfig):
+
+    # Oracle JDK includes the libjvmci compiler, allowing it to function as GraalVM.
+    # However, the Graal compiler is disabled by default and must be explicitly
+    # enabled using the -XX:+UseGraalJIT option.
+    libgraal_additional_vm_args = [
+        '-XX:+UnlockExperimentalVMOptions',
+        '-XX:+EnableJVMCI',
+        '-XX:+UseGraalJIT',
+        '-XX:-UnlockExperimentalVMOptions'
+    ]
     """
     A JDKConfig that configures the built GraalVM as a JDK config.
     """
     def __init__(self):
         default_jdk = mx.get_jdk(tag='default')
-        if GraalVMJDKConfig._is_graalvm(default_jdk.home):
+        if GraalVMJDKConfig.is_graalvm(default_jdk.home):
             graalvm_home = default_jdk.home
+            additional_vm_args = []
+        elif GraalVMJDKConfig.is_libgraal_jdk(default_jdk.home):
+            graalvm_home = default_jdk.home
+            additional_vm_args = GraalVMJDKConfig.libgraal_additional_vm_args
         else:
             graalvm_home = mx_sdk_vm.graalvm_home(fatalIfMissing=True)
+            additional_vm_args = []
         self._home_internal = graalvm_home
+        self._vm_args = additional_vm_args
         mx.JDKConfig.__init__(self, graalvm_home, tag='graalvm')
 
     @property
@@ -278,14 +432,32 @@ class GraalVMJDKConfig(mx.JDKConfig):
     def home(self, home):
         return
 
+    def processArgs(self, args, addDefaultArgs=True):
+        processed_args = super().processArgs(args, addDefaultArgs)
+        if addDefaultArgs and self._vm_args:
+            processed_args = self._vm_args + processed_args
+        return processed_args
+
     @staticmethod
-    def _is_graalvm(java_home):
+    def is_graalvm(java_home):
         release_file = os.path.join(java_home, 'release')
         if not os.path.isfile(release_file):
             return False
-        with open(release_file, 'r') as file:
+        with open(release_file, encoding='utf-8') as file:
             for line in file:
                 if line.startswith('GRAALVM_VERSION'):
+                    return True
+        return False
+
+    @staticmethod
+    def is_libgraal_jdk(java_home):
+        release_file = os.path.join(java_home, 'release')
+        if not os.path.isfile(release_file):
+            return False
+        with open(release_file, encoding='utf-8') as file:
+            for line in file:
+                if line.startswith('MODULES') and 'jdk.graal.compiler.lib' in line:
+                    # Oracle JDK has libjvmcicompiler
                     return True
         return False
 
@@ -302,6 +474,10 @@ mx.addJDKFactory('graalvm', mx.get_jdk(tag='default').javaCompliance, GraalVMJDK
 
 def maven_deploy_public_repo_dir():
     return os.path.join(_suite.get_mx_output_dir(), 'public-maven-repo')
+
+@mx.command(_suite.name, 'maven-deploy-public-repo-dir')
+def print_maven_deploy_public_repo_dir(args):
+    print(maven_deploy_public_repo_dir())
 
 @mx.command(_suite.name, 'maven-deploy-public')
 def maven_deploy_public(args, licenses=None, deploy_snapshots=True):
@@ -335,4 +511,76 @@ def maven_deploy_public(args, licenses=None, deploy_snapshots=True):
     mx.log(f'mx maven-deploy {" ".join(deploy_args)}')
     mx.maven_deploy(deploy_args)
     mx.log(f'Deployed Maven artefacts to {path}')
-    return path
+
+@mx.command(_suite.name, 'nativebridge-benchmark')
+def nativebridge_benchmark(args):
+    parser = argparse.ArgumentParser(prog='mx nativebridge-benchmark', description='Executes nativebridge benchmarks',
+                            usage='mx nativebridge-benchmark [--target-folder <folder> | --isolate-library <isolate-library> | mode+]')
+    parser.add_argument('--target-folder', help='Folder where the benchmark isolate library will be generated.', default=None)
+    parser.add_argument('--isolate-library', help='Use the given isolate library.', default=None)
+    parsed_args, args = parser.parse_known_args(args)
+
+    jdk = mx.get_jdk(tag='graalvm')
+    benchmark_dist = mx.distribution('NATIVEBRIDGE_BENCHMARK')
+    isolate_library = parsed_args.isolate_library if parsed_args.isolate_library else None
+    try:
+        if not isolate_library:
+            native_image_path = jdk.exe_path('native-image')
+            if not os.path.exists(native_image_path):
+                native_image_path = os.path.join(jdk.home, 'bin', mx.cmd_suffix('native-image'))
+            if not os.path.exists(native_image_path):
+                mx.abort(f"No native-image installed in GraalVM {jdk.home}. Switch to an environment that has an installed native-image command.")
+
+            target_dir = parsed_args.target_folder if parsed_args.target_folder else tempfile.mkdtemp()
+            target = os.path.join(target_dir, "bench")
+            native_image_args = mx.get_runtime_jvm_args(benchmark_dist, jdk=jdk) + [
+                '--shared',
+                '-o',
+                target
+            ]
+            mx.run([native_image_path] + native_image_args)
+            for n in os.listdir(target_dir):
+                _, ext = os.path.splitext(n)
+                if ext in ('.so', '.dylib', '.dll'):
+                    isolate_library = os.path.join(target_dir, n)
+                    break
+
+        launcher_project = mx.project('org.graalvm.nativebridge.launcher')
+        launcher = next(launcher_project.getArchivableResults(single=True))[0]
+        java_args = mx.get_runtime_jvm_args(benchmark_dist, jdk=jdk) + [
+            '--enable-native-access=ALL-UNNAMED',
+            'org.graalvm.nativebridge.benchmark.Main',
+            launcher,
+            isolate_library
+        ] + args
+        mx.run_java(java_args, jdk=jdk)
+    finally:
+        if not parsed_args.isolate_library and not parsed_args.target_folder:
+            shutil.rmtree(target_dir)
+
+class NativeBridgeArchiveParticipant:
+
+    providersRE = re.compile(r'(?:META-INF/versions/([1-9][0-9]*)/)?META-INF/jni-entry-points/(.+)')
+
+    def __opened__(self, arc, srcArc, services):
+        self.services = services
+        self.arc = arc
+
+    def __process__(self, arcname, contents_supplier, is_source):
+        if is_source:
+            return False
+        m = NativeBridgeArchiveParticipant.providersRE.match(arcname)
+        if m:
+            provider = m.group(2)
+            for service in contents_supplier().decode().strip().split(os.linesep):
+                assert service
+                version = m.group(1)
+                if version is None:
+                    # Non-versioned service
+                    self.services.setdefault(service, []).append(provider)
+                else:
+                    # Versioned service
+                    services = self.services.setdefault(int(version), {})
+                    services.setdefault(service, []).append(provider)
+            return True
+        return False

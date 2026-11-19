@@ -25,8 +25,11 @@
 package com.oracle.svm.core.graal.amd64;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.graal.code.SubstrateBackend.SubstrateMarkId;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
 import jdk.graal.compiler.asm.amd64.AMD64MacroAssembler;
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
@@ -35,6 +38,7 @@ import jdk.graal.compiler.lir.LIRInsertionBuffer;
 import jdk.graal.compiler.lir.LIRInstruction;
 import jdk.graal.compiler.lir.LIRInstructionClass;
 import jdk.graal.compiler.lir.Opcode;
+import jdk.graal.compiler.lir.ValueConsumer;
 import jdk.graal.compiler.lir.amd64.AMD64Call;
 import jdk.graal.compiler.lir.amd64.AMD64LIRInstruction;
 import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
@@ -42,7 +46,9 @@ import jdk.graal.compiler.lir.framemap.FrameMapBuilderTool;
 import jdk.graal.compiler.lir.gen.LIRGenerationResult;
 import jdk.graal.compiler.lir.phases.PreAllocationOptimizationPhase;
 import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.code.TargetDescription;
+import jdk.vm.ci.meta.Value;
 
 /**
  * This phase ensures that methods that modify the stack pointer in a non-standard way have a frame
@@ -50,9 +56,13 @@ import jdk.vm.ci.code.TargetDescription;
  *
  * @see LIRInstruction#modifiesStackPointer
  */
-class FramePointerPhase extends PreAllocationOptimizationPhase {
+public class FramePointerPhase extends PreAllocationOptimizationPhase {
     @Override
     protected void run(TargetDescription target, LIRGenerationResult lirGenRes, PreAllocationOptimizationContext context) {
+        if (!isSupported(lirGenRes)) {
+            return;
+        }
+
         LIR lir = lirGenRes.getLIR();
         if (!modifiesStackPointer(lir)) {
             return;
@@ -80,25 +90,66 @@ class FramePointerPhase extends PreAllocationOptimizationPhase {
                 ArrayList<LIRInstruction> instructions = lir.getLIRforBlock(block);
 
                 /*
-                 * Note that we need to restore rbp after both calls and exceptions, so for
-                 * simplicity we spill it before each call (not just the ones that might destroy it)
-                 * because then we can simply reload it in each exception handler.
+                 * We need to restore rbp after both calls and exceptions, so for simplicity we
+                 * spill it before each call (not just the ones that might destroy it) because then
+                 * we can simply reload it in each exception handler.
+                 *
+                 * Note that we must never repurpose the spill slot while it is not needed because
+                 * it is assumed to be a stack address and always patched as such when it is part of
+                 * a continuation stack.
                  */
                 buffer.init(instructions);
                 if (block.isExceptionEntry()) {
+                    buffer.append(lirGenRes.getFirstInsertPosition(), new SpillFramePointerOp(true));
                     buffer.append(lirGenRes.getFirstInsertPosition(), new ReloadFramePointerOp());
                 }
                 for (int i = 0; i < instructions.size(); i++) {
                     if (instructions.get(i) instanceof AMD64Call.CallOp callOp) {
                         buffer.append(i, new SpillFramePointerOp());
-                        if (callOp.destroysCallerSavedRegisters()) {
-                            buffer.append(i + 1, new ReloadFramePointerOp());
-                        }
+                        buffer.append(i + 1, new ReloadFramePointerOp(!mayDestroyFramePointerRegister(callOp)));
                     }
                 }
                 buffer.finish();
             }
         }
+    }
+
+    private static boolean mayDestroyFramePointerRegister(AMD64Call.CallOp callOp) {
+        return callOp.destroysCallerSavedRegisters() || callKillsRbp(callOp);
+    }
+
+    /**
+     * Checks if the call has rbp in its temp values.
+     */
+    private static boolean callKillsRbp(AMD64Call.CallOp callOp) {
+        final class RbpFinder implements ValueConsumer {
+            private boolean foundRbp = false;
+
+            @Override
+            public void visitValue(Value value, LIRInstruction.OperandMode mode, EnumSet<LIRInstruction.OperandFlag> flags) {
+                if (value instanceof RegisterValue rv && rv.getRegister().equals(AMD64.rbp)) {
+                    foundRbp = true;
+                }
+            }
+
+            boolean foundRbp() {
+                return foundRbp;
+            }
+        }
+        RbpFinder rbpTempFinder = new RbpFinder();
+
+        callOp.visitEachTemp(rbpTempFinder);
+        return rbpTempFinder.foundRbp();
+    }
+
+    static boolean isSupported(LIRGenerationResult lirGenRes) {
+        /*
+         * JIT compilation and deopt targets are not supported, see GR-64771. For these unsupported
+         * methods, a base pointer is not used, even if there are LIR instructions that modify the
+         * stack pointer directly.
+         */
+        SubstrateAMD64Backend.SubstrateLIRGenerationResult result = (SubstrateAMD64Backend.SubstrateLIRGenerationResult) lirGenRes;
+        return SubstrateUtil.HOSTED && !result.getMethod().isDeoptTarget();
     }
 
     /** Returns true if any LIR instruction modifies the stack pointer, false otherwise. */
@@ -121,14 +172,24 @@ class FramePointerPhase extends PreAllocationOptimizationPhase {
     public static class SpillFramePointerOp extends AMD64LIRInstruction {
         public static final LIRInstructionClass<SpillFramePointerOp> TYPE = LIRInstructionClass.create(SpillFramePointerOp.class);
 
+        private final boolean recordMarkOnly;
+
         SpillFramePointerOp() {
+            this(false);
+        }
+
+        SpillFramePointerOp(boolean recordMarkOnly) {
             super(TYPE);
+            this.recordMarkOnly = recordMarkOnly;
         }
 
         @Override
         public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
-            var frameMap = (SubstrateAMD64Backend.SubstrateAMD64FrameMap) crb.frameMap;
-            masm.movq(masm.makeAddress(AMD64.rsp, frameMap.getFramePointerSaveAreaOffset()), AMD64.rbp);
+            if (!recordMarkOnly) {
+                var frameMap = (SubstrateAMD64Backend.SubstrateAMD64FrameMap) crb.frameMap;
+                masm.movq(masm.makeAddress(AMD64.rsp, frameMap.getFramePointerSaveAreaOffset()), AMD64.rbp);
+            }
+            crb.recordMark(SubstrateMarkId.FRAME_POINTER_SPILLED);
         }
     }
 
@@ -136,14 +197,24 @@ class FramePointerPhase extends PreAllocationOptimizationPhase {
     public static class ReloadFramePointerOp extends AMD64LIRInstruction {
         public static final LIRInstructionClass<ReloadFramePointerOp> TYPE = LIRInstructionClass.create(ReloadFramePointerOp.class);
 
+        private final boolean recordMarkOnly;
+
         ReloadFramePointerOp() {
+            this(false);
+        }
+
+        ReloadFramePointerOp(boolean recordMarkOnly) {
             super(TYPE);
+            this.recordMarkOnly = recordMarkOnly;
         }
 
         @Override
         public void emitCode(CompilationResultBuilder crb, AMD64MacroAssembler masm) {
-            var frameMap = (SubstrateAMD64Backend.SubstrateAMD64FrameMap) crb.frameMap;
-            masm.movq(AMD64.rbp, masm.makeAddress(AMD64.rsp, frameMap.getFramePointerSaveAreaOffset()));
+            if (!recordMarkOnly) {
+                var frameMap = (SubstrateAMD64Backend.SubstrateAMD64FrameMap) crb.frameMap;
+                masm.movq(AMD64.rbp, masm.makeAddress(AMD64.rsp, frameMap.getFramePointerSaveAreaOffset()));
+            }
+            crb.recordMark(SubstrateMarkId.FRAME_POINTER_RELOADED);
         }
     }
 }

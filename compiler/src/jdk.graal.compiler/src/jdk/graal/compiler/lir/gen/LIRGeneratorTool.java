@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -41,11 +41,15 @@ import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstruction;
 import jdk.graal.compiler.lir.LIRValueUtil;
 import jdk.graal.compiler.lir.LabelRef;
+import jdk.graal.compiler.lir.StandardOp.ArbitraryValueOp;
 import jdk.graal.compiler.lir.Variable;
 import jdk.graal.compiler.lir.VirtualStackSlot;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
+import jdk.graal.compiler.replacements.nodes.StringCodepointIndexToByteIndexNode;
+import jdk.vm.ci.code.CallingConvention;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.code.RegisterConfig;
+import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.code.StackSlot;
 import jdk.vm.ci.code.TargetDescription;
 import jdk.vm.ci.code.ValueKindFactory;
@@ -175,11 +179,57 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
         throw GraalError.unimplemented("Halt operation is not implemented on this architecture");  // ExcludeFromJacocoGeneratedReport
     }
 
+    default void emitReturn(JavaKind javaKind, Value input) {
+        emitReturn(javaKind, input, Value.ILLEGAL, AllocatableValue.NONE);
+    }
+
     /**
      * Emits a return instruction. Implementations need to insert a move if the input is not in the
      * correct location.
      */
-    void emitReturn(JavaKind javaKind, Value input);
+    void emitReturn(JavaKind javaKind, Value input, AllocatableValue tailCallTarget, AllocatableValue[] additionalReturns);
+
+    /**
+     * Returns the location used for an indexed multi-return result. By default, multi-return values
+     * reuse argument locations. Calling conventions with additional result-only locations can
+     * override this mapping.
+     */
+    default AllocatableValue getAdditionalReturnLocation(CallingConvention callingConvention, int index) {
+        return callingConvention.getArgument(index);
+    }
+
+    default void emitMultiReturns(JavaKind returnResultKind, Value returnResult, Value[] additionalReturnResults, boolean[] arbitraryAdditionalReturns, Value tailCallTarget) {
+        CallingConvention cc = getResult().getCallingConvention();
+        GraalError.guarantee(additionalReturnResults.length == arbitraryAdditionalReturns.length, "mismatched additional return metadata");
+        Value updatedReturnResult = returnResult;
+        AllocatableValue[] additionalReturns = new AllocatableValue[additionalReturnResults.length];
+        // Move additionalReturnResults back to the parameter locations
+        for (int i = 0; i < additionalReturnResults.length; i++) {
+            Value additionalReturnResult = additionalReturnResults[i];
+            AllocatableValue operand = getAdditionalReturnLocation(cc, i);
+            if (arbitraryAdditionalReturns[i]) {
+                GraalError.guarantee(operand instanceof RegisterValue, "arbitrary additional return must use a register: %s", operand);
+                RegisterValue registerValue = (RegisterValue) operand;
+                if (!registerValue.equals(cc.getReturn())) {
+                    append(new ArbitraryValueOp(registerValue));
+                }
+            } else if (operand instanceof RegisterValue registerValue) {
+                emitMove(registerValue, additionalReturnResult);
+                if (returnResult.equals(additionalReturnResult) || registerValue.equals(cc.getReturn())) {
+                    // The calling convention uses the same register for both default return result
+                    // and this additional return result. Use the copy stored in this register to
+                    // avoid redundant move.
+                    updatedReturnResult = registerValue;
+                }
+            } else if (operand instanceof StackSlot stackSlot) {
+                emitMove(stackSlot, additionalReturnResult);
+            } else {
+                throw GraalError.shouldNotReachHere(operand.toString());
+            }
+            additionalReturns[i] = operand;
+        }
+        emitReturn(returnResultKind, updatedReturnResult, tailCallTarget == null ? Value.ILLEGAL : asAllocatable(tailCallTarget), additionalReturns);
+    }
 
     /**
      * Returns an {@link AllocatableValue} holding the {@code value} by moving it if necessary. If
@@ -233,6 +283,11 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     }
 
     @SuppressWarnings("unused")
+    default void emitArrayFill(JavaKind commonElementKind, Value array, Value arrayBaseOffset, Value length, Value value) {
+        throw GraalError.unimplemented("Arrays.fill substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
     default Variable emitArrayEquals(JavaKind commonElementKind, EnumSet<?> runtimeCheckedCPUFeatures,
                     Value arrayA, Value offsetA, Value arrayB, Value offsetB, Value length) {
         throw GraalError.unimplemented("Array.equals substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
@@ -265,13 +320,24 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     @SuppressWarnings("unused")
     default void emitArrayCopyWithConversion(Stride strideSrc, Stride strideDst, EnumSet<?> runtimeCheckedCPUFeatures,
                     Value arraySrc, Value offsetSrc, Value arrayDst, Value offsetDst, Value length) {
-        throw GraalError.unimplemented("Array.copy with variable stride substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
+        throw GraalError.unimplemented("Array.copy with conversion substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
     }
 
     @SuppressWarnings("unused")
     default void emitArrayCopyWithConversion(EnumSet<?> runtimeCheckedCPUFeatures,
                     Value arraySrc, Value offsetSrc, Value arrayDst, Value offsetDst, Value length, Value dynamicStrides) {
         throw GraalError.unimplemented("Array.copy with variable stride substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    /**
+     * Variant of
+     * {@link #emitArrayCopyWithConversion(Stride, Stride, EnumSet, Value, Value, Value, Value, Value)}
+     * that also reverses the byte order of values in the destination region.
+     */
+    @SuppressWarnings("unused")
+    default void emitArrayCopyWithReverseBytes(Stride stride, EnumSet<?> runtimeCheckedCPUFeatures,
+                    Value arraySrc, Value offsetSrc, Value arrayDst, Value offsetDst, Value length) {
+        throw GraalError.unimplemented("Array.copy with byte swap substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
     }
 
     /**
@@ -309,11 +375,13 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
          * characters.
          */
         UTF_16(Stride.S2),
+        UTF_16_FOREIGN_ENDIAN(Stride.S2),
         /**
          * Calculate the code range of a UTF-32 string. The result can be any of the following:
          * CR_7BIT, CR_8BIT, CR_16BIT, CR_VALID_FIXED_WIDTH, CR_BROKEN_FIXED_WIDTH.
          */
-        UTF_32(Stride.S4);
+        UTF_32(Stride.S4),
+        UTF_32_FOREIGN_ENDIAN(Stride.S4);
 
         /**
          * Stride to use when reading array elements.
@@ -322,6 +390,14 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
 
         CalcStringAttributesEncoding(Stride stride) {
             this.stride = stride;
+        }
+
+        public boolean isUTF16() {
+            return this == UTF_16 || this == UTF_16_FOREIGN_ENDIAN;
+        }
+
+        public boolean isUTF32() {
+            return this == UTF_32 || this == UTF_32_FOREIGN_ENDIAN;
         }
 
         /*
@@ -442,6 +518,10 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
          */
         MatchRange,
         /**
+         * Variant of {@link #MatchRange} for arrays in non-native endian.
+         */
+        MatchRangeForeignEndian,
+        /**
          * Find index {@code i} where {@code (array[i] | searchValues[1]) == searchValues[0]}.
          */
         WithMask,
@@ -480,13 +560,141 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
          * Note that this variant expects {@code searchValue[0]} to be a <b>direct pointer</b> into
          * a 32-byte memory region.
          */
-        Table
+        Table,
+        /**
+         * Find index {@code i} where
+         *
+         * <pre>
+         * {@code
+         * RawBytePointer lut = searchValues[0];
+         * int v0 = array[i] & 0xff;
+         * int v1 = array[i + 1] & 0xff;
+         * array[i] == v0 && array[i + 1] == v1 &&
+         * (((lut[       v0 >> 4] & lut[16 + (v0 & 0xf)]) &
+         *   (lut[32 + (v1 >> 4)] & lut[48 + (v1 & 0xf)])) != 0)
+         * }
+         * </pre>
+         *
+         * Returns a packed {@code long} containing the start index in the low 32 bits and the
+         * candidate bit set in the high 32 bits.
+         */
+        FindTwoConsecutiveTables,
+        /**
+         * Variant of {@link #FindTwoConsecutiveTables} for arrays in non-native endian.
+         */
+        FindTwoConsecutiveTablesForeignEndian,
+        /**
+         * Find index {@code i} where
+         *
+         * <pre>
+         * {@code
+         * RawBytePointer lut = searchValues[0];
+         * int v0 = array[i] & 0xff;
+         * int v1 = array[i + 1] & 0xff;
+         * int v2 = array[i + 2] & 0xff;
+         * array[i] == v0 && array[i + 1] == v1 && array[i + 2] == v2 &&
+         * (((lut[       v0 >> 4] & lut[16 + (v0 & 0xf)]) &
+         *   (lut[32 + (v1 >> 4)] & lut[48 + (v1 & 0xf)]) &
+         *   (lut[64 + (v2 >> 4)] & lut[80 + (v2 & 0xf)])) != 0)
+         * }
+         * </pre>
+         *
+         * Returns a packed {@code long} containing the start index in the low 32 bits and the
+         * candidate bit set in the high 32 bits.
+         */
+        FindThreeConsecutiveTables,
+        /**
+         * Variant of {@link #FindThreeConsecutiveTables} for arrays in non-native endian.
+         */
+        FindThreeConsecutiveTablesForeignEndian,
+        /**
+         * Find index {@code i} where
+         *
+         * <pre>
+         * {@code
+         * RawBytePointer lut = searchValues[0];
+         * int v0 = array[i] & 0xff;
+         * int v1 = array[i + 1] & 0xff;
+         * int v2 = array[i + 2] & 0xff;
+         * int v3 = array[i + 3] & 0xff;
+         * array[i] == v0 && array[i + 1] == v1 && array[i + 2] == v2 && array[i + 3] == v3 &&
+         * (((lut[       v0 >> 4] & lut[ 16 + (v0 & 0xf)]) &
+         *   (lut[32 + (v1 >> 4)] & lut[ 48 + (v1 & 0xf)]) &
+         *   (lut[64 + (v2 >> 4)] & lut[ 80 + (v2 & 0xf)]) &
+         *   (lut[96 + (v3 >> 4)] & lut[112 + (v3 & 0xf)])) != 0)
+         * }
+         * </pre>
+         *
+         * Returns a packed {@code long} containing the start index in the low 32 bits and the
+         * candidate bit set in the high 32 bits.
+         */
+        FindFourConsecutiveTables,
+        /**
+         * Variant of {@link #FindFourConsecutiveTables} for arrays in non-native endian.
+         */
+        FindFourConsecutiveTablesForeignEndian,
+        /**
+         * Variant of {@link #Table} for arrays in non-native endian.
+         */
+        TableForeignEndian;
+
+        public boolean isMatchRange() {
+            return this == MatchRange || this == MatchRangeForeignEndian;
+        }
+
+        public boolean isTable() {
+            return switch (this) {
+                case Table, TableForeignEndian,
+                                FindTwoConsecutiveTables, FindTwoConsecutiveTablesForeignEndian,
+                                FindThreeConsecutiveTables, FindThreeConsecutiveTablesForeignEndian,
+                                FindFourConsecutiveTables, FindFourConsecutiveTablesForeignEndian ->
+                    true;
+                default -> false;
+            };
+        }
+
+        public boolean isForeignEndian() {
+            return switch (this) {
+                case MatchRangeForeignEndian,
+                                TableForeignEndian,
+                                FindTwoConsecutiveTablesForeignEndian,
+                                FindThreeConsecutiveTablesForeignEndian,
+                                FindFourConsecutiveTablesForeignEndian ->
+                    true;
+                default -> false;
+            };
+        }
+
+        public boolean returnsLong() {
+            return switch (this) {
+                case FindTwoConsecutiveTables, FindTwoConsecutiveTablesForeignEndian,
+                                FindThreeConsecutiveTables, FindThreeConsecutiveTablesForeignEndian,
+                                FindFourConsecutiveTables, FindFourConsecutiveTablesForeignEndian ->
+                    true;
+                default -> false;
+            };
+        }
+
+        public int tableCount() {
+            return switch (this) {
+                case Table, TableForeignEndian -> 1;
+                case FindTwoConsecutiveTables, FindTwoConsecutiveTablesForeignEndian -> 2;
+                case FindThreeConsecutiveTables, FindThreeConsecutiveTablesForeignEndian -> 3;
+                case FindFourConsecutiveTables, FindFourConsecutiveTablesForeignEndian -> 4;
+                default -> 0;
+            };
+        }
     }
 
     @SuppressWarnings("unused")
     default Variable emitArrayIndexOf(Stride stride, ArrayIndexOfVariant variant, EnumSet<?> runtimeCheckedCPUFeatures,
                     Value array, Value offset, Value length, Value fromIndex, Value... searchValues) {
         throw GraalError.unimplemented("String.indexOf substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitIndexOfZero(Stride stride, EnumSet<?> runtimeCheckedCPUFeatures, Value arrayPointer) {
+        throw GraalError.unimplemented("ArrayUtils.indexOfZero substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
     }
 
     /*
@@ -509,6 +717,12 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
         throw GraalError.unimplemented("StringUTF16.compress substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
     }
 
+    @SuppressWarnings("unused")
+    default Variable emitCodepointIndexToByteIndex(StringCodepointIndexToByteIndexNode.InputEncoding inputEncoding, EnumSet<?> runtimeCheckedCPUFeatures, Value array, Value offset, Value length,
+                    Value index) {
+        throw GraalError.unimplemented("CodepointIndexToByteIndex substitution is not implemented on this architecture"); // ExcludeFromJacocoGeneratedReport
+    }
+
     enum CharsetName {
         ASCII,
         ISO_8859_1
@@ -521,6 +735,16 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
 
     @SuppressWarnings("unused")
     default Variable emitCountPositives(EnumSet<?> runtimeCheckedCPUFeatures, Value array, Value length) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default void emitBase64EncodeBlock(EnumSet<?> runtimeCheckedCPUFeatures, Value src, Value sp, Value sl, Value dst, Value dp, Value isURLFlag) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitBase64DecodeBlock(EnumSet<?> runtimeCheckedCPUFeatures, Value src, Value sp, Value sl, Value dst, Value dp, Value isURLFlag, Value isMimeFlag) {
         throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
     }
 
@@ -540,6 +764,12 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     }
 
     @SuppressWarnings("unused")
+    default Variable emitGaloisCounterModeAESCrypt(EnumSet<?> runtimeCheckedCPUFeatures, Value inAddr, Value len, Value ctAddr, Value outAddr, Value kAddr, Value stateAddr, Value subkeyHtblAddr,
+                    Value counterAddr) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
     default Variable emitCBCAESEncrypt(Value inAddr, Value outAddr, Value kAddr, Value rAddr, Value len) {
         throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
     }
@@ -550,7 +780,37 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     }
 
     @SuppressWarnings("unused")
-    default void emitGHASHProcessBlocks(Value state, Value hashSubkey, Value data, Value blocks) {
+    default Variable emitECBAESEncrypt(Value inAddr, Value outAddr, Value kAddr, Value len) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitECBAESDecrypt(Value inAddr, Value outAddr, Value kAddr, Value len) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default void emitGHASHProcessBlocks(EnumSet<?> runtimeCheckedCPUFeatures, Value state, Value hashSubkey, Value data, Value blocks) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default void emitPoly1305ProcessBlocks(EnumSet<?> runtimeCheckedCPUFeatures, Value input, Value length, Value accumulator, Value r) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default void emitIntegerPolynomialAssign(Value set, Value a, Value b, Value length) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default void emitIntegerPolynomialP256MontgomeryMult(EnumSet<?> runtimeCheckedCPUFeatures, Value a, Value b, Value r) {
+        throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitChaCha20Block(Value state, Value result) {
         throw GraalError.unimplemented("No specialized implementation available"); // ExcludeFromJacocoGeneratedReport
     }
 
@@ -570,12 +830,42 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     }
 
     @SuppressWarnings("unused")
-    default void emitSha1ImplCompress(Value buf, Value state) {
+    default void emitBigIntegerMontgomeryMultiply(Value a, Value b, Value n, Value len, Value inv, Value product) {
         throw GraalError.unimplemented("No specialized implementation available");
     }
 
     @SuppressWarnings("unused")
-    default void emitSha256ImplCompress(Value buf, Value state) {
+    default void emitBigIntegerMontgomerySquare(Value a, Value n, Value len, Value inv, Value product) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default void emitBigIntegerLeftShiftWorker(Value newArr, Value oldArr, Value newIdx, Value shiftCount, Value numIter) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default void emitBigIntegerRightShiftWorker(Value newArr, Value oldArr, Value newIdx, Value shiftCount, Value numIter) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default void emitSha1ImplCompress(EnumSet<?> runtimeCheckedCPUFeatures, Value buf, Value state) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitSha1ImplCompressMB(EnumSet<?> runtimeCheckedCPUFeatures, Value buf, Value state, Value ofs, Value limit) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default void emitSha256ImplCompress(EnumSet<?> runtimeCheckedCPUFeatures, Value buf, Value state) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitSha256ImplCompressMB(EnumSet<?> runtimeCheckedCPUFeatures, Value buf, Value state, Value ofs, Value limit) {
         throw GraalError.unimplemented("No specialized implementation available");
     }
 
@@ -585,12 +875,112 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     }
 
     @SuppressWarnings("unused")
+    default Variable emitDoubleKeccak(Value state0, Value state1) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitSha3ImplCompressMB(Value buf, Value state, Value blockSize, Value ofs, Value limit) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
     default void emitSha512ImplCompress(Value buf, Value state) {
         throw GraalError.unimplemented("No specialized implementation available");
     }
 
     @SuppressWarnings("unused")
+    default Variable emitSha512ImplCompressMB(Value buf, Value state, Value ofs, Value limit) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
     default void emitMD5ImplCompress(Value buf, Value state) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitMD5ImplCompressMB(Value buf, Value state, Value ofs, Value limit) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitCRC32UpdateBytes(EnumSet<?> runtimeCheckedCPUFeatures, Value crc, Value bufferAddress, Value length) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitAdler32UpdateBytes(EnumSet<?> runtimeCheckedCPUFeatures, Value adler, Value bufferAddress, Value length) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDilithiumAlmostNtt(Value coeffs, Value zetas) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitCRC32CUpdateBytes(EnumSet<?> runtimeCheckedCPUFeatures, Value crc, Value bufferAddress, Value length) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDoubleMod(Value x, Value y) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDilithiumAlmostInverseNtt(Value coeffs, Value zetas) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDilithiumNttMult(Value product, Value coeffs1, Value coeffs2) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDilithiumMontMulByConstant(Value coeffs, Value constant) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitDilithiumDecomposePoly(Value input, Value lowPart, Value highPart, Value twoGamma2, Value multiplier) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberNtt(Value poly, Value zetas) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberInverseNtt(Value poly, Value zetas) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberNttMult(Value result, Value ntta, Value nttb, Value zetas) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberAddPoly2(Value result, Value a, Value b) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberAddPoly3(Value result, Value a, Value b, Value c) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyber12To16(Value condensed, Value index, Value parsed, Value parsedLength) {
+        throw GraalError.unimplemented("No specialized implementation available");
+    }
+
+    @SuppressWarnings("unused")
+    default Variable emitKyberBarrettReduce(Value coeffs) {
         throw GraalError.unimplemented("No specialized implementation available");
     }
 
@@ -705,4 +1095,10 @@ public interface LIRGeneratorTool extends CoreProviders, DiagnosticLIRGeneratorT
     default VectorSize getMaxVectorSize(EnumSet<?> runtimeCheckedCPUFeatures) {
         throw GraalError.unimplemented("Max vector size is not specified on this architecture"); // ExcludeFromJacocoGeneratedReport
     }
+
+    /**
+     * Determines whether the given register is a reserved register, such as the register holding
+     * the heap base address for compressed pointers.
+     */
+    boolean isReservedRegister(Register r);
 }

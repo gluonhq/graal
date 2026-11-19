@@ -40,22 +40,24 @@ import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 
+import com.oracle.svm.core.JavaVersionUtil;
 import com.oracle.svm.core.OS;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateTargetDescription;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.util.InterruptImageBuilding;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.c.libc.HostedLibCBase;
 import com.oracle.svm.hosted.c.util.FileUtils;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.code.Architecture;
@@ -109,6 +111,7 @@ public abstract class CCompilerInvoker {
         return UserError.abort(messages);
     }
 
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
     private static class WindowsCCompilerInvoker extends CCompilerInvoker {
 
         WindowsCCompilerInvoker(Path tempDirectory) {
@@ -208,11 +211,13 @@ public abstract class CCompilerInvoker {
              * `/wd4804` are needed to silence warnings when querying bool types. `/wd4214` is
              * needed to make older versions of cl.exe accept bitfields larger than int-size.
              * `/wd4201` enables the use of nameless struct/union, which is used by libffi.
+             * `/wd4200` and `/wd4034` are needed for querying zero-length array fields.
              */
-            return Arrays.asList("/WX", "/W4", "/wd4201", "/wd4244", "/wd4245", "/wd4800", "/wd4804", "/wd4214");
+            return Arrays.asList("/WX", "/W4", "/wd4201", "/wd4244", "/wd4245", "/wd4800", "/wd4804", "/wd4214", "/wd4200", "/wd4034");
         }
     }
 
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
     private static class LinuxCCompilerInvoker extends CCompilerInvoker {
 
         LinuxCCompilerInvoker(Path tempDirectory) {
@@ -271,7 +276,7 @@ public abstract class CCompilerInvoker {
 
         @Override
         protected void verify() {
-            Class<? extends Architecture> substrateTargetArch = ImageSingletons.lookup(SubstrateTargetDescription.class).arch.getClass();
+            Class<? extends Architecture> substrateTargetArch = SubstrateTarget.getArchitecture().getClass();
             Class<? extends Architecture> guessed = guessArchitecture(compilerInfo.targetArch);
             if (guessed == null) {
                 UserError.abort("Linux native toolchain (%s) has no matching native-image target architecture.", compilerInfo.targetArch);
@@ -284,6 +289,7 @@ public abstract class CCompilerInvoker {
 
     }
 
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
     private static class DarwinCCompilerInvoker extends CCompilerInvoker {
 
         DarwinCCompilerInvoker(Path tempDirectory) {
@@ -318,7 +324,7 @@ public abstract class CCompilerInvoker {
 
         @Override
         protected void verify() {
-            Class<? extends Architecture> substrateTargetArch = ImageSingletons.lookup(SubstrateTargetDescription.class).arch.getClass();
+            Class<? extends Architecture> substrateTargetArch = SubstrateTarget.getArchitecture().getClass();
             Class<? extends Architecture> guessed = guessArchitecture(compilerInfo.targetArch);
             if (guessed == null) {
                 UserError.abort("Darwin native toolchain (%s) has no matching native-image target architecture.", compilerInfo.targetArch);

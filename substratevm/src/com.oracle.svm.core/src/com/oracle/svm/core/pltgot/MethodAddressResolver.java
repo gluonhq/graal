@@ -1,0 +1,57 @@
+/*
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.pltgot;
+
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.shared.Uninterruptible;
+
+public interface MethodAddressResolver {
+
+    /**
+     * Prepare resolver state after image CodeInfo is ready in each isolate.
+     */
+    @Uninterruptible(reason = "Called during isolate creation before thread initialization.")
+    default int initialize() {
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    /**
+     * Resolves the absolute address of a method represented by the given GOT entry.
+     *
+     * Note that it is the responsibility of this method to write the resolved address to the GOT
+     * entry as otherwise it will be called for subsequent calls of the same method.
+     * Implementations should use {@link GOTAccess#writeToGOTEntry} or {@link GOTAccess#writeToGOTEntries}
+     * for batch writes. GOT mapping is made read-only at the next safepoint with no active writers
+     * to avoid repeated page protection changes, {@link GOTAccess#reprotectGOTAtSafepoint()}.
+     *
+     * This method might execute in a context that does not declare writes to the memory locations
+     * it uses or other side effects that it has (e.g., foreign calls), so it must be very careful
+     * that callers don't see stale state from accesses floating across its invocation, or can deal
+     * with it accordingly.
+     */
+    @Uninterruptible(reason = Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    long resolveMethodWithGOTEntry(long gotEntry);
+
+}

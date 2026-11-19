@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,9 +40,6 @@
  */
 package org.graalvm.wasm.collection;
 
-import java.util.Arrays;
-import java.util.NoSuchElementException;
-
 public final class ByteArrayList {
     private static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
 
@@ -60,20 +57,38 @@ public final class ByteArrayList {
         size++;
     }
 
-    public void push(byte b) {
-        add(b);
-    }
-
-    public byte popBack() {
-        if (size() == 0) {
-            throw new NoSuchElementException("Cannot pop from an empty ByteArrayList.");
+    /**
+     * Add the little-endian LEB128 encoding of the signed {@code int} value to the list.
+     */
+    public void addSignedInt32(int valueArg) {
+        int value = valueArg;
+        while (true) {
+            int b = value & 0x7f;
+            value >>= 7;
+            if ((value == 0 && (b & 0x40) == 0) || (value == -1 && (b & 0x40) != 0)) {
+                add((byte) b);
+                break;
+            } else {
+                add((byte) (b | 0x80));
+            }
         }
-        size--;
-        return array[size];
     }
 
-    public byte top() {
-        return array[size - 1];
+    /**
+     * Add the little-endian LEB128 encoding of the unsigned {@code int} value to the list.
+     */
+    public void addUnsignedInt32(int valueArg) {
+        int value = valueArg;
+        while (true) {
+            int b = value & 0x7f;
+            value >>>= 7;
+            if (value == 0) {
+                add((byte) b);
+                break;
+            } else {
+                add((byte) (b | 0x80));
+            }
+        }
     }
 
     public void set(int index, byte b) {
@@ -88,6 +103,21 @@ public final class ByteArrayList {
             throw new IndexOutOfBoundsException("Index " + index + " greater or equal to list size" + size() + ".");
         }
         return array[index];
+    }
+
+    public void dropLast() {
+        if (size() == 0) {
+            throw new IndexOutOfBoundsException("Trying to drop last element of empty list.");
+        }
+        size--;
+    }
+
+    /** Truncates the list without reallocating its backing array. */
+    public void truncate(int newSize) {
+        if (newSize < 0 || newSize > size) {
+            throw new IndexOutOfBoundsException("Cannot truncate list of size " + size + " to " + newSize + ".");
+        }
+        size = newSize;
     }
 
     public int size() {
@@ -133,18 +163,5 @@ public final class ByteArrayList {
         } else {
             return EMPTY_BYTE_ARRAY;
         }
-    }
-
-    public static byte[] concat(ByteArrayList... byteArrayLists) {
-        int totalSize = Arrays.stream(byteArrayLists).mapToInt(ByteArrayList::size).sum();
-        byte[] result = new byte[totalSize];
-        int resultOffset = 0;
-        for (ByteArrayList byteArrayList : byteArrayLists) {
-            if (byteArrayList.array != null) {
-                System.arraycopy(byteArrayList.array, 0, result, resultOffset, byteArrayList.size);
-                resultOffset += byteArrayList.size;
-            }
-        }
-        return result;
     }
 }

@@ -26,23 +26,27 @@ package com.oracle.svm.core.jfr;
 
 import java.util.List;
 
+import com.oracle.svm.core.os.RawFileOperationSupport;
+import com.oracle.svm.core.os.RawFileOperationSupport.RawFileDescriptor;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
 import com.oracle.svm.core.heap.VMOperationInfos;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.jfr.events.JfrAllocationEvents;
+import com.oracle.svm.core.jfr.events.DumpReasonEvent;
 import com.oracle.svm.core.jfr.logging.JfrLogging;
 import com.oracle.svm.core.jfr.oldobject.JfrOldObjectProfiler;
 import com.oracle.svm.core.jfr.oldobject.JfrOldObjectRepository;
 import com.oracle.svm.core.jfr.sampler.JfrExecutionSampler;
 import com.oracle.svm.core.jfr.throttling.JfrEventThrottling;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.jfr.traceid.JfrEpoch;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.sampler.SamplerBufferPool;
 import com.oracle.svm.core.sampler.SamplerBuffersAccess;
 import com.oracle.svm.core.sampler.SamplerStatistics;
@@ -50,7 +54,14 @@ import com.oracle.svm.core.sampler.SubstrateSigprofHandler;
 import com.oracle.svm.core.thread.JavaThreads;
 import com.oracle.svm.core.thread.JavaVMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.core.common.NumUtil;
@@ -72,7 +83,11 @@ import jdk.jfr.internal.LogTag;
  * <li>{@link #destroyJFR()} - destroy the JFR infrastructure and free data.</li>
  * </ul>
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public class SubstrateJVM {
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jvmci-25.1-b18/src/hotspot/share/jfr/recorder/repository/jfrEmergencyDump.cpp#L553") //
+    private static final String OUT_OF_MEMORY = "Out of Memory";
+
     private final List<Configuration> knownConfigurations;
     private final JfrOptionSet options;
     private final JfrNativeEventSetting[] eventSettings;
@@ -90,7 +105,6 @@ public class SubstrateJVM {
     private final JfrUnlockedChunkWriter unlockedChunkWriter;
     private final JfrRecorderThread recorderThread;
     private final JfrOldObjectProfiler oldObjectProfiler;
-
     private final JfrLogging jfrLogging;
     private final JfrEventThrottling eventThrottler;
 
@@ -128,7 +142,6 @@ public class SubstrateJVM {
         unlockedChunkWriter = writeFile ? new JfrChunkFileWriter(globalMemory, stackTraceRepo, methodRepo, typeRepo, symbolRepo, threadRepo, oldObjectRepo) : new JfrChunkNoWriter();
         recorderThread = new JfrRecorderThread(globalMemory, unlockedChunkWriter);
         oldObjectProfiler = new JfrOldObjectProfiler();
-
         jfrLogging = new JfrLogging();
         eventThrottler = new JfrEventThrottling();
 
@@ -216,6 +229,15 @@ public class SubstrateJVM {
         return get().eventThrottler;
     }
 
+    @Fold
+    public static boolean shouldRegisterVThreadsEagerly() {
+        /*
+         * In a signal handler, we can only execute async-signal-safe code. Registering vthreads
+         * in the thread repository is therefore impossible, and we need to do that eagerly.
+         */
+        return HasJfrSupport.get() && JfrOptions.SignalHandlerBasedExecutionSampler.getValue();
+    }
+
     @Uninterruptible(reason = "Prevent races with VM operations that start/stop recording.", callerMustBe = true)
     protected boolean isRecording() {
         return recording;
@@ -238,14 +260,17 @@ public class SubstrateJVM {
 
         long threadLocalBufferSize = options.threadBufferSize.getValue();
         assert threadLocalBufferSize > 0;
-        threadLocal.initialize(WordFactory.unsigned(threadLocalBufferSize));
+        threadLocal.initialize(Word.unsigned(threadLocalBufferSize));
 
         long globalBufferSize = options.globalBufferSize.getValue();
         assert globalBufferSize > 0;
-        globalMemory.initialize(WordFactory.unsigned(globalBufferSize), options.globalBufferCount.getValue());
+        globalMemory.initialize(Word.unsigned(globalBufferSize), options.globalBufferCount.getValue());
 
         unlockedChunkWriter.initialize(options.maxChunkSize.getValue());
         stackTraceRepo.setStackTraceDepth(NumUtil.safeToInt(options.stackDepth.getValue()));
+        if (JfrEmergencyDumpSupport.isPresent()) {
+            JfrEmergencyDumpSupport.singleton().initialize();
+        }
 
         recorderThread.start();
 
@@ -293,8 +318,8 @@ public class SubstrateJVM {
     }
 
     @Uninterruptible(reason = "Result is only valid until epoch changes.", callerMustBe = true)
-    public long getStackTraceId(JfrEvent eventType, int skipCount) {
-        return getStackTraceId(eventType.getId(), skipCount);
+    public long getStackTraceId(JfrEvent eventType) {
+        return getStackTraceId(eventType.getId(), eventType.getSkipCount());
     }
 
     /**
@@ -356,8 +381,11 @@ public class SubstrateJVM {
         if (!recording) {
             return;
         }
-
         recorderThread.endRecording();
+    }
+
+    void endRecordingOperation() {
+        new JfrEndRecordingOperation().enqueue();
     }
 
     /**
@@ -392,7 +420,7 @@ public class SubstrateJVM {
                     }
                 }
             } else {
-                chunkWriter.setFilename(file);
+                chunkWriter.setFileToOpen(file);
             }
         } finally {
             chunkWriter.unlock();
@@ -513,12 +541,12 @@ public class SubstrateJVM {
 
         JfrBuffer oldBuffer = threadLocal.getJavaBuffer();
         assert oldBuffer.isNonNull() : "Java EventWriter should not be used otherwise";
-        JfrBuffer newBuffer = JfrThreadLocal.flushToGlobalMemory(oldBuffer, WordFactory.unsigned(uncommittedSize), requestedSize);
+        JfrBuffer newBuffer = JfrThreadLocal.flushToGlobalMemory(oldBuffer, Word.unsigned(uncommittedSize), requestedSize);
         if (newBuffer.isNull()) {
             /* The flush failed, so mark the EventWriter as invalid for this write attempt. */
-            JfrEventWriterAccess.update(writer, oldBuffer, 0, false);
+            JfrEventWriterAccess.updateBuffer(writer, oldBuffer, 0, false);
         } else {
-            JfrEventWriterAccess.update(writer, newBuffer, uncommittedSize, true);
+            JfrEventWriterAccess.updateBuffer(writer, newBuffer, uncommittedSize, true);
         }
 
         /*
@@ -552,7 +580,7 @@ public class SubstrateJVM {
             return nextPosition;
         }
 
-        Pointer next = WordFactory.pointer(nextPosition);
+        Pointer next = Word.pointer(nextPosition);
         assert next.aboveOrEqual(current.getCommittedPos()) : "invariant";
         assert next.belowOrEqual(JfrBufferAccess.getDataEnd(current)) : "invariant";
         if (JfrThreadLocal.isNotified()) {
@@ -581,7 +609,9 @@ public class SubstrateJVM {
      * See {@link JVM#setRepositoryLocation}.
      */
     public void setRepositoryLocation(@SuppressWarnings("unused") String dirText) {
-        // Would only be used in case of an emergency dump, which is not supported at the moment.
+        if (JfrEmergencyDumpSupport.isPresent()) {
+            JfrEmergencyDumpSupport.singleton().setRepositoryLocation(dirText);
+        }
     }
 
     /**
@@ -589,16 +619,20 @@ public class SubstrateJVM {
      */
     public void setDumpPath(String dumpPathText) {
         dumpPath = dumpPathText;
+        if (JfrEmergencyDumpSupport.isPresent()) {
+            JfrEmergencyDumpSupport.singleton().setDumpPath(dumpPathText);
+        }
     }
 
     /**
      * See {@code JVM#getDumpPath()}.
      */
     public String getDumpPath() {
-        if (dumpPath == null) {
-            dumpPath = Target_jdk_jfr_internal_SecuritySupport.getPathInProperty("user.home", null).toString();
+        if (JfrEmergencyDumpSupport.isPresent()) {
+            return JfrEmergencyDumpSupport.singleton().getDumpPath();
         }
-        return dumpPath;
+        // The JDK side passes JVM.getDumpPath() to Path.of(...), so keep this non-null.
+        return dumpPath == null ? "" : dumpPath;
     }
 
     /**
@@ -624,6 +658,15 @@ public class SubstrateJVM {
      * See {@link JVM#emitOldObjectSamples(long, boolean, boolean)}.
      */
     void emitOldObjectSamples(long cutoff, boolean emitAll, boolean skipBFS) {
+        /*
+         * The emergency-dump path emits old-object samples and then ends the native recording
+         * eagerly. The Java-side Recording object still transitions through stop/close afterward
+         * and will try to emit old-object samples again, so this hook must tolerate already-ended
+         * recordings.
+         */
+        if (!recording) {
+            return;
+        }
         oldObjectProfiler.emit(cutoff, emitAll, skipBFS);
     }
 
@@ -737,6 +780,38 @@ public class SubstrateJVM {
         return DynamicHub.fromClass(eventClass).getJfrEventConfiguration();
     }
 
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jvmci-25.1-b18/src/hotspot/share/jfr/recorder/repository/jfrEmergencyDump.cpp#L546-L556")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25-ga/src/hotspot/share/jfr/recorder/service/jfrRecorderService.cpp#L510-L526")
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Used on OOME for emergency dumps")
+    public void dumpOnOutOfMemoryError() {
+        if (!recording || !JfrEmergencyDumpSupport.isPresent()) {
+            return;
+        }
+
+        // Hotspot emits GC root paths, but we don't support that yet. So cutoff = 0.
+        emitOldObjectSamples(0, false, false);
+        DumpReasonEvent.emit(OUT_OF_MEMORY, -1);
+
+        JfrChunkWriter chunkWriter = unlockedChunkWriter.lock();
+        try {
+            boolean existingFile = chunkWriter.hasOpenFile();
+            if (!existingFile) {
+                // If no chunkfile is open, create one. This case is very unlikely.
+                RawFileDescriptor fd = JfrEmergencyDumpSupport.singleton().chunkFile();
+                if (RawFileOperationSupport.bigEndian().isValid(fd)) {
+                    chunkWriter.openFile(fd);
+                }
+            }
+            if (chunkWriter.hasOpenFile()) {
+                chunkWriter.markChunkFinal();
+                chunkWriter.closeFile();
+            }
+        } finally {
+            chunkWriter.unlock();
+        }
+        JfrEmergencyDumpSupport.singleton().onVmError();
+    }
+
     private static class JfrBeginRecordingOperation extends JavaVMOperation {
         JfrBeginRecordingOperation() {
             super(VMOperationInfos.get(JfrBeginRecordingOperation.class, "JFR begin recording", SystemEffect.SAFEPOINT));
@@ -747,6 +822,7 @@ public class SubstrateJVM {
             SubstrateJVM.getOldObjectProfiler().reset();
             JfrAllocationEvents.reset();
 
+            JfrEpoch.getInstance().changeEpoch();
             SubstrateJVM.get().recording = true;
             /* Recording is enabled, so JFR events can be triggered at any time. */
             SubstrateJVM.getThreadRepo().registerRunningThreads();
@@ -770,7 +846,6 @@ public class SubstrateJVM {
             if (!SubstrateJVM.get().recording) {
                 return;
             }
-
             SubstrateJVM.get().recording = false;
             JfrExecutionSampler.singleton().update();
 
@@ -793,6 +868,12 @@ public class SubstrateJVM {
             SubstrateJVM.getThreadLocal().teardown();
             SubstrateJVM.getSamplerBufferPool().teardown();
             SubstrateJVM.getGlobalMemory().clear();
+            SubstrateJVM.getThreadRepo().reset();
+            SubstrateJVM.getStackTraceRepo().reset();
+            SubstrateJVM.getMethodRepo().reset();
+            SubstrateJVM.getTypeRepository().reset();
+            SubstrateJVM.getSymbolRepository().reset();
+            SubstrateJVM.getOldObjectRepository().reset();
             SubstrateJVM.getOldObjectProfiler().teardown();
         }
     }
@@ -829,7 +910,9 @@ public class SubstrateJVM {
             methodRepo.teardown();
             typeRepo.teardown();
             oldObjectRepo.teardown();
-
+            if (JfrEmergencyDumpSupport.isPresent()) {
+                JfrEmergencyDumpSupport.singleton().teardown();
+            }
             initialized = false;
         }
     }

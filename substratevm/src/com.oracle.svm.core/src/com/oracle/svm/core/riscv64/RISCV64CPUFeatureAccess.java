@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,27 +33,25 @@ import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.CPUFeatureAccessImpl;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.nodes.spi.LoweringProvider;
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.riscv64.RISCV64;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public class RISCV64CPUFeatureAccess extends CPUFeatureAccessImpl {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     public RISCV64CPUFeatureAccess(EnumSet<?> buildtimeCPUFeatures, int[] offsets, byte[] errorMessageBytes, byte[] buildtimeFeatureMaskBytes) {
         super(buildtimeCPUFeatures, offsets, errorMessageBytes, buildtimeFeatureMaskBytes);
-    }
-
-    /**
-     * We include all flags which currently impact RISCV64 performance.
-     */
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public static EnumSet<RISCV64.Flag> enabledRISCV64Flags() {
-        return EnumSet.of(RISCV64.Flag.UseConservativeFence, RISCV64.Flag.AvoidUnalignedAccesses);
     }
 
     @Override
@@ -93,7 +91,7 @@ public class RISCV64CPUFeatureAccess extends CPUFeatureAccessImpl {
     }
 
     @Override
-    public void enableFeatures(Architecture runtimeArchitecture) {
+    public void enableFeatures(Architecture runtimeArchitecture, LoweringProvider runtimeLowerer) {
         RISCV64 architecture = (RISCV64) runtimeArchitecture;
         EnumSet<RISCV64.CPUFeature> features = determineHostCPUFeatures();
         architecture.getFeatures().addAll(features);

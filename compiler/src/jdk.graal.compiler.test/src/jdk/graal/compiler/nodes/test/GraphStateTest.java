@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,9 +24,18 @@
  */
 package jdk.graal.compiler.nodes.test;
 
+import java.util.Optional;
+
 import jdk.graal.compiler.core.test.GraalCompilerTest;
 import jdk.graal.compiler.nodes.GraphState;
+import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.phases.BasePhase;
+import jdk.graal.compiler.phases.BasePhase.NotApplicable;
+import jdk.graal.compiler.phases.common.CanonicalizerPhase;
+import jdk.graal.compiler.phases.common.HighTierLoweringPhase;
+import jdk.graal.compiler.phases.common.LowTierLoweringPhase;
+import jdk.graal.compiler.phases.common.MidTierLoweringPhase;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -74,5 +83,40 @@ public class GraphStateTest extends GraalCompilerTest {
 
         Assert.assertFalse(andGraphState.requiresFutureStages());
         Assert.assertTrue(andGraphState.getFutureRequiredStages().isEmpty());
+    }
+
+    @Test
+    public void testLoweringPhaseContracts() {
+        assertApplicable(new HighTierLoweringPhase(CanonicalizerPhase.create()), graphState());
+
+        MidTierLoweringPhase midTierLoweringPhase = new MidTierLoweringPhase(CanonicalizerPhase.create());
+        assertNotApplicableDueTo(midTierLoweringPhase, graphState(), StageFlag.GUARD_LOWERING);
+        assertApplicable(midTierLoweringPhase, graphState(StageFlag.GUARD_LOWERING));
+        assertNotApplicableDueTo(midTierLoweringPhase, graphState(StageFlag.GUARD_LOWERING, StageFlag.FSA), StageFlag.FSA);
+
+        LowTierLoweringPhase lowTierLoweringPhase = new LowTierLoweringPhase(CanonicalizerPhase.create());
+        assertNotApplicableDueTo(lowTierLoweringPhase, graphState(), StageFlag.MID_TIER_LOWERING);
+        assertNotApplicableDueTo(lowTierLoweringPhase, graphState(StageFlag.FSA), StageFlag.MID_TIER_LOWERING);
+        assertNotApplicableDueTo(lowTierLoweringPhase, graphState(StageFlag.MID_TIER_LOWERING), StageFlag.FSA);
+        assertApplicable(lowTierLoweringPhase, graphState(StageFlag.MID_TIER_LOWERING, StageFlag.FSA));
+    }
+
+    private static GraphState graphState(StageFlag... appliedStages) {
+        GraphState graphState = GraphState.defaultGraphState();
+        for (StageFlag stage : appliedStages) {
+            graphState.setAfterStage(stage);
+        }
+        return graphState;
+    }
+
+    private static void assertApplicable(BasePhase<?> phase, GraphState graphState) {
+        Optional<NotApplicable> notApplicable = phase.notApplicableTo(graphState);
+        Assert.assertFalse(notApplicable.toString(), notApplicable.isPresent());
+    }
+
+    private static void assertNotApplicableDueTo(BasePhase<?> phase, GraphState graphState, StageFlag stage) {
+        Optional<NotApplicable> notApplicable = phase.notApplicableTo(graphState);
+        Assert.assertTrue("Expected " + phase.getName() + " to be rejected", notApplicable.isPresent());
+        Assert.assertTrue(notApplicable.get().reason, notApplicable.get().reason.contains(stage.name()));
     }
 }

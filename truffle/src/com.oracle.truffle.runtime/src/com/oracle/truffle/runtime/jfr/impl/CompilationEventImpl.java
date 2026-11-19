@@ -40,19 +40,19 @@
  */
 package com.oracle.truffle.runtime.jfr.impl;
 
+import java.util.function.Supplier;
+
 import com.oracle.truffle.runtime.jfr.CompilationEvent;
 
 import jdk.jfr.BooleanFlag;
 import jdk.jfr.Category;
-import jdk.jfr.Description;
 import jdk.jfr.DataAmount;
+import jdk.jfr.Description;
 import jdk.jfr.Label;
 import jdk.jfr.MemoryAddress;
 import jdk.jfr.Name;
 import jdk.jfr.StackTrace;
 import jdk.jfr.Unsigned;
-
-import java.util.function.Supplier;
 
 @Name("jdk.graal.compiler.truffle.Compilation")
 @Category("Truffle Compiler")
@@ -79,11 +79,13 @@ class CompilationEventImpl extends RootFunctionEventImpl implements CompilationE
 
     @Label("Tier") @Description("The Tier of the Truffle Compiler") public int truffleTier;
 
+    @Label("Compilation Id") @Description("The VM Id of the Compilation") public String compilationId;
+
     private transient CompilationFailureEventImpl failure;
 
     @Override
     public void compilationStarted() {
-        CompilationFailureEventImpl failureEvent = new CompilationFailureEventImpl(id, source, language, rootFunction);
+        CompilationFailureEventImpl failureEvent = new CompilationFailureEventImpl(engineId, id, source, sourceHash, language, rootFunction, astSize);
         if (failureEvent.isEnabled()) {
             failureEvent.begin();
             failure = failureEvent;
@@ -107,7 +109,11 @@ class CompilationEventImpl extends RootFunctionEventImpl implements CompilationE
         end();
         if (failure != null) {
             failure.end();
-            failure.setFailureData(tier, permanent, reason, lazyStackTrace == null ? null : lazyStackTrace.get());
+            if (permanent) {
+                failure.setFailureData(tier, true, reason, lazyStackTrace == null ? null : lazyStackTrace.get());
+            } else {
+                failure = null;
+            }
         }
         truffleTier = tier;
         success = false;
@@ -146,6 +152,11 @@ class CompilationEventImpl extends RootFunctionEventImpl implements CompilationE
     @Override
     public void setPartialEvaluationTime(long time) {
         this.peTime = time;
+    }
+
+    @Override
+    public void setCompilationId(String id) {
+        this.compilationId = id;
     }
 
     @Override

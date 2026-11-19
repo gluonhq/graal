@@ -24,9 +24,8 @@
  */
 package com.oracle.svm.core.heap.dump;
 
+import com.oracle.svm.core.SubstrateTarget;
 import jdk.graal.compiler.core.common.NumUtil;
-
-import com.oracle.svm.core.config.ConfigurationValues;
 
 /* Enum of all relevant HPROF types (see enum hprofTag in HotSpot). */
 public enum HProfType {
@@ -60,7 +59,7 @@ public enum HProfType {
 
     public int getSize() {
         if (size == 0) {
-            return ConfigurationValues.getTarget().wordSize;
+            return SubstrateTarget.getWordSize();
         }
         return size;
     }

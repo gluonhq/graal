@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,14 +40,20 @@
  */
 package com.oracle.truffle.api.exception;
 
+import java.util.List;
+
 import org.graalvm.polyglot.PolyglotException;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.TruffleStackTrace;
+import com.oracle.truffle.api.TruffleStackTraceElement;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
+import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.SourceSection;
 
 /**
  * A base class for an exception thrown during the execution of a guest language program.<br>
@@ -164,6 +170,7 @@ public abstract class AbstractTruffleException extends RuntimeException implemen
     private final int stackTraceElementLimit;
     private final Throwable cause;
     private final Node location;
+    private final int bytecodeIndex;
     private Throwable lazyStackTrace;
 
     /**
@@ -203,17 +210,16 @@ public abstract class AbstractTruffleException extends RuntimeException implemen
     }
 
     /**
-     * Creates a new AbstractTruffleException initialized from the given prototype. The exception
-     * message, internal cause, stack trace limit, location, suppressed exceptions and Truffle stack
-     * trace of a newly created {@link AbstractTruffleException} are inherited from the given
-     * {@link AbstractTruffleException}.
+     * Copies the prototype's message, cause, stack trace limit, location, BCI, suppressed exceptions,
+     * and Truffle stack trace.
      *
+     * @param prototype the exception to copy
      * @since 20.3
      */
     @SuppressWarnings("this-escape")
     @TruffleBoundary
     protected AbstractTruffleException(AbstractTruffleException prototype) {
-        this(prototype.getMessage(), prototype.getCause(), prototype.getStackTraceElementLimit(), prototype.getLocation());
+        this(prototype.getMessage(), prototype.getCause(), prototype.getStackTraceElementLimit(), prototype.getLocation(), prototype.getBytecodeIndex());
         for (Throwable t : prototype.getSuppressed()) {
             this.addSuppressed(t);
         }
@@ -238,10 +244,27 @@ public abstract class AbstractTruffleException extends RuntimeException implemen
      * @since 20.3
      */
     protected AbstractTruffleException(String message, Throwable cause, int stackTraceElementLimit, Node location) {
+        this(message, cause, stackTraceElementLimit, location, -1);
+    }
+
+    /**
+     * Creates a new AbstractTruffleException with an explicit bytecode index for the exception
+     * location.
+     *
+     * @param message the exception message or {@code null}
+     * @param cause the cause or {@code null}; internal causes are hidden from interop and the embedder
+     * @param stackTraceElementLimit a stack trace limit. Use {@link #UNLIMITED_STACK_TRACE} for
+     *            unlimited stack trace length.
+     * @param location a location node or {@code null}
+     * @param bytecodeIndex a bytecode index for {@code location}, or {@code -1} if unavailable
+     * @since 25.6
+     */
+    protected AbstractTruffleException(String message, Throwable cause, int stackTraceElementLimit, Node location, int bytecodeIndex) {
         super(message, cause);
         this.stackTraceElementLimit = stackTraceElementLimit;
         this.cause = cause;
         this.location = location;
+        this.bytecodeIndex = bytecodeIndex;
     }
 
     /**
@@ -263,6 +286,45 @@ public abstract class AbstractTruffleException extends RuntimeException implemen
      */
     public final Node getLocation() {
         return location;
+    }
+
+    /**
+     * Returns the explicit BCI associated with {@link #getLocation()}.
+     *
+     * @return the BCI, or a negative value if unavailable
+     * @since 25.6
+     */
+    public final int getBytecodeIndex() {
+        return bytecodeIndex;
+    }
+
+    /**
+     * Returns a source section associated with the exception. This method may return {@code null}
+     * to indicate that the source section is not available.
+     * <p>
+     * Note: This method is expensive as it requires to access the current stack trace to get the
+     * to-most source section.
+     *
+     * @since 24.2
+     */
+    @TruffleBoundary
+    public SourceSection getEncapsulatingSourceSection() {
+        Node l = getLocation();
+        if (l == null) {
+            return null;
+        }
+        List<TruffleStackTraceElement> stackTrace = TruffleStackTrace.getStackTrace(this);
+        if (!stackTrace.isEmpty()) {
+            Object guestObject = stackTrace.get(0).getGuestObject();
+            if (guestObject != null && InteropLibrary.getUncached().hasSourceLocation(guestObject)) {
+                try {
+                    return InteropLibrary.getUncached().getSourceLocation(guestObject);
+                } catch (UnsupportedMessageException e1) {
+                    throw CompilerDirectives.shouldNotReachHere(e1);
+                }
+            }
+        }
+        return l.getEncapsulatingSourceSection();
     }
 
     /**
@@ -295,5 +357,17 @@ public abstract class AbstractTruffleException extends RuntimeException implemen
 
     final void setLazyStackTrace(Throwable stackTrace) {
         this.lazyStackTrace = stackTrace;
+    }
+
+    /**
+     * Creates an interop representation of the stack trace for the given {@code throwable}. The
+     * returned object is suitable for use as the result of
+     * {@link InteropLibrary#getExceptionStackTrace(Object)}.
+     *
+     * @since 25.1
+     */
+    @SuppressWarnings("static-method")
+    protected final Object createGuestStackTrace(Throwable throwable) {
+        return MergedHostGuestIterator.getExceptionStackTrace(throwable, null, false, false);
     }
 }

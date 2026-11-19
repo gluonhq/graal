@@ -24,6 +24,11 @@
  */
 package com.oracle.svm.core.monitor;
 
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.EXTREMELY_SLOW_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.FAST_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.SLOW_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -34,32 +39,35 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.impl.BarrieredAccess;
 
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.WeakIdentityHashMap;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.TargetElement;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.heap.RestrictHeapAccess.Access;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.DynamicHubCompanion;
-import com.oracle.svm.core.jdk.JDK21OrEarlier;
-import com.oracle.svm.core.jdk.JDKLatest;
 import com.oracle.svm.core.jfr.JfrTicks;
 import com.oracle.svm.core.jfr.events.JavaMonitorInflateEvent;
 import com.oracle.svm.core.monitor.JavaMonitorQueuedSynchronizer.JavaMonitorConditionObject;
-import com.oracle.svm.core.snippets.SubstrateForeignCallTarget;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
 import com.oracle.svm.core.thread.JavaThreads;
-import com.oracle.svm.core.thread.ThreadStatus;
+import com.oracle.svm.guest.staging.core.thread.ThreadStatus;
 import com.oracle.svm.core.thread.VMOperationControl;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.api.directives.GraalDirectives;
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
-import jdk.graal.compiler.word.BarrieredAccess;
+import jdk.graal.compiler.nodes.PiNode;
+import jdk.graal.compiler.nodes.SnippetAnchorNode;
+import jdk.graal.compiler.replacements.ReplacementsUtil;
 import jdk.internal.misc.Unsafe;
 
 /**
@@ -97,6 +105,7 @@ import jdk.internal.misc.Unsafe;
  * object monitor needs a condition object, it is atomically swapped into its
  * {@link JavaMonitorConditionObject} field.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class MultiThreadedMonitorSupport extends MonitorSupport {
 
     private static final Unsafe UNSAFE = Unsafe.getUnsafe();
@@ -113,12 +122,14 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
 
     static {
         try {
+            HashMap<Class<?>, Boolean> monitorTypes = new HashMap<>();
             /*
              * The com.oracle.svm.core.WeakIdentityHashMap used to model the
              * com.oracle.svm.core.monitor.MultiThreadedMonitorSupport#additionalMonitors map uses
-             * java.lang.ref.ReferenceQueue internally.
+             * java.lang.ref.ReferenceQueue internally. The ReferenceQueue uses the inner static
+             * class Lock for all its locking needs.
              */
-            HashMap<Class<?>, Boolean> monitorTypes = new HashMap<>();
+            monitorTypes.put(Class.forName("java.lang.ref.ReferenceQueue$Lock"), false);
             /* The WeakIdentityHashMap also synchronizes on its internal ReferenceQueue field. */
             monitorTypes.put(java.lang.ref.ReferenceQueue.class, false);
 
@@ -165,8 +176,8 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
             monitorTypes.put(DynamicHubCompanion.class, false);
 
             /*
-             * When a thread exits, it locks its own thread mutex and changes its state to
-             * TERMINATED. Without an explict monitor slot, the thread could get parked when
+             * When a thread exits, it synchronizes on its Java Thread object and changes its state
+             * to TERMINATED. Without an explicit monitor slot, the thread could get parked when
              * unlocking its own mutex (because we need to lock the shared monitor map). If the
              * thread gets blocked during unlocking, its thread state would change unexpectedly.
              */
@@ -198,16 +209,15 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
         return timed ? ThreadStatus.PARKED_TIMED : ThreadStatus.PARKED;
     }
 
+    @Override
+    public void ensureInitialized(Object obj) {
+        JavaMonitor monitor = getOrCreateMonitor(obj, MonitorInflationCause.VM_INTERNAL);
+        monitor.getOrCreateCondition(true);
+    }
+
     @SubstrateForeignCallTarget(stubCallingConvention = false)
-    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
+    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated")
     private static void slowPathMonitorEnter(Object obj) {
-        /*
-         * A stack overflow error in the locking code would be reported as a fatal error, since
-         * there must not be any exceptions flowing out of the monitor code. Enabling the yellow
-         * zone prevents stack overflows.
-         */
-        StackOverflowCheck.singleton().makeYellowZoneAvailable();
-        VMOperationControl.guaranteeOkayToBlock("No Java synchronization must be performed within a VMOperation: if the object is already locked, the VM is deadlocked");
         try {
             singleton().monitorEnter(obj, MonitorInflationCause.MONITOR_ENTER);
 
@@ -231,55 +241,81 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
              * an exception.
              */
             throw VMError.shouldNotReachHere("Unexpected exception in MonitorSupport.monitorEnter", ex);
+        }
+    }
 
+    @Override
+    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
+    public final void monitorEnter(Object obj, MonitorInflationCause cause) {
+        /*
+         * A stack overflow error for a monitorenter bytecode would be unexpected and cannot be
+         * thrown reliably (see slow path). On other code paths, a stack overflow in the middle of
+         * monitor code still poses a danger of corrupting state, although, unlike for exit, wait,
+         * and notify, no specific failure pattern is known for acquiring a monitor. In any case,
+         * enabling the yellow zone prevents stack overflows to begin with.
+         */
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
+        VMOperationControl.guaranteeOkayToBlock("No Java synchronization must be performed within a VMOperation: if the object is already locked, the VM is deadlocked");
+        try {
+            monitorEnterImpl(obj, cause);
         } finally {
             StackOverflowCheck.singleton().protectYellowZone();
         }
     }
 
-    protected static final String NO_LONGER_UNINTERRUPTIBLE = "The monitor snippet slow path is uninterruptible to avoid stack overflow errors being thrown. " +
-                    "Now the yellow zone is enabled and we are no longer uninterruptible, and allocation is allowed again too";
-
-    @RestrictHeapAccess(reason = NO_LONGER_UNINTERRUPTIBLE, access = Access.UNRESTRICTED)
-    @Override
-    public void monitorEnter(Object obj, MonitorInflationCause cause) {
-        JavaMonitor monitor;
-        int monitorOffset = getMonitorOffset(obj);
-        if (monitorOffset != 0) {
-            /*
-             * Optimized path takes advantage of the knowledge that, when a new monitor object is
-             * created, it is not shared with other threads, so we can set its state without CAS. It
-             * also has acquisitions == 1 by construction, so we don't need to set that too.
-             */
-            long current = JavaMonitor.getCurrentThreadIdentity();
-            monitor = (JavaMonitor) BarrieredAccess.readObject(obj, monitorOffset);
-            if (monitor == null) {
-                long startTicks = JfrTicks.elapsedTicks();
-                JavaMonitor newMonitor = newMonitorLock();
-                newMonitor.setState(current);
-                monitor = (JavaMonitor) UNSAFE.compareAndExchangeReference(obj, monitorOffset, null, newMonitor);
-                if (monitor == null) { // successful
-                    JavaMonitorInflateEvent.emit(obj, startTicks, MonitorInflationCause.MONITOR_ENTER);
-                    newMonitor.latestJfrTid = current;
-                    return;
-                }
-            }
-        } else {
-            monitor = getOrCreateMonitor(obj, cause);
+    protected void monitorEnterImpl(Object obj, MonitorInflationCause cause) {
+        if (probability(SLOW_PATH_PROBABILITY, !tryInflatedMonitorEnter(obj, getMonitorOffset(obj)))) {
+            JavaMonitor lockObject = getOrCreateMonitor(obj, cause);
+            lockObject.monitorEnter(obj);
         }
-        monitor.monitorEnter(obj);
+    }
+
+    @AlwaysInline("monitor fast path")
+    static boolean tryInflatedMonitorEnter(Object obj, int monitorOffset) {
+        if (probability(FAST_PATH_PROBABILITY, monitorOffset != 0)) {
+            Object existingMonitor = BarrieredAccess.readObject(obj, monitorOffset);
+            return tryFastMonitorEnter(existingMonitor);
+        }
+        return false;
+    }
+
+    @AlwaysInline("monitor fast path")
+    protected static boolean tryFastMonitorEnter(Object existingMonitor) {
+        if (probability(FAST_PATH_PROBABILITY, existingMonitor != null)) {
+            if (probability(EXTREMELY_SLOW_PATH_PROBABILITY, !VMOperationControl.isOkayToBlock())) {
+                return false; // fail on slow-path
+            }
+
+            if (GraalDirectives.inIntrinsic()) {
+                ReplacementsUtil.dynamicAssert(existingMonitor instanceof JavaMonitor, "expecting inflated monitor");
+            } else {
+                assert existingMonitor instanceof JavaMonitor;
+            }
+
+            JavaMonitor inflatedMonitor = (JavaMonitor) PiNode.piCast(existingMonitor, JavaMonitor.class, false, true, SnippetAnchorNode.anchor());
+            return inflatedMonitor.tryFastMonitorEnter();
+        }
+        return false;
+    }
+
+    @AlwaysInline("monitor fast path")
+    public static int tryFastBalancedMonitorExit(Object existingMonitor) {
+        /*
+         * Because Graal enforces structured locking, and we do not support deflation, if we reach
+         * here, we must always have an inflated monitor.
+         */
+        ReplacementsUtil.dynamicAssert(existingMonitor instanceof JavaMonitor, "expecting inflated monitor");
+
+        JavaMonitor inflatedMonitor = (JavaMonitor) PiNode.piCast(existingMonitor, JavaMonitor.class, false, true, SnippetAnchorNode.anchor());
+        return inflatedMonitor.tryFastBalancedMonitorExit();
     }
 
     @SubstrateForeignCallTarget(stubCallingConvention = false)
     @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
-    private static void slowPathMonitorExit(Object obj) {
+    private static void slowPathMonitorExit(Object obj, int status) {
         StackOverflowCheck.singleton().makeYellowZoneAvailable();
         try {
-            /*
-             * Monitor inflation cannot happen here because Graal enforces structured locking and
-             * unlocking, see comment below.
-             */
-            singleton().monitorExit(obj, MonitorInflationCause.VM_INTERNAL);
+            ((MultiThreadedMonitorSupport) singleton()).slowPathMonitorExit0(obj, status);
 
         } catch (OutOfMemoryError ex) {
             /*
@@ -304,21 +340,36 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
         }
     }
 
-    @RestrictHeapAccess(reason = NO_LONGER_UNINTERRUPTIBLE, access = Access.UNRESTRICTED)
-    @Override
-    public void monitorExit(Object obj, MonitorInflationCause cause) {
-        JavaMonitor monitor;
-        int monitorOffset = getMonitorOffset(obj);
-        if (monitorOffset != 0) {
+    private void slowPathMonitorExit0(Object obj, int status) {
+        if (status == JavaMonitor.FastMonitorExitStatus.MUST_SIGNAL_SUCCESSOR) {
+            Object existingMonitor = BarrieredAccess.readObject(obj, getMonitorOffset(obj));
+            ((JavaMonitor) existingMonitor).signalReleaseSuccessor();
+        } else if (status == JavaMonitor.FastMonitorExitStatus.USE_SLOW_PATH) {
             /*
-             * Optimized path: we know that a monitor object exists, due to structured locking, so
-             * one does not need to be created/inflated.
+             * Monitor inflation cannot happen here because Graal enforces structured locking and
+             * unlocking.
              */
-            monitor = (JavaMonitor) BarrieredAccess.readObject(obj, monitorOffset);
+            monitorExitImpl(obj, MonitorInflationCause.VM_INTERNAL);
         } else {
-            monitor = getOrCreateMonitor(obj, cause);
+            throw VMError.shouldNotReachHere("Invalid status code from monitorexit fast-path: " + status);
         }
-        monitor.monitorExit();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
+    public final void monitorExit(Object obj, MonitorInflationCause cause) {
+        /* A stack overflow here could release the lock without waking a successor. */
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
+        try {
+            monitorExitImpl(obj, cause);
+        } finally {
+            StackOverflowCheck.singleton().protectYellowZone();
+        }
+    }
+
+    protected void monitorExitImpl(Object obj, MonitorInflationCause cause) {
+        JavaMonitor lockObject = getOrCreateMonitor(obj, cause);
+        lockObject.monitorExit();
     }
 
     @Override
@@ -359,9 +410,20 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
         return lockObject != null && lockObject.isLocked();
     }
 
-    @SuppressFBWarnings(value = {"WA_AWAIT_NOT_IN_LOOP"}, justification = "This method is a wait implementation.")
     @Override
-    protected void doWait(Object obj, long timeoutMillis) throws InterruptedException {
+    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
+    protected final void doWait(Object obj, long timeoutMillis) throws InterruptedException {
+        /* A stack overflow here could return control to the caller without reacquiring the lock. */
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
+        try {
+            doWaitImpl(obj, timeoutMillis);
+        } finally {
+            StackOverflowCheck.singleton().protectYellowZone();
+        }
+    }
+
+    @SuppressFBWarnings(value = {"WA_AWAIT_NOT_IN_LOOP"}, justification = "This method is a wait implementation.")
+    private void doWaitImpl(Object obj, long timeoutMillis) throws InterruptedException {
         /*
          * Our monitor implementation does not pin virtual threads, so avoid
          * jdk.internal.misc.Blocker which expects and asserts that a virtual thread is pinned
@@ -370,15 +432,10 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
          * too, so we don't have to intercept an InterruptedException from the carrier thread to
          * clear the virtual thread interrupt.
          */
-        long compensation = -1;
         boolean attempted = false;
         boolean pinned = JavaThreads.isCurrentThreadVirtualAndPinned();
         if (pinned) {
-            if (JavaVersionUtil.JAVA_SPEC < 23) {
-                compensation = Target_jdk_internal_misc_Blocker.beginJDK22();
-            } else {
-                attempted = Target_jdk_internal_misc_Blocker.begin();
-            }
+            attempted = Target_jdk_internal_misc_Blocker.begin();
         }
         try {
             /*
@@ -394,17 +451,27 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
             }
         } finally {
             if (pinned) {
-                if (JavaVersionUtil.JAVA_SPEC < 23) {
-                    Target_jdk_internal_misc_Blocker.endJDK22(compensation);
-                } else {
-                    Target_jdk_internal_misc_Blocker.end(attempted);
-                }
+                Target_jdk_internal_misc_Blocker.end(attempted);
             }
         }
     }
 
     @Override
-    public void notify(Object obj, boolean notifyAll) {
+    @Uninterruptible(reason = "Avoid stack overflow error before yellow zone has been activated", calleeMustBe = false)
+    public final void notify(Object obj, boolean notifyAll) {
+        /*
+         * A stack overflow here might skip threads to notify, and might drop a thread entirely when
+         * transferring waiters to the lock contender queue, leaving it stranded.
+         */
+        StackOverflowCheck.singleton().makeYellowZoneAvailable();
+        try {
+            notifyImpl(obj, notifyAll);
+        } finally {
+            StackOverflowCheck.singleton().protectYellowZone();
+        }
+    }
+
+    protected void notifyImpl(Object obj, boolean notifyAll) {
         /* Make sure the current thread holds the lock on the receiver. */
         JavaMonitor lock = ensureLocked(obj, MonitorInflationCause.NOTIFY);
         /* Find the wait/notify condition of the receiver. */
@@ -527,19 +594,10 @@ public class MultiThreadedMonitorSupport extends MonitorSupport {
 
 @TargetClass(className = "jdk.internal.misc.Blocker")
 final class Target_jdk_internal_misc_Blocker {
-    @Alias
-    @TargetElement(name = "begin", onlyWith = JDK21OrEarlier.class)
-    public static native long beginJDK22();
 
     @Alias
-    @TargetElement(name = "end", onlyWith = JDK21OrEarlier.class)
-    public static native void endJDK22(long compensateReturn);
-
-    @Alias
-    @TargetElement(onlyWith = JDKLatest.class)
     public static native boolean begin();
 
     @Alias
-    @TargetElement(onlyWith = JDKLatest.class)
     public static native void end(boolean attempted);
 }

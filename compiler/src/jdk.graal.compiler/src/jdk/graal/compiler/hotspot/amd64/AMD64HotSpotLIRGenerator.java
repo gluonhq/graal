@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
  */
 package jdk.graal.compiler.hotspot.amd64;
 
+import static jdk.graal.compiler.lir.amd64.AMD64ComplexVectorOp.supports;
 import static jdk.vm.ci.amd64.AMD64.rbp;
 import static jdk.vm.ci.code.ValueUtil.asRegister;
 import static jdk.vm.ci.code.ValueUtil.isRegister;
@@ -55,7 +56,7 @@ import jdk.graal.compiler.hotspot.HotSpotLIRGenerationResult;
 import jdk.graal.compiler.hotspot.HotSpotLIRGenerator;
 import jdk.graal.compiler.hotspot.HotSpotLockStack;
 import jdk.graal.compiler.hotspot.amd64.g1.AMD64HotSpotG1BarrierSetLIRTool;
-import jdk.graal.compiler.hotspot.amd64.x.AMD64HotSpotXBarrierSetLIRGenerator;
+import jdk.graal.compiler.hotspot.amd64.shenandoah.AMD64HotSpotShenandoahBarrierSetLIRGenerator;
 import jdk.graal.compiler.hotspot.amd64.z.AMD64HotSpotZBarrierSetLIRGenerator;
 import jdk.graal.compiler.hotspot.debug.BenchmarkCounters;
 import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor;
@@ -76,7 +77,6 @@ import jdk.graal.compiler.lir.amd64.AMD64ControlFlow.StrategySwitchOp;
 import jdk.graal.compiler.lir.amd64.AMD64Move;
 import jdk.graal.compiler.lir.amd64.AMD64Move.MoveFromRegOp;
 import jdk.graal.compiler.lir.amd64.AMD64PrefetchOp;
-import jdk.graal.compiler.lir.amd64.AMD64ReadTimestampCounterWithProcid;
 import jdk.graal.compiler.lir.amd64.AMD64RestoreRegistersOp;
 import jdk.graal.compiler.lir.amd64.AMD64SaveRegistersOp;
 import jdk.graal.compiler.lir.amd64.AMD64VZeroUpper;
@@ -92,7 +92,6 @@ import jdk.vm.ci.amd64.AMD64.CPUFeature;
 import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.CallingConvention;
 import jdk.vm.ci.code.Register;
-import jdk.vm.ci.code.RegisterArray;
 import jdk.vm.ci.code.RegisterConfig;
 import jdk.vm.ci.code.RegisterValue;
 import jdk.vm.ci.meta.AllocatableValue;
@@ -117,20 +116,21 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
     }
 
     protected static BarrierSetLIRGeneratorTool getBarrierSet(GraalHotSpotVMConfig config, HotSpotProviders providers) {
-        if (config.gc == HotSpotGraalRuntime.HotSpotGC.X) {
-            return new AMD64HotSpotXBarrierSetLIRGenerator(config, providers);
-        }
         if (config.gc == HotSpotGraalRuntime.HotSpotGC.G1) {
             return new AMD64G1BarrierSetLIRGenerator(new AMD64HotSpotG1BarrierSetLIRTool(config, providers));
         }
         if (config.gc == HotSpotGraalRuntime.HotSpotGC.Z) {
             return new AMD64HotSpotZBarrierSetLIRGenerator(config, providers);
         }
+        if (config.gc == HotSpotGraalRuntime.HotSpotGC.Shenandoah) {
+            return new AMD64HotSpotShenandoahBarrierSetLIRGenerator(config, providers);
+        }
         return null;
     }
 
     private AMD64HotSpotLIRGenerator(HotSpotProviders providers, GraalHotSpotVMConfig config, LIRGenerationResult lirGenRes, BackupSlotProvider backupSlotProvider) {
-        this(new AMD64HotSpotLIRKindTool(), new AMD64ArithmeticLIRGenerator(null), getBarrierSet(config, providers), new AMD64HotSpotMoveFactory(backupSlotProvider), providers, config, lirGenRes);
+        this(new AMD64HotSpotLIRKindTool(), new AMD64ArithmeticLIRGenerator(null), getBarrierSet(config, providers),
+                        new AMD64HotSpotMoveFactory(backupSlotProvider, providers.getRegisters().getZeroValueRegister(config)), providers, config, lirGenRes);
     }
 
     protected AMD64HotSpotLIRGenerator(LIRKindTool lirKindTool, AMD64ArithmeticLIRGenerator arithmeticLIRGen, BarrierSetLIRGeneratorTool barrierSetLIRGen, MoveFactory moveFactory,
@@ -146,15 +146,16 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
         return (HotSpotProviders) super.getProviders();
     }
 
+    @SuppressWarnings("unchecked")
     @Override
     public AVXSize getMaxVectorSize(EnumSet<?> runtimeCheckedCPUFeatures) {
         int maxVectorSize = config.maxVectorSize;
-        if (supports(runtimeCheckedCPUFeatures, CPUFeature.AVX512VL)) {
+        if (supports(target(), (EnumSet<CPUFeature>) runtimeCheckedCPUFeatures, CPUFeature.AVX512VL)) {
             if (maxVectorSize < 0 || maxVectorSize >= 64) {
                 return AVXSize.ZMM;
             }
         }
-        if (supports(runtimeCheckedCPUFeatures, CPUFeature.AVX2)) {
+        if (supports(target(), (EnumSet<CPUFeature>) runtimeCheckedCPUFeatures, CPUFeature.AVX2)) {
             if (maxVectorSize < 0 || maxVectorSize >= 32) {
                 return AVXSize.YMM;
             }
@@ -286,7 +287,8 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
     private Register pollOnReturnScratchRegister;
 
     @Override
-    public void emitReturn(JavaKind kind, Value input) {
+    public void emitReturn(JavaKind kind, Value input, AllocatableValue tailCallTarget, AllocatableValue[] additionalReturns) {
+        GraalError.guarantee(Value.ILLEGAL.equals(tailCallTarget), "Returning to a custom return address is unsupported on HotSpot");
         AllocatableValue operand = Value.ILLEGAL;
         if (input != null) {
             operand = resultOperandFor(kind, input.getValueKind());
@@ -300,7 +302,8 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
             append(new AMD64RestoreRegistersOp(saveOnEntry.getSlots(), saveOnEntry));
         }
         Register thread = getProviders().getRegisters().getThreadRegister();
-        append(new AMD64HotSpotReturnOp(operand, getStub() != null, thread, pollOnReturnScratchRegister, config, getResult().requiresReservedStackAccessCheck()));
+        append(new AMD64HotSpotReturnOp(operand, additionalReturns, getStub() != null, thread,
+                        pollOnReturnScratchRegister, config, getResult().requiresReservedStackAccessCheck()));
     }
 
     @Override
@@ -312,7 +315,7 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
     private LIRFrameState currentRuntimeCallInfo;
 
     @Override
-    protected void emitForeignCallOp(ForeignCallLinkage linkage, Value targetAddress, Value result, Value[] arguments, Value[] temps, LIRFrameState info) {
+    protected void emitForeignCallOp(ForeignCallLinkage linkage, Value result, Value[] arguments, Value[] temps, LIRFrameState info) {
         currentRuntimeCallInfo = info;
         HotSpotForeignCallLinkage hsLinkage = (HotSpotForeignCallLinkage) linkage;
         AMD64 arch = (AMD64) target().arch;
@@ -328,7 +331,7 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
              */
             append(new AMD64VZeroUpper(arguments, getRegisterConfig()));
         }
-        super.emitForeignCallOp(linkage, targetAddress, result, arguments, temps, info);
+        super.emitForeignCallOp(linkage, result, arguments, temps, info);
 
         // Handle different return value locations
         Stub stub = getStub();
@@ -383,7 +386,7 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
      * @param exclude
      */
     protected Register[] getSaveableRegisters(boolean forSafepoint, AllocatableValue exclude) {
-        RegisterArray allocatableRegisters = getResult().getRegisterAllocationConfig().getAllocatableRegisters();
+        List<Register> allocatableRegisters = getResult().getRegisterAllocationConfig().getAllocatableRegisters();
 
         ArrayList<Register> registers = new ArrayList<>(allocatableRegisters.size());
         for (Register reg : allocatableRegisters) {
@@ -629,30 +632,29 @@ public class AMD64HotSpotLIRGenerator extends AMD64LIRGenerator implements HotSp
     }
 
     @Override
-    public Value emitTimeStamp() {
-        AMD64ReadTimestampCounterWithProcid timestamp = new AMD64ReadTimestampCounterWithProcid();
-        append(timestamp);
-        // Combine RDX and RAX into a single 64-bit register.
-        AllocatableValue lo = timestamp.getLowResult();
-        Value hi = getArithmetic().emitZeroExtend(timestamp.getHighResult(), 32, 64);
-        return combineLoAndHi(lo, hi);
-    }
-
-    /**
-     * Combines two 32 bit values to a 64 bit value: ( (hi << 32) | lo ).
-     */
-    private Value combineLoAndHi(Value lo, Value hi) {
-        Value shiftedHi = getArithmetic().emitShl(hi, emitConstant(LIRKind.value(AMD64Kind.DWORD), JavaConstant.forInt(32)));
-        return getArithmetic().emitOr(shiftedHi, lo);
-    }
-
-    @Override
     public int getArrayLengthOffset() {
-        return config.arrayOopDescLengthOffset();
+        return config.arrayLengthOffsetInBytes;
     }
 
     @Override
-    public Register getHeapBaseRegister() {
-        return getProviders().getRegisters().getHeapBaseRegister();
+    public boolean isReservedRegister(Register r) {
+        return getProviders().getRegisters().isReservedRegister(r);
+    }
+
+    // no need to call super because HotSpot already overrides the value according to the CPU
+    // features
+    @Override
+    public boolean usePopCountInstruction() {
+        return config.usePopCountInstruction;
+    }
+
+    @Override
+    public boolean useCountLeadingZerosInstruction() {
+        return config.useCountLeadingZerosInstruction;
+    }
+
+    @Override
+    public boolean useCountTrailingZerosInstruction() {
+        return config.useCountTrailingZerosInstruction;
     }
 }

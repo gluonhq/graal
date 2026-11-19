@@ -59,7 +59,6 @@ import com.oracle.graal.pointsto.flow.InvokeTypeFlow;
 import com.oracle.graal.pointsto.flow.LoadFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.MergeTypeFlow;
 import com.oracle.graal.pointsto.flow.MethodFlowsGraph;
-import com.oracle.graal.pointsto.flow.MonitorEnterTypeFlow;
 import com.oracle.graal.pointsto.flow.NewInstanceTypeFlow;
 import com.oracle.graal.pointsto.flow.NullCheckTypeFlow;
 import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow;
@@ -73,7 +72,7 @@ import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.typestate.TypeState;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl;
 
 import jdk.graal.compiler.graphio.GraphOutput;
@@ -234,7 +233,7 @@ class PointsToBreakdown {
         }
     }
 
-    private static class PointToStructure implements GraphStructure<PointsToBreakdown, AnalysisWrapper, WrapperClazz, Port> {
+    private static final class PointToStructure implements GraphStructure<PointsToBreakdown, AnalysisWrapper, WrapperClazz, Port> {
         enum EMPT {
             EDGE
         }
@@ -361,7 +360,6 @@ class PointsToBreakdown {
             names.put(FormalReceiverTypeFlow.class, "formalReceiver");
             names.put(OffsetLoadTypeFlow.LoadIndexedTypeFlow.class, "loadIndexed");
             names.put(MergeTypeFlow.class, "merge");
-            names.put(MonitorEnterTypeFlow.class, "monitorEnter");
             names.put(ProxyTypeFlow.class, "proxy");
             names.put(SourceTypeFlow.class, "source");
             names.put(OffsetStoreTypeFlow.StoreIndexedTypeFlow.class, "storeIndexed");
@@ -500,10 +498,10 @@ class PointsToBreakdown {
         private static final Map<Class<?>, Map<Integer, Map<Integer, Map<String, WrapperClazz>>>> clazzes = new HashMap<>();
 
         static WrapperClazz get(Class<?> clazz, int inputs, int uses, String name) {
-            return clazzes.computeIfAbsent(clazz, c -> new HashMap<>())
-                            .computeIfAbsent(inputs, s -> new HashMap<>())
-                            .computeIfAbsent(uses, s -> new HashMap<>())
-                            .computeIfAbsent(name, n -> new WrapperClazz(clazz, inputs, uses, name));
+            return clazzes.computeIfAbsent(clazz, _ -> new HashMap<>())
+                            .computeIfAbsent(inputs, _ -> new HashMap<>())
+                            .computeIfAbsent(uses, _ -> new HashMap<>())
+                            .computeIfAbsent(name, _ -> new WrapperClazz(clazz, inputs, uses, name));
         }
 
         private WrapperClazz(Class<?> wrappedClass, int inputs, int uses, String name) {
@@ -589,12 +587,12 @@ class PointsToBreakdown {
                 flowWrapper.calleeNames.add(callee.getQualifiedName());
             }
         } else if (flow instanceof NewInstanceTypeFlow || flow instanceof DynamicNewInstanceTypeFlow) {
-            flowWrapper.types = serializeTypeState(bb, flow.getState());
+            flowWrapper.types = serializeTypeState(bb, flow.getRawState());
         } else if (flow instanceof LoadFieldTypeFlow.LoadInstanceFieldTypeFlow || flow instanceof LoadFieldTypeFlow.LoadStaticFieldTypeFlow) {
             LoadFieldTypeFlow loadFlow = (LoadFieldTypeFlow) flow;
             flowWrapper.qualifiedName = fieldName(loadFlow.field());
         } else if (flow instanceof StoreFieldTypeFlow.StoreInstanceFieldTypeFlow || flow instanceof StoreFieldTypeFlow.StoreStaticFieldTypeFlow) {
-            TypeState typeState = flow.getState();
+            TypeState typeState = flow.getRawState();
             flowWrapper.types = serializeTypeState(bb, typeState);
             StoreFieldTypeFlow storeFlow = (StoreFieldTypeFlow) flow;
             flowWrapper.qualifiedName = fieldName(storeFlow.field());

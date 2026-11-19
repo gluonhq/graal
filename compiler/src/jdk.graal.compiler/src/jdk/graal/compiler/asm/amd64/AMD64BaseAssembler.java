@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -43,6 +43,7 @@ import static jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.VEXPrefixConfig.W0
 import static jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.VEXPrefixConfig.W1;
 import static jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.VEXPrefixConfig.WIG;
 import static jdk.graal.compiler.core.common.NumUtil.isByte;
+import static jdk.vm.ci.amd64.AMD64.CPU;
 import static jdk.vm.ci.amd64.AMD64.MASK;
 import static jdk.vm.ci.amd64.AMD64.XMM;
 import static jdk.vm.ci.amd64.AMD64.r12;
@@ -51,8 +52,6 @@ import static jdk.vm.ci.amd64.AMD64.rbp;
 import static jdk.vm.ci.amd64.AMD64.rsp;
 
 import java.util.EnumSet;
-
-import org.graalvm.collections.EconomicSet;
 
 import jdk.graal.compiler.asm.Assembler;
 import jdk.graal.compiler.core.common.Stride;
@@ -71,16 +70,20 @@ import jdk.vm.ci.meta.PlatformKind;
 public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
 
     /**
+     * The set of features we consider necessary for "full" AVX-512 support. In general, we want to
+     * emit only EVEX-encoded AVX-512 instructions if all of these features are present. If any of
+     * these features are missing, we prefer emitting VEX-encoded AVX1/AVX2 instructions.
+     */
+    public static final EnumSet<CPUFeature> FULL_AVX512_FEATURES = EnumSet.of(CPUFeature.AVX512F, CPUFeature.AVX512BW, CPUFeature.AVX512VL, CPUFeature.AVX512DQ);
+
+    /**
      * If this check is false, AVX512 support is absent or incomplete, and it makes little sense to
      * try to use AVX512 over SSE/AVX instructions.
      *
      * @param features feature set to check compatibility against
      */
     public static boolean supportsFullAVX512(EnumSet<CPUFeature> features) {
-        return features.contains(CPUFeature.AVX512F) &&
-                        features.contains(CPUFeature.AVX512BW) &&
-                        features.contains(CPUFeature.AVX512VL) &&
-                        features.contains(CPUFeature.AVX512DQ);
+        return features.containsAll(FULL_AVX512_FEATURES);
     }
 
     public boolean supportsFullAVX512() {
@@ -308,33 +311,13 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
         return getFeatures().contains(feature);
     }
 
-    public final boolean supports(String feature) {
-        try {
-            return getFeatures().contains(AMD64.CPUFeature.valueOf(feature));
-        } catch (IllegalArgumentException e) {
-            return false;
+    public final boolean supports(CPUFeature... features) {
+        for (CPUFeature feature : features) {
+            if (!supports(feature)) {
+                return false;
+            }
         }
-    }
-
-    /**
-     * Mitigates exception throwing by recording unknown CPU feature names.
-     */
-    private final EconomicSet<String> unknownFeatures = EconomicSet.create();
-
-    /**
-     * Determines if the CPU feature denoted by {@code name} is supported. This name based look up
-     * is for features only available in later JVMCI releases.
-     */
-    public final boolean supportsCPUFeature(String name) {
-        if (unknownFeatures.contains(name)) {
-            return false;
-        }
-        try {
-            return supports(CPUFeature.valueOf(name));
-        } catch (IllegalArgumentException e) {
-            unknownFeatures.add(name);
-            return false;
-        }
+        return true;
     }
 
     protected static boolean inRC(RegisterCategory rc, Register r) {
@@ -351,7 +334,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
     /**
      * Constants for X86 prefix bytes.
      */
-    private static class Prefix {
+    private static final class Prefix {
         private static final int REX = 0x40;
         private static final int REXB = 0x41;
         private static final int REXX = 0x42;
@@ -584,7 +567,9 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
      * There is an SIB byte: In that case, X extends SIB.index and B extends SIB.base.
      */
     protected static int getRXB(Register reg, AMD64Address rm) {
-        assert !isInvalidEncoding(reg);
+        GraalError.guarantee(!isInvalidEncoding(reg), "invalid encoding %s", reg);
+        GraalError.guarantee(rm.getBase() == null || !inRC(CPU, rm.getBase()) || rm.getBase().encoding < 16, "APX register used in %s not yet supported", rm);
+        GraalError.guarantee(rm.getIndex() == null || !inRC(CPU, rm.getIndex()) || rm.getIndex().encoding < 16, "APX register used in %s not yet supported", rm);
         int rxb = (reg == null ? 0 : reg.encoding & 0x08) >> 1;
         if (!isInvalidEncoding(rm.getIndex())) {
             rxb |= (rm.getIndex().encoding & 0x08) >> 2;
@@ -635,6 +620,10 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
     protected final void emitOperandHelper(Register reg, AMD64Address addr, int additionalInstructionSize) {
         assert !isInvalidEncoding(reg);
         emitOperandHelper(encode(reg), addr, false, additionalInstructionSize, DEFAULT_DISP8_SCALE);
+    }
+
+    protected final void emitOperandHelper(int reg, AMD64Address addr, int additionalInstructionSize, int evexDisp8Scale) {
+        emitOperandHelper(reg, addr, false, additionalInstructionSize, evexDisp8Scale);
     }
 
     protected final void emitOperandHelper(Register reg, AMD64Address addr, int additionalInstructionSize, int evexDisp8Scale) {
@@ -692,7 +681,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
                             int newDisp = disp / evexDisp8Scale;
                             if (isByte(newDisp)) {
                                 disp = newDisp;
-                                assert isByte(disp) && !overriddenForce4Byte : disp;
+                                assert isByte(disp) : disp;
                             }
                         } else {
                             overriddenForce4Byte = true;
@@ -728,7 +717,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
                             int newDisp = disp / evexDisp8Scale;
                             if (isByte(newDisp)) {
                                 disp = newDisp;
-                                assert isByte(disp) && !overriddenForce4Byte : disp;
+                                assert isByte(disp) : disp;
                             }
                         } else {
                             overriddenForce4Byte = true;
@@ -762,7 +751,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
                             int newDisp = disp / evexDisp8Scale;
                             if (isByte(newDisp)) {
                                 disp = newDisp;
-                                assert isByte(disp) && !overriddenForce4Byte : disp;
+                                assert isByte(disp) : disp;
                             }
                         } else {
                             overriddenForce4Byte = true;
@@ -824,7 +813,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
 
     }
 
-    private class SSEEncoderImpl implements SIMDEncoder {
+    private final class SSEEncoderImpl implements SIMDEncoder {
 
         @Override
         public void simdPrefix(Register xreg, Register nds, AMD64Address adr, int sizePrefix, int opcodeEscapePrefix, boolean isRexW) {
@@ -886,7 +875,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
         }
     }
 
-    private class VEXEncoderImpl implements SIMDEncoder {
+    private final class VEXEncoderImpl implements SIMDEncoder {
 
         private int sizePrefixToPP(int sizePrefix) {
             switch (sizePrefix) {
@@ -918,7 +907,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
         public void simdPrefix(Register reg, Register nds, AMD64Address rm, int sizePrefix, int opcodeEscapePrefix, boolean isRexW) {
             assert reg.encoding < 16 : "encoding out of range: " + reg.encoding;
             assert nds.encoding < 16 : "encoding out of range: " + nds.encoding;
-            emitVEX(L128, sizePrefixToPP(sizePrefix), opcodeEscapePrefixToMMMMM(opcodeEscapePrefix), isRexW ? W1 : W0, getRXB(reg, rm), nds.isValid() ? nds.encoding : 0, true);
+            emitVEX(L128, sizePrefixToPP(sizePrefix), opcodeEscapePrefixToMMMMM(opcodeEscapePrefix), isRexW ? W1 : W0, getRXB(reg, rm), nds.isValid() ? nds.encoding : 0);
         }
 
         @Override
@@ -926,7 +915,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
             assert dst.encoding < 16 : "encoding out of range: " + dst.encoding;
             assert src.encoding < 16 : "encoding out of range: " + src.encoding;
             assert nds.encoding < 16 : "encoding out of range: " + nds.encoding;
-            emitVEX(L128, sizePrefixToPP(sizePrefix), opcodeEscapePrefixToMMMMM(opcodeEscapePrefix), isRexW ? W1 : W0, getRXB(dst, src), nds.isValid() ? nds.encoding : 0, true);
+            emitVEX(L128, sizePrefixToPP(sizePrefix), opcodeEscapePrefixToMMMMM(opcodeEscapePrefix), isRexW ? W1 : W0, getRXB(dst, src), nds.isValid() ? nds.encoding : 0);
         }
     }
 
@@ -1010,9 +999,7 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
      * This function automatically chooses the 2 or 3 byte encoding, based on the XBW flags and the
      * m-mmmm field.
      */
-    protected final void emitVEX(int l, int pp, int mmmmm, int w, int rxb, int vvvv, boolean checkAVX) {
-        assert !checkAVX || getFeatures().contains(CPUFeature.AVX) : "emitting VEX prefix on a CPU without AVX support";
-
+    protected final void emitVEX(int l, int pp, int mmmmm, int w, int rxb, int vvvv) {
         assert l == L128 || l == L256 : "invalid value for VEX.L";
         assert pp == P_ || pp == P_66 || pp == P_F3 || pp == P_F2 : "invalid value for VEX.pp";
         assert mmmmm == M_0F || mmmmm == M_0F38 || mmmmm == M_0F3A : "invalid value for VEX.m-mmmm";
@@ -1091,6 +1078,11 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
 
         public static final int B0 = 0x0;
         public static final int B1 = 0x1;
+
+        public static final int RNE = 0x0;
+        public static final int RD = 0x1;
+        public static final int RU = 0x2;
+        public static final int RZ = 0x3;
 
         private EVEXPrefixConfig() {
         }
@@ -1243,9 +1235,13 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
      * The aaa field encodes the operand mask register.
      */
     private void emitEVEX(int l, int pp, int mm, int w, int rxb, int reg, int vvvvv, int z, int b, int aaa) {
+        emitEVEX(l, pp, mm, w, rxb, reg, vvvvv, z, b, aaa, false);
+    }
+
+    private void emitEVEX(int l, int pp, int mm, int w, int rxb, int reg, int vvvvv, int z, int b, int aaa, boolean allowEmbeddedRounding) {
         assert getFeatures().contains(CPUFeature.AVX512F) : "emitting EVEX prefix on a CPU without AVX512 support";
 
-        assert l == L128 || l == L256 || l == L512 : "invalid value for EVEX.L'L";
+        assert l == L128 || l == L256 || l == L512 || (allowEmbeddedRounding && b == B1 && l >= EVEXPrefixConfig.RNE && l <= EVEXPrefixConfig.RZ) : "invalid value for EVEX.L'L";
         assert pp == P_ || pp == P_66 || pp == P_F3 || pp == P_F2 : "invalid value for EVEX.pp";
         assert mm == M_0F || mm == M_0F38 || mm == M_0F3A : "invalid value for EVEX.mm";
         assert w == W0 || w == W1 : "invalid value for EVEX.W";
@@ -1300,15 +1296,35 @@ public abstract class AMD64BaseAssembler extends Assembler<CPUFeature> {
         emitEVEX(getLFlag(size), pp, mm, w, getRXBForEVEX(dst, src), (dst == null ? 0 : dst.encoding), nds.isValid() ? nds.encoding() : 0, z, b, mask.isValid() ? mask.encoding : 0);
     }
 
+    protected final void evexPrefixWithEmbeddedRounding(Register dst, Register mask, Register nds, Register src, AVXKind.AVXSize size, int pp, int mm, int w, int z, int b, int roundingMode) {
+        assert !mask.isValid() || inRC(MASK, mask);
+        assert size == AVXKind.AVXSize.XMM : "embedded rounding is only supported for scalar instructions";
+        assert b == B1 : "embedded rounding requires EVEX.b";
+        assert roundingMode >= EVEXPrefixConfig.RNE && roundingMode <= EVEXPrefixConfig.RZ : "invalid value for EVEX embedded rounding mode";
+        emitEVEX(roundingMode, pp, mm, w, getRXBForEVEX(dst, src), (dst == null ? 0 : dst.encoding), nds.isValid() ? nds.encoding() : 0, z, b, mask.isValid() ? mask.encoding : 0, true);
+    }
+
     /**
      * Helper method for emitting EVEX prefix in the form of RRRM. Because the memory addressing in
      * EVEX-encoded instructions employ a compressed displacement scheme when using disp8 form, the
      * user of this API should make sure to encode the operands using
-     * {@link #emitOperandHelper(Register, AMD64Address, int, int)}.
+     * {@link #emitOperandHelper(Register, AMD64Address, int, int)}. For VSIB addressing, EVEX.V'
+     * extends the vector index instead of {@code nds}, which must be absent.
      */
     protected final void evexPrefix(Register dst, Register mask, Register nds, AMD64Address src, AVXKind.AVXSize size, int pp, int mm, int w, int z, int b) {
         assert !mask.isValid() || inRC(MASK, mask);
-        emitEVEX(getLFlag(size), pp, mm, w, getRXB(dst, src), (dst == null ? 0 : dst.encoding), nds.isValid() ? nds.encoding() : 0, z, b, mask.isValid() ? mask.encoding : 0);
+        int vvvvv = nds.isValid() ? nds.encoding() : 0;
+        if (src.getIndex() != null && inRC(XMM, src.getIndex())) {
+            GraalError.guarantee(!nds.isValid(), "VSIB addressing cannot encode an NDS register: %s", nds);
+            /*
+             * The address index is a vector register, so this operand uses VSIB addressing. We must
+             * encode bit 4 of the index encoding in EVEX.V' rather than an NDS extension because V'
+             * selects the upper half of the vector register set for VSIB. We zero the low four bits
+             * because emitEVEX inverts them to the required EVEX.vvvv value of 1111.
+             */
+            vvvvv = src.getIndex().encoding() & 0x10;
+        }
+        emitEVEX(getLFlag(size), pp, mm, w, getRXB(dst, src), (dst == null ? 0 : dst.encoding), vvvvv, z, b, mask.isValid() ? mask.encoding : 0);
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -46,8 +46,11 @@ import jdk.graal.compiler.asm.Assembler;
 import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.code.CompilationResult;
 import jdk.graal.compiler.code.CompilationResult.CodeAnnotation;
+import jdk.graal.compiler.code.CompilationResult.CompilationResultWatermark;
 import jdk.graal.compiler.code.CompilationResult.JumpTable;
 import jdk.graal.compiler.code.DataSection.Data;
+import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.core.common.cfg.AbstractControlFlowGraph;
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
 import jdk.graal.compiler.core.common.type.DataPointerConstant;
@@ -101,26 +104,10 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
 
     public static final List<LIRInstructionVerifier> NO_VERIFIERS = Collections.emptyList();
 
-    private static class ExceptionInfo {
-
-        public final int codeOffset;
-        public final LabelRef exceptionEdge;
-
-        ExceptionInfo(int pcOffset, LabelRef exceptionEdge) {
-            this.codeOffset = pcOffset;
-            this.exceptionEdge = exceptionEdge;
-        }
+    public record ExceptionInfo(int codeOffset, LabelRef exceptionEdge) {
     }
 
-    public static class PendingImplicitException {
-
-        public final int codeOffset;
-        public final ImplicitLIRFrameState state;
-
-        PendingImplicitException(int pcOffset, ImplicitLIRFrameState state) {
-            this.codeOffset = pcOffset;
-            this.state = state;
-        }
+    public record PendingImplicitException(int codeOffset, ImplicitLIRFrameState state) {
     }
 
     public final Assembler<?> asm;
@@ -178,6 +165,10 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     /** PCOffset passed within last call to {@link #recordImplicitException(int, LIRFrameState)}. */
     private int lastImplicitExceptionOffset = Integer.MIN_VALUE;
 
+    private final boolean delayPostCallNops;
+    private int pendingPostCallNopPc = Integer.MIN_VALUE;
+    private Label pendingPostCallExceptionHandlerLabel;
+
     private final List<LIRInstructionVerifier> lirInstructionVerifiers;
 
     public CompilationResultBuilder(CoreProviders providers,
@@ -190,7 +181,8 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
                     CompilationResult compilationResult,
                     Register uncompressedNullRegister,
                     List<LIRInstructionVerifier> lirInstructionVerifiers,
-                    LIR lir) {
+                    LIR lir,
+                    boolean delayPostCallNops) {
         super(providers);
         this.target = providers.getCodeCache().getTarget();
         this.frameMap = frameMap;
@@ -202,6 +194,7 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
         this.frameContext = frameContext;
         this.options = options;
         this.debug = debug;
+        this.delayPostCallNops = delayPostCallNops;
         assert frameContext != null;
         this.dataCache = EconomicMap.create(Equivalence.DEFAULT);
         this.lirInstructionVerifiers = Objects.requireNonNull(lirInstructionVerifiers);
@@ -228,6 +221,10 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
      * @return the recorded entry for the mark
      */
     public CompilationResult.CodeMark recordMark(int codePos, CompilationResult.MarkId markId) {
+        if (markId.isUnique() && asm.isRecordingCodeSnippet()) {
+            // We cannot duplicate unique MarkId
+            asm.abortRecordingCodeSnippet();
+        }
         return compilationResult.recordMark(codePos, markId);
     }
 
@@ -250,8 +247,15 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
      * the compilation result and then {@linkplain #closeCompilationResult() closes} it.
      */
     public void finish() {
-        int position = asm.position();
-        compilationResult.setTargetCode(asm.close(false), position);
+        /*
+         * If the last emitted instruction was a call with debug info and we did not need the NOP
+         * for a following debug site, keep the call return PC inside this method. Otherwise the
+         * return PC is exactly at the method end and can become indistinguishable from the next
+         * method's start after image code layout.
+         */
+        maybeEmitDelayedPostCallNop(asm.position());
+        byte[] data = asm.close(false);
+        compilationResult.setTargetCode(data, asm.finalCodeSize());
 
         // Record exception handlers if they exist
         if (exceptionInfoList != null) {
@@ -294,7 +298,17 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     }
 
     public void recordImplicitException(int pcOffset, int dispatchOffset, LIRFrameState info) {
-        compilationResult.recordImplicitException(pcOffset, dispatchOffset, info.debugInfo());
+        DebugInfo debugInfo = info.debugInfo();
+        int recordedPcOffset = pcOffset;
+        int recordedDispatchOffset = dispatchOffset;
+        if (debugInfo != null) {
+            int adjustedPcOffset = maybeEmitDelayedPostCallNop(pcOffset);
+            if (adjustedPcOffset != pcOffset) {
+                recordedDispatchOffset = dispatchOffset == pcOffset ? adjustedPcOffset : dispatchOffset;
+                recordedPcOffset = adjustedPcOffset;
+            }
+        }
+        compilationResult.recordImplicitException(recordedPcOffset, recordedDispatchOffset, debugInfo);
         assert info.exceptionEdge == null;
     }
 
@@ -329,6 +343,28 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
         return infopoint;
     }
 
+    public void postCallNop(Call call) {
+        postCallNop(call, (Label) null);
+    }
+
+    public void postCallNop(Call call, LIRFrameState info) {
+        postCallNop(call, info != null && info.exceptionEdge != null ? info.exceptionEdge.label() : null);
+    }
+
+    private void postCallNop(Call call, Label exceptionHandlerLabel) {
+        if (!delayPostCallNops) {
+            asm.postCallNop(call);
+        } else if (call.debugInfo != null) {
+            /*
+             * Defer the NOP until we see another debug site or adjacent exception handler at the
+             * call return PC. Consecutive calls do not collide: call metadata is encoded at each
+             * call's return PC.
+             */
+            pendingPostCallNopPc = call.pcOffset + call.size;
+            pendingPostCallExceptionHandlerLabel = exceptionHandlerLabel;
+        }
+    }
+
     public void recordInfopoint(int pos, LIRFrameState info, InfopointReason reason) {
         // infopoints always need debug info
         DebugInfo debugInfo = info.debugInfo();
@@ -336,7 +372,30 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     }
 
     public void recordInfopoint(int pos, DebugInfo debugInfo, InfopointReason reason) {
-        compilationResult.recordInfopoint(pos, debugInfo, reason);
+        int recordedPos = pos;
+        if (debugInfo != null) {
+            recordedPos = maybeEmitDelayedPostCallNop(pos);
+        }
+        compilationResult.recordInfopoint(recordedPos, debugInfo, reason);
+    }
+
+    private int maybeEmitDelayedPostCallNop(int pos) {
+        if (delayPostCallNops && pos == pendingPostCallNopPc) {
+            GraalError.guarantee(pos == asm.position(), "Cannot insert delayed post-call NOP at already emitted position %d", pos);
+            asm.ensureUniquePC();
+            pendingPostCallNopPc = Integer.MIN_VALUE;
+            pendingPostCallExceptionHandlerLabel = null;
+            return asm.position();
+        }
+        return pos;
+    }
+
+    public void maybeEmitDelayedPostCallNopBeforeLabel(Label label) {
+        if (delayPostCallNops && label == pendingPostCallExceptionHandlerLabel) {
+            maybeEmitDelayedPostCallNop(asm.position());
+            pendingPostCallNopPc = Integer.MIN_VALUE;
+            pendingPostCallExceptionHandlerLabel = null;
+        }
     }
 
     public void recordSourceMapping(int pcOffset, int endPcOffset, NodeSourcePosition sourcePosition) {
@@ -448,6 +507,11 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     public boolean isSuccessorEdge(LabelRef edge) {
         assert lir != null;
         int[] order = lir.codeEmittingOrder();
+        if (currentBlockIndex >= order.length) {
+            // we are in a slow path stub
+            return false;
+        }
+
         assert order[currentBlockIndex] == edge.getSourceBlock().getId() : Assertions.errorMessage(order[currentBlockIndex], edge, edge.getSourceBlock());
         BasicBlock<?> nextBlock = LIR.getNextBlock(lir.getControlFlowGraph(), order, currentBlockIndex);
         return nextBlock == edge.getTargetBlock();
@@ -491,6 +555,16 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     }
 
     /**
+     * Speculate whether {@code block} represents a switch case. When
+     * {@link GraalOptions#AlignJumpTableEntry} is enabled, align each switch-case block but skip
+     * further alignment governed by {@link GraalOptions#IsolatedLoopHeaderAlignment} to avoid
+     * excessive paddings.
+     */
+    private static boolean maybeAlignedSwitchCase(BasicBlock<?> block) {
+        return block.getPredecessorCount() == 1 && block.getPredecessorAt(0).getSuccessorCount() > 2;
+    }
+
+    /**
      * Emits code for {@code lir} in its {@linkplain LIR#codeEmittingOrder() code emitting order}.
      */
     public void emitLIR() {
@@ -507,7 +581,7 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
                             lir.codeEmittingOrder()[currentBlockIndex] == blockId : Assertions.errorMessageContext("b", b, "lir.codeOrder", lir.codeEmittingOrder(), "currentBlockIndex",
                                             currentBlockIndex, "blockId", blockId);
             if (b != null) {
-                if (b.isAligned() && previousBlock != null) {
+                if (b.isAligned() && !maybeAlignedSwitchCase(b) && previousBlock != null) {
                     boolean hasSuccessorB = false;
                     for (int i = 0; i < previousBlock.getSuccessorCount(); i++) {
                         BasicBlock<?> succ = previousBlock.getSuccessorAt(i);
@@ -595,6 +669,9 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
     private void emitOp(LIRInstruction op) {
         try {
             int start = asm.position();
+            if (delayPostCallNops && op.hasState() && !(op instanceof StandardOp.CallOp)) {
+                start = maybeEmitDelayedPostCallNop(start);
+            }
             op.emitCode(this);
             if (op.getPosition() != null) {
                 recordSourceMapping(start, asm.position(), op.getPosition());
@@ -637,6 +714,8 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
         }
         currentBlockIndex = 0;
         lastImplicitExceptionOffset = Integer.MIN_VALUE;
+        pendingPostCallNopPc = Integer.MIN_VALUE;
+        pendingPostCallExceptionHandlerLabel = null;
         lir.resetLabels();
         needsMHDeoptHandler = false;
         conservativeLabelOffsets = false;
@@ -693,7 +772,7 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
         Integer instructionPosition = lirPositions.get(instruction);
         if (labelPosition != null && instructionPosition != null) {
             /* If both LIR positions are known, then check distance between instructions. */
-            return Math.abs(labelPosition - instructionPosition) < maxLIRDistance;
+            return NumUtil.safeAbs(labelPosition - instructionPosition) < maxLIRDistance;
         } else {
             /* Otherwise, it is not possible to make an estimation. */
             return false;
@@ -742,5 +821,62 @@ public class CompilationResultBuilder extends CoreProvidersDelegate {
 
     public List<PendingImplicitException> getPendingImplicitExceptionList() {
         return pendingImplicitExceptionList;
+    }
+
+    /**
+     * @return the sizes of recorded and pending Sites
+     */
+    public CompilationResultWatermark getSitesWatermark() {
+        return compilationResult.getSitesWatermark(exceptionInfoList == null ? 0 : exceptionInfoList.size(),
+                        pendingImplicitExceptionList == null ? 0 : pendingImplicitExceptionList.size());
+    }
+
+    /**
+     * We assume the order of {@link ExceptionInfo} in {@link #exceptionInfoList} and the order of
+     * {@link PendingImplicitException} in {@link #pendingImplicitExceptionList} will not change.
+     * Any
+     */
+    private boolean verifyPendingSites(int codeStart, CompilationResultWatermark watermarkAtCodeStart, int codeEnd, CompilationResultWatermark watermarkAtCodeEnd) {
+        if (exceptionInfoList != null) {
+            for (int i = 0; i < exceptionInfoList.size(); i++) {
+                int codeOffset = exceptionInfoList.get(i).codeOffset;
+                if (watermarkAtCodeStart.pendingExceptionInfoListSize() <= i && i < watermarkAtCodeEnd.pendingExceptionInfoListSize()) {
+                    assert codeStart <= codeOffset && codeOffset < codeEnd : Assertions.errorMessage(codeOffset, codeStart, codeEnd, exceptionInfoList);
+                } else {
+                    assert codeOffset < codeStart || codeOffset >= codeEnd : Assertions.errorMessage(codeOffset, codeStart, codeEnd, exceptionInfoList);
+                }
+            }
+        }
+        if (pendingImplicitExceptionList != null) {
+            for (int i = 0; i < pendingImplicitExceptionList.size(); i++) {
+                int codeOffset = pendingImplicitExceptionList.get(i).codeOffset;
+                if (watermarkAtCodeStart.pendingImplicitExceptionListSize() <= i && i < watermarkAtCodeEnd.pendingImplicitExceptionListSize()) {
+                    assert codeStart <= codeOffset && codeOffset < codeEnd : Assertions.errorMessage(codeOffset, codeStart, codeEnd, pendingImplicitExceptionList);
+                } else {
+                    assert codeOffset < codeStart || codeOffset >= codeEnd : Assertions.errorMessage(codeOffset, codeStart, codeEnd, pendingImplicitExceptionList);
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Duplicates the sites between {@code codeStart} and {@code codeEnd} with an offset.
+     */
+    public void duplicateSites(int codeStart, CompilationResultWatermark watermarkAtCodeStart, int codeEnd, CompilationResultWatermark watermarkAtCodeEnd, int offset) {
+        assert verifyPendingSites(codeStart, watermarkAtCodeStart, codeEnd, watermarkAtCodeEnd) : Assertions.errorMessage(codeStart, codeEnd);
+        if (exceptionInfoList != null) {
+            for (int i = watermarkAtCodeStart.pendingExceptionInfoListSize(); i < watermarkAtCodeEnd.pendingExceptionInfoListSize(); i++) {
+                ExceptionInfo ei = exceptionInfoList.get(i);
+                exceptionInfoList.add(new ExceptionInfo(ei.codeOffset + offset, ei.exceptionEdge));
+            }
+        }
+        if (pendingImplicitExceptionList != null) {
+            for (int i = watermarkAtCodeStart.pendingImplicitExceptionListSize(); i < watermarkAtCodeEnd.pendingImplicitExceptionListSize(); i++) {
+                PendingImplicitException pendingImplicitException = pendingImplicitExceptionList.get(i);
+                pendingImplicitExceptionList.add(new PendingImplicitException(pendingImplicitException.codeOffset + offset, pendingImplicitException.state()));
+            }
+        }
+        compilationResult.duplicateSites(codeStart, watermarkAtCodeStart, codeEnd, watermarkAtCodeEnd, offset);
     }
 }

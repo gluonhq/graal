@@ -26,20 +26,35 @@ package com.oracle.svm.core.meta;
 
 import java.util.Objects;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.guest.staging.meta.MethodPointer;
+
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.VMConstant;
 
-public class SubstrateMethodPointerConstant implements VMConstant {
+public final class SubstrateMethodPointerConstant implements VMConstant {
 
+    /*
+     * This entire class should be hosted-only, but with runtime compilation the analysis encounters
+     * it in type checks in the compiler backend. We mark this field hosted-only to fail on any
+     * actual runtime usage of this class.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class) //
     private final MethodPointer pointer;
 
+    @Platforms(Platform.HOSTED_ONLY.class)
     public SubstrateMethodPointerConstant(MethodPointer pointer) {
-        this.pointer = pointer;
+        this.pointer = Objects.requireNonNull(pointer);
     }
-
-    public static final SubstrateMethodPointerConstant ALWAYS_NULL = new SubstrateMethodPointerConstant(null);
 
     public MethodPointer pointer() {
         return pointer;
+    }
+
+    public ResolvedJavaMethod getMethod() {
+        return MethodRefSupport.getMethod(pointer);
     }
 
     @Override
@@ -54,25 +69,21 @@ public class SubstrateMethodPointerConstant implements VMConstant {
 
     @Override
     public String toString() {
-        return "method: " + (pointer == null ? "null" : pointer.getMethod().format("%H.%n"));
+        return "method: " + getMethod().format("%H.%n");
     }
 
     @Override
     public boolean equals(Object obj) {
-        if (!(obj instanceof SubstrateMethodPointerConstant)) {
-            return false;
+        if (this == obj) {
+            return true;
         }
-        if (this == ALWAYS_NULL) {
-            return obj == ALWAYS_NULL;
-        } else if (obj == ALWAYS_NULL) {
-            return this == ALWAYS_NULL;
-        }
-        SubstrateMethodPointerConstant that = (SubstrateMethodPointerConstant) obj;
-        return this == obj || this.pointer.getMethod().equals(that.pointer.getMethod());
+        return obj instanceof SubstrateMethodPointerConstant other &&
+                        getMethod().equals(other.getMethod()) &&
+                        pointer.permitsRewriteToPLT() == other.pointer.permitsRewriteToPLT();
     }
 
     @Override
     public int hashCode() {
-        return pointer == null ? 0 : Objects.hashCode(pointer.getMethod());
+        return Objects.hashCode(getMethod());
     }
 }

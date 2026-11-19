@@ -25,17 +25,28 @@
 package com.oracle.svm.core.heap;
 
 import org.graalvm.nativeimage.c.function.CodePointer;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.hub.Hybrid;
-
-import jdk.graal.compiler.word.Word;
+import com.oracle.svm.guest.staging.hub.Hybrid;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 
 /**
  * Persisted execution state of a yielded continuation, use via {@link StoredContinuationAccess}.
+ *
+ * Stored continuations are {@link Hybrid} objects where the array part contains the raw stack data.
+ * After writing the stack data into the object, we manually emit the correct GC write barriers for
+ * all the references (see {@link Heap#dirtyAllReferencesOf}).
  */
 @Hybrid(componentType = Word.class)
 public final class StoredContinuation {
     CodePointer ip;
+
+    /**
+     * The stack pointer (of the top frame) while yielding on the original carrier thread, for
+     * adjusting frame pointers and spilled stack pointers when mounting on another carrier thread.
+     */
+    Pointer originalCarrierSP;
 
     /** Must be allocated via {@link StoredContinuationAccess}. */
     private StoredContinuation() {

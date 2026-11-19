@@ -145,7 +145,7 @@ public final class TruffleLogger {
      * already exists it's returned, otherwise a new logger is created.
      *
      * @param id the unique id of language or instrument
-     * @param loggerName the the name of a {@link TruffleLogger}, if a {@code loggerName} is null or
+     * @param loggerName the name of a {@link TruffleLogger}, if a {@code loggerName} is null or
      *            empty a root logger for language or instrument is returned
      * @return a {@link TruffleLogger}
      * @throws NullPointerException if {@code id} is null
@@ -833,7 +833,7 @@ public final class TruffleLogger {
     }
 
     private int getLevelNum() {
-        if (!levelNumStable.isValid()) {
+        if (CompilerDirectives.isPartialEvaluationConstant(this) && !levelNumStable.isValid()) {
             CompilerDirectives.transferToInterpreterAndInvalidate();
         }
         return levelNum;
@@ -948,7 +948,6 @@ public final class TruffleLogger {
         private final LoggerNode root;
         private final Set<ContextWeakReference> activeContexts;
         private Map<String, Level> effectiveLevels;
-        private volatile Set<String> knownIds;
 
         LoggerCache(Object loggerCacheSpi) {
             Objects.requireNonNull(loggerCacheSpi);
@@ -962,8 +961,12 @@ public final class TruffleLogger {
         }
 
         synchronized void addLogLevelsForVMObject(final Object vmObject, final Map<String, Level> addedLevels) {
+            /*
+             * During pre-initialized context patching, the same vmObject can be configured again.
+             * Remove any existing registration first to keep activeContexts canonical.
+             */
+            Set<String> toRemove = removeContext(vmObject);
             activeContexts.add(new ContextWeakReference(vmObject, contextsRefQueue, addedLevels));
-            final Set<String> toRemove = collectRemovedLevels();
             reconfigure(addedLevels, toRemove);
         }
 
@@ -984,12 +987,15 @@ public final class TruffleLogger {
         }
 
         synchronized boolean isLoggable(final String loggerName, final Level level) {
-
+            /*
+             * Capture the context cardinality before processing queued GCed contexts. Reference
+             * cleanup may transition from multi-context to single-context without recomputing
+             * cached logger levels.
+             */
+            boolean isSingleContext = activeContexts.size() == 1;
             final Set<String> toRemove = collectRemovedLevels();
             if (!toRemove.isEmpty()) {
                 reconfigure(Collections.emptyMap(), toRemove);
-                // Logger's effective level may changed
-                return getLogger(loggerName).isLoggable(level);
             }
             final Map<String, Level> current = LanguageAccessor.engineAccess().getLogLevels(getSPI());
             if (current == null) {
@@ -999,7 +1005,7 @@ public final class TruffleLogger {
                 final int currentLevel = DEFAULT_VALUE;
                 return level.intValue() >= currentLevel && currentLevel != OFF_VALUE;
             }
-            if (activeContexts.size() == 1) {
+            if (isSingleContext) {
                 return true;
             }
             final int currentLevel = computeLevel(loggerName, current);
@@ -1040,6 +1046,7 @@ public final class TruffleLogger {
                         found = logger;
                         break;
                     }
+                    // Parfait_ALLOW toctou-race-condition-warning (compare-and-set pattern)
                     found = getLogger(loggerName);
                 }
             }
@@ -1047,24 +1054,11 @@ public final class TruffleLogger {
         }
 
         private TruffleLogger getOrCreateLogger(final String id, final String loggerName) {
-            Set<String> ids = getKnownIds();
-            if (!ids.contains(id)) {
-                throw new IllegalArgumentException("Unknown language or instrument id " + id + ", known ids: " + String.join(", ", ids));
+            if (!LanguageAccessor.ENGINE.isKnownLoggerId(loggerCache, id)) {
+                throw new IllegalArgumentException("Unknown language or instrument id " + id + ", known ids: " + String.join(", ", LanguageAccessor.ENGINE.getKnownLoggerIds(loggerCache)));
             }
             final String globalLoggerId = loggerName == null || loggerName.isEmpty() ? id : id + '.' + loggerName;
             return getOrCreateLogger(globalLoggerId);
-        }
-
-        private Set<String> getKnownIds() {
-            Set<String> result = knownIds;
-            if (result == null) {
-                result = new HashSet<>();
-                result.addAll(LanguageAccessor.engineAccess().getInternalIds());
-                result.addAll(LanguageAccessor.engineAccess().getLanguageIds());
-                result.addAll(LanguageAccessor.engineAccess().getInstrumentIds());
-                knownIds = result;
-            }
-            return result;
         }
 
         Object getSPI() {
@@ -1120,6 +1114,7 @@ public final class TruffleLogger {
         }
 
         private Set<String> removeContext(Object vmObject) {
+            assert Thread.holdsLock(this);
             final Set<String> toRemove = collectRemovedLevels();
             for (Iterator<ContextWeakReference> it = activeContexts.iterator(); it.hasNext();) {
                 final ContextWeakReference ref = it.next();
@@ -1392,6 +1387,7 @@ public final class TruffleLogger {
             }
 
             private void updateChildParentsImpl(final TruffleLogger parentLogger) {
+                assert Thread.holdsLock(LoggerCache.this);
                 if (children == null || children.isEmpty()) {
                     return;
                 }

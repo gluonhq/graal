@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -62,6 +62,16 @@ public final class RemoteObject {
          * Map entry. An array of the key and value.
          */
         MAP_ENTRY,
+
+        /**
+         * Array properties object created by debugger helper emulation.
+         */
+        ARRAY_PROPERTIES,
+
+        /**
+         * Array slots object created by debugger helper emulation.
+         */
+        ARRAY_SLOTS,
     }
 
     private static final Double NEGATIVE_DOUBLE_0 = Double.valueOf("-0");
@@ -102,7 +112,7 @@ public final class RemoteObject {
         this(debugValue, readEagerly, generatePreview, context, indexRange, null);
     }
 
-    private RemoteObject(DebugValue debugValue, boolean readEagerly, boolean generatePreview, InspectorExecutionContext context, IndexRange indexRange, TypeMark typeMark) {
+    public RemoteObject(DebugValue debugValue, boolean readEagerly, boolean generatePreview, InspectorExecutionContext context, IndexRange indexRange, TypeMark typeMark) {
         this.valueValue = debugValue;
         this.valueScope = null;
         this.generatePreview = generatePreview;

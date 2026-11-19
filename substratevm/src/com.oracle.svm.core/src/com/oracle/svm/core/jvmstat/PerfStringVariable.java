@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,8 +30,10 @@ import static jdk.vm.ci.meta.JavaKind.Byte;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.shared.ReflectivelyAccessed;
+
 public class PerfStringVariable extends PerfString implements MutablePerfDataEntry {
-    private final byte[] nullTerminatedValue;
+    @ReflectivelyAccessed private final byte[] nullTerminatedValue;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     PerfStringVariable(String name, int lengthInBytes) {
@@ -46,8 +48,12 @@ public class PerfStringVariable extends PerfString implements MutablePerfDataEnt
 
     public void allocate(String initialValue) {
         allocate();
-        // As on HotSpot, we reduce the length by 1 so that the null terminator fits as well.
-        byte[] stringBytes = AbstractPerfDataEntry.getBytes(initialValue, nullTerminatedValue.length - 1);
+        setValue(initialValue);
+    }
+
+    public void setValue(String value) {
+        // Reduce the length by 1 so that the null terminator fits as well.
+        byte[] stringBytes = AbstractPerfDataEntry.getBytes(value, nullTerminatedValue.length - 1);
         System.arraycopy(stringBytes, 0, nullTerminatedValue, 0, stringBytes.length);
         nullTerminatedValue[stringBytes.length] = 0;
         writeBytes(valuePtr, nullTerminatedValue);

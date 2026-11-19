@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.core.jdk;
 
-import static com.oracle.svm.core.heap.RestrictHeapAccess.Access.NO_ALLOCATION;
+import static com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess.Access.NO_ALLOCATION;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.LogHandler;
@@ -32,23 +32,25 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
-import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.SubstrateDiagnostics;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.annotate.AnnotateOriginal;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.heap.RestrictHeapAccess;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.core.log.CoreLogSupport;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
 import com.oracle.svm.core.thread.VMThreads.SafepointBehavior;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.nodes.UnreachableNode;
 
-@TargetClass(com.oracle.svm.core.util.VMError.class)
+@TargetClass(VMError.class)
 @Platforms(InternalPlatform.NATIVE_ONLY.class)
-final class Target_com_oracle_svm_core_util_VMError {
+final class Target_com_oracle_svm_shared_util_VMError {
 
     /*
      * These substitutions let the svm print the real message. The original VMError methods throw a
@@ -80,6 +82,13 @@ final class Target_com_oracle_svm_core_util_VMError {
     @Uninterruptible(reason = "Allow VMError to be used in uninterruptible code.")
     @Substitute
     private static RuntimeException shouldNotReachHereUnexpectedInput(@SuppressWarnings("unused") Object input) {
+        throw VMErrorSubstitutions.shouldNotReachHere(KnownIntrinsics.readReturnAddress(), VMError.msgShouldNotReachHereUnexpectedInput, null);
+    }
+
+    @NeverInline("Accessing instruction pointer of the caller frame")
+    @Uninterruptible(reason = "Allow VMError to be used in uninterruptible code.")
+    @Substitute
+    private static RuntimeException shouldNotReachHereUnexpectedInput(@SuppressWarnings("unused") long input) {
         throw VMErrorSubstitutions.shouldNotReachHere(KnownIntrinsics.readReturnAddress(), VMError.msgShouldNotReachHereUnexpectedInput, null);
     }
 
@@ -120,6 +129,14 @@ final class Target_com_oracle_svm_core_util_VMError {
     private static RuntimeException unsupportedFeature(String msg) {
         throw new UnsupportedFeatureError(msg);
     }
+
+    @AnnotateOriginal
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static native void guarantee(boolean condition);
+
+    @AnnotateOriginal
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static native void guarantee(boolean condition, String msg);
 }
 
 /** Dummy class to have a class with the file's name. */
@@ -149,7 +166,7 @@ public class VMErrorSubstitutions {
     @NeverInline("Starting a stack walk in the caller frame")
     private static void doShutdown(CodePointer callerIP, String msg, Throwable ex) {
         LogHandler logHandler = ImageSingletons.lookup(LogHandler.class);
-        Log log = Log.enterFatalContext(logHandler, callerIP, msg, ex);
+        Log log = CoreLogSupport.enterFatalContext(logHandler, callerIP, msg, ex);
         if (log != null) {
             try {
                 /*

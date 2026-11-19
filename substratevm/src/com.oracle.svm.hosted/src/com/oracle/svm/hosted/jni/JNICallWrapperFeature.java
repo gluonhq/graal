@@ -28,9 +28,12 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.hosted.RuntimeJNIAccess;
 
-import com.oracle.svm.core.jni.JNIRuntimeAccess;
 import com.oracle.svm.core.jni.access.JNIAccessibleMethod;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
 
 /**
@@ -39,7 +42,7 @@ import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
  * <p>
  * Java-to-native call wrappers are created by {@link JNINativeCallWrapperSubstitutionProcessor}. It
  * creates a {@link JNINativeCallWrapperMethod} for each Java method that is declared with the
- * {@code native} keyword and that was registered via {@link JNIRuntimeAccess} to be accessible via
+ * {@code native} keyword and that was registered via {@link RuntimeJNIAccess} to be accessible via
  * JNI at runtime. The method provides a graph that performs the native code invocation. This graph
  * is visible to the analysis.
  * </p>
@@ -69,6 +72,7 @@ import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
  * </ol>
  * </p>
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 class JNICallWrapperFeature implements Feature {
     @Override
     public List<Class<? extends Feature>> getRequiredFeatures() {

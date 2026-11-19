@@ -24,29 +24,32 @@
  */
 package com.oracle.svm.core.code;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.c.NonmovableObjectArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
 import com.oracle.svm.core.code.InstalledCodeObserver.InstalledCodeObserverHandle;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
 import com.oracle.svm.core.heap.CodeReferenceMapDecoder;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
 import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.memory.NullableNativeMemory;
 import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.os.CommittedMemoryProvider;
 import com.oracle.svm.core.os.VirtualMemoryProvider;
-import com.oracle.svm.core.util.DuplicatedInNativeCode;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.DuplicatedInNativeCode;
+import com.oracle.svm.shared.util.VMError;
+import org.graalvm.word.impl.Word;
 
 /**
  * This class contains methods that only make sense for runtime compiled code.
@@ -70,13 +73,14 @@ public final class RuntimeCodeInfoAccess {
 
         CodeInfoImpl impl = cast(info);
         impl.setCodeStart((CodePointer) codeStart);
-        impl.setCodeEntryPointOffset(WordFactory.unsigned(entryPointOffset));
-        impl.setCodeSize(WordFactory.unsigned(codeSize));
-        impl.setDataOffset(WordFactory.unsigned(dataOffset));
-        impl.setDataSize(WordFactory.unsigned(dataSize));
-        impl.setCodeAndDataMemorySize(WordFactory.unsigned(codeAndDataMemorySize));
+        impl.setCodeEntryPointOffset(Word.unsigned(entryPointOffset));
+        impl.setCodeSize(Word.unsigned(codeSize));
+        impl.setDataOffset(Word.unsigned(dataOffset));
+        impl.setDataSize(Word.unsigned(dataSize));
+        impl.setCodeAndDataMemorySize(Word.unsigned(codeAndDataMemorySize));
         impl.setTier(tier);
         impl.setCodeObserverHandles(observerHandles);
+        impl.setCodeInfoIndexEntriesPerBlock(1);
         impl.setAllObjectsAreInImageHeap(allObjectsAreInImageHeap);
     }
 
@@ -145,6 +149,7 @@ public final class RuntimeCodeInfoAccess {
         return objectFields;
     }
 
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean areAllObjectsOnImageHeap(CodeInfo info) {
         return cast(info).getAllObjectsAreInImageHeap();
     }
@@ -153,8 +158,8 @@ public final class RuntimeCodeInfoAccess {
      * Walks all strong references in a {@link CodeInfo} object.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static boolean walkStrongReferences(CodeInfo info, ObjectReferenceVisitor visitor) {
-        return NonmovableArrays.walkUnmanagedObjectArray(cast(info).getObjectFields(), visitor, CodeInfoImpl.FIRST_STRONGLY_REFERENCED_OBJFIELD, CodeInfoImpl.STRONGLY_REFERENCED_OBJFIELD_COUNT);
+    public static void walkStrongReferences(CodeInfo info, ObjectReferenceVisitor visitor) {
+        NonmovableArrays.walkUnmanagedObjectArray(cast(info).getObjectFields(), visitor, CodeInfoImpl.FIRST_STRONGLY_REFERENCED_OBJFIELD, CodeInfoImpl.STRONGLY_REFERENCED_OBJFIELD_COUNT);
     }
 
     /**
@@ -162,21 +167,17 @@ public final class RuntimeCodeInfoAccess {
      */
     @DuplicatedInNativeCode
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static boolean walkWeakReferences(CodeInfo info, ObjectReferenceVisitor visitor) {
+    public static void walkWeakReferences(CodeInfo info, ObjectReferenceVisitor visitor) {
         CodeInfoImpl impl = cast(info);
-        boolean continueVisiting = true;
-        continueVisiting = continueVisiting &&
-                        NonmovableArrays.walkUnmanagedObjectArray(impl.getObjectFields(), visitor, CodeInfoImpl.FIRST_WEAKLY_REFERENCED_OBJFIELD, CodeInfoImpl.WEAKLY_REFERENCED_OBJFIELD_COUNT);
-        if (CodeInfoAccess.isAliveState(impl.getState())) {
-            continueVisiting = continueVisiting && CodeReferenceMapDecoder.walkOffsetsFromPointer(impl.getCodeStart(),
-                            impl.getCodeConstantsReferenceMapEncoding(), impl.getCodeConstantsReferenceMapIndex(), visitor, null);
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getObjectFields(), visitor, CodeInfoImpl.FIRST_WEAKLY_REFERENCED_OBJFIELD, CodeInfoImpl.WEAKLY_REFERENCED_OBJFIELD_COUNT);
+        if (CodeInfoAccess.hasLiveCodeConstants(impl)) {
+            CodeReferenceMapDecoder.walkOffsetsFromPointer(impl.getCodeStart(), impl.getCodeConstantsReferenceMapEncoding(), impl.getCodeConstantsReferenceMapIndex(), visitor, null);
         }
-        continueVisiting = continueVisiting && NonmovableArrays.walkUnmanagedObjectArray(impl.getObjectConstants(), visitor);
-        continueVisiting = continueVisiting && NonmovableArrays.walkUnmanagedObjectArray(impl.getClasses(), visitor);
-        continueVisiting = continueVisiting && NonmovableArrays.walkUnmanagedObjectArray(impl.getMemberNames(), visitor);
-        continueVisiting = continueVisiting && NonmovableArrays.walkUnmanagedObjectArray(impl.getOtherStrings(), visitor);
-        continueVisiting = continueVisiting && NonmovableArrays.walkUnmanagedObjectArray(impl.getDeoptimizationObjectConstants(), visitor);
-        return continueVisiting;
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getObjectConstants(), visitor);
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getClasses(), visitor);
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getMemberNames(), visitor);
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getOtherStrings(), visitor);
+        NonmovableArrays.walkUnmanagedObjectArray(impl.getDeoptimizationObjectConstants(), visitor);
     }
 
     /**
@@ -184,22 +185,17 @@ public final class RuntimeCodeInfoAccess {
      * and/or {@link #walkWeakReferences} instead.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static boolean walkTether(CodeInfo info, ObjectReferenceVisitor visitor) {
-        Pointer address = NonmovableArrays.addressOf(cast(info).getObjectFields(), CodeInfoImpl.TETHER_OBJFIELD);
-        return callVisitor(visitor, address);
-    }
-
-    @Uninterruptible(reason = "Bridge between uninterruptible and potentially interruptible code.", mayBeInlined = true, calleeMustBe = false)
-    private static boolean callVisitor(ObjectReferenceVisitor visitor, Pointer address) {
-        return visitor.visitObjectReference(address, true, null);
+    public static void walkTether(CodeInfo info, ObjectReferenceVisitor visitor) {
+        NonmovableArrays.walkUnmanagedObjectArray(cast(info).getObjectFields(), visitor, CodeInfoImpl.TETHER_OBJFIELD, 1);
     }
 
     /**
      * This method only visits a very specific subset of all the references, so you typically want
      * to use {@link #walkStrongReferences} and/or {@link #walkWeakReferences} instead.
      */
-    public static boolean walkObjectFields(CodeInfo info, ObjectReferenceVisitor visitor) {
-        return NonmovableArrays.walkUnmanagedObjectArray(cast(info).getObjectFields(), visitor);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static void walkObjectFields(CodeInfo info, ObjectReferenceVisitor visitor) {
+        NonmovableArrays.walkUnmanagedObjectArray(cast(info).getObjectFields(), visitor);
     }
 
     public static CodeInfo allocateMethodInfo() {
@@ -219,20 +215,20 @@ public final class RuntimeCodeInfoAccess {
     }
 
     @Uninterruptible(reason = "Prevent the GC from running - otherwise, it could accidentally visit the freed memory.")
-    static void markAsInvalidated(CodeInfo info) {
+    static void markAsRemovedFromCodeCache(CodeInfo info) {
         CodeInfoImpl impl = cast(info);
-        assert CodeInfoAccess.isAliveState(impl.getState()) || impl.getState() == CodeInfo.STATE_READY_FOR_INVALIDATION : "unexpected state (probably already released)";
+        assert CodeInfoAccess.isAliveState(impl.getState()) || impl.getState() == CodeInfo.STATE_PENDING_REMOVAL_FROM_CODE_CACHE : "unexpected state (probably already released)";
         /* We can't free any data because only the GC is allowed to free CodeInfo data. */
-        CodeInfoAccess.setState(info, CodeInfo.STATE_INVALIDATED);
+        CodeInfoAccess.setState(info, CodeInfo.STATE_REMOVED_FROM_CODE_CACHE);
     }
 
     public static CodePointer allocateCodeMemory(UnsignedWord size) {
-        return (CodePointer) CommittedMemoryProvider.get().allocateExecutableMemory(size, WordFactory.unsigned(SubstrateOptions.codeAlignment()));
+        return (CodePointer) CommittedMemoryProvider.get().allocateExecutableMemory(size, Word.unsigned(SubstrateOptions.runtimeCodeAlignment()));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void releaseCodeMemory(CodePointer codeStart, UnsignedWord codeSize) {
-        CommittedMemoryProvider.get().freeExecutableMemory(codeStart, codeSize, WordFactory.unsigned(SubstrateOptions.codeAlignment()));
+        CommittedMemoryProvider.get().freeExecutableMemory(codeStart, codeSize, Word.unsigned(SubstrateOptions.runtimeCodeAlignment()));
     }
 
     public static void makeCodeMemoryExecutableReadOnly(CodePointer codeStart, UnsignedWord codeSize) {
@@ -247,10 +243,9 @@ public final class RuntimeCodeInfoAccess {
     private static void protectCodeMemory(CodePointer codeStart, UnsignedWord codeSize, int permissions) {
         int result = VirtualMemoryProvider.get().protect(codeStart, codeSize, permissions);
         if (result != 0) {
-            throw VMError.shouldNotReachHere("Failed to modify protection of code memory. This may be caused by " +
-                            "a. a too restrictive OS-limit of allowed memory mappings (see vm.max_map_count on Linux), " +
-                            "b. a too strict security policy if you are running on Security-Enhanced Linux (SELinux), or " +
-                            "c. a Native Image internal error.");
+            throw VMError.shouldNotReachHere("Failed to modify protection of code memory. " +
+                            "This error may occur if the operating system's memory mapping limit is too low (see vm.max_map_count on Linux). Please increase this limit and try again." +
+                            "If you are running on Security-Enhanced Linux (SELinux), you may also need to check the configured security policy.");
         }
     }
 
@@ -318,6 +313,7 @@ public final class RuntimeCodeInfoAccess {
         CodeInfoImpl impl = cast(info);
         action.apply(impl.getCodeInfoIndex());
         action.apply(impl.getCodeInfoEncodings());
+        action.apply(impl.getCodeInfoDefaultFrameInfoIndexes());
         action.apply(impl.getStackReferenceMapEncoding());
         action.apply(impl.getFrameInfoEncodings());
         action.apply(impl.getDeoptimizationStartOffsets());

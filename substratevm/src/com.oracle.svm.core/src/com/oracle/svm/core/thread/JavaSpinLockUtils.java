@@ -24,9 +24,8 @@
  */
 package com.oracle.svm.core.thread;
 
-import jdk.graal.compiler.nodes.PauseNode;
-
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.Uninterruptible;
 
 import jdk.internal.misc.Unsafe;
 
@@ -78,7 +77,7 @@ public class JavaSpinLockUtils {
                         yields++;
                     }
                 } else {
-                    PauseNode.pause();
+                    KnownIntrinsics.pause();
                 }
             } else if (tryLock(obj, intFieldOffset)) {
                 return true;

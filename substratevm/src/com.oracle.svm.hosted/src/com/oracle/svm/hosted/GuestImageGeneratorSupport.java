@@ -1,0 +1,305 @@
+/*
+ * Copyright (c) 2026, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted;
+
+import java.lang.reflect.Method;
+import java.nio.ByteOrder;
+import java.util.Map;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.impl.AnnotationExtractor;
+import org.graalvm.nativeimage.impl.RuntimeClassInitializationSupport;
+
+import com.oracle.svm.core.GuestImageSingletonSupport;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.layeredimagesingleton.LoadedLayeredImageSingletonInfo;
+import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.guest.staging.ArgsSupport;
+import com.oracle.svm.guest.staging.core.heap.GCCauseSupport;
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.guest.staging.JavaMainSupport;
+import com.oracle.svm.guest.staging.config.SubstrateGuestTarget;
+import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
+import com.oracle.svm.shared.ImageLayerBuildingSupportProvider;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.shared.config.ObjectLayout.IdentityHashMode;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+
+import jdk.graal.compiler.vmaccess.InvocationException;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+/**
+ * Creates and registers guest-context state needed while setting up an image build.
+ */
+final class GuestImageGeneratorSupport {
+    private static final String WINDOWS_ARGS_SUPPORT_CLASS_NAME = "com.oracle.svm.core.windows.WindowsJavaMainWrapperArgsSupport";
+
+    /** Prevents instantiation. */
+    private GuestImageGeneratorSupport() {
+    }
+
+    /**
+     * Installs the guest-staging argument support singleton after the image singleton registries
+     * have been installed.
+     * <p>
+     * {@link ArgsSupport} is used by runtime code in guest staging, so fully isolated builds need
+     * the singleton instance in the guest registry. The implementation object is therefore created
+     * in the guest context and registered through {@link GuestImageSingletonSupport}. The singleton
+     * keeps the {@code InitialLayerOnly} layer contract by following the same loaded-key check as
+     * automatic singleton registration: if layer loading already handled the key, setup does not
+     * create or register a replacement object. GR-76716 tracks direct guest-staging support for
+     * automatic singleton registration, which would let this become an ordinary guest-staging
+     * registration. GR-76886 tracks moving the Windows-specific implementation into guest staging
+     * once the required platform bindings and platform-specific registration selection are
+     * guest-staging owned.
+     */
+    static void installArgsSupport() {
+        if (ImageSingletons.lookup(LoadedLayeredImageSingletonInfo.class).handledDuringLoading(ArgsSupport.class)) {
+            return;
+        }
+
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType argsSupportType = access.lookupType(ArgsSupport.class);
+        ResolvedJavaType implementationType = getArgsSupportImplementationType(access);
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(implementationType);
+        JavaConstant argsSupport;
+        try {
+            argsSupport = access.invoke(ctor, null);
+        } catch (InvocationException ex) {
+            throw VMError.shouldNotReachHere("Error creating Java argument support in the guest context", ex);
+        }
+        GuestImageSingletonSupport.add(argsSupportType, argsSupport);
+    }
+
+    /**
+     * Installs the isolate argument parser in the builder and guest singleton registries.
+     * <p>
+     * The parser is manually registered because guest-staging does not participate in automatic
+     * singleton registration. Layer loading retains ownership when it has already handled the
+     * parser's initial-layer singleton contract.
+     */
+    static void installIsolateArgumentParser() {
+        if (ImageSingletons.lookup(LoadedLayeredImageSingletonInfo.class).handledDuringLoading(IsolateArgumentParser.class)) {
+            return;
+        }
+
+        IsolateArgumentParser parser = new IsolateArgumentParser();
+        IsolateArgumentParser.install(parser);
+
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType parserType = access.lookupType(IsolateArgumentParser.class);
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(parserType);
+        JavaConstant guestParser;
+        try {
+            guestParser = access.invoke(ctor, null);
+        } catch (InvocationException ex) {
+            throw VMError.shouldNotReachHere("Error creating the isolate argument parser in the guest context", ex);
+        }
+        ResolvedJavaMethod install = access.lookupMethod(parserType, "install", IsolateArgumentParser.class);
+        access.invoke(install, null, guestParser);
+    }
+
+    /**
+     * Installs the GCCause support singleton in the builder and guest registries. The manual
+     * registration can be removed when guest-staging types support automatic singleton
+     * registration (GR-76716).
+     */
+    static void installGCCauseSupport() {
+        if (ImageSingletons.lookup(LoadedLayeredImageSingletonInfo.class).handledDuringLoading(GCCauseSupport.class)) {
+            return;
+        }
+
+        GCCauseSupport support = new GCCauseSupport();
+        GCCauseSupport.install(support);
+
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType supportType = access.lookupType(GCCauseSupport.class);
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(supportType);
+        JavaConstant guestSupport;
+        try {
+            guestSupport = access.invoke(ctor, null);
+        } catch (InvocationException ex) {
+            throw VMError.shouldNotReachHere("Error creating GCCause support in the guest context", ex);
+        }
+        ResolvedJavaMethod install = access.lookupMethod(supportType, "install", GCCauseSupport.class);
+        access.invoke(install, null, guestSupport);
+    }
+
+    /**
+     * Returns the guest type that should implement the {@link ArgsSupport} singleton for the target
+     * platform.
+     */
+    private static ResolvedJavaType getArgsSupportImplementationType(GuestAccess access) {
+        if (Platform.includedIn(Platform.WINDOWS.class)) {
+            return access.lookupType(WINDOWS_ARGS_SUPPORT_CLASS_NAME);
+        }
+        return access.lookupType(ArgsSupport.class);
+    }
+
+    /**
+     * Installs Java-main state after the image singleton registries have been installed.
+     * <p>
+     * {@link NativeImageGeneratorRunner} resolves the application Java main method. This method runs
+     * in the generator setup phase that has active builder and guest singleton registries. The
+     * {@link JavaMainSupport} object is constructed in the guest context because it owns method
+     * handles for guest methods, then registered through {@link GuestImageSingletonSupport} so the
+     * builder-side code path performs all guest singleton registration consistently.
+     *
+     * @param javaMainMethod the application Java main method resolved by
+     *            {@link NativeImageGeneratorRunner}
+     */
+    static void installJavaMainSupport(ResolvedJavaType javaMainClass, ResolvedJavaMethod javaMainMethod) {
+        GuestAccess access = GuestAccess.get();
+        JavaConstant mainClass = access.getProviders().getConstantReflection().asJavaClass(javaMainClass);
+        JavaConstant executable = access.asExecutableConstant(javaMainMethod);
+        if (mainClass == null || executable == null) {
+            throw UserError.abort("Cannot install Java main support because no reflective executable is available for %s.", javaMainMethod.format("%H.%n(%p)"));
+        }
+
+        ResolvedJavaType javaMainSupportType = access.lookupType(JavaMainSupport.class);
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(access.getProviders().getMetaAccess(), javaMainSupportType, Class.class, Method.class);
+        JavaConstant javaMainSupport;
+        try {
+            javaMainSupport = access.invoke(ctor, null, mainClass, executable);
+        } catch (InvocationException ex) {
+            if (ex.getCause() instanceof IllegalArgumentException iae) {
+                throw UserError.abort(iae, "%s", iae.getMessage());
+            }
+            throw VMError.shouldNotReachHere("Error creating Java main support in the guest context", ex);
+        }
+        GuestImageSingletonSupport.add(javaMainSupportType, javaMainSupport);
+    }
+
+    /** Installs the guest singleton registry and its image-layer support proxy. */
+    static void installSingletonRegistry(HostedImageLayerBuildingSupport imageLayerSupport) {
+        GuestImageSingletonSupport.install();
+        registerImageLayerBuildingSupport(imageLayerSupport);
+    }
+
+    /** Registers the builder's image-layer support as a guest host proxy. */
+    private static void registerImageLayerBuildingSupport(HostedImageLayerBuildingSupport imageLayerSupport) {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType key = access.lookupType(ImageLayerBuildingSupportProvider.class);
+        JavaConstant hostProxy = access.createHostProxy(imageLayerSupport, key);
+        GuestImageSingletonSupport.add(key, hostProxy);
+    }
+
+    /** Installs a guest host proxy backed by the builder's class-initialization policy. */
+    static void installClassInitializationSupport(ClassInitializationSupport builderSupport) {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType key = access.lookupType(RuntimeClassInitializationSupport.class);
+        /*
+         * Resolve the deprecated aliases eagerly instead of requiring the host proxy implementation
+         * to invoke default methods from a concealed guest interface package.
+         */
+        ResolvedJavaType stringType = access.elements.java_lang_String;
+        Map<ResolvedJavaMethod, String> methodNameMappings = Map.of(
+                        JVMCIReflectionUtil.getUniqueDeclaredMethod(key, "rerunInitialization", stringType, stringType), "initializeAtRunTime",
+                        JVMCIReflectionUtil.getUniqueDeclaredMethod(key, "rerunInitialization", access.elements.java_lang_Class, stringType), "initializeAtRunTime");
+        JavaConstant hostProxy = access.createHostProxy(builderSupport, key, methodNameMappings);
+        GuestImageSingletonSupport.add(key, hostProxy);
+    }
+
+    /** Registers the guest-context annotation extractor. */
+    static void registerAnnotationExtractor() {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaType key = access.lookupType(AnnotationExtractor.class);
+        JavaConstant hostProxy = access.createHostProxy(new GuestAnnotationExtractorProxy(), key);
+        GuestImageSingletonSupport.add(key, hostProxy);
+    }
+
+    /** Creates and registers the target description in the guest context. */
+    static void setupTargetDescription(SubstrateTarget target) {
+        GuestAccess access = GuestAccess.get();
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(access.getProviders().getMetaAccess(), SubstrateGuestTarget.class, int.class, ByteOrder.class);
+
+        JavaConstant wordSize = JavaConstant.forInt(target.wordSize);
+        JavaConstant byteOrder = JVMCIReflectionUtil.readStaticField(access.elements.java_nio_ByteOrder, target.arch.getByteOrder().toString());
+        JavaConstant guestTargetDescription = access.invoke(ctor, null, wordSize, byteOrder);
+
+        GuestImageSingletonSupport.add(SubstrateGuestTarget.class, guestTargetDescription);
+    }
+
+    /**
+     * Installs a guest copy of the builder-selected object layout for fully isolated builds.
+     * Non-isolated builds already share the builder's singleton registry.
+     */
+    static void setupObjectLayout() {
+        GuestAccess access = GuestAccess.get();
+        if (!access.isFullyIsolated()) {
+            return;
+        }
+        ObjectLayout layout = ObjectLayout.singleton();
+        ResolvedJavaType guestLayoutType = access.lookupType(ObjectLayout.class);
+        ResolvedJavaType guestIdentityHashModeType = access.lookupType(IdentityHashMode.class);
+        ResolvedJavaType guestIntType = access.lookupType(int.class);
+        ResolvedJavaMethod ctor = JVMCIReflectionUtil.getDeclaredConstructor(guestLayoutType,
+                        guestIntType, guestIntType, guestIntType, guestIntType,
+                        guestIntType, guestIntType, guestIntType, guestIntType,
+                        guestIdentityHashModeType, guestIntType, guestIntType);
+        IdentityHashMode identityHashMode;
+        if (layout.isIdentityHashFieldInObjectHeader()) {
+            identityHashMode = IdentityHashMode.OBJECT_HEADER;
+        } else if (layout.isIdentityHashFieldAtTypeSpecificOffset()) {
+            identityHashMode = IdentityHashMode.TYPE_SPECIFIC;
+        } else {
+            VMError.guarantee(layout.isIdentityHashFieldOptional());
+            identityHashMode = IdentityHashMode.OPTIONAL;
+        }
+        int headerIdentityHashOffset = layout.isIdentityHashFieldOptional()
+                        ? -1
+                        : layout.getObjectHeaderIdentityHashOffset();
+        ResolvedJavaMethod valueOf = JVMCIReflectionUtil.getUniqueDeclaredMethod(
+                        access.getProviders().getMetaAccess(), guestIdentityHashModeType,
+                        "valueOf", String.class);
+        JavaConstant guestLayout;
+        try {
+            JavaConstant guestIdentityHashMode = access.invoke(valueOf, null,
+                            access.asGuestString(identityHashMode.name()));
+            guestLayout = access.invoke(ctor, null,
+                            JavaConstant.forInt(layout.getReferenceSize()),
+                            JavaConstant.forInt(layout.getAlignment()),
+                            JavaConstant.forInt(layout.getHubSize()),
+                            JavaConstant.forInt(layout.getHubOffset()),
+                            JavaConstant.forInt(layout.getFirstFieldOffset()),
+                            JavaConstant.forInt(layout.getArrayLengthOffset()),
+                            JavaConstant.forInt(layout.getArrayBaseOffset(Byte.BYTES)),
+                            JavaConstant.forInt(headerIdentityHashOffset),
+                            guestIdentityHashMode,
+                            JavaConstant.forInt(layout.getIdentityHashCodeNumBits()),
+                            JavaConstant.forInt(layout.getIdentityHashCodeShift()));
+        } catch (InvocationException ex) {
+            throw VMError.shouldNotReachHere("Error creating the object layout in the guest context", ex);
+        }
+        GuestImageSingletonSupport.add(guestLayoutType, guestLayout);
+    }
+
+}

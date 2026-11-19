@@ -24,11 +24,13 @@
  */
 package com.oracle.svm.hosted.code;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.hosted.annotation.AnnotationValue;
-import com.oracle.svm.hosted.annotation.SubstrateAnnotationExtractor;
-import com.oracle.svm.util.ReflectionUtil;
+import static com.oracle.svm.util.GuestAnnotationAccess.newAnnotationValue;
 
+import java.util.List;
+
+import com.oracle.svm.util.GuestAccess;
+
+import jdk.graal.compiler.annotation.AnnotationValue;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
@@ -40,21 +42,18 @@ public abstract class EntryPointCallStubMethod extends NonBytecodeMethod {
     }
 
     /**
-     * Defines the {@link Uninterruptible} annotation returned for all call stub methods. The
+     * Defines the {@code Uninterruptible} annotation returned for all call stub methods. The
      * synthetic graphs set up the fixed registers used for safepoint and stack overflow checks, so
      * they must be uninterruptible. The method then called by the stub does not need to be
      * uninterruptible itself.
      */
-    @Uninterruptible(reason = "Entry point", calleeMustBe = false)
-    @SuppressWarnings("unused")
-    private static void uninterruptibleAnnotationHolder() {
-    }
-
-    private static final AnnotationValue[] INJECTED_ANNOTATIONS = SubstrateAnnotationExtractor.prepareInjectedAnnotations(
-                    Uninterruptible.Utils.getAnnotation(ReflectionUtil.lookupMethod(EntryPointCallStubMethod.class, "uninterruptibleAnnotationHolder")));
+    private static final List<AnnotationValue> INJECTED_ANNOTATIONS = List.of(
+                    newAnnotationValue(GuestAccess.elements().Uninterruptible,
+                                    "reason", "Entry point",
+                                    "calleeMustBe", false));
 
     @Override
-    public AnnotationValue[] getInjectedAnnotations() {
+    public List<AnnotationValue> getInjectedAnnotations() {
         return INJECTED_ANNOTATIONS;
     }
 }

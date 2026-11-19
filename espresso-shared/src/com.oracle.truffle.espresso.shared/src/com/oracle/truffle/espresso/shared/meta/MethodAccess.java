@@ -1,0 +1,143 @@
+/*
+ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.truffle.espresso.shared.meta;
+
+import com.oracle.truffle.espresso.classfile.ClassfileParser;
+import com.oracle.truffle.espresso.classfile.Constants;
+import com.oracle.truffle.espresso.classfile.ExceptionHandler;
+import com.oracle.truffle.espresso.classfile.ParserMethod;
+import com.oracle.truffle.espresso.classfile.attributes.CodeAttribute;
+import com.oracle.truffle.espresso.classfile.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.classfile.descriptors.Signature;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.shared.resolver.CallKind;
+import com.oracle.truffle.espresso.shared.vtable.TableEntry;
+
+/**
+ * Represents a {@link java.lang.reflect.Method}, and provides access to various runtime metadata.
+ *
+ * @param <C> The class providing access to the VM-side java {@link Class}.
+ * @param <M> The class providing access to the VM-side java {@link java.lang.reflect.Method}.
+ * @param <F> The class providing access to the VM-side java {@link java.lang.reflect.Field}.
+ */
+public interface MethodAccess<C extends TypeAccess<C, M, F>, M extends MethodAccess<C, M, F>, F extends FieldAccess<C, M, F>> extends MemberAccess<C, M, F>, Signed, TableEntry<C, M, F> {
+    /**
+     * @return {@code true} if this method represents an instance initialization method (its
+     *         {@link #getSymbolicName() name} is {@code "<init>"}, and it is
+     *         {@link #isStatic()}), {@code false} otherwise.
+     */
+    default boolean isConstructor() {
+        return ParserMethod.isConstructor(getModifiers(), getSymbolicName());
+    }
+
+    /**
+     * @return {@code true} if this method represents a class initialization method (its
+     *         {@link #getSymbolicName() name} is {@code "<clinit>"}, its
+     *         {@link #getSymbolicSignature() signature} is {@code ()V}, and it is {@link #isStatic()
+     *         static}), {@code false} otherwise.
+     */
+    default boolean isClassInitializer() {
+        return ParserMethod.isClassInitializer(getModifiers(), getSymbolicName(), getSymbolicSignature());
+    }
+
+    /**
+     * Obtains the parsed signature for this method.
+     * <p>
+     * A default implementation is provided, but it is encouraged to override this method if the
+     * representation of methods allows for a simpler computation (for example, if the method caches
+     * its parsed signature).
+     *
+     * @param symbolPool The symbol pool from which this method draws its symbols.
+     * @return The parsed signature of this method.
+     */
+    default Symbol<Type>[] getParsedSymbolicSignature(SymbolPool symbolPool) {
+        return symbolPool.getSignatures().parsed(getSymbolicSignature());
+    }
+
+    /**
+     * Whether loading constraints checks should be skipped for this method. An example of method
+     * which should skip loading constraints are the polymorphic signature methods.
+     */
+    boolean shouldSkipLoadingConstraints();
+
+    /**
+     * Returns whether interface dispatching is required when executing a
+     * {@linkplain CallKind#isDirectCall() non-direct} call-site whose declared holder is
+     * {@code symbolicReceiver}.
+     * <p>
+     * For {@linkplain Bytecodes#isInvoke invoke bytecodes} call-sites, the declared holder is the
+     * class referenced in the constant pool by the {@code CONSTANT_MethodRef_info} this call-site
+     * references (see jvms-4.4.2).
+     * <p>
+     * This method is always called for methods whose declaring class is an interface.
+     *
+     * @implNote A simple implementation is checking whether this method can be found in
+     *           {@code symbolicReceiver}'s virtual table: if it is, this method can return
+     *           {@code false}, as a virtual dispatch would be enough.
+     */
+    boolean requiresInterfaceDispatch(C symbolicReceiver);
+
+    /**
+     * The {@link CodeAttribute} associated with this method.
+     */
+    CodeAttribute getCodeAttribute();
+
+    /**
+     * The {@link ExceptionHandler exception handlers} associated with this method.
+     */
+    ExceptionHandler[] getSymbolicExceptionHandlers();
+
+    /**
+     * Checks whether this method is a signature polymorphic method (JVMS-2.9.3).
+     * <p>
+     * Note that this may return false for instantiations of such signature polymorphic method
+     * returned by {@link #createSignaturePolymorphicIntrinsic(Symbol)}.
+     *
+     * @implNote If this method was derived from the result of {@link ClassfileParser}, then this
+     *           can simply be implemented by checking that the
+     *           {@link Constants#ACC_SIGNATURE_POLYMORPHIC signature polymorphic} flag is set in
+     *           the {@link ParserMethod#getFlags() parser flags}.
+     */
+    boolean isDeclaredSignaturePolymorphic();
+
+    /**
+     * Tries to locate an instantiation of this {@linkplain #isDeclaredSignaturePolymorphic()
+     * signature polymorphic declared method} for the given {@code signature}, or creates one if not
+     * found.
+     *
+     * @implNote This method can be implemented by using the helper method
+     *           {@link MethodHandleIntrinsics#findIntrinsic(MethodAccess, Symbol, RuntimeAccess)}.
+     *           Doing so requires a valid implementation for
+     *           {@link #createSignaturePolymorphicIntrinsic(Symbol)}
+     */
+    M findSignaturePolymorphicIntrinsic(Symbol<Signature> signature);
+
+    /**
+     * Instantiates a {@linkplain #isDeclaredSignaturePolymorphic() signature polymorphic} method
+     * for a specific signature.
+     */
+    M createSignaturePolymorphicIntrinsic(Symbol<Signature> newSignature);
+}

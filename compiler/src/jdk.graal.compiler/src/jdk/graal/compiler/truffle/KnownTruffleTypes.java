@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -54,6 +54,7 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
 
     // java.base
     public final ResolvedJavaType Object_Array = lookupType(Object[].class);
+    public final ResolvedJavaType Int = lookupType(int.class);
     public final ResolvedJavaType java_lang_Object = lookupType(Object.class);
     public final ResolvedJavaType Objects = lookupType(Objects.class);
     public final ResolvedJavaType MethodHandle = lookupType(MethodHandle.class);
@@ -69,8 +70,12 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
     public final ResolvedJavaType BufferOverflowException = lookupType(BufferOverflowException.class);
     public final ResolvedJavaType ReadOnlyBufferException = lookupType(ReadOnlyBufferException.class);
     public final ResolvedJavaType ScopedMemoryAccess_ScopedAccessError = lookupTypeOptional("jdk.internal.misc.ScopedMemoryAccess$ScopedAccessError");
+    public final ResolvedJavaType AssertionError = lookupType(AssertionError.class);
     public final ResolvedJavaType AbstractMemorySegmentImpl = lookupTypeOptional("jdk.internal.foreign.AbstractMemorySegmentImpl");
     public final ResolvedJavaType MemorySegmentProxy = lookupTypeOptional("jdk.internal.access.foreign.MemorySegmentProxy");
+    public final ResolvedJavaType AtomicIntegerFieldUpdater = lookupType("java.util.concurrent.atomic.AtomicIntegerFieldUpdater$AtomicIntegerFieldUpdaterImpl");
+    public final ResolvedJavaType AtomicLongFieldUpdater = lookupType("java.util.concurrent.atomic.AtomicLongFieldUpdater$CASUpdater");
+    public final ResolvedJavaType AtomicReferenceFieldUpdater = lookupType("java.util.concurrent.atomic.AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl");
 
     public final Set<ResolvedJavaType> primitiveBoxTypes = Set.of(
                     lookupType(JavaKind.Boolean.toBoxedJavaClass()),
@@ -83,8 +88,16 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
                     lookupType(JavaKind.Short.toBoxedJavaClass()));
     public final ResolvedJavaField Reference_referent = findField(lookupTypeCached(Reference.class), "referent");
 
+    // jdk.jfr
+    public final ResolvedJavaType Event = lookupTypeOptional("jdk.internal.event.Event");
+
     // truffle.api
     public final ResolvedJavaType CompilerDirectives = lookupType("com.oracle.truffle.api.CompilerDirectives");
+    public final ResolvedJavaType CompilerDirectives_CompilationFinal = lookupType("com.oracle.truffle.api.CompilerDirectives$CompilationFinal");
+    public final ResolvedJavaType CompilerDirectives_TruffleBoundary = lookupType("com.oracle.truffle.api.CompilerDirectives$TruffleBoundary");
+    public final ResolvedJavaType CompilerDirectives_ValueType = lookupType("com.oracle.truffle.api.CompilerDirectives$ValueType");
+    public final ResolvedJavaType CompilerDirectives_EarlyInline = lookupTypeOptional("com.oracle.truffle.api.CompilerDirectives$EarlyInline");
+    public final ResolvedJavaType CompilerDirectives_EarlyEscapeAnalysis = lookupTypeOptional("com.oracle.truffle.api.CompilerDirectives$EarlyEscapeAnalysis");
     public final ResolvedJavaType CompilerAsserts = lookupType("com.oracle.truffle.api.CompilerAsserts");
     public final ResolvedJavaType ExactMath = lookupType("com.oracle.truffle.api.ExactMath");
     public final ResolvedJavaType HostCompilerDirectives = lookupType("com.oracle.truffle.api.HostCompilerDirectives");
@@ -93,9 +106,13 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
     // truffle.api.nodes
     public final ResolvedJavaType RootNode = lookupType("com.oracle.truffle.api.nodes.RootNode");
     public final ResolvedJavaType Node = lookupTypeCached("com.oracle.truffle.api.nodes.Node");
+    public final ResolvedJavaType Node_Child = lookupType("com.oracle.truffle.api.nodes.Node$Child");
+    public final ResolvedJavaType Node_Children = lookupType("com.oracle.truffle.api.nodes.Node$Children");
     public final ResolvedJavaField Node_parent = findField(Node, "parent");
     public final ResolvedJavaType UnexpectedResultException = lookupType("com.oracle.truffle.api.nodes.UnexpectedResultException");
     public final ResolvedJavaType SlowPathException = lookupType("com.oracle.truffle.api.nodes.SlowPathException");
+    public final ResolvedJavaType ExplodeLoop = lookupType("com.oracle.truffle.api.nodes.ExplodeLoop");
+    public final ResolvedJavaType ExplodeLoop_LoopExplosionKind = lookupType("com.oracle.truffle.api.nodes.ExplodeLoop$LoopExplosionKind");
 
     // truffle.api.frame
     public final ResolvedJavaType VirtualFrame = lookupType("com.oracle.truffle.api.frame.VirtualFrame");
@@ -103,7 +120,9 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
     public final ResolvedJavaField FrameDescriptor_defaultValue = findField(FrameDescriptor, "defaultValue");
     public final ResolvedJavaField FrameDescriptor_materializeCalled = findField(FrameDescriptor, "materializeCalled");
     public final ResolvedJavaField FrameDescriptor_indexedSlotTags = findField(FrameDescriptor, "indexedSlotTags");
+    public final ResolvedJavaField FrameDescriptor_indexedSlotCount = findField(FrameDescriptor, "indexedSlotCount", false);
     public final ResolvedJavaField FrameDescriptor_auxiliarySlotCount = findField(FrameDescriptor, "auxiliarySlotCount");
+    public final ResolvedJavaField FrameDescriptor_illegalDefaultValue = findField(FrameDescriptor, "ILLEGAL_DEFAULT_VALUE", false);
 
     public final ResolvedJavaType FrameSlotKind = lookupTypeCached("com.oracle.truffle.api.frame.FrameSlotKind");
     public final ResolvedJavaField FrameSlotKind_Object = findField(FrameSlotKind, "Object");
@@ -122,8 +141,9 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
 
     // truffle.api.object
     public final ResolvedJavaType Shape = lookupType("com.oracle.truffle.api.object.Shape");
-    public final ResolvedJavaType DynamicObject = lookupType("com.oracle.truffle.api.object.DynamicObject");
-    public final ResolvedJavaType UnsafeAccess = lookupType("com.oracle.truffle.object.UnsafeAccess");
+    public final ResolvedJavaType DynamicObject = lookupTypeCached("com.oracle.truffle.api.object.DynamicObject");
+    public final ResolvedJavaField DynamicObject_shape = findField(DynamicObject, "shape");
+    public final ResolvedJavaType UnsafeAccess = lookupType("com.oracle.truffle.api.object.UnsafeAccess");
 
     // truffle.api.string
     public final ResolvedJavaType TruffleString = lookupType("com.oracle.truffle.api.strings.TruffleString");
@@ -152,12 +172,13 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
     public final ResolvedJavaType BaseOSRRootNode = lookupTypeCached("com.oracle.truffle.runtime.BaseOSRRootNode");
     public final ResolvedJavaField BaseOSRRootNode_loopNode = findField(BaseOSRRootNode, "loopNode");
     public final ResolvedJavaType CompilationState = lookupType("com.oracle.truffle.runtime.CompilationState");
+    public final ResolvedJavaType TruffleCallBoundary = lookupType("com.oracle.truffle.runtime.TruffleCallBoundary");
 
     public final ResolvedJavaType OptimizedCallTarget = lookupTypeCached("com.oracle.truffle.runtime.OptimizedCallTarget");
     public final ResolvedJavaMethod OptimizedCallTarget_call = findMethod(OptimizedCallTarget, "call", Object_Array);
-    public final ResolvedJavaMethod OptimizedCallTarget_callDirect = findMethod(OptimizedCallTarget, "callDirect", Node, Object_Array);
-    public final ResolvedJavaMethod OptimizedCallTarget_callInlined = findMethod(OptimizedCallTarget, "callInlined", Node, Object_Array);
-    public final ResolvedJavaMethod OptimizedCallTarget_callIndirect = findMethod(OptimizedCallTarget, "callIndirect", Node, Object_Array);
+    public final ResolvedJavaMethod OptimizedCallTarget_callDirect = findMethod(OptimizedCallTarget, "callDirect", Node, Int, Object_Array);
+    public final ResolvedJavaMethod OptimizedCallTarget_callInlined = findMethod(OptimizedCallTarget, "callInlined", Node, Int, Object_Array);
+    public final ResolvedJavaMethod OptimizedCallTarget_callIndirect = findMethod(OptimizedCallTarget, "callIndirect", Node, Int, Object_Array);
     public final ResolvedJavaMethod OptimizedCallTarget_callBoundary = findMethod(OptimizedCallTarget, "callBoundary", Object_Array);
     public final ResolvedJavaMethod OptimizedCallTarget_executeRootNode = findMethod(OptimizedCallTarget, "executeRootNode", VirtualFrame, CompilationState);
     public final ResolvedJavaMethod OptimizedCallTarget_profiledPERoot = findMethod(OptimizedCallTarget, "profiledPERoot", Object_Array);
@@ -167,10 +188,12 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
 
     public final ResolvedJavaType OptimizedDirectCallNode = lookupTypeCached("com.oracle.truffle.runtime.OptimizedDirectCallNode");
     public final ResolvedJavaField OptimizedDirectCallNode_inliningForced = findField(OptimizedDirectCallNode, "inliningForced");
-    public final ResolvedJavaField OptimizedDirectCallNode_callCount = findField(OptimizedDirectCallNode, "callCount");
 
     public final ResolvedJavaType OptimizedAssumption = lookupType("com.oracle.truffle.runtime.OptimizedAssumption");
     public final ResolvedJavaType[] skippedExceptionTypes = createSkippedExceptionTypes();
+
+    // truffle.dsl
+    public final ResolvedJavaType Specialization = lookupType("com.oracle.truffle.api.dsl.Specialization");
 
     /**
      * JDK 22+24 introduced JFR tracing in Java code of the constructors for {@link Throwable} and
@@ -215,28 +238,20 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
         Throwable_jfrTracing = getThrowableJFRTracingField(metaAccess);
     }
 
-    public static final int JDK = Runtime.version().feature();
-
-    private static boolean throwableUsesJFRTracing() {
-        return JDK >= 22;
-    }
-
     private static ResolvedJavaField getThrowableJFRTracingField(MetaAccessProvider metaAccess) {
-        if (throwableUsesJFRTracing()) {
-            ResolvedJavaType throwableType = metaAccess.lookupJavaType(Throwable.class);
-            for (ResolvedJavaField staticField : throwableType.getStaticFields()) {
-                if (staticField.getName().equals("jfrTracing") &&
-                                staticField.getType().equals(metaAccess.lookupJavaType(boolean.class)) && staticField.isVolatile()) {
-                    return staticField;
-                }
+        ResolvedJavaType throwableType = metaAccess.lookupJavaType(Throwable.class);
+        for (ResolvedJavaField staticField : throwableType.getStaticFields()) {
+            if (staticField.getName().equals("jfrTracing") &&
+                            staticField.getType().equals(metaAccess.lookupJavaType(boolean.class))) {
+                return staticField;
             }
-            throw GraalError.shouldNotReachHere("Field Throwable.jfrTracing not found. This field was added in JDK-22+24 and must be present. " +
-                            "This either means this field was removed in which case this code needs to be adapted or the meta access lookup above failed which should never happen.");
         }
-        return null;
+        throw GraalError.shouldNotReachHere("Field Throwable.jfrTracing not found. This field was added in JDK-22+24 and must be present. " +
+                        "This either means this field was removed in which case this code needs to be adapted or the meta access lookup above failed which should never happen.");
     }
 
     private ResolvedJavaType[] createSkippedExceptionTypes() {
+        // keep in sync with truffle/docs/DeoptCyclePatterns.md
         List<ResolvedJavaType> types = new ArrayList<>(16);
         types.add(UnexpectedResultException);
         types.add(SlowPathException);
@@ -252,6 +267,7 @@ public class KnownTruffleTypes extends AbstractKnownTruffleTypes {
         types.add(BufferUnderflowException);
         types.add(BufferOverflowException);
         types.add(ReadOnlyBufferException);
+        types.add(AssertionError);
         return types.toArray(ResolvedJavaType[]::new);
     }
 

@@ -25,7 +25,6 @@
 package com.oracle.graal.pointsto.heap;
 
 import static com.oracle.graal.pointsto.ObjectScanner.ScanReason;
-import static com.oracle.graal.pointsto.ObjectScanner.constantAsObject;
 
 import java.util.Map;
 import java.util.Objects;
@@ -41,7 +40,8 @@ import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.AnalysisFuture;
 import com.oracle.graal.pointsto.util.CompletionExecutor;
-import com.oracle.svm.util.LogUtils;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.shared.util.LogUtils;
 
 import jdk.graal.compiler.core.common.type.CompressibleConstant;
 import jdk.graal.compiler.debug.DebugContext;
@@ -84,20 +84,39 @@ public class HeapSnapshotVerifier {
         return checkHeapSnapshot(metaAccess, executor, stage, false, embeddedConstants);
     }
 
-    /**
-     * Heap verification does a complete scan from roots (static fields and embedded constant) and
-     * compares the object graph against the shadow heap. If any new reachable objects or primitive
-     * values are found then the verifier automatically patches the shadow heap. If this is during
-     * analysis then the heap scanner will also notify the analysis of the new objects.
-     */
     public boolean checkHeapSnapshot(UniverseMetaAccess metaAccess, CompletionExecutor executor, String phase, boolean forAnalysis, Map<Constant, Object> embeddedConstants) {
+        return checkHeapSnapshot(metaAccess, executor, phase, forAnalysis, embeddedConstants, false);
+    }
+
+    /**
+     * Heap verification does a complete scan from roots (static fields and embedded constants) and
+     * compares the hosted object graph against the {@link ImageHeap shadow heap}. If any new
+     * reachable objects or primitive values are found then the verifier automatically patches the
+     * shadow heap. During
+     * analysis, values processed by such a patch are also reported to the analysis.
+     * <p>
+     * Verification can materialize and traverse an {@link ImageHeapConstant} that has not been
+     * marked reachable by {@link ImageHeapScanner}. Calling
+     * {@link ImageHeapConstant#ensureReaderInstalled()} or traversing a snapshot does not by itself
+     * call {@link ImageHeapScanner#markReachable}. When verification observes such a snapshot as a
+     * static or instance field value, it processes the field edge through {@link ImageHeapScanner}
+     * even if the snapshot already equals the hosted value. This performs normal object validation
+     * and reachability callbacks.
+     * <p>
+     * The verifier intentionally does not mark every object that it traverses as reachable. Equal
+     * object-array elements are only traversed: a reachable array already marks its elements
+     * reachable, while marking elements of an unreachable array here would retain a speculative
+     * graph.
+     */
+    protected boolean checkHeapSnapshot(UniverseMetaAccess metaAccess, CompletionExecutor executor, String phase, boolean forAnalysis, Map<Constant, Object> embeddedConstants,
+                    boolean skipReachableCheck) {
         info("Verifying the heap snapshot %s%s ...", phase, (forAnalysis ? ", iteration " + iterations : ""));
         analysisModified = false;
         heapPatched = false;
         int reachableTypesBefore = bb.getUniverse().getReachableTypes();
         iterations++;
         scannedObjects.reset();
-        ObjectScanner objectScanner = installObjectScanner(metaAccess, executor);
+        ObjectScanner objectScanner = installObjectScanner(metaAccess, executor, skipReachableCheck);
         executor.start();
         scanTypes(objectScanner);
         objectScanner.scanBootImageHeapRoots(embeddedConstants);
@@ -132,8 +151,8 @@ public class HeapSnapshotVerifier {
         return analysisModified || verificationReachableTypes > 0;
     }
 
-    protected ObjectScanner installObjectScanner(@SuppressWarnings("unused") UniverseMetaAccess metaAccess, CompletionExecutor executor) {
-        return new ObjectScanner(bb, executor, scannedObjects, new ScanningObserver());
+    protected ObjectScanner installObjectScanner(@SuppressWarnings("unused") UniverseMetaAccess metaAccess, CompletionExecutor executor, boolean skipReachableCheck) {
+        return new ObjectScanner(bb, executor, scannedObjects, new ScanningObserver(skipReachableCheck));
     }
 
     protected void scanTypes(@SuppressWarnings("unused") ObjectScanner objectScanner) {
@@ -144,7 +163,10 @@ public class HeapSnapshotVerifier {
 
     protected final class ScanningObserver implements ObjectScanningObserver {
 
-        public ScanningObserver() {
+        private final boolean skipReachableCheck;
+
+        public ScanningObserver(boolean skipReachableCheck) {
+            this.skipReachableCheck = skipReachableCheck;
         }
 
         @Override
@@ -179,7 +201,7 @@ public class HeapSnapshotVerifier {
                 verifyStaticFieldValue(typeData, field, fieldSnapshot, fieldValue, reason);
             } else {
                 ImageHeapInstance receiverObject = (ImageHeapInstance) getSnapshot(receiver, reason);
-                if (receiverObject == null || (receiverObject.isInBaseLayer() && !bb.getUniverse().getImageLayerLoader().getRelinkedFields(receiverObject.getType()).contains(field.getPosition()))) {
+                if (receiverObject == null || (receiverObject.isInSharedLayer() && !bb.getUniverse().getImageLayerLoader().getRelinkedFields(receiverObject.getType()).contains(field.getPosition()))) {
                     return false;
                 }
                 JavaConstant fieldSnapshot = receiverObject.readFieldValue(field);
@@ -191,19 +213,23 @@ public class HeapSnapshotVerifier {
         private void verifyStaticFieldValue(TypeData typeData, AnalysisField field, JavaConstant fieldSnapshot, JavaConstant fieldValue, ScanReason reason) {
             JavaConstant result = fieldSnapshot;
             JavaConstant unwrappedSnapshot = maybeUnwrapSnapshot(fieldSnapshot, fieldValue instanceof ImageHeapConstant);
-            if (!Objects.equals(unwrappedSnapshot, fieldValue)) {
-                String format = "Value mismatch for static field %s %n snapshot:  %s %n new value: %s %n";
+            boolean constantEqual = Objects.equals(unwrappedSnapshot, fieldValue);
+            if (constantEqual && patchPrimitiveArrayValue(bb, fieldSnapshot, fieldValue)) {
+                heapPatched = true;
+            }
+            boolean unreachableHeapConstant = fieldSnapshot instanceof ImageHeapConstant imageHeapConstant && !imageHeapConstant.isReachable();
+            if (!constantEqual || unreachableHeapConstant) {
+                String format = constantEqual ? "Reachability mismatch for static field %s %n snapshot:  %s %n new value: %s %n"
+                                : "Value mismatch for static field %s %n snapshot:  %s %n new value: %s %n";
                 Consumer<ScanReason> onAnalysisModified = analysisModified(reason, format, field, unwrappedSnapshot, fieldValue);
                 result = scanner.patchStaticField(typeData, field, fieldValue, reason, onAnalysisModified).ensureDone();
-                heapPatched = true;
-            } else if (patchPrimitiveArrayValue(bb, fieldSnapshot, fieldValue)) {
                 heapPatched = true;
             }
             scanner.ensureReaderInstalled(result);
         }
 
         private void verifyInstanceFieldValue(AnalysisField field, JavaConstant receiver, ImageHeapInstance receiverObject, JavaConstant fieldSnapshot, JavaConstant fieldValue, ScanReason reason) {
-            if (fieldSnapshot instanceof ImageHeapConstant ihc && ihc.isInBaseLayer() && ihc.getHostedObject() == null) {
+            if (fieldSnapshot instanceof ImageHeapConstant ihc && ihc.isInSharedLayer() && ihc.getHostedObject() == null && !(ihc instanceof ImageHeapRelocatableConstant)) {
                 /*
                  * We cannot verify a base layer constant which doesn't have a backing hosted
                  * object. Since the hosted object is missing the constant would be replaced with
@@ -213,12 +239,16 @@ public class HeapSnapshotVerifier {
             }
             JavaConstant result = fieldSnapshot;
             JavaConstant unwrappedSnapshot = maybeUnwrapSnapshot(fieldSnapshot, fieldValue instanceof ImageHeapConstant);
-            if (!Objects.equals(unwrappedSnapshot, fieldValue)) {
-                String format = "Value mismatch for instance field %s of %s %n snapshot:  %s %n new value: %s %n";
+            boolean constantEqual = Objects.equals(unwrappedSnapshot, fieldValue);
+            if (constantEqual && patchPrimitiveArrayValue(bb, fieldSnapshot, fieldValue)) {
+                heapPatched = true;
+            }
+            boolean unreachableHeapConstant = fieldSnapshot instanceof ImageHeapConstant imageHeapConstant && !imageHeapConstant.isReachable();
+            if (!constantEqual || unreachableHeapConstant) {
+                String format = constantEqual ? "Reachability mismatch for instance field %s of %s %n snapshot:  %s %n new value: %s %n"
+                                : "Value mismatch for instance field %s of %s %n snapshot:  %s %n new value: %s %n";
                 Consumer<ScanReason> onAnalysisModified = analysisModified(reason, format, field, asString(receiver), unwrappedSnapshot, fieldValue);
                 result = scanner.patchInstanceField(receiverObject, field, fieldValue, reason, onAnalysisModified).ensureDone();
-                heapPatched = true;
-            } else if (patchPrimitiveArrayValue(bb, fieldSnapshot, fieldValue)) {
                 heapPatched = true;
             }
             scanner.ensureReaderInstalled(result);
@@ -260,7 +290,7 @@ public class HeapSnapshotVerifier {
              * the future, then compare the produced value.
              */
             JavaConstant elementSnapshot = arrayObject.readElementValue(index);
-            if (elementSnapshot instanceof ImageHeapConstant ihc && ihc.isInBaseLayer() && ihc.getHostedObject() == null) {
+            if (elementSnapshot instanceof ImageHeapConstant ihc && ihc.isInSharedLayer() && ihc.getHostedObject() == null) {
                 /*
                  * We cannot verify a base layer constant which doesn't have a backing hosted
                  * object. Since the hosted object is missing the constant would be replaced with
@@ -295,14 +325,15 @@ public class HeapSnapshotVerifier {
             }
             if (isPrimitiveArrayConstant(bb, snapshot)) {
                 AnalysisError.guarantee(isPrimitiveArrayConstant(bb, newValue));
-                Object snapshotArray = ((ImageHeapPrimitiveArray) snapshot).getArray();
-                Object newValueArray = constantAsObject(bb, newValue);
-                if (!Objects.deepEquals(snapshotArray, newValueArray)) {
+                ImageHeapPrimitiveArray primitiveArrayConstant = (ImageHeapPrimitiveArray) snapshot;
+                JavaConstant snapshotArray = primitiveArrayConstant.getArray();
+                GuestAccess access = GuestAccess.get();
+                if (!access.invokeStatic(GuestAccess.elements().java_util_Objects_deepEquals, snapshotArray, newValue).asBoolean()) {
                     /* Guarantee that the shadowed constant and the hosted constant are the same. */
-                    AnalysisError.guarantee(((ImageHeapPrimitiveArray) snapshot).getHostedObject().equals(newValue));
+                    AnalysisError.guarantee(primitiveArrayConstant.getHostedObject().equals(newValue));
                     Integer length = bb.getUniverse().getHostedValuesProvider().readArrayLength(newValue);
                     /* Since the shadowed constant didn't change, the length should match. */
-                    System.arraycopy(newValueArray, 0, snapshotArray, 0, length);
+                    access.copyArray(newValue, 0, snapshotArray, 0, length);
                     return true;
                 }
             }
@@ -325,11 +356,11 @@ public class HeapSnapshotVerifier {
                 result = (ImageHeapConstant) constant;
             } else {
                 Object task = imageHeap.getSnapshot(constant);
-                if (task == null && bb.getUniverse().hostVM().useBaseLayer() && bb.getUniverse().getImageLayerLoader().hasValueForConstant(constant)) {
+                if (task == null && bb.getUniverse().hostVM().buildingExtensionLayer() && bb.getUniverse().getImageLayerLoader().hasValueForConstant(constant)) {
                     /* The constant might not have been accessed in the extension image yet */
                     task = bb.getUniverse().getImageLayerLoader().getValueForConstant(constant);
                 }
-                if (task == null && bb.getUniverse().hostVM().useBaseLayer()) {
+                if (task == null && bb.getUniverse().hostVM().buildingExtensionLayer()) {
                     /*
                      * This does not distinguish between base and extension layer constants at the
                      * moment. Doing so would require some refactoring to determine earlier if the
@@ -418,7 +449,7 @@ public class HeapSnapshotVerifier {
 
         @SuppressWarnings({"unchecked", "rawtypes"})
         private void ensureTypeScanned(JavaConstant value, JavaConstant typeConstant, AnalysisType type, ScanReason reason) {
-            if (!type.isReachable()) {
+            if (!skipReachableCheck && !type.isReachable()) {
                 error(reason, "The heap snapshot verifier discovered a type not marked as reachable: %s", type);
             }
             Object task = imageHeap.getSnapshot(typeConstant);

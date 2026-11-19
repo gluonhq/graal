@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,34 +27,50 @@ package jdk.graal.compiler.core.phases;
 import static jdk.graal.compiler.phases.common.DeadCodeEliminationPhase.Optionality.Required;
 
 import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.graph.Graph;
+import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.phases.PlaceholderPhase;
 import jdk.graal.compiler.phases.common.AddressLoweringPhase;
+import jdk.graal.compiler.phases.common.BreakChainedPhisPhase;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
 import jdk.graal.compiler.phases.common.DeadCodeEliminationPhase;
 import jdk.graal.compiler.phases.common.ExpandLogicPhase;
 import jdk.graal.compiler.phases.common.FinalCanonicalizerPhase;
 import jdk.graal.compiler.phases.common.FixReadsPhase;
+import jdk.graal.compiler.phases.common.InitMemoryVerificationPhase;
 import jdk.graal.compiler.phases.common.LowTierLoweringPhase;
 import jdk.graal.compiler.phases.common.OptimizeExtendsPhase;
 import jdk.graal.compiler.phases.common.OptimizeOffsetAddressPhase;
 import jdk.graal.compiler.phases.common.ProfileCompiledMethodsPhase;
 import jdk.graal.compiler.phases.common.PropagateDeoptimizeProbabilityPhase;
 import jdk.graal.compiler.phases.common.RemoveOpaqueValuePhase;
+import jdk.graal.compiler.phases.common.TransplantGraphsPhase;
+import jdk.graal.compiler.phases.common.WriteBarrierAdditionPhase;
+import jdk.graal.compiler.phases.schedule.PartialRedundancySchedulePhase;
+import jdk.graal.compiler.phases.common.writesinking.WriteSinkingPhase;
 import jdk.graal.compiler.phases.schedule.SchedulePhase;
 import jdk.graal.compiler.phases.schedule.SchedulePhase.SchedulingStrategy;
 import jdk.graal.compiler.phases.tiers.LowTierContext;
+import jdk.graal.compiler.vector.phases.VectorLoweringPhaseSuite;
+import jdk.graal.compiler.vector.phases.RemoveEmptyLoopsPhase;
+import jdk.graal.compiler.vector.replacements.VectorIntrinsics;
+import jdk.graal.compiler.virtual.phases.ea.LowTierReadEliminationPhase;
 
 public class LowTier extends BaseTier<LowTierContext> {
 
-    static class Options {
+    public static class Options {
 
         // @formatter:off
+        @Option(help = "Break chained phis", type = OptionType.Debug)
+        public static final OptionKey<Boolean> BreakChainedPhis = new OptionKey<>(true);
         @Option(help = "", type = OptionType.Debug)
         public static final OptionKey<Boolean> ProfileCompiledMethods = new OptionKey<>(false);
+        @Option(help = "Enable write sinking.", type = OptionType.Expert)
+        public static final OptionKey<Boolean> OptWriteSinking = new OptionKey<>(true);
         // @formatter:on
 
     }
@@ -71,16 +87,42 @@ public class LowTier extends BaseTier<LowTierContext> {
             appendPhase(new ProfileCompiledMethodsPhase());
         }
 
+        if (Graph.Options.VerifyGraalGraphs.getValue(options)) {
+            appendPhase(new InitMemoryVerificationPhase());
+        }
+
         appendPhase(new LowTierLoweringPhase(canonicalizerWithGVN));
+
+        if (VectorIntrinsics.Options.Vectorization.getValue(options)) {
+            appendPhase(new VectorLoweringPhaseSuite(canonicalizerWithGVN));
+        }
 
         appendPhase(new ExpandLogicPhase(canonicalizerWithGVN));
 
         appendPhase(new OptimizeOffsetAddressPhase(canonicalizerWithGVN));
 
-        appendPhase(new FixReadsPhase(true,
-                        new SchedulePhase(GraalOptions.StressTestEarlyReads.getValue(options) ? SchedulingStrategy.EARLIEST : SchedulingStrategy.LATEST_OUT_OF_LOOPS_IMPLICIT_NULL_CHECKS)));
+        appendPhase(new OptimizeExtendsPhase(OptimizeExtendsPhase.Mode.COMBINE));
+
+        if (PartialRedundancySchedulePhase.Options.PartialRedundancyScheduling.getValue(options)) {
+            appendPhase(new FixReadsPhase(true, new PartialRedundancySchedulePhase()));
+        } else {
+            appendPhase(new FixReadsPhase(true,
+                            new SchedulePhase(GraalOptions.StressTestEarlyReads.getValue(options) ? SchedulingStrategy.EARLIEST : SchedulingStrategy.LATEST_OUT_OF_LOOPS_IMPLICIT_NULL_CHECKS)));
+        }
+
+        if (Options.OptWriteSinking.getValue(options)) {
+            appendPhase(new WriteSinkingPhase(canonicalizerWithoutGVN));
+        }
+
+        if (GraalOptions.OptReadElimination.getValue(options)) {
+            appendPhase(new LowTierReadEliminationPhase(canonicalizerWithoutGVN));
+        }
+
+        appendPhase(new WriteBarrierAdditionPhase(GraphState.StageFlag.LOW_TIER_BARRIER_ADDITION));
 
         appendPhase(canonicalizerWithoutGVN);
+
+        appendPhase(new RemoveEmptyLoopsPhase(canonicalizerWithoutGVN));
 
         /*
          * This placeholder should be replaced by an instance of {@link AddressLoweringPhase}
@@ -95,11 +137,22 @@ public class LowTier extends BaseTier<LowTierContext> {
 
         appendPhase(new PropagateDeoptimizeProbabilityPhase());
 
-        appendPhase(new OptimizeExtendsPhase());
+        if (Options.BreakChainedPhis.getValue(options)) {
+            appendPhase(new BreakChainedPhisPhase());
+        }
+
+        appendPhase(new OptimizeExtendsPhase(OptimizeExtendsPhase.Mode.FOLD_READS));
 
         appendPhase(new RemoveOpaqueValuePhase());
 
-        appendPhase(new SchedulePhase(SchedulePhase.SchedulingStrategy.LATEST_OUT_OF_LOOPS));
+        appendPhase(new SchedulePhase.FinalSchedulePhase());
+
+        /*
+         * TransplantLowTierSnippetPhase is marked as placeholder phase because we can only
+         * instantiate it once we have a suites object for the callee graphs available at some later
+         * vm specific time.
+         */
+        appendPhase(new PlaceholderPhase<>(TransplantGraphsPhase.class));
     }
 
     public final CanonicalizerPhase getCanonicalizerWithoutGVN() {

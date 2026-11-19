@@ -53,6 +53,10 @@ import static org.junit.Assert.fail;
 import org.graalvm.shadowed.org.json.JSONArray;
 import org.graalvm.shadowed.org.json.JSONObject;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameter;
+import org.junit.runners.Parameterized.Parameters;
 
 import com.oracle.truffle.tools.utils.java_websocket.client.WebSocketClient;
 import com.oracle.truffle.tools.utils.java_websocket.handshake.ServerHandshake;
@@ -65,7 +69,14 @@ import org.graalvm.polyglot.Value;
 /**
  * Test handling of multiple engines by the Inspector.
  */
+@RunWith(Parameterized.class)
 public class MultiEngineTest extends EnginesGCedTest {
+    @Parameters(name = "useBytecode={0}")
+    public static List<Boolean> getParameters() {
+        return List.of(false, true);
+    }
+
+    @Parameter(0) public Boolean useBytecode;
 
     private static final String[] INITIAL_MESSAGES = {
                     "{\"id\":1,\"method\":\"Runtime.enable\"}",
@@ -125,8 +136,9 @@ public class MultiEngineTest extends EnginesGCedTest {
         AtomicInteger port = new AtomicInteger(0);
         verifySerialDebug(port, isUp, error);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
         for (int i = 0; i < sources.length; i++) {
-            runEngine(sources[i], port, out, isUp[i]);
+            runEngine(sources[i], port, out, err, isUp[i]);
         }
         if (error.get() != null) {
             throw new AssertionError(error.get());
@@ -167,6 +179,7 @@ public class MultiEngineTest extends EnginesGCedTest {
         }
         List<Throwable> errors = Collections.synchronizedList(new LinkedList<>());
         ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
         Thread[] threads = new Thread[sources.length];
         int port = getFreePort();
         verifyParallelDebug(port, isUp, errors);
@@ -174,7 +187,7 @@ public class MultiEngineTest extends EnginesGCedTest {
             int index = i;
             Thread t = new Thread(() -> {
                 try {
-                    runEngine(sources[index], new AtomicInteger(port), out, isUp[index]);
+                    runEngine(sources[index], new AtomicInteger(port), out, err, isUp[index]);
                 } catch (Throwable thr) {
                     thr.printStackTrace();
                     errors.add(thr);
@@ -187,11 +200,11 @@ public class MultiEngineTest extends EnginesGCedTest {
             threads[i].join();
         }
         if (!errors.isEmpty()) {
-            AssertionError err = new AssertionError();
+            AssertionError assertionError = new AssertionError();
             for (Throwable thr : errors) {
-                err.addSuppressed(thr);
+                assertionError.addSuppressed(thr);
             }
-            throw err;
+            throw assertionError;
         }
         String output = new String(out.toByteArray());
         for (int i = 0; i < sources.length; i++) {
@@ -214,12 +227,13 @@ public class MultiEngineTest extends EnginesGCedTest {
         };
         List<Throwable> errors = Collections.synchronizedList(new LinkedList<>());
         ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
         CountDownLatch isUp = new CountDownLatch(1);
         final String samePath = "samePath" + SecureInspectorPathGenerator.getToken();
         AtomicInteger port = new AtomicInteger(0);
         Thread t = new Thread(() -> {
             try {
-                runEngine(sources[0], port, samePath, out, isUp);
+                runEngine(sources[0], port, samePath, out, err, isUp);
             } catch (Throwable thr) {
                 errors.add(thr);
                 isUp.countDown();
@@ -228,7 +242,7 @@ public class MultiEngineTest extends EnginesGCedTest {
         t.start();
         isUp.await();
         try {
-            runEngine(sources[1], port, samePath, out, isUp);
+            runEngine(sources[1], port, samePath, out, err, isUp);
             fail();
         } catch (Throwable thr) {
             String message = thr.getMessage();
@@ -237,11 +251,11 @@ public class MultiEngineTest extends EnginesGCedTest {
         checkSuspendAndResume(port.get(), samePath);
         t.join();
         if (!errors.isEmpty()) {
-            AssertionError err = new AssertionError();
+            AssertionError assertionError = new AssertionError();
             for (Throwable thr : errors) {
-                err.addSuppressed(thr);
+                assertionError.addSuppressed(thr);
             }
-            throw err;
+            throw assertionError;
         }
     }
 
@@ -274,14 +288,14 @@ public class MultiEngineTest extends EnginesGCedTest {
         }).start();
     }
 
-    private String runEngine(Source src, AtomicInteger port, OutputStream out, CountDownLatch isUp) {
-        return runEngine(src, port, src.getName() + "." + SecureInspectorPathGenerator.getToken(), out, isUp);
+    private String runEngine(Source src, AtomicInteger port, OutputStream out, OutputStream err, CountDownLatch isUp) {
+        return runEngine(src, port, src.getName() + "." + SecureInspectorPathGenerator.getToken(), out, err, isUp);
     }
 
-    private String runEngine(Source src, AtomicInteger port, String path, OutputStream out, CountDownLatch isUp) {
-        try (Engine e = Engine.newBuilder().option("inspect", Integer.toString(port.get())).option("inspect.Path", path).err(out).build()) {
+    private String runEngine(Source src, AtomicInteger port, String path, OutputStream out, OutputStream err, CountDownLatch isUp) {
+        try (Engine e = Engine.newBuilder().option("inspect", Integer.toString(port.get())).option("inspect.Path", path).out(out).err(err).build()) {
             addEngineReference(e);
-            Context c = Context.newBuilder().engine(e).allowAllAccess(true).build();
+            Context c = Context.newBuilder().engine(e).option("sl.UseBytecode", Boolean.toString(useBytecode)).allowAllAccess(true).build();
             if (port.get() == 0) {
                 port.set(InspectorAddressTest.parseWSPort(out.toString()));
             }

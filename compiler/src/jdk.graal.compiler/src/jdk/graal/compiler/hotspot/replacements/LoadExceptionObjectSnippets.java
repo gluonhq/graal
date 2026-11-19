@@ -25,15 +25,14 @@
 package jdk.graal.compiler.hotspot.replacements;
 
 import static jdk.graal.compiler.hotspot.meta.HotSpotForeignCallsProviderImpl.LOAD_AND_CLEAR_EXCEPTION;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.EXCEPTION_OOP_LOCATION;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.EXCEPTION_PC_LOCATION;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.readExceptionOop;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.EXCEPTION_OOP_LOCATION;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.EXCEPTION_PC_LOCATION;
 import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.registerAsWord;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.writeExceptionOop;
-import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.writeExceptionPc;
 import static jdk.graal.compiler.hotspot.replacements.HotspotSnippetsOptions.LoadExceptionObjectInVM;
 import static jdk.graal.compiler.nodes.PiNode.piCastToSnippetReplaceeStamp;
 import static jdk.graal.compiler.replacements.SnippetTemplate.DEFAULT_REPLACER;
+
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.api.replacements.Snippet.ConstantParameter;
@@ -51,9 +50,6 @@ import jdk.graal.compiler.replacements.SnippetTemplate.Arguments;
 import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
 import jdk.graal.compiler.replacements.Snippets;
 import jdk.graal.compiler.replacements.nodes.ReadRegisterNode;
-import jdk.graal.compiler.word.Word;
-import org.graalvm.word.WordFactory;
-
 import jdk.vm.ci.code.BytecodeFrame;
 import jdk.vm.ci.code.Register;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -72,9 +68,10 @@ public class LoadExceptionObjectSnippets implements Snippets {
     @Snippet
     public static Object loadException(@ConstantParameter Register threadRegister) {
         Word thread = registerAsWord(threadRegister);
-        Object exception = readExceptionOop(thread);
-        writeExceptionOop(thread, null);
-        writeExceptionPc(thread, WordFactory.zero());
+        Object exception = EXCEPTION_OOP_LOCATION.readObject(thread);
+        // Reset the JavaThread exception state after loading the pending exception.
+        EXCEPTION_OOP_LOCATION.writeObject(thread, null);
+        EXCEPTION_PC_LOCATION.writeWord(thread, Word.zero());
         return piCastToSnippetReplaceeStamp(exception);
     }
 
@@ -107,8 +104,8 @@ public class LoadExceptionObjectSnippets implements Snippets {
                 loadExceptionC.computeStateDuring(loadExceptionObject.stateAfter());
                 graph.replaceFixedWithFixed(loadExceptionObject, loadExceptionC);
             } else {
-                Arguments args = new Arguments(loadException, loadExceptionObject.graph().getGuardsStage(), tool.getLoweringStage());
-                args.addConst("threadRegister", registers.getThreadRegister());
+                Arguments args = new Arguments(loadException, loadExceptionObject.graph(), tool.getLoweringStage());
+                args.add("threadRegister", registers.getThreadRegister());
                 template(tool, loadExceptionObject, args).instantiate(tool.getMetaAccess(), loadExceptionObject, DEFAULT_REPLACER, args);
             }
         }

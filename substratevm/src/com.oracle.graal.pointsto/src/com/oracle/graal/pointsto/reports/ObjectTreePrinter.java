@@ -28,8 +28,6 @@ import static com.oracle.graal.pointsto.reports.ReportUtils.CHILD;
 import static com.oracle.graal.pointsto.reports.ReportUtils.CONNECTING_INDENT;
 import static com.oracle.graal.pointsto.reports.ReportUtils.EMPTY_INDENT;
 import static com.oracle.graal.pointsto.reports.ReportUtils.LAST_CHILD;
-import static com.oracle.graal.pointsto.reports.ReportUtils.fieldComparator;
-import static com.oracle.graal.pointsto.reports.ReportUtils.reasonComparator;
 
 import java.io.PrintWriter;
 import java.util.ArrayDeque;
@@ -44,10 +42,13 @@ import java.util.Set;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.ObjectScanner;
 import com.oracle.graal.pointsto.ObjectScanningObserver;
+import com.oracle.graal.pointsto.api.HostVM;
 import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 import jdk.graal.compiler.options.OptionValues;
+import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -65,7 +66,7 @@ public final class ObjectTreePrinter extends ObjectScanner {
         /* Use linked hash map for predictable iteration order. */
         Map<JavaConstant, ObjectNodeBase> constantToNode = new LinkedHashMap<>();
         ObjectTreePrinter printer = new ObjectTreePrinter(bb, constantToNode);
-        printer.scanBootImageHeapRoots(fieldComparator, reasonComparator);
+        printer.scanBootImageHeapRoots(ReportUtils.fieldComparator(), ReportUtils.reasonComparator());
         printer.printTypeHierarchy(out, constantToNode);
     }
 
@@ -77,16 +78,20 @@ public final class ObjectTreePrinter extends ObjectScanner {
         }
 
         String format() {
-            if (source instanceof ResolvedJavaField) {
-                ResolvedJavaField field = (ResolvedJavaField) source;
-                return field.format("%H.%n:%T");
-            } else if (source instanceof ResolvedJavaMethod) {
-                ResolvedJavaMethod method = (ResolvedJavaMethod) source;
-                return method.format("%H.%n(%p)");
-            } else if (source != null) {
-                return source.toString();
-            }
-            throw JVMCIError.shouldNotReachHere("null source");
+            return format(source);
+        }
+
+        private static String format(Object srcObj) {
+            return switch (srcObj) {
+                case AnalysisField field -> loaderName(field.getDeclaringClass()) + ':' + field.format("%H.%n:%T");
+                case AnalysisMethod method -> loaderName(method.getDeclaringClass()) + ':' + method.format("%H.%n(%p)");
+                case BytecodePosition bcp -> "%s [bci: %d]".formatted(format(bcp.getMethod()), bcp.getBCI());
+                default -> throw JVMCIError.shouldNotReachHere("unknown srcObj");
+            };
+        }
+
+        private static String loaderName(AnalysisType type) {
+            return type.getUniverse().hostVM().loaderName(type);
         }
     }
 
@@ -278,7 +283,7 @@ public final class ObjectTreePrinter extends ObjectScanner {
                     "com.ibm.icu.impl.ICUResourceBundleReader.CACHE*",
                     "ibm.icu.impl.DayPeriodRules$DayPeriodRulesData*",
                     "com.ibm.icu.util.ULocale.nameCache*",
-                    "com.oracle.svm.core.option.RuntimeOptionsSupportImpl.set(String, Object)"};
+                    "com.oracle.svm.guest.staging.option.RuntimeOptionsSupportImpl.set(String, Object)"};
 
     private final SimpleMatcher suppressTypeMatcher;
     private final SimpleMatcher expandTypeMatcher;
@@ -396,6 +401,10 @@ public final class ObjectTreePrinter extends ObjectScanner {
 
     static String constantAsString(BigBang bb, JavaConstant constant) {
         Object object = constantAsObject(bb, constant);
+        String loaderPrefix = "";
+        if (object != null) {
+            loaderPrefix = HostVM.loaderName(object.getClass().getClassLoader()) + ':';
+        }
         if (object instanceof String) {
             String str = (String) object;
             str = escape(str);
@@ -403,9 +412,9 @@ public final class ObjectTreePrinter extends ObjectScanner {
                 str = str.substring(0, 10);
                 str = str + "...";
             }
-            return "\"" + str + "\"";
+            return loaderPrefix + "\"" + str + "\"";
         } else {
-            return escape(JavaKind.Object.format(object));
+            return loaderPrefix + escape(JavaKind.Object.format(object));
         }
     }
 

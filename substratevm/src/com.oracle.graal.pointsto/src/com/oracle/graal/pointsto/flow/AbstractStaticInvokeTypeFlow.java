@@ -27,14 +27,14 @@ package com.oracle.graal.pointsto.flow;
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
-import com.oracle.svm.common.meta.MultiMethod.MultiMethodKey;
+import com.oracle.svm.common.meta.MethodVariant.MethodVariantKey;
 
 import jdk.vm.ci.code.BytecodePosition;
 
 public abstract class AbstractStaticInvokeTypeFlow extends DirectInvokeTypeFlow {
     protected AbstractStaticInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey) {
-        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariantKey callerMethodVariantKey) {
+        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMethodVariantKey);
     }
 
     protected AbstractStaticInvokeTypeFlow(PointsToAnalysis bb, MethodFlowsGraph methodFlows, AbstractStaticInvokeTypeFlow original) {
@@ -42,18 +42,7 @@ public abstract class AbstractStaticInvokeTypeFlow extends DirectInvokeTypeFlow 
     }
 
     @Override
-    public void initFlow(PointsToAnalysis bb) {
-        /* Trigger the update for static invokes, there is no receiver to trigger it. */
-        bb.postFlow(this);
-    }
-
-    @Override
-    public boolean needsInitialization() {
-        return true;
-    }
-
-    @Override
     public String toString() {
-        return "StaticInvoke<" + targetMethod.format("%h.%n") + ">" + ":" + getState();
+        return "StaticInvoke<" + targetMethod.format("%h.%n") + ">" + ":" + getStateDescription();
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,7 @@ package com.oracle.truffle.sl;
 import static com.oracle.truffle.api.CompilerDirectives.shouldNotReachHere;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.bytecode.BytecodeNode;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
@@ -53,17 +54,34 @@ import com.oracle.truffle.sl.runtime.SLLanguageView;
 
 /**
  * SL does not need a sophisticated error checking and reporting mechanism, so all unexpected
- * conditions just abort execution. This exception class is used when we abort from within the SL
- * implementation.
+ * conditions just abort execution. The exceptions defined in this class are used when we abort from
+ * within the SL implementation.
  */
-public class SLException extends AbstractTruffleException {
+@SuppressWarnings("serial")
+public final class SLException extends AbstractTruffleException {
 
-    private static final long serialVersionUID = -6799734410727348507L;
     private static final InteropLibrary UNCACHED_LIB = InteropLibrary.getFactory().getUncached();
 
+    private SLException(String message, Node location, int bytecodeIndex) {
+        super(message, null, UNLIMITED_STACK_TRACE, location, bytecodeIndex);
+    }
+
     @TruffleBoundary
-    public SLException(String message, Node location) {
-        super(message, location);
+    public static AbstractTruffleException create(String message, Node location, int bytecodeIndex) {
+        return new SLException(message, location, bytecodeIndex);
+    }
+
+    @TruffleBoundary
+    public static AbstractTruffleException typeError(Node operation, int bytecodeIndex, Object... values) {
+        String operationName = null;
+        if (operation != null) {
+            NodeInfo nodeInfo = SLLanguage.lookupNodeInfo(operation.getClass());
+            if (nodeInfo != null) {
+                operationName = nodeInfo.shortName();
+            }
+        }
+
+        return typeError(operation, bytecodeIndex, operationName, values);
     }
 
     /**
@@ -71,23 +89,22 @@ public class SLException extends AbstractTruffleException {
      * are no automatic type conversions of values.
      */
     @TruffleBoundary
-    public static SLException typeError(Node operation, Object... values) {
+    @SuppressWarnings("deprecation")
+    public static AbstractTruffleException typeError(Node location, int bytecodeIndex, String operationName, Object... values) {
         StringBuilder result = new StringBuilder();
         result.append("Type error");
 
-        if (operation != null) {
-            SourceSection ss = operation.getEncapsulatingSourceSection();
+        if (location != null) {
+            BytecodeNode bytecodeNode = bytecodeIndex >= 0 ? BytecodeNode.get(location) : null;
+            SourceSection ss = bytecodeNode != null ? bytecodeNode.getSourceLocation(bytecodeIndex) : location.getEncapsulatingSourceSection();
             if (ss != null && ss.isAvailable()) {
                 result.append(" at ").append(ss.getSource().getName()).append(" line ").append(ss.getStartLine()).append(" col ").append(ss.getStartColumn());
             }
         }
 
         result.append(": operation");
-        if (operation != null) {
-            NodeInfo nodeInfo = SLLanguage.lookupNodeInfo(operation.getClass());
-            if (nodeInfo != null) {
-                result.append(" \"").append(nodeInfo.shortName()).append("\"");
-            }
+        if (location != null) {
+            result.append(" \"").append(operationName).append("\"");
         }
 
         result.append(" not defined for");
@@ -128,7 +145,17 @@ public class SLException extends AbstractTruffleException {
                 }
             }
         }
-        return new SLException(result.toString(), operation);
+        return SLException.create(result.toString(), location, bytecodeIndex);
+    }
+
+    @TruffleBoundary
+    public static AbstractTruffleException undefinedFunction(Node location, int bytecodeIndex, Object name) {
+        throw create("Undefined function: " + name, location, bytecodeIndex);
+    }
+
+    @TruffleBoundary
+    public static AbstractTruffleException undefinedProperty(Node location, int bytecodeIndex, Object name) {
+        throw create("Undefined property: " + name, location, bytecodeIndex);
     }
 
 }

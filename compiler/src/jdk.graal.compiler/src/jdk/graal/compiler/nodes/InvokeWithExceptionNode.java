@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
  */
 package jdk.graal.compiler.nodes;
 
+import static jdk.graal.compiler.nodeinfo.InputType.Association;
 import static jdk.graal.compiler.nodeinfo.InputType.Extension;
 import static jdk.graal.compiler.nodeinfo.InputType.Memory;
 import static jdk.graal.compiler.nodeinfo.InputType.State;
@@ -53,9 +54,15 @@ import org.graalvm.word.LocationIdentity;
 
 import jdk.vm.ci.code.BytecodeFrame;
 
+/**
+ * The {@code InvokeWithExceptionNode} represents all kinds of method calls with an
+ * {@linkplain WithExceptionNode exception edge}
+ *
+ * It can be associated with {@link ReadArgumentNode}s.
+ */
 // @formatter:off
 @NodeInfo(nameTemplate = "Invoke!#{p#targetMethod/s}",
-          allowedUsageTypes = {Memory},
+          allowedUsageTypes = {Memory, Association},
           cycles = CYCLES_UNKNOWN, cyclesRationale = CYCLES_UNKNOWN_RATIONALE,
           size   = SIZE_UNKNOWN,   sizeRationale   = SIZE_UNKNOWN_RATIONALE)
 // @formatter:on
@@ -72,7 +79,11 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
     private boolean isInOOMETry;
 
     public InvokeWithExceptionNode(CallTargetNode callTarget, AbstractBeginNode exceptionEdge, int bci) {
-        super(TYPE, callTarget.returnStamp().getTrustedStamp());
+        this(callTarget, exceptionEdge, bci, callTarget.returnStamp().getTrustedStamp());
+    }
+
+    public InvokeWithExceptionNode(CallTargetNode callTarget, AbstractBeginNode exceptionEdge, int bci, Stamp stamp) {
+        super(TYPE, stamp);
         this.exceptionEdge = exceptionEdge;
         this.bci = bci;
         this.callTarget = callTarget;
@@ -224,6 +235,9 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
             newInvoke.setStateAfter(stateAfter);
             newInvoke.setStateDuring(stateDuring);
             newInvoke.setInlineControl(inlineControl);
+            newInvoke.setInOOMETry(isInOOMETry);
+            newInvoke.setPolymorphic(polymorphic);
+            newInvoke.setClassInit(classInit);
             AbstractBeginNode oldException = this.exceptionEdge;
             graph().replaceSplitWithFixed(this, newInvoke, this.next());
             GraphUtil.killCFG(oldException);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,15 @@ package jdk.graal.compiler.loop.phases;
 
 import static jdk.graal.compiler.core.common.GraalOptions.MaximumDesiredSize;
 
+import jdk.graal.compiler.nodes.MergeNode;
+import jdk.graal.compiler.nodes.LoopEndNode;
+import jdk.graal.compiler.nodes.BinaryOpLogicNode;
+import jdk.graal.compiler.graph.NodeBitMap;
+import jdk.graal.compiler.core.common.type.Stamp;
+import org.graalvm.collections.UnmodifiableEconomicMap;
+import org.graalvm.collections.Pair;
+import org.graalvm.collections.EconomicSet;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -33,7 +42,6 @@ import java.util.List;
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Equivalence;
 
-import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.core.common.RetryableBailoutException;
 import jdk.graal.compiler.core.common.calc.CanonicalCondition;
 import jdk.graal.compiler.core.common.type.IntegerStamp;
@@ -55,7 +63,6 @@ import jdk.graal.compiler.nodes.FixedGuardNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.FrameState;
-import jdk.graal.compiler.nodes.GraphState.GuardsStage;
 import jdk.graal.compiler.nodes.GraphState.StageFlag;
 import jdk.graal.compiler.nodes.GuardPhiNode;
 import jdk.graal.compiler.nodes.IfNode;
@@ -75,15 +82,20 @@ import jdk.graal.compiler.nodes.VirtualState.NodePositionClosure;
 import jdk.graal.compiler.nodes.calc.AddNode;
 import jdk.graal.compiler.nodes.calc.CompareNode;
 import jdk.graal.compiler.nodes.calc.ConditionalNode;
+import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.extended.OpaqueNode;
 import jdk.graal.compiler.nodes.extended.SwitchNode;
 import jdk.graal.compiler.nodes.loop.CountedLoopInfo;
+import jdk.graal.compiler.nodes.loop.BasicInductionVariable;
 import jdk.graal.compiler.nodes.loop.DefaultLoopPolicies;
 import jdk.graal.compiler.nodes.loop.InductionVariable.Direction;
+import jdk.graal.compiler.nodes.loop.InductionVariable;
+import jdk.graal.compiler.nodes.loop.InductionVariableHelper;
 import jdk.graal.compiler.nodes.loop.Loop;
 import jdk.graal.compiler.nodes.loop.LoopFragment;
 import jdk.graal.compiler.nodes.loop.LoopFragmentInside;
 import jdk.graal.compiler.nodes.loop.LoopFragmentWhole;
+import jdk.graal.compiler.nodes.loop.LoopsData;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.spi.Simplifiable;
 import jdk.graal.compiler.nodes.spi.SimplifierTool;
@@ -92,11 +104,23 @@ import jdk.graal.compiler.nodes.util.IntegerHelper;
 import jdk.graal.compiler.nodes.virtual.VirtualObjectNode;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
 import jdk.graal.compiler.phases.common.util.EconomicSetNodeEventListener;
+import jdk.graal.compiler.phases.common.util.LoopUtility;
 
+/**
+ * GraalVM loop transformations.
+ */
 public abstract class LoopTransformations {
 
     private LoopTransformations() {
         // does not need to be instantiated
+    }
+
+    private static int saturatedConstantMaxTripCount(Loop loop) {
+        try {
+            return Math.toIntExact(LoopUtility.tripCountSignedExact(loop.counted()));
+        } catch (ArithmeticException e) {
+            return Integer.MAX_VALUE;
+        }
     }
 
     public static LoopFragmentInside peel(Loop loop) {
@@ -123,15 +147,27 @@ public abstract class LoopTransformations {
 
     @SuppressWarnings("try")
     public static void fullUnroll(Loop loop, CoreProviders context, CanonicalizerPhase canonicalizer) {
-        // assert loop.isCounted(); //TODO (gd) strengthen : counted with known trip count
+        fullUnroll(loop, context, canonicalizer, true);
+    }
+
+    @SuppressWarnings("try")
+    public static void fullUnroll(Loop loop, CoreProviders context, CanonicalizerPhase canonicalizer, boolean requireCounted) {
         LoopBeginNode loopBegin = loop.loopBegin();
         StructuredGraph graph = loopBegin.graph();
+        loop.detectCounted();
+        if (loop.isCounted() && loop.counted().isConstantMaxTripCount()) {
+            LoopsData loopsData = context.getLoopsDataProvider().getLoopsData(graph);
+            int fullUnrollFactor = saturatedConstantMaxTripCount(loop);
+            LoopUtility.updateDescendantLoopCloneFactors(loopsData, loop, fullUnrollFactor);
+        } else {
+            GraalError.guarantee(!requireCounted, "Full unroll requires a counted loop with a constant max trip count: %s", loop);
+        }
         int initialNodeCount = graph.getNodeCount();
         SimplifierTool defaultSimplifier = GraphUtil.getDefaultSimplifier(context, canonicalizer.getCanonicalizeReads(), graph.getAssumptions(), graph.getOptions());
         /*
          * IMPORTANT: Canonicalizations inside the body of the remaining loop can introduce new
          * control flow that is not automatically picked up by the control flow graph computation of
-         * the original LoopEx data structure, thus we disable simplification and manually simplify
+         * the original loop data structure, thus we disable simplification and manually simplify
          * conditions in the peeled iteration to simplify the exit path.
          */
         CanonicalizerPhase c = canonicalizer.copyWithoutSimplification();
@@ -233,6 +269,7 @@ public abstract class LoopTransformations {
     public static void partialUnroll(Loop loop, EconomicMap<LoopBeginNode, OpaqueNode> opaqueUnrolledStrides) {
         assert loop.loopBegin().isMainLoop();
         adaptCountedLoopExitProbability(loop.counted().getCountedExit(), loop.localLoopFrequency() / 2D);
+        LoopUtility.updateDescendantLoopCloneFactors(loop.loopsData(), loop, 2);
         LoopFragmentInside newSegment = loop.inside().duplicate();
         newSegment.insertWithinAfter(loop, opaqueUnrolledStrides);
         loop.loopBegin().graph().getOptimizationLog().withProperty("unrollFactor", loop.loopBegin().getUnrollFactor()).report(LoopTransformations.class, "LoopPartialUnroll", loop.loopBegin());
@@ -250,7 +287,7 @@ public abstract class LoopTransformations {
      * for the exit that can later be duplicated cleanly.
      */
     public static void ensureExitsHaveUniqueStates(Loop loop) {
-        if (loop.loopBegin().graph().getGuardsStage() == GuardsStage.AFTER_FSA) {
+        if (loop.loopBegin().graph().getGuardsStage().areFrameStatesAtDeopts()) {
             return;
         }
         for (LoopExitNode lex : loop.loopBegin().loopExits()) {
@@ -353,6 +390,8 @@ public abstract class LoopTransformations {
         assert preLoop.nodes().contains(preLoopBegin);
         assert preLoop.nodes().contains(preLoopExitNode);
 
+        LoopUtility.updateDescendantLoopCloneFactors(loop.loopsData(), loop, 2);
+
         /*
          * Duplicate the original loop two times, each duplication will create a merge for the loop
          * exits of the original loop and the duplication one.
@@ -371,8 +410,6 @@ public abstract class LoopTransformations {
         AbstractMergeNode postMergeNode = postEndNode.merge();
         graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After post loop duplication");
 
-        preLoopBegin.incrementSplits();
-        preLoopBegin.incrementSplits();
         preLoopBegin.setPreLoop();
         mainLoopBegin.setMainLoop();
         postLoopBegin.setPostLoop();
@@ -455,8 +492,18 @@ public abstract class LoopTransformations {
         assert mainLoopExitNode.predecessor() instanceof IfNode : Assertions.errorMessage(mainLoopExitNode);
         assert postLoopExitNode.predecessor() instanceof IfNode : Assertions.errorMessage(postLoopExitNode);
 
-        setSingleVisitedLoopFrequencySplitProbability(preLoopExitNode);
-        setSingleVisitedLoopFrequencySplitProbability(postLoopExitNode);
+        /*
+         * The bodies of pre and post loops are assumed to be executed just once. As the local loop
+         * frequency is calculated from the loop exit probabilities, it has to be taken into account
+         * how often the exit check is performed. If the loop is inverted, i.e., tail-counted, the
+         * exit will be taken at the end of the first body execution. Thus, the frequency of the
+         * exit check is 1. If the loop is head-counted, the exit check will be performed twice,
+         * which is reflected by a frequency of 2. This results in the correct relative frequency
+         * being propagated into the loop body.
+         */
+        final int prePostFrequency = loop.counted().isInverted() ? 1 : 2;
+        adaptCountedLoopExitProbability(preLoopExitNode, prePostFrequency);
+        adaptCountedLoopExitProbability(postLoopExitNode, prePostFrequency);
 
         if (graph.isAfterStage(StageFlag.VALUE_PROXY_REMOVAL)) {
             // The pre and post loops don't require safepoints at all
@@ -474,7 +521,8 @@ public abstract class LoopTransformations {
 
     /**
      * Inject a split probability for the (counted) loop check that will result in a loop frequency
-     * of 1 (in case this is the only loop exit).
+     * of 1 (in case this is the only loop exit). This implies that the loop body is expected to be
+     * never entered.
      */
     private static void setSingleVisitedLoopFrequencySplitProbability(AbstractBeginNode lex) {
         IfNode ifNode = ((IfNode) lex.predecessor());
@@ -483,11 +531,13 @@ public abstract class LoopTransformations {
     }
 
     /**
-     * Inject a new frequency for the condition dominating the given loop exit path. This
-     * calculation will act as if the given loop exit is the only exit of the loop.
+     * Inject a new branch probability for the condition dominating the given loop exit path. This
+     * probability is based on the local frequency of the exit check. This calculation will act as
+     * if the given loop exit is the only exit of the loop.
      */
-    public static void adaptCountedLoopExitProbability(AbstractBeginNode lex, double newFrequency) {
-        double probability = 1.0D - 1.0D / newFrequency;
+    public static void adaptCountedLoopExitProbability(AbstractBeginNode lex, double newExitCheckFrequency) {
+        invalidateCFGFrequencies(lex.graph().getLastCFG());
+        double probability = 1.0D - 1.0D / newExitCheckFrequency;
         if (probability <= 0D) {
             setSingleVisitedLoopFrequencySplitProbability(lex);
             return;
@@ -495,6 +545,12 @@ public abstract class LoopTransformations {
         IfNode ifNode = ((IfNode) lex.predecessor());
         boolean trueSucc = ifNode.trueSuccessor() == lex;
         ifNode.setTrueSuccessorProbability(BranchProbabilityData.injected(probability, trueSucc));
+    }
+
+    private static void invalidateCFGFrequencies(ControlFlowGraph cfg) {
+        if (cfg != null) {
+            cfg.invalidateFrequencies();
+        }
     }
 
     public static class PreMainPostResult {
@@ -568,8 +624,9 @@ public abstract class LoopTransformations {
     }
 
     private static void rewirePreToMainPhis(LoopBeginNode preLoopBegin, LoopFragment mainLoop, LoopFragment preLoop, LoopExitNode preLoopCountedExit, boolean inverted) {
-        // Update the main loop phi initialization to carry from the pre loop
-        for (PhiNode prePhiNode : preLoopBegin.phis()) {
+        // Update the main loop phi initialization to carry from the pre loop, use a snapshot
+        // because guard prox nodes can reference the loop begin and change usage lists
+        for (PhiNode prePhiNode : preLoopBegin.phis().snapshot()) {
             PhiNode mainPhiNode = mainLoop.getDuplicatedNode(prePhiNode);
             rewirePhi(prePhiNode, mainPhiNode, preLoopCountedExit, preLoop, inverted);
         }
@@ -660,7 +717,7 @@ public abstract class LoopTransformations {
          */
         LoopBeginNode preLoopBegin = preLoop.loopBegin();
         StructuredGraph graph = preLoopBegin.graph();
-        for (PhiNode prePhiNode : preLoopBegin.phis()) {
+        for (PhiNode prePhiNode : preLoopBegin.phis().snapshot()) {
             PhiNode postPhiNode = postLoop.getDuplicatedNode(prePhiNode);
             PhiNode mainPhiNode = mainLoop.getDuplicatedNode(prePhiNode);
 
@@ -787,7 +844,7 @@ public abstract class LoopTransformations {
         final int bits = ((IntegerStamp) loop.counted().getLimitCheckedIV().valueNode().stamp(NodeView.DEFAULT)).getBits();
         long stride = loop.counted().getLimitCheckedIV().constantStride();
         try {
-            NumUtil.addExact(stride, stride, bits);
+            LoopUtility.addExact(bits, stride, stride);
             return false;
         } catch (ArithmeticException ae) {
             return true;
@@ -795,7 +852,10 @@ public abstract class LoopTransformations {
     }
 
     public static boolean isUnrollableLoop(Loop loop) {
-        if (!loop.isCounted() || !loop.counted().getLimitCheckedIV().isConstantStride() || !loop.loop().getChildren().isEmpty() || loop.loopBegin().loopEnds().count() != 1 ||
+        if (LoopUtility.excludeLoopFromOptimizer(loop)) {
+            return false;
+        }
+        if (!loop.isCounted() || !loop.counted().getLimitCheckedIV().isConstantStride() || !loop.getCFGLoop().getChildren().isEmpty() || loop.loopBegin().loopEnds().count() != 1 ||
                         loop.loopBegin().loopExits().count() > 1 || loop.counted().isInverted()) {
             // loops without exits can be unrolled, inverted loops cannot be unrolled without
             // protecting their first iteration
@@ -803,6 +863,14 @@ public abstract class LoopTransformations {
         }
         assert loop.counted().getDirection() != null;
         LoopBeginNode loopBegin = loop.loopBegin();
+        // Splitting a simple loop creates pre/main/post loops whose pre/post parts omit safepoint polls.
+        // For example, the pre-loop of
+        // for (int i = Integer.MAX_VALUE - 1; (long) i < limit; i += 3) { ... }
+        // may not terminate when limit exceeds every int. Keep its poll unless both the limit-checked IV
+        // and its native-width root are known not to overflow.
+        if (loopBegin.isSimpleLoop() && !loop.counted().loopAndRootCanNeverOverflow()) {
+            return false;
+        }
         LogicNode condition = loop.counted().getLimitTest().condition();
         if (!(condition instanceof CompareNode)) {
             return false;
@@ -825,11 +893,495 @@ public abstract class LoopTransformations {
             // Flow-less loops to partial unroll for now. 3 blocks corresponds to an if that either
             // exits or continues the loop. There might be fixed and floating work within the loop
             // as well.
-            if (loop.loop().getBlocks().size() < 3) {
+            if (loop.getCFGLoop().getBlocks().size() < 3) {
                 return true;
             }
-            condition.getDebug().log(DebugContext.VERBOSE_LEVEL, "isUnrollableLoop %s too large to unroll %s ", loopBegin, loop.loop().getBlocks().size());
+            condition.getDebug().log(DebugContext.VERBOSE_LEVEL, "isUnrollableLoop %s too large to unroll %s ", loopBegin, loop.getCFGLoop().getBlocks().size());
         }
         return false;
+    }
+
+    /**
+     *
+     * Perform loop inversion around the {@link IfNode} of the loop. The IfNode must be the counted
+     * exit of the loop.
+     *
+     * @param loop the loop to be inverted
+     * @param ifNode the {@link IfNode} that is used as the inversion condition: that one is moved
+     *            to the loop end
+     * @param originalProxyStamps the original stamps of all loop proxies before inversion, used to
+     *            ensure a stamp never gets worse during inversion
+     *
+     * @return the not entered proxy values derived for the inverted loop
+     */
+    public static EconomicMap<ProxyNode, Node> invert(Loop loop, IfNode ifNode, EconomicMap<ProxyNode, Stamp> originalProxyStamps) {
+        final LoopBeginNode lb = loop.loopBegin();
+        final StructuredGraph graph = lb.graph();
+        final DebugContext debug = graph.getDebug();
+        assert graph.isBeforeStage(StageFlag.VALUE_PROXY_REMOVAL) : "Graph must be before stage " + StageFlag.VALUE_PROXY_REMOVAL + " but is " + graph.getGraphState();
+
+        assert lb.loopExits().count() >= 1 : "Mus have at least 1 loop exit " + lb;
+        assert lb.loopEnds().count() == 1 : "Must merge multi-end loops before inversion";
+        assert loop.counted().getCountedExit() instanceof LoopExitNode : "Can only invert loop that have a loop exit node as counted exit";
+        /*
+         * In order to protect the inverted loop afterwards we need to find the proxied values
+         * flowing out of the loop if the loop body is not actually entered. For this ideally we
+         * would want to duplicate the loop, set the condition to false and canonicalize through it.
+         * However, this is costly, thus we visit all proxy inputs recursively until we found all
+         * floating nodes necessary on the path to the loop phis. We duplicate this set for the loop
+         * phi forward inputs and have our set of proxy nodes for the protection logic.
+         */
+        EconomicMap<ProxyNode, NodeBitMap> proxyToChain = EconomicMap.create();
+        EconomicMap<ProxyNode, Node> proxyZeroTripInputs = findZeroTripProxyValues(loop, proxyToChain);
+
+        boolean trueSuccessor = ifNode.falseSuccessor() instanceof LoopExitNode;
+        // move all anchored/guarded nodes to the loop header
+        if (trueSuccessor) {
+            ifNode.trueSuccessor().replaceAtUsages(lb, InputType.Guard, InputType.Anchor);
+        } else {
+            ifNode.falseSuccessor().replaceAtUsages(lb, InputType.Guard, InputType.Anchor);
+        }
+
+        final LoopExitNode lex = (LoopExitNode) loop.counted().getCountedExit();
+        int count = lex.proxies().count();
+        int size = proxyZeroTripInputs.size();
+        assert count == size : count + " vs " + size;
+        final LoopEndNode inversionEnd = loop.loopBegin().getSingleLoopEnd();
+
+        IfNode newControlSplit = (IfNode) ifNode.copyWithInputs(true);
+        debug.dump(DebugContext.DETAILED_LEVEL, graph, "Inversion: After creation of new exit condition %s", ifNode);
+
+        FixedWithNextNode fwn = (FixedWithNextNode) inversionEnd.predecessor();
+        fwn.setNext(null);
+        fwn.setNext(newControlSplit);
+        BeginNode newBegin = graph.add(new BeginNode());
+        newBegin.setNodeSourcePosition(lb.getNodeSourcePosition());
+        if (trueSuccessor) {
+            newControlSplit.setTrueSuccessor(newBegin);
+            assert ifNode.trueSuccessor().hasNoUsages() : "During rewire " + ifNode.trueSuccessor() + " must not have usage";
+        } else {
+            newControlSplit.setFalseSuccessor(newBegin);
+            assert ifNode.falseSuccessor().hasNoUsages() : "During rewire " + ifNode.falseSuccessor() + " must not have usage";
+        }
+        newBegin.setNext(inversionEnd);
+
+        debug.dump(DebugContext.DETAILED_LEVEL, graph, "Inversion: After placing new loop condition %s at inversion end %s", ifNode, inversionEnd);
+        rewireToLoopEnd(loop, lex, newControlSplit, proxyToChain, proxyZeroTripInputs, originalProxyStamps);
+        debug.dump(DebugContext.DETAILED_LEVEL, graph, "Inversion: After reparing all phi/iv/value proxy usages moved to the post dominating loop end");
+
+        FixedWithNextNode fwn1 = (FixedWithNextNode) ifNode.predecessor();
+        FixedNode next;
+        fwn1.setNext(null);
+        if (trueSuccessor) {
+            next = ifNode.trueSuccessor();
+            ifNode.setTrueSuccessor(null);
+            ifNode.setFalseSuccessor(null);
+            newControlSplit.setFalseSuccessor(lex);
+        } else {
+            next = ifNode.falseSuccessor();
+            ifNode.setTrueSuccessor(null);
+            ifNode.setFalseSuccessor(null);
+            newControlSplit.setTrueSuccessor(lex);
+        }
+        fwn1.setNext(next);
+        GraphUtil.killCFG(ifNode);
+        lb.setCompilerInverted();
+        debug.dump(DebugContext.DETAILED_LEVEL, graph, "Inversion: After rewiring exit path");
+        return proxyZeroTripInputs;
+    }
+
+    /**
+     * Note: this code assumes it is only called with a head-counted, i.e. non-inverted, loop.
+     *
+     * Compute zero trip proxy values for the loop. They are needed to build a protection diamond
+     * for inverted loops and used in the "loop-not-entered" path after the loop (through phis).
+     *
+     * Find the values of all loop proxies of the loop if it is exited upon its first iteration.
+     * Since we are dealing with a head counted loop where the counted loop condition dominates the
+     * rest of the loop body the only values that can be proxied here are floating node (chains)
+     * since there must not be a fixed node on the exit path, else we will not be able to invert the
+     * loop.
+     */
+    private static EconomicMap<ProxyNode, Node> findZeroTripProxyValues(Loop loop, EconomicMap<ProxyNode, NodeBitMap> proxyToChain) {
+        EconomicMap<ProxyNode, Node> zeroTripProxyValues = EconomicMap.create();
+        final LoopBeginNode lb = loop.loopBegin();
+        final StructuredGraph graph = lb.graph();
+        final LoopExitNode lex = (LoopExitNode) loop.counted().getCountedExit();
+        for (ProxyNode proxy : lex.proxies()) {
+            NodeBitMap allNodesUntilPhis = graph.createNodeBitMap();
+            visitUntilPhiFromProxy(allNodesUntilPhis, loop, proxy.value());
+            assert !loop.isOutsideLoop(proxy.value()) : "This phase assumes all proxied nodes are defined inside a loop and part of the loop fragment:" + proxy;
+            /*
+             * In order to properly capture the zero-trip tree of floating nodes we duplicate them
+             * and then replace the phi with its input on the forward end predecessor only for the
+             * new, duplicated, nodes and therefore have created a zero trip floating node tree with
+             * the root (the phi) replaced.
+             */
+            proxyToChain.put(proxy, allNodesUntilPhis);
+            Mark before = graph.getMark();
+            UnmodifiableEconomicMap<Node, Node> duplicates = graph.addDuplicates(allNodesUntilPhis, graph, allNodesUntilPhis.count(), (EconomicMap<Node, Node>) null);
+            for (PhiNode phi : lb.phis()) {
+                phi.replaceAtMatchingUsages(phi.valueAt(lb.forwardEnd()), x -> graph.isNew(before, x));
+            }
+            /*
+             * It is possible that the original loop proxied a FloatingGuardedNode that references
+             * the loop begin. In this case we rewire the zero trip value to before the loop.
+             */
+            for (Node usage : lb.usages().snapshot()) {
+                if (!graph.isNew(before, usage)) {
+                    continue;
+                }
+                for (Position p : usage.inputPositions()) {
+                    if ((p.getInputType() == InputType.Anchor || p.getInputType() == InputType.Guard) && p.get(usage) == lb) {
+                        p.set(usage, AbstractBeginNode.prevBegin(lb.forwardEnd()));
+                        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After updating guard/anchor edge for loop begin in zero trips %s", usage);
+                    }
+                }
+            }
+
+            ValueNode zeroTripVal = (ValueNode) duplicates.get(proxy.value());
+            if (zeroTripVal == null) {
+                assert lb.isPhiAtMerge(proxy.value()) : " cannot find replacement " + proxy.value() + " duplicates=" + duplicates + " found=" + allNodesUntilPhis;
+                zeroTripVal = ((PhiNode) proxy.value()).valueAt(lb.forwardEnd());
+            }
+            zeroTripProxyValues.put(proxy, zeroTripVal);
+            graph.getDebug().log(DebugContext.VERY_DETAILED_LEVEL, "Proxy %s contains the transitive floating node set until loop phis of %s which is deducted to map to this zero trip val %s->%s",
+                            proxy, allNodesUntilPhis, proxy.value(),
+                            duplicates.get(proxy.value()));
+        }
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After creating zero trip proxy values for %s", loop);
+        return zeroTripProxyValues;
+    }
+
+    /**
+     * Visit all input nodes from current until a node is either a loop phi, outside the loop or a
+     * fixed node.
+     */
+    private static void visitUntilPhiFromProxy(NodeBitMap visited, Loop loop, ValueNode node) {
+        ArrayDeque<Pair<Node, Node>> stack = new ArrayDeque<>();
+        stack.push(Pair.create(node, null));
+        while (!stack.isEmpty()) {
+            Pair<Node, Node> cur = stack.pop();
+            if (stopProcessingInputs(cur.getLeft(), cur.getRight(), loop, visited)) {
+                continue;
+            }
+            visited.mark(cur.getLeft());
+            for (Node input : cur.getLeft().inputs()) {
+                if (input instanceof ValueNode) {
+                    stack.push(Pair.create(input, cur.getLeft()));
+                }
+            }
+        }
+    }
+
+    private static boolean stopProcessingInputs(Node current, Node usage, Loop loop, NodeBitMap visited) {
+        if (visited.isMarked(current) || loop.loopBegin().isPhiAtMerge(current) || loop.isOutsideLoop(current)) {
+            return true;
+        }
+        if (current instanceof FixedNode) {
+            if (current == loop.loopBegin() && usage != null && isGuardEdge(current, usage)) {
+                // we allow guard inputs to fixed node if they go to the loop header, any other
+                // fixed node proxied is considered a problem
+                return true;
+            }
+            GraalError.shouldNotReachHere(
+                            "Head counted loops cannot proxy a fixed node as that node would be before " + "the loop exit condition meaning there is code between the exit condition " +
+                                            "check and the loop begin which is not allowed for a loop to be head counted." + " Node " + current + " reached over " + visited + " loop=" + loop); // ExcludeFromJacocoGeneratedReport
+        }
+        return false;
+    }
+
+    private static boolean isGuardEdge(Node input, Node usage) {
+        boolean foundGuardEdge = false;
+        for (Position p : usage.inputPositions()) {
+            if (p.get(usage) == input) {
+                // if there are multiple inputs from usage to input of different input types and one
+                // of them is non guard we want to fail
+                if (p.getInputType() == InputType.Guard) {
+                    foundGuardEdge = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        return foundGuardEdge;
+    }
+
+    /**
+     * Rewire all usages of induction variables that have been dominating the loop body before the
+     * the loop end place (i.e. the new exit condition and the loop exit and all involved proxies).
+     *
+     * @param proxyToChain
+     * @param proxyZeroTripInputs
+     * @param originalProxyStamps
+     */
+    private static void rewireToLoopEnd(Loop loop, LoopExitNode lex, IfNode newExitCondition, EconomicMap<ProxyNode, NodeBitMap> proxyToChain, EconomicMap<ProxyNode, Node> proxyZeroTripInputs,
+                    EconomicMap<ProxyNode, Stamp> originalProxyStamps) {
+        final StructuredGraph graph = lex.graph();
+        /*
+         * After inversion, references to loop phis and induction variables in the rotated
+         * exit condition and duplicated proxy expressions must use their loop-end values.
+         *
+         * These substitutions must behave as simultaneous assignments. Collecting the
+         * replacements before applying them is not sufficient: replaceAllInputs searches
+         * the usage's current inputs, so a later replacement can also rewrite an input
+         * inserted by an earlier replacement.
+         *
+         * For example, with prev -> cur and cur -> cur + 3, the expression cur - prev
+         * must become (cur + 3) - cur. Replacing by value sequentially could instead
+         * produce (cur + 3) - (cur + 3), because the second replacement also matches
+         * the cur inserted by the first.
+         *
+         * Therefore, record all matching input positions before applying any replacement,
+         * then update those positions directly. Each replacement affects only its original
+         * input occurrences, preserving the intended simultaneous substitution.
+         */
+        class ReplacementPair {
+            ValueNode input;
+            ValueNode usage;
+            ValueNode newNode;
+            List<Position> positions = new ArrayList<>();
+
+            ReplacementPair(ValueNode input, ValueNode usage, ValueNode newNode) {
+                this.input = input;
+                this.usage = usage;
+                this.newNode = newNode;
+                for (Position position : usage.inputPositions()) {
+                    if (position.get(usage) == input) {
+                        positions.add(position);
+                    }
+                }
+            }
+
+        }
+
+        NodeBitMap newNodes = graph.createNodeBitMap();
+        EconomicMap<ProxyNode, UnmodifiableEconomicMap<Node, Node>> newProxyDuplicates = EconomicMap.create();
+
+        /*
+         * Loop Proxies:
+         *
+         * Loop proxies are special because they can proxy arbitrary values derived from the loop
+         * body. If we only proxy loop phis or (derived) ivs, it would be easy to derive the next
+         * iteration value for a loop proxy after inversion. However, since arbitrary values
+         * produced (invariant) inside the loop can be proxied we need a different strategy.
+         *
+         * Thus, we take the tree of floating nodes derived for the zero trip proxy values and add
+         * their duplicates to the graph. This is a new node set. Then we iterate all phis and ivs
+         * and replace them with their next iteration value in this new proxy rooted tree of
+         * floating nodes. This gives us a new floating node tree for the proxy we can use, which
+         * has all old phis and ivs replaced with their next iteration values.
+         */
+
+        for (ProxyNode proxy : lex.proxies().snapshot()) {
+            NodeBitMap allNodes = proxyToChain.get(proxy);
+            UnmodifiableEconomicMap<Node, Node> newNodesProxy = graph.addDuplicates(allNodes, graph, allNodes.count(), (EconomicMap<Node, Node>) null);
+            for (Node newNode : newNodesProxy.getValues()) {
+                newNodes.markAndGrow(newNode);
+            }
+            newProxyDuplicates.put(proxy, newNodesProxy);
+        }
+
+        ArrayList<ReplacementPair> flatReplacements = new ArrayList<>();
+        LoopBeginNode lb = loop.loopBegin();
+
+        /*
+         * We need to rewire values using ivs as well as values accessing the plain phi
+         */
+        for (PhiNode phi : lb.phis().snapshot()) {
+            ValueNode phiValueNextIteration = phi.valueAt(lb.getSingleLoopEnd());
+            for (Node usage : phi.usages()) {
+                if (usage == newExitCondition.condition() || newNodes.contains(usage)) {
+                    flatReplacements.add(new ReplacementPair(phi, (ValueNode) usage, phiValueNextIteration));
+                }
+            }
+        }
+        EconomicMap<Node, InductionVariable> ivs = loop.getInductionVariables();
+        List<InductionVariable> ivSnapShotBefore = new ArrayList<>();
+        for (InductionVariable iv : ivs.getValues()) {
+            ivSnapShotBefore.add(iv);
+        }
+        for (InductionVariable iv : ivSnapShotBefore) {
+            ValueNode oldIvOp = null;
+            if (iv instanceof BasicInductionVariable) {
+                oldIvOp = ((BasicInductionVariable) iv).getOp();
+            } else {
+                oldIvOp = iv.valueNode();
+            }
+            InductionVariable nextIteration = InductionVariableHelper.nextIteration(iv);
+            ValueNode nextItIvValue = null;
+            if (nextIteration instanceof BasicInductionVariable) {
+                nextItIvValue = ((BasicInductionVariable) nextIteration).getOp();
+            } else {
+                nextItIvValue = nextIteration.valueNode();
+            }
+            for (Node usage : oldIvOp.usages()) {
+                if (usage == newExitCondition.condition() || !newNodes.isNew(usage) && newNodes.contains(usage)) {
+                    flatReplacements.add(new ReplacementPair(oldIvOp, (ValueNode) usage, nextItIvValue));
+                }
+            }
+        }
+        for (ReplacementPair replacement : flatReplacements) {
+            graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "Before replacing old input %s with new input %s at usage %s", replacement.input, replacement.newNode,
+                            replacement.usage);
+            for (Position position : replacement.positions) {
+                position.set(replacement.usage, replacement.newNode);
+            }
+        }
+        /*
+         * Rebuild new proxies to avoid canonicalizations of them if they have been loop proxies
+         * before
+         */
+        for (ProxyNode proxy : lex.proxies().snapshot()) {
+            UnmodifiableEconomicMap<Node, Node> proxyDuplicateTree = newProxyDuplicates.get(proxy);
+            Node duplicate = proxyDuplicateTree.get(proxy.value());
+            // the proxy value was a loop phi
+            if (duplicate == null) {
+                assert lb.isPhiAtMerge(proxy.value()) : " cannot find replacement " + proxy.value() + " duplicates=" + proxyDuplicateTree;
+                duplicate = ((PhiNode) proxy.value()).valueAt(lb.getSingleLoopEnd());
+            }
+            Node newNode = null;
+            ValueNode newTreeRoot = (ValueNode) duplicate;
+            newNode = proxy.duplicateOn(lex, newTreeRoot);
+            proxy.replaceAtUsages(newNode);
+            ((ProxyNode) newNode).inferStamp();
+            proxy.safeDelete();
+            assert newNode != null;
+            proxyZeroTripInputs.put((ProxyNode) newNode, proxyZeroTripInputs.get(proxy));
+            proxyZeroTripInputs.removeKey(proxy);
+            originalProxyStamps.put((ProxyNode) newNode, originalProxyStamps.get(proxy));
+            originalProxyStamps.removeKey(proxy);
+        }
+    }
+
+    public record ProtectionData(MergeNode merge, EconomicMap<ProxyNode, PhiNode> proxyToPhiMap) {
+    }
+
+    /**
+     * Protect the loop with a first iteration entry check, i.e. a diamond that checks the loop
+     * condition with its initial iteration value.
+     *
+     * Before
+     *
+     * <pre>
+     * for (i = 0; i < end; i++) {
+     *     // body
+     * }
+     * </pre>
+     *
+     * after
+     *
+     * <pre>
+     * if (0 < end) {
+     *     for (i = 0; i < end; i++) {
+     *         // body
+     *     }
+     * }
+     * </pre>
+     */
+    public static ProtectionData protectFirstLoopIteration(Loop loop, EconomicMap<ProxyNode, Node> originalProxyValuesZeroIteration) {
+        LoopBeginNode lb = loop.loopBegin();
+        int loopEndCount = lb.getLoopEndCount();
+        assert loopEndCount == 1 : "Protecting loops during inversion can only work with a single loop end but this one " + loop + " has " + loop;
+
+        StructuredGraph graph = lb.graph();
+        loop.resetCounted();
+        loop.detectCounted(true/* ignore protection, we are building it */);
+
+        assert loop.isCounted() : "Loop must be counted to protect it";
+
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After reseting counted loop data %s", lb);
+
+        LoopExitNode lex = (LoopExitNode) loop.counted().getCountedExit();
+        MergeNode merge = graph.add(new MergeNode());
+        merge.setStateAfter(lex.stateAfter().duplicateWithVirtualState());
+
+        EndNode endNonEntered = graph.add(new EndNode());
+        EndNode endEntered = graph.add(new EndNode());
+        BeginNode beginEntered = graph.add(new BeginNode());
+        BeginNode beginNotEntered = graph.add(new BeginNode());
+
+        IfNode limitTest = loop.counted().getLimitTest();
+        LogicNode condition = limitTest.condition();
+
+        assert condition instanceof BinaryOpLogicNode : condition;
+
+        boolean useX = !loop.whole().contains(((BinaryOpLogicNode) condition).getY());
+        ValueNode condX = ((BinaryOpLogicNode) condition).getX();
+        assert useX || !loop.whole().contains(condX) : condX + " must not be part of loop " + loop.whole();
+
+        CountedLoopInfo counted = loop.counted();
+        ValueNode newConditionIV = counted.limitCheckedPreviousOrRootEntryValue();
+        BinaryOpLogicNode copy = (BinaryOpLogicNode) condition.copyWithInputs(true);
+        if (useX) {
+            copy.setX(newConditionIV);
+        } else {
+            copy.setY(newConditionIV);
+        }
+
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After creating new protection condition %s", condition);
+
+        IfNode ifNode = null;
+        final BranchProbabilityData trueSuccProbability = limitTest.getProfileData();
+        if (limitTest.trueSuccessor() instanceof LoopExitNode) {
+            ifNode = graph.add(new IfNode(copy, beginNotEntered, beginEntered, trueSuccProbability));
+        } else {
+            ifNode = graph.add(new IfNode(copy, beginEntered, beginNotEntered, trueSuccProbability));
+        }
+
+        beginNotEntered.setNext(endNonEntered);
+        merge.addForwardEnd(endEntered);
+        merge.addForwardEnd(endNonEntered);
+        FixedNode next = lex.next();
+        lex.setNext(null);
+        lex.setNext(endEntered);
+        merge.setNext(next);
+        FixedWithNextNode loopPred = (FixedWithNextNode) lb.forwardEnd().predecessor();
+        loopPred.setNext(null);
+        beginEntered.setNext(lb.forwardEnd());
+        loopPred.setNext(ifNode);
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After building first iteration protection CF for loop %s", lb);
+
+        /*
+         * Loop exit and merge state: The merge becomes a completely new, deep duplicated state with
+         * the correct phis assigned to it. However, the exit state remains and should still use the
+         * old values. To distinguish between old, untouched exit state(s) we create a decoupled,
+         * completely new exit state for the lex as well. There might be post dominating usages that
+         * have common outer/virtual states with the exit states and we would miss necessary proxy
+         * -> new phi updates else where.
+         */
+        lex.setStateAfter(lex.stateAfter().duplicateWithVirtualState());
+        EconomicSet<Node> lexStateSet = EconomicSet.create(Equivalence.IDENTITY);
+        lex.stateAfter().applyToVirtual(x -> lexStateSet.add(x));
+
+        EconomicMap<ProxyNode, PhiNode> phis = EconomicMap.create();
+        for (ProxyNode thisLoopProxy : lex.proxies().snapshot()) {
+            PhiNode newPhi = thisLoopProxy.createPhi(merge);
+            newPhi.addInput(thisLoopProxy);
+            newPhi.addInput((ValueNode) originalProxyValuesZeroIteration.get(thisLoopProxy));
+            newPhi.inferStamp();
+            final PhiNode effectPhi = newPhi;
+            /*
+             * Replace the phi in everything below the loop exit except the state, since that one
+             * remains on the loop exit.
+             */
+            thisLoopProxy.replaceAtUsages(effectPhi, x -> !lexStateSet.contains(x) && x != effectPhi && !merge.isPhiAtMerge(x));
+            graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After processing loop protection proxy %s and replacing it with phi %s", thisLoopProxy, effectPhi);
+            phis.put(thisLoopProxy, newPhi);
+        }
+        // nodes post dominating the exit might be anchored at the exit, we change the CFG, thus
+        // re-anchor them to the merge
+        lex.replaceAtUsages(merge, InputType.Guard, InputType.Anchor);
+        graph.getDebug().dump(DebugContext.VERY_DETAILED_LEVEL, graph, "After protecting first iteration of loop %s", lb);
+        return new ProtectionData(merge, phis);
+    }
+
+    public static EconomicMap<ProxyNode, Stamp> getLoopProxyStamps(Loop loop) {
+        EconomicMap<ProxyNode, Stamp> originalProxyStampsBeforeInversion = EconomicMap.create();
+        final LoopExitNode lex = (LoopExitNode) loop.counted().getCountedExit();
+        for (ProxyNode thisLoopProxy : lex.proxies()) {
+            originalProxyStampsBeforeInversion.put(thisLoopProxy, thisLoopProxy.stamp(NodeView.DEFAULT));
+        }
+        return originalProxyStampsBeforeInversion;
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,6 +30,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -41,6 +42,7 @@ import org.graalvm.collections.MapCursor;
 
 import jdk.graal.compiler.bytecode.Bytecode;
 import jdk.graal.compiler.code.SourceStackTraceBailoutException;
+import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.core.common.type.ObjectStamp;
 import jdk.graal.compiler.core.common.util.CompilationAlarm;
 import jdk.graal.compiler.debug.Assertions;
@@ -50,6 +52,7 @@ import jdk.graal.compiler.graph.Graph;
 import jdk.graal.compiler.graph.LinkedStack;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeBitMap;
+import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.graal.compiler.graph.NodeStack;
 import jdk.graal.compiler.graph.Position;
@@ -57,6 +60,7 @@ import jdk.graal.compiler.graph.iterators.NodeIterable;
 import jdk.graal.compiler.nodes.AbstractBeginNode;
 import jdk.graal.compiler.nodes.AbstractEndNode;
 import jdk.graal.compiler.nodes.AbstractMergeNode;
+import jdk.graal.compiler.nodes.BeginNode;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.ControlSinkNode;
 import jdk.graal.compiler.nodes.ControlSplitNode;
@@ -80,11 +84,16 @@ import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.ValuePhiNode;
 import jdk.graal.compiler.nodes.ValueProxyNode;
 import jdk.graal.compiler.nodes.WithExceptionNode;
+import jdk.graal.compiler.nodes.debug.ControlFlowAnchored;
 import jdk.graal.compiler.nodes.extended.MultiGuardNode;
+import jdk.graal.compiler.nodes.extended.SwitchCaseProbabilityNode;
+import jdk.graal.compiler.nodes.java.LoadFieldNode;
 import jdk.graal.compiler.nodes.java.LoadIndexedNode;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.graal.compiler.nodes.java.MonitorIdNode;
+import jdk.graal.compiler.nodes.memory.MemoryAnchorNode;
 import jdk.graal.compiler.nodes.memory.MemoryPhiNode;
+import jdk.graal.compiler.nodes.memory.ReadNode;
 import jdk.graal.compiler.nodes.spi.ArrayLengthProvider;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.nodes.spi.CoreProvidersDelegate;
@@ -147,6 +156,11 @@ public class GraphUtil {
         for (Node marked : markedNodes) {
             if (marked.isAlive()) {
                 marked.markDeleted();
+            }
+        }
+        for (Node m : markedNodes) {
+            if (m instanceof FixedWithNextNode fixed) {
+                GraalError.guarantee(fixed.next() == null || fixed.next().isDeleted(), "dead node %s has live next %s", m, fixed.next());
             }
         }
     }
@@ -271,9 +285,8 @@ public class GraphUtil {
             EconomicSet<Node> unusedNodes = null;
             EconomicSet<Node> unsafeNodes = null;
             Graph.NodeEventScope nodeEventScope = null;
-            OptionValues options = node.getOptions();
             boolean verifyGraalGraphEdges = node.graph().verifyGraphEdges;
-            boolean verifyKillCFGUnusedNodes = GraphUtil.Options.VerifyKillCFGUnusedNodes.getValue(options);
+            boolean verifyKillCFGUnusedNodes = node.graph().verifyKillCFGUnusedNodes;
             if (verifyGraalGraphEdges) {
                 unsafeNodes = collectUnsafeNodes(node.graph());
             }
@@ -291,7 +304,8 @@ public class GraphUtil {
                         if (e == Graph.NodeEvent.ZERO_USAGES && isFloatingNode(n) && !(n instanceof GuardNode)) {
                             collectedUnusedNodes.add(n);
                         }
-                        if (e == Graph.NodeEvent.INPUT_CHANGED && n instanceof FixedNode && !(n instanceof AbstractMergeNode) && n.predecessor() == null) {
+                        if ((e == Graph.NodeEvent.INPUT_CHANGED || e == Graph.NodeEvent.CONTROL_FLOW_CHANGED) && n instanceof FixedNode && !(n instanceof AbstractMergeNode) &&
+                                        n.predecessor() == null) {
                             if (!deadControlFLow.contains(n)) {
                                 collectedUnusedNodes.add(n);
                             }
@@ -860,7 +874,12 @@ public class GraphUtil {
 
             } else if (current instanceof ValuePhiNode phi) {
                 if (visitedPhiInputMap == null) {
-                    visitedPhiInputMap = EconomicMap.create();
+                    /*
+                     * We may look up array lengths during canonicalization of nodes that aren't
+                     * part of the graph yet. We must use the system hashcode for those,
+                     * Node.hashCode must only be called on nodes that are part of the graph.
+                     */
+                    visitedPhiInputMap = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
                 }
                 return filterArrayLengthResult(phiArrayLength(phi, mode, constantReflection, visitedPhiInputMap), allowOnlyConstantResult);
 
@@ -924,7 +943,8 @@ public class GraphUtil {
             if (i == 0) {
                 assert singleLength == null;
                 singleLength = length;
-            } else if (singleLength == length) {
+            } else if (singleLength == length ||
+                            (singleLength.isJavaConstant() && length.isJavaConstant() && singleLength.asJavaConstant().equals(length.asJavaConstant()))) {
                 /* Nothing to do, still having a single length. */
             } else {
                 return null;
@@ -1070,11 +1090,15 @@ public class GraphUtil {
     }
 
     public static boolean tryKillUnused(Node node) {
-        if (node.isAlive() && isFloatingNode(node) && node.hasNoUsages() && !(node instanceof GuardNode)) {
+        if (shouldKillUnused(node)) {
             killWithUnusedFloatingInputs(node);
             return true;
         }
         return false;
+    }
+
+    public static boolean shouldKillUnused(Node node) {
+        return node.isAlive() && isFloatingNode(node) && node.hasNoUsages() && !(node instanceof GuardNode);
     }
 
     /**
@@ -1097,11 +1121,12 @@ public class GraphUtil {
 
                     @Override
                     public FixedNode next() {
-                        try {
-                            return current;
-                        } finally {
-                            current = (FixedNode) current.predecessor();
+                        if (!hasNext()) {
+                            throw new NoSuchElementException();
                         }
+                        FixedNode result = current;
+                        current = (FixedNode) current.predecessor();
+                        return result;
                     }
                 };
             }
@@ -1171,15 +1196,6 @@ public class GraphUtil {
                 return getLowerer().smallestCompareWidth();
             } else {
                 return null;
-            }
-        }
-
-        @Override
-        public boolean supportsRounding() {
-            if (getLowerer() != null) {
-                return getLowerer().supportsRounding();
-            } else {
-                return false;
             }
         }
 
@@ -1458,4 +1474,142 @@ public class GraphUtil {
         return true;
     }
 
+    /**
+     * Optimizes control split nodes by deduplicating the successor nodes of its control flow graph
+     * successor statements.
+     *
+     * An example would be case statements of a Switch. The illustrative example below is for a
+     * switch control split node. However, we perform the same transformation also for if nodes.
+     *
+     * <p>
+     * This transformation is only applied to patterns where the same code prefix is executed after
+     * each case, such as the following example:
+     *
+     * <pre>
+     * public static int switchReducePattern(int a) {
+     *     int result = 0;
+     *     switch (a) {
+     *         case 1:
+     *             result = sideEffect;
+     *             // some other code 1
+     *             break;
+     *         case 2:
+     *             result = sideEffect;
+     *             // some other code 2
+     *             break;
+     *         case 3:
+     *             result = sideEffect;
+     *             // some other code 3
+     *             break;
+     *         default:
+     *             result = sideEffect;
+     *             // some other code 4
+     *             break;
+     *     }
+     *     return result;
+     * }
+     * </pre>
+     *
+     * <p>
+     * The optimized code will have the common successor code extracted before the switch statement,
+     * resulting in:
+     *
+     * <pre>
+     * public static int switchReducePattern(int a) {
+     *     int result = 0;
+     *     result = sideEffect; // deduplicated before switch
+     *     switch (a) {
+     *         case 1:
+     *             // some other code 1
+     *             break;
+     *         case 2:
+     *             // some other code 2
+     *             break;
+     *         case 3:
+     *             // some other code 3
+     *             break;
+     *         default:
+     *             // some other code 4
+     *             break;
+     *     }
+     *     return result;
+     * }
+     * </pre>
+     */
+    public static void tryDeDuplicateSplitSuccessors(ControlSplitNode split, SimplifierTool tool) {
+        do {
+            Node referenceSuccessor = null;
+            for (Node successor : split.successors()) {
+                if (successor instanceof BeginNode begin && begin.next() instanceof FixedWithNextNode fwn) {
+                    if (successor.hasUsages()) {
+                        return;
+                    }
+                    if (!GraalOptions.OptDeduplicateReadsAcrossBranches.getValue(split.getOptions()) && (fwn instanceof LoadFieldNode || fwn instanceof ReadNode)) {
+                        return;
+                    }
+                    if (fwn instanceof AbstractBeginNode || fwn instanceof ControlFlowAnchored || fwn instanceof MemoryAnchorNode || fwn instanceof SwitchCaseProbabilityNode) {
+                        /*
+                         * Cannot do this optimization for begin nodes, because it could move guards
+                         * above the control split that need to stay below a branch.
+                         *
+                         * Cannot do this optimization for ControlFlowAnchored nodes, because these
+                         * are anchored in their control-flow position, and should not be moved
+                         * upwards.
+                         */
+                        return;
+                    }
+                    if (referenceSuccessor == null) {
+                        referenceSuccessor = fwn;
+                    } else {
+                        // ensure we are alike the reference successor - check if all case
+                        // successors are structurally and data wise the same node
+                        if (referenceSuccessor.getClass() != fwn.getClass()) {
+                            return;
+                        }
+                        if (!fwn.dataFlowEquals(referenceSuccessor)) {
+                            return;
+                        }
+                    }
+                } else {
+                    return;
+                }
+            }
+
+            List<Node> successorList = split.successors().snapshot();
+            FixedWithNextNode firstSuccessorNext = (FixedWithNextNode) ((FixedWithNextNode) successorList.getFirst()).next();
+
+            GraphUtil.unlinkFixedNode(firstSuccessorNext);
+            split.graph().addBeforeFixed(split, firstSuccessorNext);
+
+            for (int i = 1; i < successorList.size(); i++) {
+                FixedNode otherSuccessorNext = ((FixedWithNextNode) successorList.get(i)).next();
+                otherSuccessorNext.replaceAtUsages(firstSuccessorNext);
+                split.graph().removeFixed((FixedWithNextNode) otherSuccessorNext);
+            }
+
+            /*
+             * Immediately cleanup usages - this is required as certain simplify implementations in
+             * the compiler expect "known" graph shapes. De-duplication is an intrusive operation
+             * that can destroy these invariants (temporarily). Thus, we immediately cleanup
+             * floating usages to be deduplicated as well to have a correct graph shape again.
+             *
+             * Mostly relevant for commit allocation nodes and other partial escaped graph shapes.
+             */
+            for (Node usage : firstSuccessorNext.usages().snapshot()) {
+                if (usage.isAlive()) {
+                    NodeClass<?> usageNodeClass = usage.getNodeClass();
+                    if (usageNodeClass.valueNumberable() && !usageNodeClass.isLeafNode()) {
+                        Node newNode = split.graph().findDuplicate(usage);
+                        if (newNode != null) {
+                            usage.replaceAtUsagesAndDelete(newNode);
+                        }
+                    }
+                    if (usage.isAlive()) {
+                        tool.addToWorkList(usage);
+                    }
+                }
+            }
+        } while (true); // TERMINATION ARGUMENT: processing fixed nodes until duplication is no
+        // longer possible.
+    }
 }

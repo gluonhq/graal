@@ -26,28 +26,35 @@
 
 package jdk.graal.compiler.hotspot.test;
 
-import static jdk.vm.ci.meta.DeoptimizationReason.BoundsCheckException;
-import static jdk.vm.ci.meta.DeoptimizationReason.LoopLimitCheck;
 import static jdk.graal.compiler.core.common.GraalOptions.LoopPredication;
 import static jdk.graal.compiler.core.common.GraalOptions.LoopPredicationMainPath;
 import static jdk.graal.compiler.core.common.GraalOptions.SpeculativeGuardMovement;
+import static jdk.vm.ci.meta.DeoptimizationReason.BoundsCheckException;
+import static jdk.vm.ci.meta.DeoptimizationReason.LoopLimitCheck;
 
-import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
-import jdk.graal.compiler.core.test.GraalCompilerTest;
 import org.graalvm.collections.EconomicMap;
+import org.junit.Assert;
+import org.junit.Test;
+
 import jdk.graal.compiler.core.common.cfg.CFGLoop;
+import jdk.graal.compiler.core.phases.MidTier;
+import jdk.graal.compiler.core.test.GraalCompilerTest;
 import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.loop.phases.AggressivePartialUnrollPhase;
+import jdk.graal.compiler.loop.phases.InjectLoopCounterStampsPhase;
+import jdk.graal.compiler.loop.phases.LoopInversionPhase;
 import jdk.graal.compiler.loop.phases.LoopPredicationPhase;
+import jdk.graal.compiler.loop.phases.LoopRotationPhase;
+import jdk.graal.compiler.loop.phases.SimulationBasedLoopPeeling;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.calc.IntegerBelowNode;
 import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
-import org.junit.Assert;
-import org.junit.Test;
-
+import jdk.graal.compiler.util.EconomicHashSet;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
 import jdk.vm.ci.hotspot.HotSpotVMConfigAccess;
 import jdk.vm.ci.hotspot.HotSpotVMConfigStore;
@@ -69,6 +76,17 @@ public class RangeCheckPredicatesTest extends GraalCompilerTest {
         EconomicMap<OptionKey<?>, Object> overrides = OptionValues.newOptionMap();
         overrides.put(SpeculativeGuardMovement, false);
         overrides.put(LoopPredication, true);
+        // Keep graph-shape assertions on the legacy mid-tier phase plan.
+        overrides.put(MidTier.Options.StripMineNonCountedLoops, false);
+        overrides.put(MidTier.Options.StripMineCountedLoops, false);
+        overrides.put(MidTier.Options.StripMiningPreparationPhases, false);
+        overrides.put(MidTier.Options.OptExactArithmetic, false);
+        overrides.put(LoopInversionPhase.Options.LoopInversion, false);
+        overrides.put(LoopRotationPhase.Options.LoopRotation, false);
+        overrides.put(AggressivePartialUnrollPhase.Options.AggressivePartialUnroll, false);
+        overrides.put(SimulationBasedLoopPeeling.Options.SimulationBasedLoopPeeling, false);
+        // Keep loop-counter stamp injection out of tests that verify LoopPredication graph shapes.
+        overrides.put(InjectLoopCounterStampsPhase.Options.OptLoopPhiStamps, false);
         return overrides;
     }
 
@@ -113,7 +131,7 @@ public class RangeCheckPredicatesTest extends GraalCompilerTest {
     private void runNoOutOfBound(String methodName, int size, OptionValues options, Object... testParameters) {
         final ResolvedJavaMethod method = getResolvedJavaMethod(methodName);
         final int[] array = new int[size];
-        final HashSet<DeoptimizationReason> deoptimizationReasons = new HashSet<>();
+        final Set<DeoptimizationReason> deoptimizationReasons = new EconomicHashSet<>();
         deoptimizationReasons.add(BoundsCheckException);
         deoptimizationReasons.add(LoopLimitCheck);
         Object[] args = new Object[testParameters.length + 1];

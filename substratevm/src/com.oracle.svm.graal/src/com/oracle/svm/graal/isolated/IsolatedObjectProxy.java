@@ -26,6 +26,13 @@ package com.oracle.svm.graal.isolated;
 
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.core.graal.isolated.ClientIsolateThread;
+import com.oracle.svm.core.graal.isolated.CompilerHandle;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileClient;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileContext;
+
 /** Base class for objects that act as a proxy for objects in the compilation client's isolate. */
 public abstract class IsolatedObjectProxy<T> {
     protected final ClientHandle<T> handle;
@@ -79,12 +86,14 @@ public abstract class IsolatedObjectProxy<T> {
         return s;
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.IntExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static int hashCode0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> handle) {
         return IsolatedCompileClient.get().unhand(handle).hashCode();
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static CompilerHandle<String> toString0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> handle) {
         Object obj = IsolatedCompileClient.get().unhand(handle);
         String s = "Isolated: " + obj;

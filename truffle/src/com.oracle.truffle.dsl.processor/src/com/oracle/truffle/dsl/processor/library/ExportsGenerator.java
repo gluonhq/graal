@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -88,6 +88,7 @@ import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory;
 import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory.GeneratorMode;
 import com.oracle.truffle.dsl.processor.generator.GeneratorUtils;
 import com.oracle.truffle.dsl.processor.generator.NodeConstants;
+import com.oracle.truffle.dsl.processor.generator.NodeGeneratorPlugs;
 import com.oracle.truffle.dsl.processor.generator.StaticConstants;
 import com.oracle.truffle.dsl.processor.java.ElementUtils;
 import com.oracle.truffle.dsl.processor.java.model.CodeAnnotationMirror;
@@ -222,8 +223,8 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
 
             Map<String, ExportMessageData> messages = filterDeclaredMessages(libraryExports);
 
-            CodeTypeElement uncachedClass = createUncached(libraryExports, messages);
-            CodeTypeElement cacheClass = createCached(libraryExports, messages);
+            CodeTypeElement uncachedClass = createUncached(libraryExports, messages, true);
+            CodeTypeElement cacheClass = createCached(libraryExports, messages, true);
 
             CodeTypeElement resolvedExports = createResolvedExports(libraryExports, messages, createLibraryExportsClassName(libraryBaseType), cacheClass, uncachedClass);
             resolvedExports.add(cacheClass);
@@ -468,7 +469,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
             CodeTreeBuilder builder = CodeTreeBuilder.createBuilder();
             boolean needsCast = !variable.equals(expression);
             if (needsCast && !ElementUtils.isAssignable(receiverSourceType, receiverTargetType)) {
-                builder.startParantheses();
+                builder.startParentheses();
                 builder.cast(receiverTargetType);
             }
             builder.string(receiverName);
@@ -551,7 +552,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
         return providerClass;
     }
 
-    CodeTypeElement createCached(ExportsLibrary libraryExports, Map<String, ExportMessageData> messages) {
+    CodeTypeElement createCached(ExportsLibrary libraryExports, Map<String, ExportMessageData> messages, boolean addReplacements) {
         TypeMirror exportReceiverType = libraryExports.getReceiverType();
         final Modifier classVisibility = resolveSubclassVisibility(libraryExports);
         final boolean isFinalExports = classVisibility == Modifier.PRIVATE;
@@ -638,7 +639,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                     break;
                 }
                 FlatNodeGenFactory factory = new FlatNodeGenFactory(context, GeneratorMode.EXPORTED_MESSAGE, acceptsMessage.getSpecializedNode(),
-                                cachedSharedNodes, libraryExports.getSharedExpressions(), constants, nodeConstants);
+                                cachedSharedNodes, libraryExports.getSharedExpressions(), constants, nodeConstants, NodeGeneratorPlugs.DEFAULT);
                 List<CacheExpression> caches = new ArrayList<>();
                 for (CacheKey key : eagerCaches.keySet()) {
                     caches.add(key.cache);
@@ -787,7 +788,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
         Map<NodeData, CodeTypeElement> sharedNodes = new HashMap<>();
 
         for (ExportMessageData export : messages.values()) {
-            if (export.isGenerated()) {
+            if (export.isGenerated() && export.getResolvedMessage().getReplacementMethod() == null) {
                 continue;
             }
             LibraryMessage message = export.getResolvedMessage();
@@ -811,14 +812,14 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                 }
                 ExecutableElement exportMethod = (ExecutableElement) export.getMessageElement();
                 CodeTree cachedReceiverAccess = createReceiverCast(libraryExports, messages, modelReceiverType, cachedExportReceiverType, CodeTreeBuilder.singleString("receiver"), true);
-                cachedReceiverAccess = CodeTreeBuilder.createBuilder().startParantheses().tree(cachedReceiverAccess).end().build();
+                cachedReceiverAccess = CodeTreeBuilder.createBuilder().startParentheses().tree(cachedReceiverAccess).end().build();
                 cachedExecute = cacheClass.add(createDirectCall(cachedReceiverAccess, message, exportMethod));
             } else {
                 CodeTypeElement dummyNodeClass = sharedNodes.get(cachedSpecializedNode);
                 boolean shared = true;
                 if (dummyNodeClass == null) {
                     FlatNodeGenFactory factory = new FlatNodeGenFactory(context, GeneratorMode.EXPORTED_MESSAGE, cachedSpecializedNode, cachedSharedNodes, libraryExports.getSharedExpressions(),
-                                    constants, nodeConstants);
+                                    constants, nodeConstants, NodeGeneratorPlugs.DEFAULT);
                     dummyNodeClass = createClass(libraryExports, null, modifiers(), "Cached", types.Node);
                     factory.create(dummyNodeClass);
                     sharedNodes.put(cachedSpecializedNode, dummyNodeClass);
@@ -828,10 +829,13 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                 for (Element element : dummyNodeClass.getEnclosedElements()) {
                     String simpleName = element.getSimpleName().toString();
                     if (element.getKind() == ElementKind.METHOD) {
+                        CodeExecutableElement executable = (CodeExecutableElement) element;
+                        if (hasDeprecatedThrownTypes(executable.getThrownTypes()) || ElementUtils.isDeprecated(export.getElement())) {
+                            GeneratorUtils.mergeSuppressWarnings(executable, "deprecation");
+                        }
                         if (simpleName.endsWith("AndSpecialize")) {
                             // nothing to do for specialize method
                         } else if (simpleName.startsWith(ExportsParser.EXECUTE_PREFIX) && simpleName.endsWith(ExportsParser.EXECUTE_SUFFIX)) {
-                            CodeExecutableElement executable = (CodeExecutableElement) element;
                             executable.setVarArgs(message.getExecutable().isVarArgs());
                             cachedExecute = CodeExecutableElement.clone(executable);
                             cachedExecute.setSimpleName(CodeNames.of(message.getName()));
@@ -859,22 +863,25 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                 throw new AssertionError("execute not found");
             }
             if (message.getName().equals(ACCEPTS)) {
-                if (export.getExportsLibrary().isFinalReceiver() && (cachedSpecializedNode == null || !cachedSpecializedNode.needsRewrites(context)) && eagerCaches.isEmpty()) {
+                if (export.getExportsLibrary().isFinalReceiver() && (cachedSpecializedNode == null || !cachedSpecializedNode.needsSpecialize()) && eagerCaches.isEmpty()) {
                     cachedExecute.getModifiers().add(Modifier.STATIC);
                 }
                 cachedExecute.setSimpleName(CodeNames.of(ACCEPTS_METHOD_NAME));
                 ElementUtils.setVisibility(cachedExecute.getModifiers(), Modifier.PRIVATE);
             } else {
                 GeneratorUtils.addOverride(cachedExecute);
+                boolean hasDeprecatedThrownTypes = false;
                 if (!isFinalExports) {
                     // if this message might be extended we need to fully match the exception
                     // signature
-                    GeneratorUtils.addThrownExceptions(cachedExecute, message.getExecutable().getThrownTypes());
+                    List<? extends TypeMirror> thrownTypes = export.getResolvedMessage().getExecutable().getThrownTypes();
+                    GeneratorUtils.addThrownExceptions(cachedExecute, thrownTypes);
+                    hasDeprecatedThrownTypes = hasDeprecatedThrownTypes(thrownTypes);
                 }
                 if (libraryExports.needsState()) {
                     injectCachedAssertions(export.getExportsLibrary().getLibrary(), cachedExecute);
                 }
-                if (message.isDeprecated()) {
+                if (message.isDeprecated() || hasDeprecatedThrownTypes) {
                     GeneratorUtils.mergeSuppressWarnings(cachedExecute, "deprecation");
                 }
 
@@ -916,9 +923,74 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
             }
         }
 
+        if (addReplacements) {
+            cacheClass.getEnclosedElements().addAll(createReplacementMethods(messages));
+        }
+
         nodeConstants.addToClass(cacheClass);
 
         return cacheClass;
+    }
+
+    private static List<? extends ExecutableElement> createReplacementMethods(Map<String, ExportMessageData> messages) {
+        List<ExecutableElement> replacementMethods = new ArrayList<>();
+        for (ExportMessageData export : messages.values()) {
+            LibraryMessage message = export.getResolvedMessage();
+            LibraryMessage replacementMessage = message.getReplacementOf();
+            if (replacementMessage != null) {
+                ExecutableElement replacementMethod = message.getReplacementMethod();
+                if (replacementMethod != null) {
+                    // We generate the `replacementMessage`
+                    // that will automatically delegate to the `replacementMethod` method
+                    CodeExecutableElement replaceExecute = CodeExecutableElement.cloneNoAnnotations(replacementMessage.getExecutable());
+                    if (replacementMessage.isDeprecated()) {
+                        GeneratorUtils.mergeSuppressWarnings(replaceExecute, "deprecation");
+                    }
+                    CodeTreeBuilder builder = replaceExecute.createBuilder();
+                    builder.startReturn();
+                    builder.startCall((String) null, replacementMethod.getSimpleName().toString());
+                    List<? extends VariableElement> messageParameters = replacementMessage.getExecutable().getParameters();
+                    int size = messageParameters.size();
+                    for (int i = 0; i < size; i++) {
+                        VariableElement messageParam = messageParameters.get(i);
+                        builder.string(messageParam.getSimpleName().toString());
+                    }
+                    builder.end(); // call
+                    builder.end(); // return
+                    replacementMethods.add(replaceExecute);
+                } else if (!messages.containsKey(replacementMessage.getName()) || parametersDiffer(replacementMessage, messages.get(replacementMessage.getName()).getResolvedMessage())) {
+                    // We generate the `replacementMessage`
+                    // that will automatically delegate to the current `message`.
+                    CodeExecutableElement replaceExecute = CodeExecutableElement.cloneNoAnnotations(replacementMessage.getExecutable());
+                    if (replacementMessage.isDeprecated()) {
+                        GeneratorUtils.mergeSuppressWarnings(replaceExecute, "deprecation");
+                    }
+                    CodeTreeBuilder builder = replaceExecute.createBuilder();
+                    builder.startReturn();
+                    builder.startCall(null, message.getExecutable());
+                    List<? extends VariableElement> messageParameters = message.getExecutable().getParameters();
+                    List<? extends VariableElement> replaceParameters = replaceExecute.getParameters();
+                    int size = messageParameters.size();
+                    for (int i = 0; i < size; i++) {
+                        VariableElement messageParam = messageParameters.get(i);
+                        VariableElement replaceParam = replaceParameters.get(i);
+                        if (ElementUtils.typeEquals(messageParam.asType(), replaceParam.asType())) {
+                            builder.string(replaceParam.getSimpleName().toString());
+                        } else {
+                            builder.string("(" + messageParam.asType() + ") " + replaceParam.getSimpleName());
+                        }
+                    }
+                    builder.end(); // call
+                    builder.end(); // return
+                    replacementMethods.add(replaceExecute);
+                }
+            }
+        }
+        return replacementMethods;
+    }
+
+    private static boolean parametersDiffer(LibraryMessage message1, LibraryMessage message2) {
+        return !ElementUtils.parametersEquals(message1.getExecutable(), message2.getExecutable());
     }
 
     private static Map<String, ExportMessageData> filterDeclaredMessages(ExportsLibrary libraryExports) {
@@ -1144,6 +1216,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                         builder.string(constructorReceiverName + ".getClass()").end();
                     } else {
                         builder.string("(").cast(receiverType).string(constructorReceiverName + ").getClass()").end();
+                        GeneratorUtils.mergeSuppressWarnings(constructor, "cast");
                     }
                 }
                 acceptsBuilder.startStaticCall(types.CompilerDirectives, "isExact").string(receiverName).string("this.receiverClass_").end();
@@ -1190,7 +1263,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
         return builder.build();
     }
 
-    CodeTypeElement createUncached(ExportsLibrary libraryExports, Map<String, ExportMessageData> messages) {
+    CodeTypeElement createUncached(ExportsLibrary libraryExports, Map<String, ExportMessageData> messages, boolean addReplacements) {
         final TypeMirror exportReceiverType = libraryExports.getReceiverType();
         final Modifier classVisibility = resolveSubclassVisibility(libraryExports);
         final boolean isFinalExports = classVisibility == Modifier.PRIVATE;
@@ -1288,7 +1361,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
         NodeConstants nodeConstants = new NodeConstants();
 
         for (ExportMessageData export : messages.values()) {
-            if (export.isGenerated()) {
+            if (export.isGenerated() && export.getResolvedMessage().getReplacementMethod() == null) {
                 continue;
             }
             LibraryMessage message = export.getResolvedMessage();
@@ -1312,7 +1385,7 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                 }
             } else {
                 FlatNodeGenFactory factory = new FlatNodeGenFactory(context, GeneratorMode.EXPORTED_MESSAGE, uncachedSpecializedNode, uncachedSharedNodes, Collections.emptyMap(), constants,
-                                nodeConstants);
+                                nodeConstants, NodeGeneratorPlugs.DEFAULT);
                 CodeExecutableElement generatedUncached = factory.createUncached();
                 if (firstNode) {
                     uncachedClass.getEnclosedElements().addAll(factory.createUncachedFields());
@@ -1336,23 +1409,37 @@ public class ExportsGenerator extends CodeTypeElementFactory<ExportsData> {
                 CodeTreeBuilder b = uncachedExecute.createBuilder();
                 b.lineComment("declared: " + export.isDeclared());
                 GeneratorUtils.addBoundaryOrTransferToInterpreter(uncachedExecute, b);
+                boolean hasDeprecatedThrownTypes = false;
                 if (!isFinalExports) {
                     // if this message might be extended we need to fully match the exception
                     // signature
-                    GeneratorUtils.addThrownExceptions(uncachedExecute, export.getResolvedMessage().getExecutable().getThrownTypes());
+                    List<? extends TypeMirror> thrownTypes = export.getResolvedMessage().getExecutable().getThrownTypes();
+                    GeneratorUtils.addThrownExceptions(uncachedExecute, thrownTypes);
+                    hasDeprecatedThrownTypes = hasDeprecatedThrownTypes(thrownTypes);
                 }
                 GeneratorUtils.addOverride(uncachedExecute);
-                if (message.isDeprecated()) {
+                if (message.isDeprecated() || export.getMessageElement() != null && ElementUtils.isDeprecated(export.getMessageElement()) || hasDeprecatedThrownTypes) {
                     GeneratorUtils.mergeSuppressWarnings(uncachedExecute, "deprecation");
                 }
                 addAcceptsAssertion(b, null);
                 b.tree(originalBody);
             }
-
+        }
+        if (addReplacements) {
+            uncachedClass.getEnclosedElements().addAll(createReplacementMethods(messages));
         }
         nodeConstants.addToClass(uncachedClass);
         return uncachedClass;
 
+    }
+
+    static boolean hasDeprecatedThrownTypes(List<? extends TypeMirror> thrownTypes) {
+        for (TypeMirror m : thrownTypes) {
+            if (ElementUtils.isDeprecated(m)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static void injectCachedAssertions(LibraryData libraryData, CodeExecutableElement cachedExecute) {

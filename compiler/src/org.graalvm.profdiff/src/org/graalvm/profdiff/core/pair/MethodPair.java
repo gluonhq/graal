@@ -24,9 +24,12 @@
  */
 package org.graalvm.profdiff.core.pair;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Spliterator;
 import java.util.stream.StreamSupport;
 
+import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.Pair;
 import org.graalvm.profdiff.core.CompilationFragment;
 import org.graalvm.profdiff.core.CompilationUnit;
@@ -121,6 +124,24 @@ public class MethodPair {
             return StreamSupport.stream(pairs, false).filter(pair -> !(pair.getLeft() instanceof CompilationFragment && pair.getRight() instanceof CompilationFragment)).map(
                             pair -> new CompilationUnitPair(pair.getLeft(), pair.getRight())).iterator();
         };
+    }
+
+    /**
+     * Returns a list of pairs of compilations with the same compilation ID.
+     */
+    public List<CompilationUnitPair> getCompilationUnitPairsBySameCompilationId() {
+        EconomicMap<String, CompilationUnit> compilationUnitsById = EconomicMap.create();
+        for (CompilationUnit compilationUnit : method2.getCompilationUnits()) {
+            compilationUnitsById.put(compilationUnit.getCompilationId(), compilationUnit);
+        }
+        List<CompilationUnitPair> pairs = new ArrayList<>();
+        for (CompilationUnit compilationUnit : method1.getCompilationUnits()) {
+            CompilationUnit match = compilationUnitsById.get(compilationUnit.getCompilationId());
+            if (match != null) {
+                pairs.add(new CompilationUnitPair(compilationUnit, match));
+            }
+        }
+        return pairs;
     }
 
     /**

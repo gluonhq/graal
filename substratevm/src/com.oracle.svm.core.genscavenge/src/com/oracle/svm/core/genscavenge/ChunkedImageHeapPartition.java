@@ -24,20 +24,16 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.NavigableMap;
-import java.util.Queue;
-import java.util.TreeMap;
 
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.core.genscavenge.ChunkedImageHeapAllocator.AlignedChunk;
+import com.oracle.svm.core.image.ImageHeapLayouter.ImageHeapLayouterControl;
 import com.oracle.svm.core.image.ImageHeapObject;
+import com.oracle.svm.core.image.ImageHeapObjectSorter;
 import com.oracle.svm.core.image.ImageHeapPartition;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.debug.Assertions;
 
@@ -45,142 +41,137 @@ import jdk.graal.compiler.debug.Assertions;
  * The image heap comes in partitions. Each partition holds objects with different properties
  * (read-only/writable, primitives/objects).
  */
-public class ChunkedImageHeapPartition implements ImageHeapPartition {
+final class ChunkedImageHeapPartition implements ImageHeapPartition {
     private final String name;
     private final boolean writable;
-    private final boolean hugeObjects;
-    private final int startAlignment;
-    private final int endAlignment;
+    private final boolean unalignedChunks;
     private final int minimumObjectSize;
-    private final List<ImageHeapObject> objects = new ArrayList<>();
+    private List<ImageHeapObject> objects = new ArrayList<>();
 
     Object firstObject;
     Object lastObject;
 
-    long startOffset = -1;
-    long endOffset = -1;
+    private long startOffset = -1;
+    private long endOffset = -1;
 
-    ChunkedImageHeapPartition(String name, boolean writable, boolean hugeObjects, int startAlignment, int endAlignment) {
+    ChunkedImageHeapPartition(String name, boolean writable, boolean unalignedChunks) {
         this.name = name;
         this.writable = writable;
-        this.hugeObjects = hugeObjects;
-        this.startAlignment = startAlignment;
-        this.endAlignment = endAlignment;
+        this.unalignedChunks = unalignedChunks;
 
         /* Cache to prevent frequent lookups of the object layout from ImageSingletons. */
-        this.minimumObjectSize = ConfigurationValues.getObjectLayout().getMinImageHeapObjectSize();
+        this.minimumObjectSize = ObjectLayout.singleton().getMinImageHeapObjectSize();
     }
 
     void assign(ImageHeapObject obj) {
+        requireObjects();
         assert obj.getPartition() == this : obj;
         objects.add(obj);
     }
 
-    void layout(ChunkedImageHeapAllocator allocator) {
-        if (hugeObjects) {
-            layoutInUnalignedChunks(allocator);
+    void layout(ChunkedImageHeapAllocator allocator, ImageHeapObjectSorter objectSorter, ImageHeapLayouterControl control) {
+        requireObjects();
+        if (objects.isEmpty()) {
+            /*
+             * Without objects, there is no need to start a new chunk, or to force finishing the
+             * current chunk and therefore committing space for the rest of it. Another partition
+             * might be able to continue filling it, or, if no more objects follow, we don't need to
+             * dedicate space in the image at all.
+             */
+            startOffset = allocator.getPosition();
+            endOffset = startOffset;
+            return;
+        }
+
+        objectSorter.sort(this, objects);
+        if (unalignedChunks) {
+            layoutInUnalignedChunks(allocator, control);
         } else {
-            layoutInAlignedChunks(allocator);
+            layoutInAlignedChunks(allocator, control);
         }
     }
 
-    private void layoutInUnalignedChunks(ChunkedImageHeapAllocator allocator) {
+    private void layoutInUnalignedChunks(ChunkedImageHeapAllocator allocator, ImageHeapLayouterControl control) {
         allocator.finishAlignedChunk();
-        allocator.alignBetweenChunks(getStartAlignment());
         startOffset = allocator.getPosition();
 
-        for (ImageHeapObject info : objects) { // No need to sort by size
-            appendAllocatedObject(info, allocator.allocateUnalignedChunkForObject(info, isWritable()));
+        for (ImageHeapObject info : objects) {
+            setOffsetOfAllocatedObject(info, allocator.allocateUnalignedChunkForObject(info, isWritable()));
+            control.poll();
         }
+        firstObject = objects.getFirst().getWrapped();
+        lastObject = objects.getLast().getWrapped();
 
-        allocator.alignBetweenChunks(getEndAlignment());
         endOffset = allocator.getPosition();
     }
 
-    private void layoutInAlignedChunks(ChunkedImageHeapAllocator allocator) {
-        allocator.maybeStartAlignedChunk();
-        allocator.alignInAlignedChunk(getStartAlignment());
+    private void layoutInAlignedChunks(ChunkedImageHeapAllocator allocator, ImageHeapLayouterControl control) {
+        AlignedChunk firstChunk = allocator.maybeStartAlignedChunk();
         startOffset = allocator.getPosition();
-
-        allocateObjectsInAlignedChunks(allocator);
-
-        allocator.alignInAlignedChunk(getEndAlignment());
+        allocateObjectsInAlignedChunks(allocator, control, firstChunk);
         endOffset = allocator.getPosition();
     }
 
-    private void allocateObjectsInAlignedChunks(ChunkedImageHeapAllocator allocator) {
-        NavigableMap<Long, Queue<ImageHeapObject>> sortedObjects = createSortedObjectsMap();
-        while (!sortedObjects.isEmpty()) {
-            ImageHeapObject info = dequeueBestFit(sortedObjects, allocator.getRemainingBytesInAlignedChunk());
-            if (info == null) {
-                allocator.startNewAlignedChunk();
-            } else {
-                appendAllocatedObject(info, allocator.allocateObjectInAlignedChunk(info, isWritable()));
+    /**
+     * Allocates {@link ImageHeapObject} instances into aligned memory chunks using the provided
+     * allocator and control.
+     * <p>
+     * NOTE: This method is invoked at runtime for building auxiliary images. For this reason,
+     * iteration over chunks is intentionally performed by index rather than using Java iterators,
+     * which avoids creating many short-lived Iterator objects at runtime.
+     */
+    private void allocateObjectsInAlignedChunks(ChunkedImageHeapAllocator allocator, ImageHeapLayouterControl control, AlignedChunk firstChunk) {
+        int firstObjectIndex = firstChunk.getObjects().size();
+        AlignedChunk lastChunk = firstChunk;
+        ArrayList<AlignedChunk> allocationChunks = new ArrayList<>();
+        allocationChunks.add(firstChunk);
+        int objectCount = objects.size();
+        for (int i = 0; i < objectCount; i++) {
+            ImageHeapObject object = objects.get(i);
+            long allocationOffset = -1;
+            long objSize = object.getSize();
+            assert objSize >= minimumObjectSize : Assertions.errorMessage(object, objSize);
+
+            int chunksCount = allocationChunks.size();
+            for (int j = 0; j < chunksCount; j++) {
+                AlignedChunk chunk = allocationChunks.get(j);
+                if (objSize <= chunk.getUnallocatedBytes()) {
+                    allocationOffset = chunk.allocate(object, isWritable());
+                    if (chunk.getUnallocatedBytes() < minimumObjectSize) {
+                        allocationChunks.remove(j);
+                    }
+                    break;
+                }
             }
-        }
-    }
 
-    private ImageHeapObject dequeueBestFit(NavigableMap<Long, Queue<ImageHeapObject>> sortedObjects, long nbytes) {
-        if (nbytes < minimumObjectSize) {
-            return null;
-        }
-        Map.Entry<Long, Queue<ImageHeapObject>> entry = sortedObjects.floorEntry(nbytes);
-        if (entry == null) {
-            return null;
-        }
-        Queue<ImageHeapObject> queue = entry.getValue();
-        ImageHeapObject info = queue.remove();
-        if (queue.isEmpty()) {
-            sortedObjects.remove(entry.getKey());
-        }
-        return info;
-    }
+            if (allocationOffset == -1) {
+                lastChunk = allocator.startNewAlignedChunk();
+                control.poll();
 
-    private NavigableMap<Long, Queue<ImageHeapObject>> createSortedObjectsMap() {
-        ImageHeapObject[] sorted = objects.toArray(new ImageHeapObject[0]);
-        Arrays.sort(sorted, new SizeComparator());
-
-        NavigableMap<Long, Queue<ImageHeapObject>> map = new TreeMap<>();
-        Queue<ImageHeapObject> currentQueue = null;
-        long currentObjectsSize = -1;
-        for (ImageHeapObject obj : sorted) {
-            long objSize = obj.getSize();
-            if (objSize != currentObjectsSize) {
-                assert objSize > currentObjectsSize && objSize >= ConfigurationValues.getObjectLayout().getMinImageHeapObjectSize() : Assertions.errorMessage(obj, objSize);
-                currentObjectsSize = objSize;
-                currentQueue = new ArrayDeque<>();
-                map.put(currentObjectsSize, currentQueue);
+                allocationOffset = lastChunk.allocate(object, isWritable());
+                if (lastChunk.getUnallocatedBytes() >= minimumObjectSize) {
+                    allocationChunks.add(lastChunk);
+                }
             }
-            assert currentQueue != null;
-            currentQueue.add(obj);
+
+            setOffsetOfAllocatedObject(object, allocationOffset);
         }
-        return map;
+
+        if (firstChunk.getObjects().size() > firstObjectIndex) {
+            firstObject = firstChunk.getObjects().get(firstObjectIndex).getWrapped();
+        } else {
+            List<AlignedChunk> alignedChunks = allocator.getAlignedChunks();
+            AlignedChunk secondChunk = alignedChunks.get(alignedChunks.indexOf(firstChunk) + 1);
+            firstObject = secondChunk.getObjects().getFirst().getWrapped();
+        }
+        lastObject = lastChunk.getObjects().getLast().getWrapped();
     }
 
-    private void appendAllocatedObject(ImageHeapObject info, long allocationOffset) {
-        if (firstObject == null) {
-            firstObject = extractObject(info);
-        }
+    private void setOffsetOfAllocatedObject(ImageHeapObject info, long allocationOffset) {
         assert info.getPartition() == this;
         long offsetInPartition = allocationOffset - startOffset;
-        assert ConfigurationValues.getObjectLayout().isAligned(offsetInPartition) : "start: " + offsetInPartition + " must be aligned.";
+        assert ObjectLayout.singleton().isAligned(offsetInPartition) : "start: " + offsetInPartition + " must be aligned.";
         info.setOffsetInPartition(offsetInPartition);
-        lastObject = extractObject(info);
-    }
-
-    private static Object extractObject(ImageHeapObject info) {
-        if (info.getConstant() instanceof SubstrateObjectConstant) {
-            return info.getObject();
-        } else {
-            /*
-             * The info wraps an ImageHeapObject, i.e., a build time representation of an object
-             * that is not backed by a raw hosted object. We set the partition limit to the actual
-             * constant. The constant reflection provider knows that this is a build time value, and
-             * it will not wrap it in a JavaConstant when reading it. This case is not different
-             * from normal objects referencing simulated objects.
-             */
-            return info.getConstant();
-        }
     }
 
     @Override
@@ -188,20 +179,22 @@ public class ChunkedImageHeapPartition implements ImageHeapPartition {
         return name;
     }
 
-    boolean isWritable() {
+    @Override
+    public boolean isWritable() {
         return writable;
     }
 
-    boolean usesUnalignedObjects() {
-        return hugeObjects;
+    boolean usesUnalignedChunks() {
+        return unalignedChunks;
     }
 
-    final int getStartAlignment() {
-        return startAlignment;
+    void releaseObjectReferences() {
+        requireObjects();
+        objects = null;
     }
 
-    final int getEndAlignment() {
-        return endAlignment;
+    private void requireObjects() {
+        VMError.guarantee(objects != null, "Image heap partition objects were released.");
     }
 
     @Override
@@ -223,12 +216,5 @@ public class ChunkedImageHeapPartition implements ImageHeapPartition {
     @Override
     public String toString() {
         return name;
-    }
-
-    private static class SizeComparator implements Comparator<ImageHeapObject> {
-        @Override
-        public int compare(ImageHeapObject o1, ImageHeapObject o2) {
-            return Long.signum(o1.getSize() - o2.getSize());
-        }
     }
 }

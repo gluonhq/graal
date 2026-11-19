@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
  */
 package jdk.graal.compiler.nodes;
 
+import static jdk.graal.compiler.nodeinfo.InputType.Association;
 import static jdk.graal.compiler.nodeinfo.InputType.Extension;
 import static jdk.graal.compiler.nodeinfo.InputType.Memory;
 import static jdk.graal.compiler.nodeinfo.InputType.State;
@@ -40,6 +41,8 @@ import static jdk.graal.compiler.nodes.Invoke.SIZE_UNKNOWN_RATIONALE;
 
 import java.util.Map;
 
+import org.graalvm.word.LocationIdentity;
+
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeClass;
@@ -52,16 +55,16 @@ import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import jdk.graal.compiler.nodes.spi.UncheckedInterfaceProvider;
-import org.graalvm.word.LocationIdentity;
-
 import jdk.vm.ci.code.BytecodeFrame;
 
 /**
  * The {@code InvokeNode} represents all kinds of method calls.
+ *
+ * It can be associated with {@link ReadArgumentNode}s.
  */
 // @formatter:off
 @NodeInfo(nameTemplate = "Invoke#{p#targetMethod/s}",
-          allowedUsageTypes = {Memory},
+          allowedUsageTypes = {Memory, Association},
           cycles = CYCLES_UNKNOWN, cyclesRationale = CYCLES_UNKNOWN_RATIONALE,
           size   = SIZE_UNKNOWN,   sizeRationale   = SIZE_UNKNOWN_RATIONALE)
 // @formatter:on
@@ -76,6 +79,7 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
     protected InlineControl inlineControl;
     protected final LocationIdentity identity;
     private boolean isInOOMETry;
+    private boolean sideEffect;
 
     public InvokeNode(CallTargetNode callTarget, int bci) {
         this(callTarget, bci, callTarget.returnStamp().getTrustedStamp());
@@ -96,6 +100,7 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
         this.polymorphic = false;
         this.inlineControl = InlineControl.Normal;
         this.identity = identity;
+        this.sideEffect = super.hasSideEffect();
     }
 
     @Override
@@ -260,6 +265,15 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
     @Override
     public void setInOOMETry(boolean isInOOMETry) {
         this.isInOOMETry = isInOOMETry;
+    }
+
+    public void setSideEffect(boolean sideEffect) {
+        this.sideEffect = sideEffect;
+    }
+
+    @Override
+    public boolean hasSideEffect() {
+        return sideEffect;
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,12 +25,12 @@
 package com.oracle.graal.reachability;
 
 import java.lang.reflect.Executable;
-import java.lang.reflect.Field;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.Set;
+
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.graal.pointsto.AbstractAnalysisEngine;
 import com.oracle.graal.pointsto.ClassInclusionPolicy;
@@ -47,7 +47,7 @@ import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.CompletionExecutor;
 import com.oracle.graal.pointsto.util.Timer;
 import com.oracle.graal.pointsto.util.TimerCollection;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.svm.common.meta.MethodVariant;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.debug.DebugContext;
@@ -107,12 +107,12 @@ public abstract class ReachabilityAnalysisEngine extends AbstractAnalysisEngine 
     }
 
     @Override
-    public AnalysisMethod addRootMethod(Executable method, boolean invokeSpecial, Object reason, MultiMethod.MultiMethodKey... otherRoots) {
+    public AnalysisMethod addRootMethod(Executable method, boolean invokeSpecial, Object reason, MethodVariant.MethodVariantKey... otherRoots) {
         return addRootMethod(metaAccess.lookupJavaMethod(method), invokeSpecial, reason, otherRoots);
     }
 
     @Override
-    public AnalysisMethod forcedAddRootMethod(Executable method, boolean invokeSpecial, Object reason, MultiMethod.MultiMethodKey... otherRoots) {
+    public AnalysisMethod forcedAddRootMethod(AnalysisMethod method, boolean invokeSpecial, Object reason, MethodVariant.MethodVariantKey... otherRoots) {
         return addRootMethod(method, invokeSpecial, reason, otherRoots);
     }
 
@@ -143,43 +143,36 @@ public abstract class ReachabilityAnalysisEngine extends AbstractAnalysisEngine 
         for (ResolvedJavaField javaField : type.getInstanceFields(true)) {
             AnalysisField field = (AnalysisField) javaField;
             if (field.getName().equals(fieldName)) {
-                field.registerAsAccessed("root field");
-                return field.getType();
+                return addRootField(field);
             }
         }
         throw AnalysisError.userError("Field not found: " + fieldName);
     }
 
     @Override
-    public AnalysisType addRootField(Field field) {
-        AnalysisField analysisField = getMetaAccess().lookupJavaField(field);
+    public AnalysisType addRootField(AnalysisField analysisField) {
         analysisField.registerAsAccessed("root field");
         return analysisField.getType();
     }
 
     @Override
-    public AnalysisMethod addRootMethod(AnalysisMethod m, boolean invokeSpecial, Object reason, MultiMethod.MultiMethodKey... otherRoots) {
+    public AnalysisMethod addRootMethod(AnalysisMethod m, boolean invokeSpecial, Object reason, MethodVariant.MethodVariantKey... otherRoots) {
         assert otherRoots.length == 0 : otherRoots;
         ReachabilityAnalysisMethod method = (ReachabilityAnalysisMethod) m;
         if (m.isStatic()) {
-            postTask(() -> {
-                if (method.registerAsDirectRootMethod(reason)) {
-                    markMethodImplementationInvoked(method, reason);
-                }
-            });
+            if (method.registerAsDirectRootMethod(reason)) {
+                postTask(() -> markMethodImplementationInvoked(method, reason));
+            }
+
         } else if (invokeSpecial) {
             AnalysisError.guarantee(!method.isAbstract(), "Abstract methods cannot be registered as special invoke entry point.");
-            postTask(() -> {
-                if (method.registerAsDirectRootMethod(reason)) {
-                    markMethodImplementationInvoked(method, reason);
-                }
-            });
+            if (method.registerAsDirectRootMethod(reason)) {
+                postTask(() -> markMethodImplementationInvoked(method, reason));
+            }
         } else {
-            postTask(() -> {
-                if (method.registerAsVirtualRootMethod(reason)) {
-                    markMethodInvoked(method, reason);
-                }
-            });
+            if (method.registerAsVirtualRootMethod(reason)) {
+                postTask(() -> markMethodInvoked(method, reason));
+            }
         }
         return method;
     }
@@ -292,6 +285,7 @@ public abstract class ReachabilityAnalysisEngine extends AbstractAnalysisEngine 
 
     @Override
     public boolean finish() throws InterruptedException {
+        assert isInitialized();
         do {
             runReachability();
             assert executor.getPostedOperations() == 0 : executor.getPostedOperations();
@@ -320,26 +314,13 @@ public abstract class ReachabilityAnalysisEngine extends AbstractAnalysisEngine 
      * method.
      */
     private void computeCallers() {
-        Set<ReachabilityAnalysisMethod> seen = new HashSet<>();
+        EconomicSet<ReachabilityAnalysisMethod> seen = EconomicSet.create();
         Deque<ReachabilityAnalysisMethod> queue = new ArrayDeque<>();
 
-        for (AnalysisMethod m : universe.getMethods()) {
-            ReachabilityAnalysisMethod method = ((ReachabilityAnalysisMethod) m);
-            if (method.isDirectRootMethod() || method.isEntryPoint()) {
-                if (seen.add(method)) {
-                    queue.add(method);
-                }
-            }
-            if (method.isVirtualRootMethod()) {
-                for (ReachabilityAnalysisType subtype : method.getDeclaringClass().getInstantiatedSubtypes()) {
-                    ReachabilityAnalysisMethod resolved = subtype.resolveConcreteMethod(method, subtype);
-                    if (resolved != null) {
-                        if (seen.add(resolved)) {
-                            queue.add(resolved);
-                        }
-                    }
-                }
-            }
+        for (AnalysisMethod m : AnalysisUniverse.getCallTreeRoots(getUniverse())) {
+            ReachabilityAnalysisMethod method = (ReachabilityAnalysisMethod) m;
+            queue.add(method);
+            seen.add(method);
         }
 
         while (!queue.isEmpty()) {

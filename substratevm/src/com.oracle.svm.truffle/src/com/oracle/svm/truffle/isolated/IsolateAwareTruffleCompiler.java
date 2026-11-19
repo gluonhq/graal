@@ -24,8 +24,6 @@
  */
 package com.oracle.svm.truffle.isolated;
 
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.graalvm.nativeimage.CurrentIsolate;
@@ -37,19 +35,22 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.VMRuntime;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.ComparableWord;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
+import org.graalvm.word.WordBase;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-import com.oracle.svm.graal.isolated.ClientHandle;
-import com.oracle.svm.graal.isolated.ClientIsolateThread;
-import com.oracle.svm.graal.isolated.CompilerIsolateThread;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.core.graal.isolated.ClientIsolateThread;
+import com.oracle.svm.core.graal.isolated.CompilerIsolateThread;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileClient;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileContext;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
 import com.oracle.svm.graal.isolated.ImageHeapObjects;
 import com.oracle.svm.graal.isolated.ImageHeapRef;
-import com.oracle.svm.graal.isolated.IsolatedCompileClient;
-import com.oracle.svm.graal.isolated.IsolatedCompileContext;
 import com.oracle.svm.graal.isolated.IsolatedGraalUtils;
 import com.oracle.svm.graal.isolated.IsolatedHandles;
 import com.oracle.svm.truffle.api.SubstrateCompilableTruffleAST;
@@ -59,16 +60,15 @@ import com.oracle.truffle.compiler.TruffleCompilable;
 import com.oracle.truffle.compiler.TruffleCompilationTask;
 import com.oracle.truffle.compiler.TruffleCompilerListener;
 
-import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.graal.compiler.core.common.SuppressFBWarnings;
 import jdk.graal.compiler.nodes.PauseNode;
 import jdk.graal.compiler.truffle.PartialEvaluator;
 import jdk.graal.compiler.truffle.TruffleCompilation;
+import jdk.graal.compiler.truffle.TruffleCompilationIdentifier;
 import jdk.graal.compiler.truffle.phases.TruffleTier;
-import jdk.graal.compiler.word.Word;
 
 public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
-    private static final Word ISOLATE_INITIALIZING = WordFactory.signed(-1);
+    private static final ComparableWord ISOLATE_INITIALIZING = Word.signed(-1);
 
     private final UninterruptibleUtils.AtomicWord<Isolate> sharedIsolate = new UninterruptibleUtils.AtomicWord<>();
 
@@ -108,8 +108,8 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
                 if (listener != null) {
                     eventContext = new IsolatedEventContext(listener, compilable, task);
                 }
-                ClientHandle<CompilationIdentifier> compilationIdentifier = client.hand(delegate.createCompilationIdentifier(task, compilable));
-                ClientHandle<String> thrownException = doCompile0(context,
+                ClientHandle<TruffleCompilationIdentifier> compilationIdentifier = client.hand(delegate.createCompilationIdentifier(task, compilable));
+                doCompile0(context,
                                 (ClientIsolateThread) CurrentIsolate.getCurrentThread(),
                                 ImageHeapObjects.ref(delegate),
                                 client.hand(task),
@@ -117,11 +117,6 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
                                 compilationIdentifier,
                                 client.hand(eventContext),
                                 firstCompilation.getAndSet(false));
-
-                String exception = client.unhand(thrownException);
-                if (exception != null) {
-                    throw new RuntimeException("Method doCompile threw: " + exception);
-                }
             } finally {
                 IsolatedCompileClient.set(null);
             }
@@ -133,7 +128,7 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
     protected CompilerIsolateThread beforeCompilation() {
         Isolate isolate = getSharedIsolate();
         if (isolate.isNull()) {
-            if (sharedIsolate.compareAndSet(WordFactory.nullPointer(), (Isolate) ISOLATE_INITIALIZING)) {
+            if (sharedIsolate.compareAndSet(Word.nullPointer(), (Isolate) ISOLATE_INITIALIZING)) {
                 try {
                     /* Adding the shutdown hook may fail if a shutdown is already in progress. */
                     Runtime.getRuntime().addShutdownHook(new Thread(this::sharedIsolateShutdown));
@@ -143,7 +138,7 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
                 } catch (Throwable e) {
                     /* Reset the value so that the teardown hook doesn't hang. */
                     assert sharedIsolate.get().equal(ISOLATE_INITIALIZING);
-                    sharedIsolate.set(WordFactory.nullPointer());
+                    sharedIsolate.set(Word.nullPointer());
                     throw e;
                 }
             }
@@ -171,7 +166,8 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
         }
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileContext.VoidExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileContext.ExceptionRethrowCallerEpilogue.class)
     protected static void compilerIsolateThreadShutdown(@SuppressWarnings("unused") @CEntryPoint.IsolateThreadContext CompilerIsolateThread context) {
         VMRuntime.shutdown();
     }
@@ -181,16 +177,20 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
         Isolates.detachThread(context);
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
-    private static ClientHandle<String> doCompile0(@SuppressWarnings("unused") @CEntryPoint.IsolateThreadContext CompilerIsolateThread context,
+    @CEntryPoint(exceptionHandler = IsolatedCompileContext.ResetContextWordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(epilogue = IsolatedCompileContext.ExitCompilationEpilogue.class, callerEpilogue = IsolatedCompileContext.ExceptionRethrowCallerEpilogue.class)
+    private static WordBase doCompile0(@SuppressWarnings("unused") @CEntryPoint.IsolateThreadContext CompilerIsolateThread context,
                     ClientIsolateThread client,
                     ImageHeapRef<SubstrateTruffleCompilerImpl> delegateRef,
                     ClientHandle<TruffleCompilationTask> taskHandle,
                     ClientHandle<SubstrateCompilableTruffleAST> compilableHandle,
-                    ClientHandle<CompilationIdentifier> compilationIdentifier,
+                    ClientHandle<TruffleCompilationIdentifier> compilationIdentifier,
                     ClientHandle<IsolatedEventContext> eventContextHandle,
                     boolean firstCompilation) {
+
         IsolatedCompileContext.set(new IsolatedCompileContext(client));
+        // The context is cleared in the CEntryPointOptions.epilogue (also in case of an exception)
+
         try {
             SubstrateTruffleCompilerImpl delegate = ImageHeapObjects.deref(delegateRef);
             IsolatedCompilableTruffleAST compilable = new IsolatedCompilableTruffleAST(compilableHandle);
@@ -211,31 +211,58 @@ public class IsolateAwareTruffleCompiler implements SubstrateTruffleCompiler {
                 compilation.setCompilationId(new IsolatedTruffleCompilationIdentifier(compilationIdentifier, task, compilable));
                 delegate.doCompile(compilation, listener);
             }
-            return IsolatedHandles.nullHandle(); // no exception
-        } catch (Throwable t) {
-            StringWriter writer = new StringWriter();
-            t.printStackTrace(new PrintWriter(writer));
-            return IsolatedCompileContext.get().createStringInClient(writer.toString());
         } finally {
             /*
-             * Compilation isolate do not use a dedicated reference handler thread, so we trigger
+             * Compilation isolates do not use a dedicated reference handler thread, so we trigger
              * the reference handling manually when a compilation finishes.
              */
             Heap.getHeap().doReferenceHandling();
-            IsolatedCompileContext.set(null);
         }
+
+        return Word.zero();
     }
 
-    @CEntryPoint(include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.VoidExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static void copyEncodedOptions(@SuppressWarnings("unused") @CEntryPoint.IsolateThreadContext ClientIsolateThread client, ClientHandle<byte[]> encodedOptionsHandle, PointerBase buffer) {
         byte[] encodedOptions = IsolatedCompileClient.get().unhand(encodedOptionsHandle);
         CTypeConversion.asByteBuffer(buffer, encodedOptions.length).put(encodedOptions);
     }
 
     @Override
-    public void teardown() {
+    public void teardown(Runnable shutdownCompilationsAndWaitAction) {
         if (SubstrateOptions.shouldCompileInIsolates()) {
-            tearDownIsolateOnShutdown();
+            /*
+             * Start a separate thread for shutting down any ongoing compilations. If we are in a
+             * process with a single Truffle runtime (e.g. a language launcher), it can {@linkplain
+             * System#exit exit} early without waiting for this thread to finish. If there are
+             * potentially multiple isolates in the current process, the thread will delay the
+             * shutdown of the runtime isolate until the compilation isolate has been fully torn
+             * down.
+             */
+            Thread t = new Thread(() -> {
+                try {
+                    shutdownCompilationsAndWaitAction.run();
+                } finally {
+                    /*
+                     * Call tear down in the finally block to tear down the isolate
+                     * even when the shutdownCompilationsAndWaitAction is interrupted
+                     * by CEntryPointSnippets::initiateTearDownIsolateInterruptibly
+                     */
+                    tearDownIsolateOnShutdown();
+                }
+            });
+            // we ignore uncaught exceptions here. For example
+            // if the waiting thread was interrupted.
+            t.setUncaughtExceptionHandler((_, _) -> {
+            });
+            /*
+             * Technically this does not need to be a daemon thread, as either way this thread is
+             * still being waited on when tearing down the isolate. However it seems more correct to
+             * mark this thread as daemon as it should not prevent the regular JVM shutdown.
+             */
+            t.setDaemon(true);
+            t.start();
         }
     }
 

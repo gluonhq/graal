@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,11 +42,12 @@ package com.oracle.truffle.runtime;
 
 import static com.oracle.truffle.runtime.OptimizedRuntimeOptions.CompilerIdleDelay;
 
-import java.io.CharArrayWriter;
-import java.io.PrintWriter;
-import java.lang.annotation.Annotation;
+import java.io.PrintStream;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
+import java.net.URL;
 import java.nio.Buffer;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
@@ -63,6 +64,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -70,7 +73,6 @@ import java.util.stream.Collectors;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.UnmodifiableEconomicMap;
-import org.graalvm.home.Version;
 import org.graalvm.nativeimage.ImageInfo;
 import org.graalvm.options.OptionCategory;
 import org.graalvm.options.OptionDescriptor;
@@ -85,12 +87,9 @@ import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.ExactMath;
 import com.oracle.truffle.api.HostCompilerDirectives;
-import com.oracle.truffle.api.HostCompilerDirectives.BytecodeInterpreterSwitch;
-import com.oracle.truffle.api.HostCompilerDirectives.InliningCutoff;
 import com.oracle.truffle.api.OptimizationFailedException;
 import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.Truffle;
@@ -114,8 +113,6 @@ import com.oracle.truffle.api.impl.ThreadLocalHandshake;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.LoopNode;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.nodes.Node.Child;
-import com.oracle.truffle.api.nodes.Node.Children;
 import com.oracle.truffle.api.nodes.RepeatingNode;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.nodes.SlowPathException;
@@ -124,13 +121,11 @@ import com.oracle.truffle.api.object.DynamicObject;
 import com.oracle.truffle.api.object.Shape;
 import com.oracle.truffle.api.profiles.BranchProfile;
 import com.oracle.truffle.api.profiles.ConditionProfile;
+import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.api.strings.AbstractTruffleString;
 import com.oracle.truffle.api.strings.TruffleString;
-import com.oracle.truffle.compiler.ConstantFieldInfo;
-import com.oracle.truffle.compiler.HostMethodInfo;
 import com.oracle.truffle.compiler.OptimizedAssumptionDependency;
-import com.oracle.truffle.compiler.PartialEvaluationMethodInfo;
 import com.oracle.truffle.compiler.TruffleCompilable;
 import com.oracle.truffle.compiler.TruffleCompilationSupport;
 import com.oracle.truffle.compiler.TruffleCompiler;
@@ -146,15 +141,12 @@ import com.oracle.truffle.runtime.debug.TraceCompilationPolymorphismListener;
 import com.oracle.truffle.runtime.debug.TraceSplittingListener;
 import com.oracle.truffle.runtime.serviceprovider.TruffleRuntimeServices;
 
-import jdk.vm.ci.code.BailoutException;
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.code.stack.InspectedFrame;
 import jdk.vm.ci.code.stack.InspectedFrameVisitor;
 import jdk.vm.ci.code.stack.StackIntrospection;
 import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.SpeculationLog;
@@ -166,10 +158,6 @@ import jdk.vm.ci.services.Services;
 public abstract class OptimizedTruffleRuntime implements TruffleRuntime, TruffleCompilerRuntime {
 
     private static final int JAVA_SPECIFICATION_VERSION = Runtime.version().feature();
-    public static final Version MIN_COMPILER_VERSION = Version.create(23, 1, 2);
-    public static final int MIN_JDK_VERSION = 21;
-    public static final int MAX_JDK_VERSION = 25;
-    public static final Version NEXT_VERSION_UPDATE = Version.create(25, 1);
 
     /**
      * Used only to reset state for native image compilation.
@@ -196,11 +184,11 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         return (OptimizedTruffleRuntime) Truffle.getRuntime();
     }
 
-    private final LoopNodeFactory loopNodeFactory;
     private EngineCacheSupport engineCacheSupport;
-    private final UnmodifiableEconomicMap<String, Class<?>> lookupTypes;
+    private final Iterable<Class<?>> extraLookupTypes;
+    private UnmodifiableEconomicMap<String, Class<?>> lookupTypes;
     private final FloodControlHandler floodControlHandler;
-    private final List<OptionDescriptors> runtimeOptionDescriptors;
+    private final List<OptionDescriptors> extensionOptionDescriptors;
     protected volatile OptionDescriptors engineOptions;
 
     protected final TruffleCompilationSupport compilationSupport;
@@ -209,28 +197,28 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     @SuppressWarnings("this-escape")
     public OptimizedTruffleRuntime(TruffleCompilationSupport compilationSupport, Iterable<Class<?>> extraLookupTypes) {
         this.compilationSupport = compilationSupport;
-        this.lookupTypes = initLookupTypes(extraLookupTypes);
+        this.extraLookupTypes = extraLookupTypes;
         List<OptionDescriptors> options = new ArrayList<>();
-        this.loopNodeFactory = loadGraalRuntimeServiceProvider(LoopNodeFactory.class, options, true);
         EngineCacheSupport support = loadEngineCacheSupport(options);
         this.engineCacheSupport = support == null ? new EngineCacheSupport.Disabled() : support;
         this.previousEngineCacheSupportOptions = engineCacheSupport.getEngineOptions();
-        options.add(OptimizedRuntimeOptions.getDescriptors());
-        options.add(new CompilerOptionsDescriptors());
-        this.runtimeOptionDescriptors = options;
+        this.extensionOptionDescriptors = options;
         this.floodControlHandler = loadGraalRuntimeServiceProvider(FloodControlHandler.class, null, false);
     }
 
     public final void initializeEngineCacheSupport(EngineCacheSupport support) {
-        this.runtimeOptionDescriptors.remove(this.previousEngineCacheSupportOptions);
+        this.extensionOptionDescriptors.remove(this.previousEngineCacheSupportOptions);
         this.engineCacheSupport = support;
         OptionDescriptors engineCacheOptions = support.getEngineOptions();
         this.previousEngineCacheSupportOptions = engineCacheOptions;
-        this.runtimeOptionDescriptors.add(engineCacheOptions);
+        this.extensionOptionDescriptors.add(engineCacheOptions);
     }
 
     protected EngineCacheSupport loadEngineCacheSupport(List<OptionDescriptors> options) {
-        return loadGraalRuntimeServiceProvider(EngineCacheSupport.class, options, false);
+        DebugEngineCacheSupport debugEngineCacheSupport = new DebugEngineCacheSupport();
+        OptionDescriptors serviceOptions = debugEngineCacheSupport.getEngineOptions();
+        options.add(serviceOptions);
+        return debugEngineCacheSupport;
     }
 
     public abstract ThreadLocalHandshake getThreadLocalHandshake();
@@ -252,7 +240,15 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
      * Returns a set of classes that need to be initialized before compilations can be performed.
      */
     public final Iterable<Class<?>> getLookupTypes() {
-        return lookupTypes.getValues();
+        return getLookupTypesMap().getValues();
+    }
+
+    private UnmodifiableEconomicMap<String, Class<?>> getLookupTypesMap() {
+        UnmodifiableEconomicMap<String, Class<?>> map = this.lookupTypes;
+        if (map == null) {
+            this.lookupTypes = map = initLookupTypes(extraLookupTypes);
+        }
+        return map;
     }
 
     /**
@@ -351,52 +347,13 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         return bestFactory;
     }
 
-    @Override
-    public ConstantFieldInfo getConstantFieldInfo(ResolvedJavaField field) {
-        if (field.isAnnotationPresent(Child.class)) {
-            return ConstantFieldInfo.CHILD;
-        }
-        if (field.isAnnotationPresent(Children.class)) {
-            return ConstantFieldInfo.CHILDREN;
-        }
-        CompilationFinal cf = field.getAnnotation(CompilationFinal.class);
-        if (cf != null) {
-            int dimensions = actualStableDimensions(field, cf.dimensions());
-            return ConstantFieldInfo.forDimensions(dimensions);
-        }
-        return null;
-    }
-
-    private static int actualStableDimensions(ResolvedJavaField field, int dimensions) {
-        if (dimensions == 0) {
-            return 0;
-        }
-        int arrayDim = getArrayDimensions(field.getType());
-        if (dimensions < 0) {
-            if (dimensions != -1) {
-                throw new IllegalArgumentException("Negative @CompilationFinal dimensions");
-            }
-            return arrayDim;
-        }
-        if (dimensions > arrayDim) {
-            throw new IllegalArgumentException(String.format("@CompilationFinal(dimensions=%d) exceeds declared array dimensions (%d) of field %s", dimensions, arrayDim, field));
-        }
-        return dimensions;
-    }
-
-    private static int getArrayDimensions(JavaType type) {
-        int dimensions = 0;
-        for (JavaType componentType = type; componentType.isArray(); componentType = componentType.getComponentType()) {
-            dimensions++;
-        }
-        return dimensions;
-    }
-
     @SuppressWarnings("deprecation")
     private static UnmodifiableEconomicMap<String, Class<?>> initLookupTypes(Iterable<Class<?>> extraTypes) {
         EconomicMap<String, Class<?>> m = EconomicMap.create();
         for (Class<?> c : new Class<?>[]{
                         Node.class,
+                        Node.Child.class,
+                        Node.Children.class,
                         RootNode.class,
                         UnexpectedResultException.class,
                         SlowPathException.class,
@@ -405,6 +362,17 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                         OptimizedAssumption.class,
                         HostCompilerDirectives.class,
                         CompilerDirectives.class,
+                        CompilerDirectives.CompilationFinal.class,
+                        CompilerDirectives.TruffleBoundary.class,
+                        CompilerDirectives.ValueType.class,
+                        CompilerDirectives.EarlyInline.class,
+                        CompilerDirectives.EarlyEscapeAnalysis.class,
+                        HostCompilerDirectives.BytecodeInterpreterSwitch.class,
+                        HostCompilerDirectives.BytecodeInterpreterFetchOpcode.class,
+                        HostCompilerDirectives.BytecodeInterpreterHandler.class,
+                        HostCompilerDirectives.BytecodeInterpreterHandlerConfig.class,
+                        HostCompilerDirectives.InliningCutoff.class,
+                        HostCompilerDirectives.InliningRoot.class,
                         InlineDecision.class,
                         CompilerAsserts.class,
                         ExactMath.class,
@@ -441,6 +409,10 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                         InlineSupport.LongField.class,
                         InlineSupport.DoubleField.class,
                         InlineSupport.ReferenceField.class,
+                        ExplodeLoop.class,
+                        ExplodeLoop.LoopExplosionKind.class,
+                        Specialization.class,
+                        TruffleCallBoundary.class,
         }) {
             m.put(c.getName(), c);
         }
@@ -479,6 +451,11 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         }
         for (String className : new String[]{
                         "com.oracle.truffle.api.strings.TStringOps",
+                        "java.util.concurrent.atomic.AtomicIntegerFieldUpdater$AtomicIntegerFieldUpdaterImpl",
+                        "java.util.concurrent.atomic.AtomicLongFieldUpdater$CASUpdater",
+                        "java.util.concurrent.atomic.AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl",
+                        "com.oracle.truffle.api.object.UnsafeAccess", // JDK 25+
+                        // JDK < 25, remove after dropping JDK 21 compatibility (GR-64984):
                         "com.oracle.truffle.object.UnsafeAccess",
         }) {
             try {
@@ -487,6 +464,13 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
             } catch (ClassNotFoundException e) {
                 throw new NoClassDefFoundError(className);
             }
+        }
+        String className = "jdk.internal.event.Event";
+        try {
+            Class<?> c = Class.forName(className);
+            m.put(className, c);
+        } catch (ClassNotFoundException e) {
+            // Ignored: jdk.internal.event.Event is optional
         }
         return m;
     }
@@ -497,12 +481,13 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
      */
     @Override
     public ResolvedJavaType resolveType(MetaAccessProvider metaAccess, String className, boolean required) {
-        Class<?> c = lookupTypes.get(className);
+        Class<?> c = getLookupTypesMap().get(className);
         if (c == null) {
             if (!required) {
                 return null;
             }
-            throw new NoClassDefFoundError(className);
+            String msg = String.format("%s (need to update %s.initLookupTypes?)", className, OptimizedTruffleRuntime.class.getName());
+            throw new NoClassDefFoundError(msg);
         }
         ResolvedJavaType type = metaAccess.lookupJavaType(c);
         // In some situations, we may need the class to be linked now, especially if we are
@@ -527,90 +512,6 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         }
     }
 
-    @Override
-    public HostMethodInfo getHostMethodInfo(ResolvedJavaMethod method) {
-        return new HostMethodInfo(isTruffleBoundary(method),
-                        isBytecodeInterpreterSwitch(method),
-                        isBytecodeInterpreterSwitchBoundary(method),
-                        isInliningCutoff(method));
-    }
-
-    private static boolean isBytecodeInterpreterSwitch(ResolvedJavaMethod method) {
-        return getAnnotation(BytecodeInterpreterSwitch.class, method) != null;
-    }
-
-    private static boolean isInliningCutoff(ResolvedJavaMethod method) {
-        return getAnnotation(InliningCutoff.class, method) != null;
-    }
-
-    @SuppressWarnings("deprecation")
-    private static boolean isBytecodeInterpreterSwitchBoundary(ResolvedJavaMethod method) {
-        return getAnnotation(com.oracle.truffle.api.HostCompilerDirectives.BytecodeInterpreterSwitchBoundary.class, method) != null;
-    }
-
-    private static boolean isTruffleBoundary(ResolvedJavaMethod method) {
-        return getAnnotation(TruffleBoundary.class, method) != null;
-    }
-
-    @Override
-    public PartialEvaluationMethodInfo getPartialEvaluationMethodInfo(ResolvedJavaMethod method) {
-        TruffleBoundary truffleBoundary = getAnnotation(TruffleBoundary.class, method);
-        TruffleCallBoundary truffleCallBoundary = getAnnotation(TruffleCallBoundary.class, method);
-        return new PartialEvaluationMethodInfo(getLoopExplosionKind(method),
-                        getInlineKind(truffleBoundary, truffleCallBoundary, method, true),
-                        getInlineKind(truffleBoundary, truffleCallBoundary, method, false),
-                        method.canBeInlined(),
-                        isSpecializationMethod(method));
-    }
-
-    private static boolean isSpecializationMethod(ResolvedJavaMethod method) {
-        return getAnnotation(Specialization.class, method) != null;
-    }
-
-    private static LoopExplosionKind getLoopExplosionKind(ResolvedJavaMethod method) {
-        ExplodeLoop explodeLoop = getAnnotation(ExplodeLoop.class, method);
-        if (explodeLoop == null) {
-            return LoopExplosionKind.NONE;
-        }
-        switch (explodeLoop.kind()) {
-            case FULL_UNROLL:
-                return LoopExplosionKind.FULL_UNROLL;
-            case FULL_UNROLL_UNTIL_RETURN:
-                return LoopExplosionKind.FULL_UNROLL_UNTIL_RETURN;
-            case FULL_EXPLODE:
-                return LoopExplosionKind.FULL_EXPLODE;
-            case FULL_EXPLODE_UNTIL_RETURN:
-                return LoopExplosionKind.FULL_EXPLODE_UNTIL_RETURN;
-            case MERGE_EXPLODE:
-                return LoopExplosionKind.MERGE_EXPLODE;
-            default:
-                throw new InternalError(String.format("Unknown Truffle LoopExplosionKind %s", explodeLoop.kind()));
-        }
-    }
-
-    private static InlineKind getInlineKind(TruffleBoundary truffleBoundary, TruffleCallBoundary truffleCallBoundary, ResolvedJavaMethod method, boolean duringPartialEvaluation) {
-        if (truffleBoundary != null) {
-            if (duringPartialEvaluation) {
-                // Since this method is invoked by the bytecode parser plugins, which can be invoked
-                // by the partial evaluator, we want to prevent inlining across the boundary during
-                // partial evaluation,
-                // even if the TruffleBoundary allows inlining after partial evaluation.
-                if (truffleBoundary.transferToInterpreterOnException()) {
-                    return InlineKind.DO_NOT_INLINE_WITH_SPECULATIVE_EXCEPTION;
-                } else {
-                    return InlineKind.DO_NOT_INLINE_WITH_EXCEPTION;
-                }
-            } else if (!truffleBoundary.allowInlining()) {
-                return InlineKind.DO_NOT_INLINE_WITH_EXCEPTION;
-            }
-        } else if (truffleCallBoundary != null) {
-            return InlineKind.DO_NOT_INLINE_WITH_EXCEPTION;
-        } else if (JFRListener.isInstrumented(method)) {
-            return InlineKind.DO_NOT_INLINE_WITH_EXCEPTION;
-        }
-        return InlineKind.INLINE;
-    }
-
     public final void initializeKnownMethods(MetaAccessProvider metaAccess) {
         knownMethods = new KnownMethods(metaAccess);
     }
@@ -630,11 +531,7 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         if (!(repeatingNode instanceof Node)) {
             throw new IllegalArgumentException("Repeating node must be of type Node.");
         }
-        return getLoopNodeFactory().create(repeatingNode);
-    }
-
-    protected final LoopNodeFactory getLoopNodeFactory() {
-        return loopNodeFactory;
+        return OptimizedOSRLoopNode.create(repeatingNode);
     }
 
     public final EngineCacheSupport getEngineCacheSupport() {
@@ -699,6 +596,17 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
      */
     private static final class FrameVisitor<T> implements InspectedFrameVisitor<T> {
 
+        private static final MethodHandle GET_LOCAL_INT;
+        static {
+            try {
+                // Keep source builds compatible with stock JDKs; primitive-local support is required
+                // when walking optimized frames.
+                GET_LOCAL_INT = MethodHandles.lookup().findVirtual(InspectedFrame.class, "getLocalInt", MethodType.methodType(int.class, int.class));
+            } catch (NoSuchMethodException | IllegalAccessException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
         private final FrameInstanceVisitor<T> visitor;
         private final KnownMethods methods;
 
@@ -714,13 +622,21 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         }
 
         /**
-         * A Truffle {@link FrameInstance} logically consists of three components: a
-         * {@link com.oracle.truffle.api.frame.Frame frame}, a {@link CallTarget call target}, and a
-         * {@link Node call node}. These objects are spread across multiple native
-         * {@link InspectedFrame InspectedFrames}, so this visitor remembers previously-seen native
-         * frames (as necessary) in order to construct Truffle {@link FrameInstance FrameInstances}.
-         *
-         * For example, consider this sample stack trace:
+         * Visits selected native frames from the innermost to the outermost guest call. A Truffle
+         * {@link FrameInstance} combines the executing guest's
+         * {@link com.oracle.truffle.api.frame.Frame frame} and {@link CallTarget call target} with
+         * its call-site {@link Node location} and bytecode index. The call-site metadata describes
+         * where this guest calls the next inner guest, not where this guest was called. Thus,
+         * the innermost guest has no call-site metadata.
+         * <p>
+         * On the regular call-target path, the guest frame and call target come from
+         * {@link OptimizedCallTarget#executeRootNode(VirtualFrame, CompilationState)}. The location
+         * and explicit bytecode index come from a previously visited {@code callDirect},
+         * {@code callIndirect}, or {@code callInlined} frame. The runtime-support
+         * {@link OptimizedRuntimeSupport#callInlined(Node, CallTarget, Object[])} wrapper supplies a
+         * location but no explicit bytecode index. A missing explicit index is represented by
+         * {@code -1}, allowing {@link FrameInstance#getBytecodeIndex()} to ask the guest root for it.
+         * For example:
          *
          * <pre>
          *  ... -> executeRootNode(A) -> callDirect -> executeRootNode(B) -> callDirect -> executeRootNode(C)
@@ -729,18 +645,29 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
          *                  FrameInstance(A)                    FrameInstance(B)           FrameInstance(C)
          * </pre>
          *
-         * Method C is at the top of the stack (it has not called another guest method). Thus, it
-         * does not have a call node. Its call target and frame are the first two parameters of
-         * executeRootNode(C) {@link InspectedFrame}, so we can construct a {@link FrameInstance}
-         * using this frame.
+         * Visiting {@code executeRootNode(C)} emits C without a call node. The next
+         * {@code callDirect} frame supplies B's call-site metadata, remembered in
+         * {@link #callNodeFrame} until {@code executeRootNode(B)} emits B. The same process emits A.
+         * <p>
+         * The interpreter fast path combines both roles in
+         * {@link OptimizedCallTarget#callRoot(Node, int, RootNode, Object[])}. Its non-null frame
+         * local and root parameter identify the executing guest, while its location and bytecode
+         * index describe the call made by the caller. For example:
          *
-         * Down the stack, method B calls C, so it does have a call node. This node is a parameter
-         * to the callDirect {@link InspectedFrame}, so we remember this frame and use it to
-         * construct a {@link FrameInstance} when we reach executeRootNode(B). We construct a
-         * {@link FrameInstance} for A the same way.
+         * <pre>
+         *  ... -> callRoot(A) -> callRoot(B) -> callRoot(C)
+         *         (A's frame)    (B's frame,   (C's frame,
+         *                        A's call)    B's call)
+         * </pre>
          *
-         *
-         * OSR complicates things. Consider this sample stack trace:
+         * Visiting {@code callRoot(C)} emits C, then retains that native frame as B's call site.
+         * Visiting {@code callRoot(B)} uses it to emit B, then retains B's native frame for A. A
+         * {@code callRoot} invocation can have a null frame when it delegates to the regular
+         * call-target path; in this case, the frame was already captured while visiting
+         * {@code executeRootNode}, so only the call-site metadata is retained. This avoids emitting
+         * the guest twice and supports mixed fast-path and regular calls.
+         * <p>
+         * OSR must not appear as an additional guest call. Consider:
          *
          * <pre>
          *  ... -> executeRootNode(A) -> callOSR -> executeRootNode(A_OSR) -> callDirect -> ...
@@ -749,38 +676,72 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
          *                                    FrameInstance(A)
          * </pre>
          *
-         * With OSR, the program state may be inconsistent between OSR and non-OSR frames. The OSR
-         * frame (executeRootNode(A_OSR)) contains the most up-to-date Truffle
-         * {@link com.oracle.truffle.api.frame.Frame}, so we remember it. OSR should be transparent,
-         * so the call target is obtained from the non-OSR frame (executeRootNode(A)).
+         * The first OSR frame encountered is retained in {@link #osrFrame}, without emitting a
+         * guest frame. When the enclosing non-OSR guest is reached, an
+         * {@link OptimizedOSRFrameInstance} combines that guest's call target with the current OSR
+         * execution state. This also applies when the non-OSR guest uses {@code callRoot}.
+         * <p>
+         * {@link #skipFrames} counts logical guest frames, not call-site wrappers or OSR frames.
+         * OSR frames encountered while skipping are ignored. After visiting a guest, pending OSR
+         * and call-site state is cleared. A fast-path {@code callRoot} frame instead retains itself
+         * as the next caller's call site, including when its guest frame is skipped.
          */
         @Override
         public T visitFrame(InspectedFrame frame) {
-            if (frame.isMethod(methods.callDirectMethod) || frame.isMethod(methods.callIndirectMethod) || frame.isMethod(methods.callInlinedMethod) ||
+            boolean callRoot = frame.isMethod(methods.callRootMethod);
+            if (callRoot) {
+                if (frame.getLocal(OptimizedFrameInstance.CALL_ROOT_FRAME_INDEX) == null) {
+                    /* This callRoot invocation took the regular call-target path. */
+                    callNodeFrame = frame;
+                    return null;
+                }
+            } else if (frame.isMethod(methods.callDirectMethod) || frame.isMethod(methods.callIndirectMethod) || frame.isMethod(methods.callInlinedMethod) ||
                             frame.isMethod(methods.callInlinedCallMethod)) {
                 callNodeFrame = frame;
                 return null;
-            }
-            assert frame.isMethod(methods.callTargetMethod);
-            if (isOSRFrame(frame)) {
-                if (skipFrames == 0 && osrFrame == null) {
-                    osrFrame = frame;
-                }
-                return null;
-            } else if (skipFrames > 0) {
-                skipFrames--;
-                return null;
             } else {
-                try {
-                    if (osrFrame != null) {
-                        return visitor.visitFrame(new OptimizedOSRFrameInstance(frame, callNodeFrame, osrFrame));
-                    } else {
-                        return visitor.visitFrame(new OptimizedFrameInstance(frame, callNodeFrame));
+                assert frame.isMethod(methods.callTargetMethod);
+                if (isOSRFrame(frame)) {
+                    if (skipFrames == 0 && osrFrame == null) {
+                        osrFrame = frame;
                     }
-                } finally {
-                    osrFrame = null;
-                    callNodeFrame = null;
+                    return null;
+                } else if (skipFrames > 0) {
+                    skipFrames--;
+                    return null;
                 }
+            }
+            try {
+                if (skipFrames > 0) {
+                    skipFrames--;
+                    return null;
+                }
+                int bytecodeIndex = readBytecodeIndex(callNodeFrame);
+                OptimizedFrameInstance frameInstance;
+                if (osrFrame != null) {
+                    frameInstance = new OptimizedOSRFrameInstance(frame, callNodeFrame, bytecodeIndex, osrFrame);
+                } else {
+                    int frameIndex = callRoot ? OptimizedFrameInstance.CALL_ROOT_FRAME_INDEX : OptimizedFrameInstance.FRAME_INDEX;
+                    frameInstance = new OptimizedFrameInstance(frame, callNodeFrame, bytecodeIndex, frameIndex);
+                }
+                return visitor.visitFrame(frameInstance);
+            } finally {
+                osrFrame = null;
+                callNodeFrame = callRoot ? frame : null;
+            }
+        }
+
+        private int readBytecodeIndex(InspectedFrame inspectedFrame) {
+            if (inspectedFrame == null || inspectedFrame.isMethod(methods.callInlinedCallMethod)) {
+                return -1;
+            }
+            try {
+                return (int) GET_LOCAL_INT.invokeExact(inspectedFrame, OptimizedFrameInstance.CALL_NODE_BYTECODE_INDEX_NOTIFY_INDEX);
+            } catch (StackOverflowError e) {
+                // Stack walking can run while a guest language is handling a stack overflow.
+                throw e;
+            } catch (Throwable t) {
+                throw CompilerDirectives.shouldNotReachHere("Failed to read the call-site bytecode index", t);
             }
         }
 
@@ -792,7 +753,8 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     private <T> T iterateImpl(FrameInstanceVisitor<T> visitor, final int skip) {
         KnownMethods methods = getKnownMethods();
         FrameVisitor<T> jvmciVisitor = new FrameVisitor<>(visitor, methods, skip);
-        return getStackIntrospection().iterateFrames(methods.anyFrameMethod, methods.anyFrameMethod, 0, jvmciVisitor);
+        ResolvedJavaMethod[] anyFrameMethods = methods.getAnyFrameMethods();
+        return getStackIntrospection().iterateFrames(anyFrameMethods, anyFrameMethods, 0, jvmciVisitor);
     }
 
     protected abstract StackIntrospection getStackIntrospection();
@@ -802,10 +764,6 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     public <T> T getCapability(Class<T> capability) {
         if (capability == TVMCI.class) {
             return capability.cast(tvmci);
-        } else if (capability == com.oracle.truffle.api.object.LayoutFactory.class) {
-            com.oracle.truffle.api.object.LayoutFactory layoutFactory = loadObjectLayoutFactory();
-            ModuleUtil.exportTo(layoutFactory.getClass());
-            return capability.cast(layoutFactory);
         } else if (capability == TVMCI.Test.class) {
             return capability.cast(getTestTvmci());
         }
@@ -833,10 +791,25 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     }
 
     private void shutdown() {
+        flushCompilations(null);
         getListener().onShutdown();
         TruffleCompiler tcp = truffleCompiler;
         if (tcp != null) {
             tcp.shutdown();
+        }
+    }
+
+    public final void shutdownCompilationForEngine(EngineData engine) {
+        Objects.requireNonNull(engine);
+        engine.ensureClosed();
+        flushCompilations(engine);
+    }
+
+    public void flushCompilations(EngineData engine) {
+        BackgroundCompileQueue queue = getCompileQueue();
+        // compile queue might be null if no call target was yet created
+        if (queue != null) {
+            queue.flush(engine);
         }
     }
 
@@ -860,7 +833,8 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         }
         compileImpl(callTarget, task);
 
-        if (oldBlockCompilations == null && callTarget.blockCompilations != null) {
+        List<OptimizedCallTarget> newBlockCompilations = callTarget.blockCompilations;
+        if (oldBlockCompilations == null && newBlockCompilations != null && !newBlockCompilations.isEmpty()) {
             // retry with block compilations
             ((CompilationTask) task).reset();
             listeners.onCompilationQueued(callTarget, task.tier());
@@ -904,10 +878,27 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
 
     public abstract BackgroundCompileQueue getCompileQueue();
 
+    @SuppressWarnings("unused")
+    protected void onEngineCreated(EngineData engine) {
+    }
+
+    private final AtomicLong stoppedCompilationTime = new AtomicLong(0);
+
+    public final AtomicLong stoppedCompilationTime() {
+        return stoppedCompilationTime;
+    }
+
     @SuppressWarnings("try")
     public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation) {
         Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);
-        return getCompileQueue().submitCompilation(priority, optimizedCallTarget);
+        return getCompileQueue().submitCompilation(priority, optimizedCallTarget, CompilationTask.SubmissionReason.EXPLICIT);
+    }
+
+    @SuppressWarnings("try")
+    public CompilationTask submitForCompilation(OptimizedCallTarget optimizedCallTarget, boolean lastTierCompilation, CompilationTask.SubmissionReason submissionReason) {
+        BackgroundCompileQueue compileQueue = getCompileQueue();
+        Priority priority = new Priority(optimizedCallTarget.getCallAndLoopCount(), lastTierCompilation ? Priority.Tier.LAST : Priority.Tier.FIRST);
+        return compileQueue.submitCompilation(priority, optimizedCallTarget, submissionReason);
     }
 
     @SuppressWarnings("all")
@@ -967,7 +958,24 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                 // ignore interrupted
             }
         }
+    }
 
+    public void waitForCompilation(OptimizedCallTarget optimizedCallTarget, long timeout, BooleanSupplier cancelledPredicate) throws ExecutionException, TimeoutException {
+        CompilationTask task = optimizedCallTarget.getCompilationTask();
+        if (task != null) {
+            BooleanSupplier prev = task.cancelledPredicate;
+            try {
+                task.cancelledPredicate = cancelledPredicate;
+                try {
+                    task.awaitCompletion(timeout, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    // ignore interrupted
+                }
+            } finally {
+                task.cancelledPredicate = prev;
+            }
+        }
     }
 
     public int getCompilationQueueSize() {
@@ -998,68 +1006,16 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         return OptimizedTVMCI.getEngineData(rootNode);
     }
 
-    @SuppressWarnings("deprecation")
-    private static com.oracle.truffle.api.object.LayoutFactory loadObjectLayoutFactory() {
-        return selectObjectLayoutFactory(loadService(com.oracle.truffle.api.object.LayoutFactory.class));
-    }
-
-    private static <T> List<ServiceLoader<T>> loadService(Class<T> service) {
-        ClassLoader runtimeClassLoader = OptimizedTruffleRuntime.class.getClassLoader();
-        ClassLoader appClassLoader = service.getClassLoader();
-        ServiceLoader<T> appLoader = ServiceLoader.load(service, appClassLoader);
-        if (runtimeClassLoader.equals(appClassLoader)) {
-            /*
-             * Primary mode of operation for Truffle consumed from the application module path.
-             */
-            return List.of(appLoader);
-        } else {
-            ServiceLoader<T> runtimeLoader = ServiceLoader.load(service, runtimeClassLoader);
-            /*
-             * The Graal module (i.e., jdk.graal.compiler) is loaded by the platform class loader.
-             * Its module dependencies such as Truffle are supplied via --module-path which means
-             * they are loaded by the app class loader. As such, we need to search the app class
-             * loader path as well.
-             */
-            return List.of(runtimeLoader, appLoader);
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    private static com.oracle.truffle.api.object.LayoutFactory selectObjectLayoutFactory(Iterable<? extends Iterable<com.oracle.truffle.api.object.LayoutFactory>> availableLayoutFactories) {
-        String layoutFactoryImplName = Services.getSavedProperty("truffle.object.LayoutFactory");
-        com.oracle.truffle.api.object.LayoutFactory bestLayoutFactory = null;
-        for (Iterable<com.oracle.truffle.api.object.LayoutFactory> currentLayoutFactories : availableLayoutFactories) {
-            for (com.oracle.truffle.api.object.LayoutFactory currentLayoutFactory : currentLayoutFactories) {
-                if (layoutFactoryImplName != null) {
-                    if (currentLayoutFactory.getClass().getName().equals(layoutFactoryImplName)) {
-                        return currentLayoutFactory;
-                    }
-                } else {
-                    if (bestLayoutFactory == null) {
-                        bestLayoutFactory = currentLayoutFactory;
-                    } else if (currentLayoutFactory.getPriority() >= bestLayoutFactory.getPriority()) {
-                        assert currentLayoutFactory.getPriority() != bestLayoutFactory.getPriority();
-                        bestLayoutFactory = currentLayoutFactory;
-                    }
-                }
-            }
-        }
-        return bestLayoutFactory;
-    }
-
-    protected String printStackTraceToString(Throwable e) {
-        CharArrayWriter caw = new CharArrayWriter();
-        e.printStackTrace(new PrintWriter(caw));
-        return caw.toString();
-    }
-
     public final class KnownMethods {
+
         public final ResolvedJavaMethod callDirectMethod;
         public final ResolvedJavaMethod callInlinedMethod;
         public final ResolvedJavaMethod callIndirectMethod;
         public final ResolvedJavaMethod callTargetMethod;
         public final ResolvedJavaMethod callInlinedCallMethod;
-        public final ResolvedJavaMethod[] anyFrameMethod;
+        public final ResolvedJavaMethod callRootMethod;
+
+        private final ResolvedJavaMethod[] anyFrameMethods;
 
         public KnownMethods(MetaAccessProvider metaAccess) {
             this.callDirectMethod = metaAccess.lookupJavaMethod(OptimizedFrameInstance.CALL_DIRECT);
@@ -1067,13 +1023,13 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
             this.callInlinedMethod = metaAccess.lookupJavaMethod(OptimizedFrameInstance.CALL_INLINED);
             this.callInlinedCallMethod = metaAccess.lookupJavaMethod(OptimizedFrameInstance.CALL_INLINED_CALL);
             this.callTargetMethod = metaAccess.lookupJavaMethod(OptimizedFrameInstance.CALL_TARGET_METHOD);
-            this.anyFrameMethod = new ResolvedJavaMethod[]{callDirectMethod, callIndirectMethod, callInlinedMethod, callTargetMethod, callInlinedCallMethod};
+            this.callRootMethod = metaAccess.lookupJavaMethod(OptimizedFrameInstance.CALL_ROOT);
+            this.anyFrameMethods = new ResolvedJavaMethod[]{callDirectMethod, callIndirectMethod, callInlinedMethod, callTargetMethod, callInlinedCallMethod, callRootMethod};
         }
-    }
 
-    @Override
-    public boolean isValueType(ResolvedJavaType type) {
-        return getAnnotation(CompilerDirectives.ValueType.class, type) != null;
+        public ResolvedJavaMethod[] getAnyFrameMethods() {
+            return anyFrameMethods;
+        }
     }
 
     @Override
@@ -1082,12 +1038,26 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         // The logger can be null if the engine is closed.
         if (logger != null) {
             logger.log(Level.INFO, message);
+        } else {
+            /*
+             * If you need to debug an issue with suppressed log messages enable this option.
+             */
+            if (Boolean.getBoolean("truffle.PrintSuppressedLogMessages")) {
+                // avoid findbugs warning, this is just a debug feature
+                PrintStream out = System.out;
+                out.println("Suppressed log [" + loggerId + "] " + message);
+            }
         }
     }
 
     @Override
     public boolean isSuppressedFailure(TruffleCompilable compilable, Supplier<String> serializedException) {
         return floodControlHandler != null && floodControlHandler.isSuppressedFailure(compilable, serializedException);
+    }
+
+    @Override
+    public final boolean isJavaInstrumentationActive() {
+        return JFRListener.isActive();
     }
 
     /**
@@ -1099,32 +1069,6 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     @SuppressWarnings("unused")
     final boolean isSuppressedCompilationFailure(Throwable throwable) {
         return compilationSupport.isSuppressedCompilationFailure(throwable);
-    }
-
-    // https://bugs.openjdk.java.net/browse/JDK-8209535
-
-    private static BailoutException handleAnnotationFailure(NoClassDefFoundError e, String attemptedAction) {
-        throw new BailoutException(e, "Error while %s. " +
-                        "This usually means that the unresolved type is in the signature of some other " +
-                        "method or field in the same class. This can be resolved by modifying the relevant class path " +
-                        "or module path such that it includes the missing type.",
-                        attemptedAction);
-    }
-
-    private static <T extends Annotation> T getAnnotation(Class<T> annotationClass, ResolvedJavaMethod method) {
-        try {
-            return annotationClass.cast(method.getAnnotation(annotationClass));
-        } catch (NoClassDefFoundError e) {
-            throw handleAnnotationFailure(e, String.format("querying %s for presence of a %s annotation", method.format("%H.%n(%p)"), annotationClass.getName()));
-        }
-    }
-
-    private static <T extends Annotation> T getAnnotation(Class<T> annotationClass, ResolvedJavaType type) {
-        try {
-            return annotationClass.cast(type.getAnnotation(annotationClass));
-        } catch (NoClassDefFoundError e) {
-            throw handleAnnotationFailure(e, String.format("querying %s for presence of a %s annotation", type.toJavaName(), annotationClass.getName()));
-        }
     }
 
     /**
@@ -1150,16 +1094,24 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
     }
 
     final OptionDescriptors getOptionDescriptors() {
-        // The engineOptions field needs to be initialized lazily because the
-        // OptimizedRuntimeAccessor
-        // cannot be used in the OptimizedTruffleRuntime constructor. The OptimizedTruffleRuntime
-        // must be
-        // fully initialized before using the accessor otherwise a NullPointerException will be
-        // thrown from the Accessor.Constants static initializer because the Truffle#getRuntime
-        // still returns null.
+        /*
+         * The engineOptions field needs to be initialized lazily because the
+         * OptimizedRuntimeAccessor cannot be used in the OptimizedTruffleRuntime constructor. The
+         * OptimizedTruffleRuntime must be fully initialized before using the accessor otherwise a
+         * NullPointerException will be thrown from the Accessor.Constants static initializer
+         * because the Truffle#getRuntime still returns null.
+         */
         OptionDescriptors res = engineOptions;
         if (res == null) {
-            res = OptimizedRuntimeAccessor.LANGUAGE.createOptionDescriptorsUnion(runtimeOptionDescriptors.toArray(new OptionDescriptors[runtimeOptionDescriptors.size()]));
+            List<OptionDescriptors> options = new ArrayList<>(extensionOptionDescriptors.size() + 2);
+            /*
+             * We initialize these options lazily so in case no engine options are used we don't
+             * need to load them.
+             */
+            options.addAll(extensionOptionDescriptors);
+            options.add(OptimizedRuntimeOptions.getDescriptors());
+            options.add(new CompilerOptionsDescriptors());
+            res = OptimizedRuntimeAccessor.LANGUAGE.createOptionDescriptorsUnion(options.toArray(OptionDescriptors[]::new));
             engineOptions = res;
         }
         return res;
@@ -1271,7 +1223,7 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                 if (target instanceof OptimizedCallTarget) {
                     OptimizedCallTarget callTarget = ((OptimizedCallTarget) target);
                     if (callTarget.isSplit()) {
-                        builder.append(" <split-").append(Integer.toHexString(callTarget.hashCode())).append(">");
+                        builder.append(" <split-").append(callTarget.id).append(">");
                     }
                 }
 
@@ -1282,9 +1234,13 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
         }
 
         private static String formatPath(SourceSection sourceSection) {
-            if (sourceSection.getSource().getPath() != null) {
+            Source source = sourceSection.getSource();
+            URL url = source.getURL();
+            if (url != null && !"file".equals(url.getProtocol())) {
+                return url.toExternalForm();
+            } else if (source.getPath() != null) {
                 Path path = FileSystems.getDefault().getPath(".").toAbsolutePath();
-                Path filePath = FileSystems.getDefault().getPath(sourceSection.getSource().getPath()).toAbsolutePath();
+                Path filePath = FileSystems.getDefault().getPath(source.getPath()).toAbsolutePath();
 
                 try {
                     return path.relativize(filePath).toString();
@@ -1418,7 +1374,9 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                 descriptors.add(convertDescriptor(descriptor));
             }
             for (TruffleCompilerOptionDescriptor descriptor : optionsArray) {
-                descriptors.add(convertDescriptorLegacy(descriptor));
+                if (isLegacyOption(convertToLegacyOptionName(descriptor.name()))) {
+                    descriptors.add(convertDescriptorLegacy(descriptor));
+                }
             }
             return descriptors.iterator();
         }
@@ -1473,6 +1431,28 @@ public abstract class OptimizedTruffleRuntime implements TruffleRuntime, Truffle
                     return OptionCategory.INTERNAL;
             }
         }
+    }
+
+    public enum CompilationActivityMode {
+        /**
+         * Process compilations regularly.
+         */
+        RUN_COMPILATION,
+        /**
+         * Stop compilations temporarily.
+         */
+        STOP_COMPILATION,
+        /**
+         * Shutdown compilations permanently.
+         */
+        SHUTDOWN_COMPILATION;
+    }
+
+    /**
+     * Returns the current host compilation activity mode. The default is to run compilations.
+     */
+    protected CompilationActivityMode getCompilationActivityMode() {
+        return CompilationActivityMode.RUN_COMPILATION;
     }
 
 }

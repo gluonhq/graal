@@ -24,6 +24,12 @@
  */
 package com.oracle.svm.hosted.c.info;
 
+import com.oracle.svm.hosted.RawPointerToGuestValue;
+import com.oracle.svm.hosted.CTypedefGuestValue;
+import com.oracle.svm.hosted.CStructGuestValue;
+import com.oracle.svm.hosted.CPointerToGuestValue;
+import com.oracle.svm.hosted.CEnumGuestValue;
+import com.oracle.svm.hosted.CEnumConstantGuestValue;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
@@ -34,7 +40,6 @@ import java.util.TreeMap;
 
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.constant.CEnum;
-import org.graalvm.nativeimage.c.constant.CEnumConstant;
 import org.graalvm.nativeimage.c.constant.CEnumLookup;
 import org.graalvm.nativeimage.c.constant.CEnumValue;
 import org.graalvm.nativeimage.c.struct.CBitfield;
@@ -49,29 +54,30 @@ import org.graalvm.nativeimage.c.struct.RawFieldOffset;
 import org.graalvm.nativeimage.c.struct.RawPointerTo;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.nativeimage.c.struct.UniqueLocationIdentity;
-import org.graalvm.nativeimage.c.type.CTypedef;
 import org.graalvm.word.PointerBase;
 
 import com.oracle.graal.pointsto.infrastructure.WrappedElement;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaType;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.graal.pointsto.util.GraalAccess;
-import com.oracle.svm.core.c.struct.PinnedObjectField;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.c.struct.PinnedObjectField;
 import com.oracle.svm.hosted.c.BuiltinDirectives;
 import com.oracle.svm.hosted.c.NativeCodeContext;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.c.info.AccessorInfo.AccessorKind;
 import com.oracle.svm.hosted.c.info.SizableInfo.ElementKind;
 import com.oracle.svm.hosted.cenum.CEnumCallWrapperMethod;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.hosted.substitute.AnnotationSubstitutionProcessor;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
 import jdk.graal.compiler.bytecode.BridgeMethodUtils;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
-import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -101,7 +107,7 @@ public class InfoTreeBuilder {
             name = nameBuilder.toString();
         }
         this.nativeCodeInfo = new NativeCodeInfo(name, codeCtx.getDirectives(), isBuiltin);
-        originalProviders = GraalAccess.getOriginalProviders();
+        originalProviders = GuestAccess.get().getProviders();
     }
 
     public NativeCodeInfo construct() {
@@ -124,10 +130,6 @@ public class InfoTreeBuilder {
             createEnumInfo(type);
         }
         return nativeCodeInfo;
-    }
-
-    private MetaAccessProvider getMetaAccess() {
-        return nativeLibs.getMetaAccess();
     }
 
     protected void createConstantInfo(ResolvedJavaMethod method) {
@@ -210,7 +212,7 @@ public class InfoTreeBuilder {
     }
 
     public static String getTypedefName(ResolvedJavaType type) {
-        CTypedef typedefAnnotation = type.getAnnotation(CTypedef.class);
+        CTypedefGuestValue typedefAnnotation = CTypedefGuestValue.get(type);
         return typedefAnnotation != null ? typedefAnnotation.name() : null;
     }
 
@@ -224,13 +226,17 @@ public class InfoTreeBuilder {
         List<AccessorInfo> structAccessorInfos = new ArrayList<>();
 
         for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
-            final AccessorInfo accessorInfo;
-            final String fieldName;
+            if (!AnnotationSubstitutionProcessor.isIncluded(method, method.getDeclaringClass(), method)) {
+                continue;
+            }
 
             CField fieldAnnotation = getMethodAnnotation(method, CField.class);
             CFieldAddress fieldAddressAnnotation = getMethodAnnotation(method, CFieldAddress.class);
             CFieldOffset fieldOffsetAnnotation = getMethodAnnotation(method, CFieldOffset.class);
             CBitfield bitfieldAnnotation = getMethodAnnotation(method, CBitfield.class);
+
+            final AccessorInfo accessorInfo;
+            final String fieldName;
             if (fieldAnnotation != null) {
                 accessorInfo = new AccessorInfo(method, getAccessorKind(method), false, hasLocationIdentityParameter(method), hasUniqueLocationIdentity(method));
                 fieldName = getStructFieldName(accessorInfo, fieldAnnotation.value());
@@ -256,7 +262,7 @@ public class InfoTreeBuilder {
                     structAccessorInfos.add(accessorInfo);
                 } else {
                     Map<String, List<AccessorInfo>> map = bitfieldAnnotation != null ? bitfieldAccessorInfos : fieldAccessorInfos;
-                    List<AccessorInfo> accessorInfos = map.computeIfAbsent(fieldName, k -> new ArrayList<>());
+                    List<AccessorInfo> accessorInfos = map.computeIfAbsent(fieldName, _ -> new ArrayList<>());
                     accessorInfos.add(accessorInfo);
                 }
 
@@ -322,7 +328,7 @@ public class InfoTreeBuilder {
                 if (fieldName == null) {
                     structAccessorInfos.add(accessorInfo);
                 } else {
-                    List<AccessorInfo> accessorInfos = fieldAccessorInfos.computeIfAbsent(fieldName, k -> new ArrayList<>());
+                    List<AccessorInfo> accessorInfos = fieldAccessorInfos.computeIfAbsent(fieldName, _ -> new ArrayList<>());
                     accessorInfos.add(accessorInfo);
                 }
 
@@ -514,7 +520,7 @@ public class InfoTreeBuilder {
     }
 
     private boolean validInterfaceDefinition(ResolvedJavaType type, Class<? extends Annotation> annotationClass) {
-        assert type.getAnnotation(annotationClass) != null;
+        assert GuestAnnotationAccess.isAnnotationPresent(type, annotationClass);
 
         if (!type.isInterface() || !nativeLibs.isPointerBase(type)) {
             nativeLibs.addError("Annotation @" + ClassUtil.getUnqualifiedName(annotationClass) + " can only be used on an interface that extends " + PointerBase.class.getSimpleName(), type);
@@ -524,7 +530,7 @@ public class InfoTreeBuilder {
     }
 
     private static String removePrefix(String name, String prefix) {
-        assert prefix.length() > 0;
+        assert !prefix.isEmpty();
         String result = name;
         if (result.startsWith(prefix)) {
             result = result.substring(prefix.length());
@@ -538,7 +544,7 @@ public class InfoTreeBuilder {
     private static String getConstantName(ResolvedJavaMethod method) {
         CConstant constantAnnotation = getMethodAnnotation(method, CConstant.class);
         String name = constantAnnotation.value();
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = method.getName();
             /* Remove "get" prefix for automatically inferred names. */
             name = removePrefix(name, "get");
@@ -547,22 +553,22 @@ public class InfoTreeBuilder {
     }
 
     private String getCPointerToTypeName(ResolvedJavaType type) {
-        CPointerTo pointerToAnnotation = type.getAnnotation(CPointerTo.class);
-        Class<?> pointerToType = pointerToAnnotation.value();
+        CPointerToGuestValue pointerToAnnotation = CPointerToGuestValue.get(type);
+        ResolvedJavaType pointerToType = pointerToAnnotation.value();
         String nameOfCType = pointerToAnnotation.nameOfCType();
 
-        CStruct pointerToCStructAnnotation;
-        CPointerTo pointerToCPointerAnnotation;
+        boolean pointerToCStruct;
+        boolean pointerToCPointer;
         do {
-            pointerToCStructAnnotation = pointerToType.getAnnotation(CStruct.class);
-            pointerToCPointerAnnotation = pointerToType.getAnnotation(CPointerTo.class);
-            if (pointerToCStructAnnotation != null || pointerToCPointerAnnotation != null) {
+            pointerToCStruct = GuestAnnotationAccess.isAnnotationPresent(pointerToType, CStruct.class);
+            pointerToCPointer = GuestAnnotationAccess.isAnnotationPresent(pointerToType, CPointerTo.class);
+            if (pointerToCStruct || pointerToCPointer) {
                 break;
             }
             pointerToType = pointerToType.getInterfaces().length == 1 ? pointerToType.getInterfaces()[0] : null;
         } while (pointerToType != null);
 
-        int n = (nameOfCType.length() > 0 ? 1 : 0) + (pointerToCStructAnnotation != null ? 1 : 0) + (pointerToCPointerAnnotation != null ? 1 : 0);
+        int n = (!nameOfCType.isEmpty() ? 1 : 0) + (pointerToCStruct ? 1 : 0) + (pointerToCPointer ? 1 : 0);
         if (n != 1) {
             nativeLibs.addError("Exactly one of " +  //
                             "1) literal C type name, " +  //
@@ -571,31 +577,31 @@ public class InfoTreeBuilder {
             return "__error";
         }
 
-        if (pointerToCStructAnnotation != null) {
-            return getStructName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
-        } else if (pointerToCPointerAnnotation != null) {
-            return getCPointerToTypeName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+        if (pointerToCStruct) {
+            return getStructName(pointerToType) + "*";
+        } else if (pointerToCPointer) {
+            return getCPointerToTypeName(pointerToType) + "*";
         } else {
             return nameOfCType;
         }
     }
 
     private String getRawPointerToTypeName(ResolvedJavaType type) {
-        RawPointerTo pointerToAnnotation = type.getAnnotation(RawPointerTo.class);
-        Class<?> pointerToType = pointerToAnnotation.value();
+        RawPointerToGuestValue pointerToAnnotation = RawPointerToGuestValue.get(type);
+        ResolvedJavaType pointerToType = pointerToAnnotation.value();
 
-        RawStructure pointerToRawStructAnnotation;
-        RawPointerTo pointerToRawPointerAnnotation;
+        boolean pointerToRawStruct;
+        boolean pointerToRawPointer;
         do {
-            pointerToRawStructAnnotation = pointerToType.getAnnotation(RawStructure.class);
-            pointerToRawPointerAnnotation = pointerToType.getAnnotation(RawPointerTo.class);
-            if (pointerToRawStructAnnotation != null || pointerToRawPointerAnnotation != null) {
+            pointerToRawStruct = GuestAnnotationAccess.isAnnotationPresent(pointerToType, RawStructure.class);
+            pointerToRawPointer = GuestAnnotationAccess.isAnnotationPresent(pointerToType, RawPointerTo.class);
+            if (pointerToRawStruct || pointerToRawPointer) {
                 break;
             }
             pointerToType = pointerToType.getInterfaces().length == 1 ? pointerToType.getInterfaces()[0] : null;
         } while (pointerToType != null);
 
-        int n = (pointerToRawStructAnnotation != null ? 1 : 0) + (pointerToRawPointerAnnotation != null ? 1 : 0);
+        int n = (pointerToRawStruct ? 1 : 0) + (pointerToRawPointer ? 1 : 0);
         if (n != 1) {
             nativeLibs.addError("Exactly one of " +  //
                             "1) class annotated with @" + RawStructure.class.getSimpleName() + ", or " + //
@@ -603,26 +609,25 @@ public class InfoTreeBuilder {
             return "__error";
         }
 
-        if (pointerToRawStructAnnotation != null) {
-            return getStructName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+        if (pointerToRawStruct) {
+            return getStructName(pointerToType) + "*";
         } else {
-            assert pointerToRawPointerAnnotation != null;
-            return getRawPointerToTypeName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+            assert pointerToRawPointer;
+            return getRawPointerToTypeName(pointerToType) + "*";
         }
     }
 
     private static String getStructName(ResolvedJavaType type) {
-        CStruct structAnnotation = type.getAnnotation(CStruct.class);
+        CStructGuestValue structAnnotation = CStructGuestValue.get(type);
 
         if (structAnnotation == null) {
-            RawStructure rsanno = type.getAnnotation(RawStructure.class);
-            assert rsanno != null : "Unexpected struct type " + type;
+            assert GuestAnnotationAccess.isAnnotationPresent(type, RawStructure.class) : "Unexpected struct type " + type;
             return getSimpleJavaName(type);
         }
 
         String name = structAnnotation.value();
 
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = getSimpleJavaName(type);
         }
         if (structAnnotation.addStructKeyword()) {
@@ -643,7 +648,7 @@ public class InfoTreeBuilder {
     }
 
     private static String getStructFieldName(AccessorInfo info, String annotationValue) {
-        if (annotationValue.length() != 0) {
+        if (!annotationValue.isEmpty()) {
             return annotationValue;
         } else {
             return removePrefix(info.getAnnotatedElement().getName(), info.getAccessorPrefix());
@@ -656,7 +661,7 @@ public class InfoTreeBuilder {
             return;
         }
 
-        CEnum annotation = type.getAnnotation(CEnum.class);
+        CEnumGuestValue annotation = CEnumGuestValue.get(type);
         String name = annotation.value();
         if (name.isEmpty()) {
             name = "int";
@@ -698,14 +703,14 @@ public class InfoTreeBuilder {
         ResolvedJavaType originalType = originalProviders.getMetaAccess().lookupJavaType(enumValue);
         assert enumValue.isNonNull() && originalType.equals(((WrappedElement) enumInfo.getAnnotatedElement()).getWrapped());
 
-        CEnumConstant fieldAnnotation = field.getAnnotation(CEnumConstant.class);
+        CEnumConstantGuestValue fieldAnnotation = CEnumConstantGuestValue.get(field);
         String name = "";
         boolean includeInLookup = true;
         if (fieldAnnotation != null) {
             name = fieldAnnotation.value();
             includeInLookup = fieldAnnotation.includeInLookup();
         }
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = field.getName();
         }
 
@@ -760,6 +765,13 @@ public class InfoTreeBuilder {
          * when overwriting a method with covariant return types. As a workaround, we look up the
          * original method and use the annotations of the original method.
          */
-        return BridgeMethodUtils.getAnnotation(annotationClass, method);
+        T annotation = OriginalMethodProvider.getJavaMethod(method).getAnnotation(annotationClass);
+        if (annotation == null && method.isBridge()) {
+            ResolvedJavaMethod bridged = BridgeMethodUtils.getBridgedMethod(method);
+            if (bridged != null) {
+                annotation = OriginalMethodProvider.getJavaMethod(bridged).getAnnotation(annotationClass);
+            }
+        }
+        return annotation;
     }
 }

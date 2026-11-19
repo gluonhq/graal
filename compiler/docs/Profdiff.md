@@ -21,7 +21,8 @@ There is a separate command for each use cae:
 - `mx profdiff jit-vs-jit`: compare two profiled JIT experiments,
 - `mx profdiff jit-vs-aot`: compare a profiled JIT experiment with an (optionally profiled) AOT experiment,
 - `mx profdiff aot-vs-aot`: compare two profiled AOT experiments,
-- `mx profdiff aot-vs-aot-jit-profile`: compare two AOT experiments using an external profile from a JIT experiment.
+- `mx profdiff aot-vs-aot-jit-profile`: compare two AOT experiments using an external profile from a JIT experiment,
+- `mx profdiff compare-replayed`: compare optimization logs from replay compilation by matching compilation IDs.
 
 Run `mx profdiff help` to show the general help or `mx profdiff help COMMAND` to show help for a command.
 
@@ -163,6 +164,18 @@ for i in 1 2; do
     mx profjson -E proftool_scrabble_* -o scrabble_prof_$i.json
 done
 mx profdiff aot-vs-aot scrabble_log_1 scrabble_prof_1.json scrabble_log_2 scrabble_prof_2.json
+```
+
+## Example: compare replayed recordings across compiler revisions
+
+To isolate the impact of a compiler patch on optimization decisions, replay the same recording on a baseline compiler
+revision and on the tested revision as described in [ReplayCompilation.md](ReplayCompilation.md), collecting
+optimization logs for both runs. `compare-replayed` then compares compilations with the same compilation ID in the two
+log directories, letting you inspect the actual optimization differences for the same recorded compilations. It does not
+require proftool data:
+
+```sh
+mx profdiff compare-replayed baseline_log tested_log
 ```
 
 # Profdiff documentation

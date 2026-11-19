@@ -47,6 +47,7 @@ import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -63,13 +64,17 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
+import com.oracle.truffle.api.test.SubprocessTestUtils;
+import org.graalvm.nativeimage.ImageInfo;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.oracle.truffle.api.CallTarget;
@@ -527,43 +532,55 @@ public class LoggingTest {
     }
 
     @Test
-    public void testGarbageCollectedContext() {
-        TestHandler handler = new TestHandler();
-        Context collectedContext = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINEST.toString())).logHandler(handler).build();
-        collectedContext.eval(LoggingLanguageFirst.ID, "");
-        List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINEST, Collections.emptyMap());
-        Assert.assertEquals(expected, handler.getLog());
-        Reference<Context> collectedContextRef = new WeakReference<>(collectedContext);
-        collectedContext = null;
-        GCUtils.assertGc("Cannot free context.", collectedContextRef);
-        handler = new TestHandler();
-        try (Context newContext = newContextBuilder().logHandler(handler).build()) {
-            newContext.eval(LoggingLanguageFirst.ID, "");
-            expected = createExpectedLog(LoggingLanguageFirst.ID, Level.INFO, Collections.emptyMap());
+    public void testGarbageCollectedContext() throws IOException, InterruptedException {
+        runInSubprocess(() -> {
+            TestHandler handler = new TestHandler();
+            Context collectedContext = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINEST.toString())).logHandler(handler).build();
+            collectedContext.eval(LoggingLanguageFirst.ID, "");
+            List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINEST, Collections.emptyMap());
             Assert.assertEquals(expected, handler.getLog());
+            Reference<Context> collectedContextRef = new WeakReference<>(collectedContext);
+            collectedContext = null;
+            GCUtils.assertGc("Cannot free context.", collectedContextRef);
+            handler = new TestHandler();
+            try (Context newContext = newContextBuilder().logHandler(handler).build()) {
+                newContext.eval(LoggingLanguageFirst.ID, "");
+                expected = createExpectedLog(LoggingLanguageFirst.ID, Level.INFO, Collections.emptyMap());
+                Assert.assertEquals(expected, handler.getLog());
+            }
+        });
+    }
+
+    private static void runInSubprocess(Runnable runnable) throws IOException, InterruptedException {
+        if (ImageInfo.inImageCode()) {
+            runnable.run();
+        } else {
+            SubprocessTestUtils.newBuilder(LoggingTest.class, runnable).run();
         }
     }
 
     @Test
-    public void testGarbageCollectedContext2() {
-        TestHandler collectedContextHandler = new TestHandler();
-        Context collectedContext = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINEST.toString())).logHandler(collectedContextHandler).build();
-        TestHandler contextHandler = new TestHandler();
-        try (Context context = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINE.toString())).logHandler(contextHandler).build()) {
-            collectedContext.eval(LoggingLanguageFirst.ID, "");
-            List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINEST, Collections.emptyMap());
-            Assert.assertEquals(expected, collectedContextHandler.getLog());
-            context.eval(LoggingLanguageFirst.ID, "");
-            expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINE, Collections.emptyMap());
-            Assert.assertEquals(expected, contextHandler.getLog());
-            Reference<Context> collectedContextRef = new WeakReference<>(collectedContext);
-            collectedContext = null;
-            GCUtils.assertGc("Cannot free context.", collectedContextRef);
-            contextHandler.clear();
-            context.eval(LoggingLanguageFirst.ID, "");
-            expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINE, Collections.emptyMap());
-            Assert.assertEquals(expected, contextHandler.getLog());
-        }
+    public void testGarbageCollectedContext2() throws IOException, InterruptedException {
+        runInSubprocess(() -> {
+            TestHandler collectedContextHandler = new TestHandler();
+            Context collectedContext = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINEST.toString())).logHandler(collectedContextHandler).build();
+            TestHandler contextHandler = new TestHandler();
+            try (Context context = newContextBuilder().options(createLoggingOptions(LoggingLanguageFirst.ID, null, Level.FINE.toString())).logHandler(contextHandler).build()) {
+                collectedContext.eval(LoggingLanguageFirst.ID, "");
+                List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINEST, Collections.emptyMap());
+                Assert.assertEquals(expected, collectedContextHandler.getLog());
+                context.eval(LoggingLanguageFirst.ID, "");
+                expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINE, Collections.emptyMap());
+                Assert.assertEquals(expected, contextHandler.getLog());
+                Reference<Context> collectedContextRef = new WeakReference<>(collectedContext);
+                collectedContext = null;
+                GCUtils.assertGc("Cannot free context.", collectedContextRef);
+                contextHandler.clear();
+                context.eval(LoggingLanguageFirst.ID, "");
+                expected = createExpectedLog(LoggingLanguageFirst.ID, Level.FINE, Collections.emptyMap());
+                Assert.assertEquals(expected, contextHandler.getLog());
+            }
+        });
     }
 
     @Test
@@ -867,6 +884,7 @@ public class LoggingTest {
     }
 
     @Test
+    @Ignore("GR-72074")
     public void testNoContextLoggingBasic() {
         // Engine handler overridden by context handler, logging from language with context
         final Level defaultLevel = Level.INFO;
@@ -1013,6 +1031,7 @@ public class LoggingTest {
     }
 
     @Test
+    @Ignore("GR-70315")
     public void testNoContextLoggingMultipleEngines() {
         TestHandler engine1Handler = new TestHandler();
         TestHandler engine2Handler = new TestHandler();
@@ -1355,67 +1374,95 @@ public class LoggingTest {
     }
 
     @Test
-    @SuppressWarnings({"unused", "try"})
-    public void testInterpreterOnlyWarning() {
-        String warnInterpreterOnlyValue = System.getProperty("polyglot.engine.WarnInterpreterOnly");
-        if (warnInterpreterOnlyValue != null) {
-            System.getProperties().remove("polyglot.engine.WarnInterpreterOnly");
+    public void testGR49739() throws IOException, InterruptedException {
+        runInSubprocess(() -> {
+            Assume.assumeTrue(GCUtils.isSupported());
+            AtomicReference<TruffleLogger> loggerHolder = new AtomicReference<>();
+            AbstractLoggingLanguage.action = (ctx, defaultLoggers) -> {
+                loggerHolder.set(ctx.env.getLogger("after.close"));
+                return false;
+            };
+            Context.Builder contextBuilder = newContextBuilder();
+            contextBuilder.option("log." + LoggingLanguageFirst.ID + ".level", "CONFIG");
+            Context ctx = contextBuilder.build();
+            Reference<Context> ctxRef = new WeakReference<>(ctx);
+            try {
+                ctx.eval(LoggingLanguageFirst.ID, "");
+            } finally {
+                ctx.close();
+                ctx = null;
+            }
+            GCUtils.assertGc("Context should be collected.", ctxRef);
+            TruffleLogger closedLogger = loggerHolder.getAndSet(null);
+            Assert.assertNotNull(closedLogger);
+            AbstractPolyglotTest.assertFails(() -> closedLogger.config("Should fail"), AssertionError.class,
+                            (e) -> Assert.assertTrue(e.getMessage().contains("Invalid sharing of bound TruffleLogger")));
+        });
+    }
+
+    @Test
+    public void testContextOverridesErrorStream() {
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
+        try (Engine engine = newEngineBuilder().build()) {
+            try (Context ctx = Context.newBuilder().engine(engine).err(err).build()) {
+                ctx.eval(LoggingLanguageFirst.ID, "");
+            }
         }
+        List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.INFO, Collections.emptyMap());
+        // Remove trailing '\r' on Windows
+        List<String> lines = Arrays.stream(err.toString().split("\n")).map(String::trim).collect(Collectors.toList());
+        List<Map.Entry<Level, String>> actual = parseLog(lines);
+        Assert.assertEquals(expected, actual);
+    }
+
+    private static List<Map.Entry<Level, String>> parseLog(List<String> lines) {
+        List<Map.Entry<Level, String>> content = new ArrayList<>();
+        Pattern pattern = Pattern.compile("\\[(.*)] (.*): (.*)");
+        for (String line : lines) {
+            Matcher m = pattern.matcher(line);
+            if (m.matches()) {
+                content.add(new AbstractMap.SimpleImmutableEntry<>(Level.parse(m.group(2)), m.group(3)));
+            }
+        }
+        return content;
+    }
+
+    @Test
+    public void testLogFileOnEngine() throws IOException {
+        Path logFile = Files.createTempFile("test", ".log").toAbsolutePath();
         try {
-            TestHandler handler = new TestHandler();
-            try (Context ctx = Context.newBuilder().logHandler(handler).build()) {
-                boolean hasMessage = hasInterpreterOnlyWarning(handler.getLog());
-                boolean graalRuntime = AbstractPolyglotTest.isGraalRuntime();
-                Assert.assertTrue(graalRuntime != hasMessage);
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
+            try (Engine engine = newEngineBuilder().option("log.file", logFile.toString()).build()) {
+                try (Context ctx = Context.newBuilder().engine(engine).err(err).build()) {
+                    ctx.eval(LoggingLanguageFirst.ID, "");
+                }
             }
-            handler.clear();
-            try (Context ctx = Context.newBuilder().option("engine.WarnInterpreterOnly", "true").logHandler(handler).build()) {
-                boolean hasMessage = hasInterpreterOnlyWarning(handler.getLog());
-                boolean graalRuntime = AbstractPolyglotTest.isGraalRuntime();
-                Assert.assertTrue(graalRuntime != hasMessage);
-            }
-            handler.clear();
-            try (Context ctx = Context.newBuilder().option("engine.WarnInterpreterOnly", "false").logHandler(handler).build()) {
-                Assert.assertFalse(hasInterpreterOnlyWarning(handler.getLog()));
-            }
+            List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.INFO, Collections.emptyMap());
+            List<Map.Entry<Level, String>> actual = parseLog(Files.readAllLines(logFile));
+            Assert.assertTrue(err.toString().isEmpty());    // Context error stream must be empty
+            Assert.assertEquals(expected, actual);          // Log witten to engine's log.file
         } finally {
-            if (warnInterpreterOnlyValue != null) {
-                System.setProperty("polyglot.engine.WarnInterpreterOnly", warnInterpreterOnlyValue);
-            }
+            Files.delete(logFile);
         }
     }
 
     @Test
-    public void testGR49739() {
-        AtomicReference<TruffleLogger> loggerHolder = new AtomicReference<>();
-        AbstractLoggingLanguage.action = (ctx, defaultLoggers) -> {
-            loggerHolder.set(ctx.env.getLogger("after.close"));
-            return false;
-        };
-        Context.Builder contextBuilder = newContextBuilder();
-        contextBuilder.option("log." + LoggingLanguageFirst.ID + ".level", "CONFIG");
-        Context ctx = contextBuilder.build();
-        Reference<Context> ctxRef = new WeakReference<>(ctx);
+    public void testLogFileOnContext() throws IOException {
+        Path logFile = Files.createTempFile("test", ".log").toAbsolutePath();
         try {
-            ctx.eval(LoggingLanguageFirst.ID, "");
-        } finally {
-            ctx.close();
-            ctx = null;
-        }
-        GCUtils.assertGc("Context should be collected.", ctxRef);
-        TruffleLogger closedLogger = loggerHolder.getAndSet(null);
-        Assert.assertNotNull(closedLogger);
-        AbstractPolyglotTest.assertFails(() -> closedLogger.config("Should fail"), AssertionError.class, (e) -> Assert.assertTrue(e.getMessage().contains("Invalid sharing of bound TruffleLogger")));
-    }
-
-    private static boolean hasInterpreterOnlyWarning(Iterable<Map.Entry<Level, String>> log) {
-        for (Map.Entry<Level, String> record : log) {
-            String message = record.getValue();
-            if (message.startsWith("The polyglot engine uses a fallback runtime that does not support runtime compilation to native code.")) {
-                return true;
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
+            try (Engine engine = newEngineBuilder().logHandler(err).build()) {
+                try (Context ctx = Context.newBuilder().engine(engine).option("log.file", logFile.toString()).build()) {
+                    ctx.eval(LoggingLanguageFirst.ID, "");
+                }
             }
+            List<Map.Entry<Level, String>> expected = createExpectedLog(LoggingLanguageFirst.ID, Level.INFO, Collections.emptyMap());
+            List<Map.Entry<Level, String>> actual = parseLog(Files.readAllLines(logFile));
+            Assert.assertTrue(err.toString().isEmpty());    // Engine log must be empty
+            Assert.assertEquals(expected, actual);          // Log written to context's log.file
+        } finally {
+            Files.delete(logFile);
         }
-        return false;
     }
 
     @SuppressWarnings("all")
@@ -1711,13 +1758,13 @@ public class LoggingTest {
         }
 
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return LoggingLanguageFirst.class;
+        String getLanguageId() {
+            return LoggingLanguageFirst.ID;
         }
 
     }

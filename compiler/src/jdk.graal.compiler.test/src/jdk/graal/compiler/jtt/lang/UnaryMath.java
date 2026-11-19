@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,7 +26,6 @@ package jdk.graal.compiler.jtt.lang;
 
 import jdk.graal.compiler.jtt.JTTTest;
 import jdk.graal.compiler.options.OptionValues;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 public abstract class UnaryMath extends JTTTest {
@@ -47,20 +46,11 @@ public abstract class UnaryMath extends JTTTest {
         Object receiver = null;
         long testIteration = 0;
 
-        long step = STEP;
-        if (Boolean.getBoolean(COMPILATION_PLAN_FUZZING_SYSTEM_PROPERTY)) {
-            /*
-             * When we fuzz the phase plan, testAgainstExpected recompiles the method every time.
-             * Use fewer iterations to compensate for the extra cost.
-             */
-            step *= 20;
-        }
-
-        for (long l = Long.MIN_VALUE;; l += step) {
+        for (long l = Long.MIN_VALUE;; l += STEP) {
             double d = Double.longBitsToDouble(l);
             Result expect = executeExpected(method, receiver, d);
             try {
-                testAgainstExpected(options, method, expect, EMPTY, receiver, d);
+                testAgainstExpected(options, method, expect, receiver, d);
                 testIteration++;
             } catch (AssertionError e) {
                 throw new AssertionError(String.format("%d: While testing %g [long: %d, hex: %x]", testIteration, d, l, l), e);

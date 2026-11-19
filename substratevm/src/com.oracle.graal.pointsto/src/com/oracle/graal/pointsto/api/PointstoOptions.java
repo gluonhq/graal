@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,13 +31,32 @@ import java.util.Locale;
 
 import org.graalvm.collections.EconomicMap;
 
+import com.oracle.graal.pointsto.typestate.TypeState;
+
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.options.OptionKey;
 
 public class PointstoOptions {
 
     @Option(help = "Track primitive values using the infrastructure of points-to analysis.")//
-    public static final OptionKey<Boolean> TrackPrimitiveValues = new OptionKey<>(false);
+    public static final OptionKey<Boolean> TrackPrimitiveValues = new OptionKey<>(true) {
+        @Override
+        protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
+            if (!newValue) {
+                UsePredicates.update(values, false);
+            }
+        }
+    };
+
+    @Option(help = "Use predicates in points-to analysis.")//
+    public static final OptionKey<Boolean> UsePredicates = new OptionKey<>(true) {
+        @Override
+        protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
+            if (newValue) {
+                TrackPrimitiveValues.update(values, true);
+            }
+        }
+    };
 
     @Option(help = "Use experimental Reachability Analysis instead of points-to.")//
     public static final OptionKey<Boolean> UseExperimentalReachabilityAnalysis = new OptionKey<>(false);
@@ -75,6 +94,11 @@ public class PointstoOptions {
     @Option(help = "The maximum number of objects recorded for each type of a type state before disabling heap sensitivity for that type. The analysis must be heap sensitive. It has a minimum value of 1.")//
     public static final OptionKey<Integer> MaxObjectSetSize = new OptionKey<>(100);
 
+    @Option(help = "The maximum total number of objects recorded in a type state before disabling heap sensitivity for all its types. " +
+                    "The resulting type state can still contain more objects if all its objects are already context-insensitive summaries of distinct types. " +
+                    "The analysis must be heap sensitive. It has a minimum value of 1.")//
+    public static final OptionKey<Integer> MaxTypeStateObjects = new OptionKey<>(15_000);
+
     @Option(help = "The maximum number of constant objects recorded for each type before merging the constants into one unique constant object per type. " +
                     "If the value is 0 there is no limit.")//
     public static final OptionKey<Integer> MaxConstantObjectsPerType = new OptionKey<>(0);
@@ -106,6 +130,13 @@ public class PointstoOptions {
     @Option(help = "The maximum number of types recorded in a type flow. -1 indicates no limitation.")//
     public static final OptionKey<Integer> TypeFlowSaturationCutoff = new OptionKey<>(20);
 
+    @Option(help = "The maximum number of types that will be represented as an array before switching to bitsets. By default 20 to align with TypeFlowSaturationCutoff. " +
+                    "Note that we can also disable the array-based handling completely by setting the threshold to zero.")//
+    public static final OptionKey<Integer> MultiTypeStateArrayBitSetThreshold = new OptionKey<>(20);
+
+    @Option(help = "The maximum number of types on which the analysis should speculate that the result will be small enough to be array-based.")//
+    public static final OptionKey<Integer> MultiTypeStateArrayBitSetIntersectionSpeculationThreshold = new OptionKey<>(32);
+
     @Option(help = "Enable the type flow saturation analysis performance optimization.")//
     public static final OptionKey<Boolean> RemoveSaturatedTypeFlows = new OptionKey<>(true) {
         @Override
@@ -131,11 +162,32 @@ public class PointstoOptions {
     @Option(help = "Allow a type flow state to contain types not compatible with its declared type.")//
     public static final OptionKey<Boolean> RelaxTypeFlowStateConstraints = new OptionKey<>(true);
 
+    /**
+     * This flag enables conservative modeling of unsafe access during the analysis. Unsafe-accessed
+     * fields with closed value bounds receive all instantiated subtypes of those bounds; fields
+     * with open value bounds saturate to account for unknown extension types. Unsafe reference loads
+     * start saturated because the analysis does not track their source fields and therefore cannot
+     * derive a narrower value bound. Requires {@link #RemoveSaturatedTypeFlows}, which in turn
+     * requires {@link #AliasArrayTypeFlows}.
+     */
+    @Option(help = "Conservatively model unsafe-accessed field values and saturate all unsafe loads.")//
+    public static final OptionKey<Boolean> UseConservativeUnsafeAccess = new OptionKey<>(true);
+
     @Option(help = "Deprecated, option no longer has any effect.", deprecated = true)//
     static final OptionKey<Boolean> UnresolvedIsError = new OptionKey<>(true);
 
     @Option(help = "Report analysis statistics.")//
     public static final OptionKey<Boolean> PrintPointsToStatistics = new OptionKey<>(false);
+
+    /**
+     * The {@link TypeState} memory footprint report enabled by this option is also generated as a
+     * part of {@link #PrintPointsToStatistics}. However, running the full
+     * {@link #PrintPointsToStatistics} is resource-intensive, so we expose
+     * {@code PrintTypeStateMemoryFootprint} to allow computing just the footprint if the rest is
+     * not required.
+     */
+    @Option(help = "Report the memory footprint of TypeState objects used by the analysis.")//
+    public static final OptionKey<Boolean> PrintTypeStateMemoryFootprint = new OptionKey<>(false);
 
     @Option(help = "Path to the contents of the Inspect web server.")//
     public static final OptionKey<String> InspectServerContentPath = new OptionKey<>("inspect");
@@ -185,6 +237,7 @@ public class PointstoOptions {
                     MaxHeapContextDepth.update(values, 0);
                     MinCallingContextDepth.update(values, 0);
                     MaxCallingContextDepth.update(values, 0);
+                    UseConservativeUnsafeAccess.update(values, false);
                     break;
 
                 case "_1obj":
@@ -193,6 +246,7 @@ public class PointstoOptions {
                     MaxHeapContextDepth.update(values, 0);
                     MinCallingContextDepth.update(values, 1);
                     MaxCallingContextDepth.update(values, 1);
+                    UseConservativeUnsafeAccess.update(values, false);
                     break;
 
                 case "_2obj1h":
@@ -201,6 +255,7 @@ public class PointstoOptions {
                     MaxHeapContextDepth.update(values, 1);
                     MinCallingContextDepth.update(values, 2);
                     MaxCallingContextDepth.update(values, 2);
+                    UseConservativeUnsafeAccess.update(values, false);
                     break;
 
                 case "_3obj2h":
@@ -209,6 +264,7 @@ public class PointstoOptions {
                     MaxHeapContextDepth.update(values, 2);
                     MinCallingContextDepth.update(values, 3);
                     MaxCallingContextDepth.update(values, 3);
+                    UseConservativeUnsafeAccess.update(values, false);
                     break;
 
                 case "_4obj3h":
@@ -217,10 +273,16 @@ public class PointstoOptions {
                     MaxHeapContextDepth.update(values, 3);
                     MinCallingContextDepth.update(values, 4);
                     MaxCallingContextDepth.update(values, 4);
+                    UseConservativeUnsafeAccess.update(values, false);
                     break;
 
                 default:
                     throw shouldNotReachHere("Unknown context sensitivity setting:" + newValue);
+            }
+            if (!newValue.toLowerCase(Locale.ROOT).equals("insens")) {
+                /* GR-58495: WP-SCCP is not yet compatible with context-sensitive analysis. */
+                TrackPrimitiveValues.update(values, false);
+                UsePredicates.update(values, false);
             }
         }
     };

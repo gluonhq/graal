@@ -26,15 +26,21 @@ package com.oracle.svm.core;
 
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 
 @AutomaticallyRegisteredFeature
 public class SubstrateExitHandlerFeature implements InternalFeature {
     @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
+    @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
-        if (SubstrateOptions.needsExitHandlers()) {
+        if (SubstrateOptions.InstallExitHandlers.getValue()) {
             RuntimeSupport.getRuntimeSupport().addStartupHook(new SubstrateExitHandlerStartupHook());
         }
     }
@@ -43,7 +49,7 @@ public class SubstrateExitHandlerFeature implements InternalFeature {
 final class SubstrateExitHandlerStartupHook implements RuntimeSupport.Hook {
     @Override
     public void execute(boolean isFirstIsolate) {
-        if (isFirstIsolate) {
+        if (SubstrateOptions.isSignalHandlingAllowed() && isFirstIsolate) {
             Target_java_lang_Terminator.setup();
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,14 +26,23 @@ package jdk.graal.compiler.loop.phases;
 
 import java.util.Optional;
 
+import org.graalvm.collections.EconomicMap;
+
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.core.common.type.IntegerStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.Invoke;
+import jdk.graal.compiler.nodes.LoopBeginNode;
+import jdk.graal.compiler.nodes.LoopBeginNode.SafepointState;
 import jdk.graal.compiler.nodes.LoopEndNode;
+import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.StructuredGraph.ScheduleResult;
+import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.extended.ForeignCall;
 import jdk.graal.compiler.nodes.loop.InductionVariable;
@@ -45,11 +54,9 @@ import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionType;
 import jdk.graal.compiler.phases.BasePhase;
 import jdk.graal.compiler.phases.tiers.MidTierContext;
-
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 public class LoopSafepointEliminationPhase extends BasePhase<MidTierContext> {
-
     public static class Options {
         //@formatter:off
         @Option(help = "Removes safepoints on counted loop ends.", type = OptionType.Expert)
@@ -57,80 +64,504 @@ public class LoopSafepointEliminationPhase extends BasePhase<MidTierContext> {
         //@formatter:on
     }
 
-    private static final long IntegerRangeDistance = Math.abs((long) Integer.MAX_VALUE - (long) Integer.MIN_VALUE);
-
     /**
-     * To be implemented by subclasses to perform additional checks. Returns <code>true</code> if
-     * the safepoint was also disabled in subclasses and we therefore don't need to continue
-     * traversing.
+     * Records the safepoint-state updates selected by this phase before mutating the graph. The
+     * optimizer may inspect and update loop-end, loop-exit, and guest loop-begin safepoint states
+     * in several steps; keeping the updates in a plan avoids transient graph states that would
+     * violate invariants such as enabling guest safepoints both at a {@link LoopBeginNode} and at
+     * its {@link LoopEndNode loop ends}.
      */
-    @SuppressWarnings("unused")
-    protected boolean onCallInLoop(LoopEndNode loopEnd, FixedNode currentCallNode) {
-        return true;
-    }
+    public static class LoopSafepointPlan {
+        /** Planned state updates for every loop begin in the graph, initialized from the graph. */
+        private final EconomicMap<LoopBeginNode, SafepointStateEffect> loopStates;
 
-    /**
-     * To be implemented by subclasses to compute additional fields.
-     */
-    @SuppressWarnings("unused")
-    protected void onSafepointDisabledLoopBegin(Loop loop) {
-    }
-
-    /**
-     * Determines whether guest safepoints should be allowed at all. To be implemented by
-     * subclasses. The default implementation returns <code>false</code>, leading to guest
-     * safepoints being disabled for all loops in the graph.
-     */
-    protected boolean allowGuestSafepoints() {
-        return false;
-    }
-
-    public static boolean loopIsIn32BitRange(Loop loop) {
-        if (loop.counted().getStamp().getBits() <= 32) {
-            return true;
+        public LoopSafepointPlan(StructuredGraph g) {
+            loopStates = EconomicMap.create();
+            for (LoopBeginNode lb : g.getNodes(LoopBeginNode.TYPE)) {
+                loopStates.put(lb, new SafepointStateEffect(lb));
+            }
         }
+
+        /**
+         * Applies all planned safepoint-state updates to their loops. For each loop, this updates
+         * the host loop-end safepoints, the guest loop-begin or loop-end safepoints, and the
+         * loop-exit safepoints.
+         */
+        public void apply() {
+            for (SafepointStateEffect loopPlan : loopStates.getValues()) {
+                loopPlan.apply();
+            }
+        }
+
+        /**
+         * If a loop has multiple back-edges that would each receive a guest safepoint, replace them
+         * by a single guest safepoint at the loop begin.
+         */
+        public void switchGuestSafepointsToLoopBeginIfMultipleBackEdges(Loop loop) {
+            loopStates.get(loop.loopBegin()).switchGuestSafepointsToLoopBeginIfMultipleBackEdges();
+        }
+
+        /**
+         * Plans the guest safepoint state for {@code loop}'s {@link LoopBeginNode}. Enabling this
+         * state means guest safepoint insertion emits one safepoint at the loop begin instead of
+         * emitting guest safepoints at the loop's back-edges. The per-loop effect enforces that this
+         * state can only be enabled when all guest loop-end safepoints for the same loop are
+         * disabled.
+         */
+        public void setGuestLoopBeginState(Loop loop, SafepointState state) {
+            loopStates.get(loop.loopBegin()).setGuestLoopBeginState(state);
+        }
+
+        public void setGuestEndStateAllEnds(Loop loop, SafepointState state) {
+            loopStates.get(loop.loopBegin()).setGuestEndStateAllEnds(state);
+        }
+
+        public void setGuestEndState(LoopEndNode loopEnd, SafepointState state) {
+            loopStates.get(loopEnd.loopBegin()).setGuestEndState(loopEnd, state);
+        }
+
+        public void setEndState(LoopEndNode loopEnd, SafepointState state) {
+            LoopBeginNode lb = loopEnd.loopBegin();
+            loopStates.get(lb).setEndState(loopEnd, state);
+        }
+
+        public void setEndStateAllEnds(Loop loop, SafepointState state) {
+            loopStates.get(loop.loopBegin()).setEndStateAllEnds(state);
+        }
+
+        public void setExitState(Loop loop, SafepointState state) {
+            loopStates.get(loop.loopBegin()).setExitState(state);
+        }
+
+        public boolean canSafepoint(LoopEndNode len) {
+            return loopStates.get(len.loopBegin()).getEndStates().get(len).canSafepoint();
+        }
+
+    }
+
+    /**
+     * Models safepoint-state transforms that can be {@linkplain #apply applied} to a single loop.
+     *
+     * The planned guest safepoint locations are mutually exclusive:
+     *
+     * <pre>{@code
+     * guestLoopBeginState.canSafepoint() => all guestEndStates cannot safepoint
+     * any guestEndState.canSafepoint()  => guestLoopBeginState cannot safepoint
+     * }</pre>
+     *
+     * This mirrors the invariant enforced by {@link LoopBeginNode} and {@link LoopEndNode} setters,
+     * but catches invalid transitions while the plan is still being built.
+     */
+    public static class SafepointStateEffect {
+        /**
+         * The safepoint state that should be assigned to the loop exit nodes of this loop.
+         */
+        private SafepointState exitState;
+        /**
+         * The safepoint state assigned to every loop end of this loop.
+         */
+        private final EconomicMap<LoopEndNode, SafepointState> endStates;
+        /**
+         * The guest safepoint state assigned to every loop end of this loop.
+         */
+        private final EconomicMap<LoopEndNode, SafepointState> guestEndStates;
+        /**
+         * The corresponding loop begin node.
+         */
+        private final LoopBeginNode loopBegin;
+
+        /**
+         * The guest safepoint state assigned to the loop begin of this loop. New loop begins start
+         * with {@link SafepointState#OPTIMIZER_DISABLED}; the plan is initialized from the current
+         * {@link LoopBeginNode#getGuestLoopBeginSafepointState()} value.
+         */
+        private SafepointState guestLoopBeginState;
+
+        public SafepointStateEffect(LoopBeginNode lb) {
+            this.loopBegin = lb;
+            endStates = EconomicMap.create();
+            guestEndStates = EconomicMap.create();
+            // Start with the states before the elimination
+            for (LoopEndNode len : lb.loopEnds()) {
+                endStates.put(len, len.getSafepointState());
+                guestEndStates.put(len, len.getGuestSafepointState());
+            }
+            exitState = lb.getLoopExitsSafepointState();
+            guestLoopBeginState = lb.getGuestLoopBeginSafepointState();
+        }
+
+        public SafepointState getExitState() {
+            return exitState;
+        }
+
+        public void setExitState(SafepointState exitState) {
+            this.exitState = exitState;
+        }
+
+        public EconomicMap<LoopEndNode, SafepointState> getEndStates() {
+            return endStates;
+        }
+
+        public EconomicMap<LoopEndNode, SafepointState> getGuestEndStates() {
+            return guestEndStates;
+        }
+
+        public SafepointState getGuestLoopBeginState() {
+            return guestLoopBeginState;
+        }
+
+        /**
+         * Sets the planned guest safepoint state for the loop begin. A state that can safepoint is
+         * rejected if any planned guest loop-end safepoint for the same loop can also safepoint.
+         */
+        public void setGuestLoopBeginState(SafepointState newState) {
+            if (newState.canSafepoint()) {
+                for (LoopEndNode len : loopBegin.loopEnds()) {
+                    SafepointState guestEndState = guestEndStates.get(len);
+                    GraalError.guarantee(!guestEndState.canSafepoint(),
+                                    "Cannot enable a guest safepoint at the loop begin while a guest safepoint at a loop end is enabled, loopBeginState=%s, loopEndState=%s", newState, guestEndState);
+                }
+            }
+            guestLoopBeginState = newState;
+        }
+
+        public void setEndState(LoopEndNode len, SafepointState newState) {
+            endStates.put(len, newState);
+        }
+
+        public void setEndStateAllEnds(SafepointState newState) {
+            for (LoopEndNode len : loopBegin.loopEnds()) {
+                endStates.put(len, newState);
+            }
+        }
+
+        public void setGuestEndStateAllEnds(SafepointState newState) {
+            GraalError.guarantee(!newState.canSafepoint() || !guestLoopBeginState.canSafepoint(),
+                            "Cannot enable guest safepoints at loop ends while a guest safepoint at the loop begin is enabled, loopEndsState=%s, loopBeginState=%s", newState, guestLoopBeginState);
+            for (LoopEndNode len : loopBegin.loopEnds()) {
+                guestEndStates.put(len, newState);
+            }
+        }
+
+        public void setGuestEndState(LoopEndNode len, SafepointState newState) {
+            GraalError.guarantee(!newState.canSafepoint() || !guestLoopBeginState.canSafepoint(),
+                            "Cannot enable a guest safepoint at a loop end while a guest safepoint at the loop begin is enabled, loopEndState=%s, loopBeginState=%s", newState, guestLoopBeginState);
+            guestEndStates.put(len, newState);
+        }
+
+        /**
+         * Replaces duplicated guest safepoints on multiple back-edges by a single guest safepoint at
+         * the loop begin.
+         *
+         * <pre>{@code
+         * if count(loopEnds where guestEndState.canSafepoint()) > 1:
+         *     disable guest safepoints on all loop ends
+         *     enable guest safepoint at loop begin
+         * }</pre>
+         *
+         * Loops with a single back-edge keep the safepoint at the loop end, and loops whose guest
+         * safepoints are permanently disabled keep {@link SafepointState#MUST_NEVER_SAFEPOINT}.
+         */
+        public void switchGuestSafepointsToLoopBeginIfMultipleBackEdges() {
+            if (loopBegin.getLoopEndCount() < 2 || guestLoopBeginState == SafepointState.MUST_NEVER_SAFEPOINT) {
+                return;
+            }
+            int guestSafepointedBackEdges = 0;
+            for (LoopEndNode len : loopBegin.loopEnds()) {
+                if (guestEndStates.get(len).canSafepoint()) {
+                    guestSafepointedBackEdges++;
+                    if (guestSafepointedBackEdges > 1) {
+                        setGuestEndStateAllEnds(SafepointState.OPTIMIZER_DISABLED);
+                        setGuestLoopBeginState(SafepointState.ENABLED);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /**
+         * Applies the planned states to the graph. When enabling a guest safepoint at the loop
+         * begin, guest safepoints on loop ends are disabled first so the graph never temporarily has
+         * guest safepoints enabled at both locations.
+         */
+        public void apply() {
+            for (LoopEndNode len : loopBegin.loopEnds()) {
+                len.setSafepointState(endStates.get(len));
+            }
+            if (guestLoopBeginState.canSafepoint()) {
+                loopBegin.setGuestSafepoint(SafepointState.OPTIMIZER_DISABLED);
+                loopBegin.setGuestLoopBeginSafepoint(guestLoopBeginState);
+            } else {
+                loopBegin.setGuestLoopBeginSafepoint(guestLoopBeginState);
+                for (LoopEndNode len : loopBegin.loopEnds()) {
+                    len.setGuestSafepointState(guestEndStates.get(len));
+                }
+            }
+            loopBegin.setLoopExitSafepoint(exitState);
+        }
+
+    }
+
+    private static final long IntegerRangeDistance = NumUtil.unsafeAbs((long) Integer.MAX_VALUE - (long) Integer.MIN_VALUE);
+
+    public static boolean loopIsInIterationRange(Loop loop, long distance) {
         final Stamp limitStamp = loop.counted().getTripCountLimit().stamp(NodeView.DEFAULT);
-        if (limitStamp instanceof IntegerStamp) {
-            final IntegerStamp limitIStamp = (IntegerStamp) limitStamp;
-            final long upperBoundLimit = limitIStamp.upperBound();
+        if (limitStamp instanceof IntegerStamp limitIStamp) {
             final Stamp startStamp = loop.counted().getBodyIVStart().stamp(NodeView.DEFAULT);
-            if (startStamp instanceof IntegerStamp) {
-                final IntegerStamp startIStamp = (IntegerStamp) startStamp;
-                final long lowerBoundStart = startIStamp.lowerBound();
-                if (IntegerStamp.subtractionOverflows(upperBoundLimit, lowerBoundStart, 64)) {
+            if (startStamp instanceof IntegerStamp startIStamp) {
+                final boolean ascending = loop.counted().getDirection() == InductionVariable.Direction.Up;
+                final IntegerStamp lowerStamp = ascending ? startIStamp : limitIStamp;
+                final IntegerStamp upperStamp = ascending ? limitIStamp : startIStamp;
+                final long lowerBound = lowerStamp.lowerBound();
+                final long upperBound = upperStamp.upperBound();
+                if (IntegerStamp.subtractionOverflows(upperBound, lowerBound, 64)) {
                     return false;
                 }
-                final long startToLimitDistance = Math.abs(upperBoundLimit - lowerBoundStart);
+                try {
+                    final long startToLimitDistance = NumUtil.safeAbs(upperBound - lowerBound);
 
-                /*
-                 * Divide the distance by the absolute value of the stride. For non-constant strides
-                 * assume a worst case stride of 1 since a stride of 0 isn't recognized as an
-                 * induction variable.
-                 */
-                final InductionVariable counter = loop.counted().getLimitCheckedIV();
-                final long stride = counter.isConstantStride() ? Math.abs(counter.constantStride()) : 1;
-                final long strideRelativeStartToLimitDistance = startToLimitDistance / stride;
-                return strideRelativeStartToLimitDistance <= IntegerRangeDistance;
+                    /*
+                     * Divide the distance by the absolute value of the stride. For non-constant
+                     * strides assume a worst case stride of 1 since a stride of 0 isn't recognized
+                     * as an induction variable.
+                     */
+                    final InductionVariable counter = loop.counted().getLimitCheckedIV();
+                    final long stride = counter.isConstantStride() ? NumUtil.safeAbs(counter.constantStride()) : 1;
+                    final long strideRelativeStartToLimitDistance = startToLimitDistance / stride;
+                    return strideRelativeStartToLimitDistance <= distance;
+                } catch (ArithmeticException e) {
+                    return false;
+                }
             }
         }
         return false;
     }
 
+    public static boolean iterationRangeIsIn32Bit(Loop loop) {
+        if (loop.counted().getStamp().getBits() <= 32) {
+            return true;
+        }
+        return loopIsInIterationRange(loop, IntegerRangeDistance);
+    }
+
+    /**
+     * Determines if the compiler's optimizer believes this is a lightweight loop. The compiler
+     * removes safepoint polls on loop ends for loops that iterate over the {@code 32 bit int}
+     * range. This is a heuristic and a trade-off between latency and throughput because long
+     * running loops without safepoint polls increase the time-to-safepoint.
+     */
+    public static boolean loopIsLightweight(Loop loop, ScheduleResult schedule) {
+        /*
+         * The estimation of loop wall clock time in cycles is done by using the frequencies
+         * computed by the control flow graph. Since we do not want a single loop delaying
+         * safepoints too much we need to take the local loop frequency for all the code inside the
+         * loop. It does not matter what the frequency to the start block is. Whenever we execute a
+         * loop, it alone must not increase the time to safepoint too much.
+         */
+        final double loopEntryFrequency = schedule.blockFor(loop.loopBegin().forwardEnd()).getRelativeFrequency();
+        double cost = 0;
+        for (Node node : loop.whole().nodes()) {
+            HIRBlock block = schedule.getNodeToBlockMap().get(node);
+            // phis are not scheduled with all scheduling strategies
+            if (block != null) {
+                final double loopLocalFrequency = block.getRelativeFrequency() / loopEntryFrequency;
+                cost += node.estimatedNodeCycles().value * loopLocalFrequency;
+            }
+        }
+        return cost <= MAX_NON_SAFEPOINT_LOOP_TIME;
+    }
+
+    /**
+     * Maximum number of cycles for a loop to execute before another safepoint is reached. We assume
+     * on a 4 GHz machine the time-to-safepoint should never be more than 1 millisecond. 4 GHz means
+     * 4*10^9 Hz / second. So divided by 1000ms we get the number of cycles per MS the loop should
+     * not exceed.
+     */
+    //@formatter:off
+    private static final double MAX_NON_SAFEPOINT_LOOP_TIME = 4D * Math.pow(10D, 9D)/* == 4 GHz */ / 1000D /* ms */;
+    //@formatter:on
+
     @Override
     public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
-        return ALWAYS_APPLICABLE;
+        return NotApplicable.unlessRunAfter(this, GraphState.StageFlag.LOOP_OVERFLOWS_CHECKED, graphState);
     }
 
     @Override
-    protected final void run(StructuredGraph graph, MidTierContext context) {
-        LoopsData loops = context.getLoopsDataProvider().getLoopsData(graph);
-        if (Options.RemoveLoopSafepoints.getValue(graph.getOptions())) {
+    protected void run(StructuredGraph graph, MidTierContext context) {
+        new SafepointOptimizer(graph, context).optimizeSafepoints().apply();
+    }
+
+    public static class SafepointOptimizer {
+        private final StructuredGraph graph;
+        private final MidTierContext context;
+        private final boolean simulateOnly;
+
+        public SafepointOptimizer(StructuredGraph graph, MidTierContext context) {
+            this(graph, context, false);
+        }
+
+        /** Creates an optimizer that can either apply or conservatively simulate safepoint removal. */
+        public SafepointOptimizer(StructuredGraph graph, MidTierContext context, boolean simulateOnly) {
+            this.graph = graph;
+            this.context = context;
+            this.simulateOnly = simulateOnly;
+        }
+
+        /**
+         * Disable safepoints on loop ends by body nodes. If there is a node that is a guaranteed
+         * safepoint (like a call) we can disable the safepoint on the dominated loop end because
+         * there will be a safepoint poll done already on every iteration of the loop.
+         *
+         * So for a pattern
+         *
+         * <pre>
+         * while (header) {
+         *     if (someCondition1) {
+         *         call1();
+         *         continue;
+         *     }
+         *     code();
+         *     if (someCondition2) {
+         *         call2();
+         *         continue;
+         *     }
+         *     restOfBody();
+         * }
+         * </pre>
+         *
+         * we know that both {@code continue} backedges are dominated by a call. {@code call1} and
+         * {@code call2} dominate the backedges. We can remove safepoint polls from both of them
+         * because the call will be a guaranteed safepoint.
+         */
+        private int disableSafepointsByBodyNodes(LoopSafepointPlan safepointPlan, Loop loop, ControlFlowGraph cfg) {
+            int loopEndSafepointsDisabled = 0;
+            for (LoopEndNode loopEnd : loop.loopBegin().loopEnds()) {
+                HIRBlock b = cfg.blockFor(loopEnd);
+                blocks: while (b != loop.getCFGLoop().getHeader()) {
+                    assert b != null;
+                    for (FixedNode node : b.getNodes()) {
+                        boolean canDisableSafepoint = canDisableSafepoint(node, context);
+                        boolean disabledInSubclass = onCallInLoop(safepointPlan, loopEnd, node);
+                        if (canDisableSafepoint) {
+                            safepointPlan.setEndState(loopEnd, SafepointState.OPTIMIZER_DISABLED);
+                            graph.getOptimizationLog().report(LoopSafepointEliminationPhase.class, "SafepointElimination", loop.loopBegin());
+                            loopEndSafepointsDisabled++;
+                            /*
+                             * we can only stop if subclasses also say we can stop iterating blocks
+                             */
+                            if (disabledInSubclass) {
+                                break blocks;
+                            }
+                        }
+                    }
+                    b = b.getDominator();
+                }
+            }
+            return loopEndSafepointsDisabled;
+        }
+
+        public LoopSafepointPlan optimizeSafepoints() {
+            LoopsData loops = context.getLoopsDataProvider().getLoopsData(graph);
             loops.detectCountedLoops();
-            for (Loop loop : loops.countedLoops()) {
-                if (loop.loop().getChildren().isEmpty() && (loop.loopBegin().isPreLoop() || loop.loopBegin().isPostLoop() || loopIsIn32BitRange(loop) || loop.loopBegin().isStripMinedInner())) {
+            return optimizeSafepoints(loops);
+        }
+
+        public LoopSafepointPlan optimizeSafepoints(LoopsData loops) {
+            LoopSafepointPlan graphWidePlan = new LoopSafepointPlan(graph);
+
+            final boolean optimisticallyRemoveLoopSafepoints = Options.RemoveLoopSafepoints.getValue(graph.getOptions());
+
+            for (Loop loop : loops.loops()) {
+                if (!allowGuestSafepoints()) {
+                    graphWidePlan.setGuestEndStateAllEnds(loop, SafepointState.MUST_NEVER_SAFEPOINT);
+                    graphWidePlan.setGuestLoopBeginState(loop, SafepointState.MUST_NEVER_SAFEPOINT);
+                }
+                if (!loop.loopBegin().canEndsSafepoint() && !loop.loopBegin().canEndsGuestSafepoint()) {
+                    /*
+                     * There are no safepoints at the loop ends. Therefore, we want safepoints at
+                     * loop exits. Skip optimization of loop exit safepoints.
+                     */
+                    continue;
+                }
+
+                int loopEndSafepointsDisabled = disableSafepointsByBodyNodes(graphWidePlan, loop, loops.getCFG());
+                final boolean allLoopEndSafepointsDisabledByBodyNodes = loopEndSafepointsDisabled == loop.loopBegin().getLoopEndCount();
+                if (!allLoopEndSafepointsDisabledByBodyNodes && optimisticallyRemoveLoopSafepoints) {
+                    if (optimizeSafepointsForCountedLoop(graphWidePlan, loop)) {
+                        /*
+                         * We removed all loop end safepoints if we do it optimistically for the
+                         * entire loop.
+                         */
+                        loopEndSafepointsDisabled = loop.loopBegin().getLoopEndCount();
+                    }
+                }
+                graphWidePlan.switchGuestSafepointsToLoopBeginIfMultipleBackEdges(loop);
+                if (!loop.loopBegin().canExitsSafepoint()) {
+                    continue;
+                }
+                final boolean allLoopEndSafepointsEnabled = loopEndSafepointsDisabled == 0;
+                // strip mined outer is never counted
+                final boolean stripMinedOuter = loop.loopBegin().isAnyStripMinedOuter();
+                // retain the exit safepoint for all non-counted loops
+                if (loop.isCounted() || stripMinedOuter) {
+                    if (allLoopEndSafepointsEnabled || allLoopEndSafepointsDisabledByBodyNodes) {
+                        /**
+                         * If all paths inside the loop are guaranteed to trigger a safepoint
+                         * explicitly via SafepointNodes, or implicitly via other nodes (e.g.,
+                         * InvokeNode), we can drop the exit safepoint.
+                         */
+                        graphWidePlan.setExitState(loop, SafepointState.OPTIMIZER_DISABLED);
+                    }
+                }
+
+            }
+            loops.deleteUnusedNodes();
+
+            return graphWidePlan;
+        }
+
+        /**
+         * Determines whether guest safepoints should be allowed at all. To be implemented by
+         * subclasses. The default implementation returns <code>false</code>, leading to guest
+         * safepoints being disabled for all loops in the graph.
+         */
+        protected boolean allowGuestSafepoints() {
+            return false;
+        }
+
+        /**
+         * To be implemented by subclasses to perform additional checks. Returns <code>true</code>
+         * if the safepoint was also disabled in subclasses and we therefore don't need to continue
+         * traversing.
+         */
+        @SuppressWarnings("unused")
+        protected boolean onCallInLoop(LoopSafepointPlan safepointPlan, LoopEndNode loopEnd, FixedNode currentCallNode) {
+            return true;
+        }
+
+        /**
+         * To be implemented by subclasses to compute additional fields.
+         */
+        @SuppressWarnings("unused")
+        protected void onSafepointDisabledLoopBegin(LoopSafepointPlan safepointPlan, Loop loop) {
+        }
+
+        /**
+         * Tries to optimize away safepoints for the given counted loop completely. We have not been
+         * able to remove safepoints from the loop ends of the given loop yet. However, the
+         * optimizer may believe this loop is short running enough to remove safepoints.
+         */
+        private boolean optimizeSafepointsForCountedLoop(LoopSafepointPlan safepointPlan, Loop loop) {
+            if (loop.isCounted()) {
+                final boolean leafLoop = loop.getCFGLoop().getChildren().isEmpty();
+                final boolean preLoop = loop.loopBegin().isPreLoop();
+                final boolean postLoop = loop.loopBegin().isPostLoop();
+                final boolean briefLoop = loopIsInBriefRange(loop);
+                final boolean stripMinedInner = loop.loopBegin().isAnyStripMinedInner();
+                if (leafLoop && (preLoop || postLoop || briefLoop || stripMinedInner)) {
                     boolean hasSafepoint = false;
                     for (LoopEndNode loopEnd : loop.loopBegin().loopEnds()) {
-                        hasSafepoint |= loopEnd.canSafepoint();
+                        hasSafepoint |= loopEnd.getSafepointState().canSafepoint();
                     }
                     if (hasSafepoint) {
                         if (!loop.counted().counterNeverOverflows()) {
@@ -140,51 +571,62 @@ public class LoopSafepointEliminationPhase extends BasePhase<MidTierContext> {
                             if (allowsLoopLimitChecks && allowsFloatingGuards) {
                                 loop.counted().createOverFlowGuard();
                             } else {
-                                // Cannot disable this safepoint, because the loop could overflow.
-                                continue;
+                                /*
+                                 * Cannot disable this safepoint, because the loop could overflow.
+                                 */
+                                return false;
                             }
                         }
-                        loop.loopBegin().disableSafepoint();
-                        if (loop.loopBegin().isStripMinedInner()) {
-                            // graal strip mined this loop, trust the heuristics and remove the
-                            // inner
-                            // loop safepoint
-                            loop.loopBegin().disableGuestSafepoint();
+                        /*
+                         * Two cases permit removing this loop's safepoint: both the checked IV and its
+                         * root are proved non-overflowing, or the loop is a non-counted strip-mined inner
+                         * loop with its own bound. For an ordinary widened test such as (long) i < limit,
+                         * the proof must cover the updated int counter i as well as its long conversion.
+                         *
+                         * Non-counted strip mining supplies a separate bound: for a unit-stride strip, it
+                         * tests int (i - stripStart) against the strip size. Here i is the reused root IV and
+                         * i - stripStart is the checked distance. With stripStart = MAX_VALUE and i =
+                         * MIN_VALUE after one increment, the int subtraction gives 1, so overflow of i does
+                         * not lose the iteration count. The bounded inner strip returns to the outer
+                         * safepoint. Other counted loops need the checked-IV and root proofs below before
+                         * their safepoints can be removed.
+                         */
+                        if (!(loop.loopBegin().isNonCountedStripMinedInner() || loop.counted().loopAndRootCanNeverOverflow())) {
+                            return false;
+                        }
+                        safepointPlan.setEndStateAllEnds(loop, SafepointState.OPTIMIZER_DISABLED);
+                        if (stripMinedInner) {
+                            /*
+                             * graal strip mined this loop, trust the heuristics and remove the
+                             * inner loop safepoint
+                             */
+                            safepointPlan.setGuestEndStateAllEnds(loop, SafepointState.OPTIMIZER_DISABLED);
                         } else {
-                            // let the shape of the loop decide whether a guest safepoint is needed
-                            onSafepointDisabledLoopBegin(loop);
+                            /*
+                             * let the shape of the loop decide whether a guest safepoint is needed
+                             */
+                            onSafepointDisabledLoopBegin(safepointPlan, loop);
                         }
                         graph.getOptimizationLog().report(LoopSafepointEliminationPhase.class, "SafepointElimination", loop.loopBegin());
+                        return true;
                     }
                 }
             }
+            return false;
         }
-        for (Loop loop : loops.loops()) {
-            if (!allowGuestSafepoints()) {
-                loop.loopBegin().disableGuestSafepoint();
-            }
-            for (LoopEndNode loopEnd : loop.loopBegin().loopEnds()) {
-                HIRBlock b = loops.getCFG().blockFor(loopEnd);
-                blocks: while (b != loop.loop().getHeader()) {
-                    assert b != null;
-                    for (FixedNode node : b.getNodes()) {
-                        boolean canDisableSafepoint = canDisableSafepoint(node, context);
-                        boolean disabledInSubclass = onCallInLoop(loopEnd, node);
-                        if (canDisableSafepoint) {
-                            loopEnd.disableSafepoint();
-                            graph.getOptimizationLog().report(LoopSafepointEliminationPhase.class, "SafepointElimination", loop.loopBegin());
 
-                            // we can only stop if subclasses also say we can stop iterating blocks
-                            if (disabledInSubclass) {
-                                break blocks;
-                            }
-                        }
-                    }
-                    b = b.getDominator();
-                }
+        /**
+         * Determine if this loop is a brief range loop. A brief range loop is one where we assume
+         * that we can drop the safepoint because the body of the loop executes quickly enough.
+         */
+        public boolean loopIsInBriefRange(Loop loop) {
+            if (simulateOnly) {
+                int innerLoopTrips = CountedStripMiningPhase.Options.CountedStripMiningInnerLoopTrips.getValue(loop.loopBegin().getOptions());
+                return loopIsInIterationRange(loop, innerLoopTrips);
             }
+            return iterationRangeIsIn32Bit(loop);
         }
-        loops.deleteUnusedNodes();
+
     }
 
     public static boolean canDisableSafepoint(FixedNode node, CoreProviders context) {

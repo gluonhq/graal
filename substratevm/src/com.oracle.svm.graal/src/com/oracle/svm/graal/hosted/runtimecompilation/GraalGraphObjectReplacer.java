@@ -39,18 +39,21 @@ import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.svm.common.meta.MultiMethod;
+import com.oracle.svm.core.SubstrateMetadata;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.ImageCodeInfo;
+import com.oracle.svm.core.debug.SubstrateDebugInfoInstaller;
+import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
 import com.oracle.svm.core.graal.nodes.SubstrateFieldLocationIdentity;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.core.hub.DynamicHubUtils;
+import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.shared.option.HostedOptionKey;
 import com.oracle.svm.core.util.HostedStringDeduplication;
-import com.oracle.svm.core.util.ObservableImageHeapMapProvider;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.util.ObservableImageHeapMapProvider;
+import com.oracle.svm.graal.RuntimeCompilationSupport;
 import com.oracle.svm.graal.SubstrateGraalRuntime;
 import com.oracle.svm.graal.SubstrateGraalUtils;
-import com.oracle.svm.graal.TruffleRuntimeCompilationSupport;
 import com.oracle.svm.graal.meta.SubstrateField;
 import com.oracle.svm.graal.meta.SubstrateMethod;
 import com.oracle.svm.graal.meta.SubstrateSignature;
@@ -65,33 +68,38 @@ import com.oracle.svm.hosted.meta.HostedField;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedType;
 import com.oracle.svm.hosted.meta.HostedUniverse;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.OriginalClassProvider;
+import com.oracle.svm.util.OriginalFieldProvider;
+import com.oracle.svm.util.OriginalMethodProvider;
 
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.api.runtime.GraalRuntime;
 import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
 import jdk.graal.compiler.debug.MetricKey;
-import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.hotspot.GraalHotSpotVMConfig;
 import jdk.graal.compiler.hotspot.HotSpotBackendFactory;
 import jdk.graal.compiler.hotspot.SnippetResolvedJavaMethod;
 import jdk.graal.compiler.hotspot.SnippetResolvedJavaType;
+import jdk.graal.compiler.hotspot.SnippetSignature;
 import jdk.graal.compiler.nodes.FieldLocationIdentity;
 import jdk.graal.compiler.options.Option;
 import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.hotspot.HotSpotJVMCIRuntime;
-import jdk.vm.ci.hotspot.HotSpotObjectConstant;
-import jdk.vm.ci.hotspot.HotSpotResolvedJavaField;
-import jdk.vm.ci.hotspot.HotSpotResolvedJavaMethod;
-import jdk.vm.ci.hotspot.HotSpotResolvedJavaType;
-import jdk.vm.ci.hotspot.HotSpotSignature;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.Local;
+import jdk.vm.ci.meta.LocalVariableTable;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.Signature;
+import jdk.vm.ci.runtime.JVMCIRuntime;
 
 /**
  * Replaces Graal related objects during analysis in the universe.
@@ -110,7 +118,7 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
     private final ConcurrentMap<FieldLocationIdentity, SubstrateFieldLocationIdentity> fieldLocationIdentities = new ConcurrentHashMap<>();
     private final ConcurrentMap<AnalysisType, SubstrateType> types = new ConcurrentHashMap<>();
     private final ConcurrentMap<ResolvedSignature<AnalysisType>, SubstrateSignature> signatures = new ConcurrentHashMap<>();
-    private final SubstrateProviders sProviders;
+    private final SubstrateRuntimeProviders sProviders;
     private final SubstrateUniverseFactory universeFactory;
     private SubstrateGraalRuntime sGraalRuntime;
 
@@ -125,11 +133,11 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
     private boolean forbidNewTypes = false;
     private BeforeAnalysisAccessImpl beforeAnalysisAccess;
 
-    public GraalGraphObjectReplacer(AnalysisUniverse aUniverse, SubstrateProviders sProviders, SubstrateUniverseFactory universeFactory) {
+    public GraalGraphObjectReplacer(AnalysisUniverse aUniverse, SubstrateRuntimeProviders sProviders, SubstrateUniverseFactory universeFactory) {
         this.aUniverse = aUniverse;
         this.sProviders = sProviders;
         this.universeFactory = universeFactory;
-        this.imageCodeInfo = CodeInfoTable.getImageCodeCache();
+        this.imageCodeInfo = CodeInfoTable.getCurrentLayerImageCodeCache();
         this.stringTable = HostedStringDeduplication.singleton();
     }
 
@@ -142,6 +150,7 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
         this.beforeAnalysisAccess = beforeAnalysisAccess;
     }
 
+    @SuppressWarnings("unchecked")
     @Override
     public Object apply(Object source) {
 
@@ -155,19 +164,19 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
             return dest;
         }
 
-        if (source instanceof SnippetResolvedJavaMethod || source instanceof SnippetResolvedJavaType) {
+        if (source instanceof SnippetResolvedJavaMethod || source instanceof SnippetResolvedJavaType || source instanceof SnippetSignature) {
+            // skip checks for "hotspot" in the class name
             return source;
         }
         if (source instanceof MetaAccessProvider) {
             dest = sProviders.getMetaAccessProvider();
-        } else if (source instanceof HotSpotJVMCIRuntime) {
-            throw new UnsupportedFeatureException("HotSpotJVMCIRuntime should not appear in the image: " + source);
+        } else if (source instanceof JVMCIRuntime) {
+            throw new UnsupportedFeatureException("JVMCIRuntime should not appear in the image: " + source);
         } else if (source instanceof GraalHotSpotVMConfig) {
             throw new UnsupportedFeatureException("GraalHotSpotVMConfig should not appear in the image: " + source);
-        } else if (source instanceof HotSpotBackendFactory) {
-            HotSpotBackendFactory factory = (HotSpotBackendFactory) source;
+        } else if (source instanceof HotSpotBackendFactory factory) {
             Architecture hostArch = HotSpotJVMCIRuntime.runtime().getHostJVMCIBackend().getTarget().arch;
-            if (!factory.getArchitecture().equals(hostArch.getClass())) {
+            if (!factory.getArchitecture().equals(hostArch.getName())) {
                 throw new UnsupportedFeatureException("Non-host architecture HotSpotBackendFactory should not appear in the image: " + source);
             }
         } else if (source instanceof GraalRuntime) {
@@ -184,30 +193,49 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
         } else if (source instanceof MetricKey) {
             /* Ensure lazily initialized name fields are computed. */
             ((MetricKey) source).getName();
-        } else if (source instanceof NodeClass) {
-            /* Ensure lazily initialized shortName field is computed. */
-            ((NodeClass<?>) source).shortName();
 
-        } else if (source instanceof HotSpotResolvedJavaMethod) {
-            throw new UnsupportedFeatureException(source.toString());
-        } else if (source instanceof HotSpotResolvedJavaField) {
-            throw new UnsupportedFeatureException(source.toString());
-        } else if (source instanceof HotSpotResolvedJavaType) {
-            throw new UnsupportedFeatureException(source.toString());
-        } else if (source instanceof HotSpotSignature) {
-            throw new UnsupportedFeatureException(source.toString());
-        } else if (source instanceof HotSpotObjectConstant) {
-            throw new UnsupportedFeatureException(source.toString());
-        } else if (source instanceof ResolvedJavaMethod && !(source instanceof SubstrateMethod)) {
-            dest = createMethod((ResolvedJavaMethod) source);
-        } else if (source instanceof ResolvedJavaField && !(source instanceof SubstrateField)) {
-            dest = createField((ResolvedJavaField) source);
-        } else if (source instanceof ResolvedJavaType && !(source instanceof SubstrateType)) {
-            dest = createType((ResolvedJavaType) source);
+        } else if (source instanceof ResolvedJavaMethod) {
+            if (source instanceof OriginalMethodProvider) {
+                dest = createMethod((ResolvedJavaMethod) source);
+            } else if (source instanceof SubstrateMetadata) {
+                // do nothing, metadata needed by the compiler at runtime
+            } else if (!(source instanceof SharedRuntimeMethod)) {
+                throw new UnsupportedFeatureException("ResolvedJavaMethod that is not a subtype of SharedRuntimeMethod is not allowed at runtime, method=" + source);
+            }
+        } else if (source instanceof ResolvedJavaField) {
+            if (source instanceof OriginalFieldProvider) {
+                dest = createField((ResolvedJavaField) source);
+            } else if (source instanceof SubstrateMetadata) {
+                // do nothing, metadata needed by the compiler at runtime
+            } else if (!(source instanceof SubstrateField)) {
+                throw new UnsupportedFeatureException("ResolvedJavaField that is not a subtype of SubstrateField is not allowed at runtime, method=" + source);
+            }
+        } else if (source instanceof ResolvedJavaType) {
+            if (source instanceof OriginalClassProvider) {
+                dest = createType((ResolvedJavaType) source);
+            } else if (source instanceof SubstrateMetadata) {
+                // do nothing, metadata needed by the compiler at runtime
+            } else if (!(source instanceof SubstrateType)) {
+                throw new UnsupportedFeatureException("ResolvedJavaType that is not a subtype of SubstrateType is not allowed at runtime, method=" + source);
+            }
+        } else if (source instanceof Signature) {
+            if (source instanceof ResolvedSignature) {
+                dest = createSignature((ResolvedSignature<AnalysisType>) source);
+            } else if (source instanceof SubstrateMetadata) {
+                // do nothing, metadata needed by the compiler at runtime
+            } else if (!(source instanceof SubstrateSignature)) {
+                throw new UnsupportedFeatureException(source.toString());
+            }
+        } else if (source instanceof JavaConstant cst) {
+            if (source instanceof ImageHeapConstant heapConstant) {
+                dest = SubstrateGraalUtils.hostedToRuntime(heapConstant, beforeAnalysisAccess.getBigBang().getConstantReflectionProvider());
+            } else if (source instanceof SubstrateMetadata) {
+                // do nothing, the interpreter runtime needs this meta data at runtime
+            } else if (cst.getJavaKind().isObject() && !cst.isDefaultForKind() && !(cst instanceof SubstrateObjectConstant)) {
+                throw new UnsupportedFeatureException("Unknown subtype of JavaConstant for inclusion in runtime heap " + source);
+            }
         } else if (source instanceof FieldLocationIdentity && !(source instanceof SubstrateFieldLocationIdentity)) {
             dest = createFieldLocationIdentity((FieldLocationIdentity) source);
-        } else if (source instanceof ImageHeapConstant heapConstant) {
-            dest = SubstrateGraalUtils.hostedToRuntime(heapConstant, beforeAnalysisAccess.getBigBang().getConstantReflectionProvider());
         }
 
         assert dest != null;
@@ -235,7 +263,7 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
         } else {
             aMethod = aUniverse.lookup(original);
         }
-        aMethod = aMethod.getMultiMethod(MultiMethod.ORIGINAL_METHOD);
+        aMethod = aMethod.getMethodVariant(MethodVariant.ORIGINAL_METHOD);
         assert aMethod != null;
 
         SubstrateMethod sMethod = methods.get(aMethod);
@@ -252,21 +280,36 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
                  * be the target of an invokeinterface, which doesn't necessarily correspond to an
                  * actual declared method, so normal resolution will not work.
                  */
-                beforeAnalysisAccess.registerSubtypeReachabilityHandler((a, reachableSubtype) -> {
-                    AnalysisType subtype = beforeAnalysisAccess.getMetaAccess().lookupJavaType(reachableSubtype);
+                beforeAnalysisAccess.registerSubtypeReachabilityHandler((_, reachableSubtype) -> {
+                    AnalysisType subtype = reachableSubtype instanceof AnalysisType aType ? aType : aUniverse.lookup(reachableSubtype);
                     if (!subtype.equals(baseType)) {
                         AnalysisMethod resolvedOverride = subtype.resolveConcreteMethod(baseMethod, null);
                         if (resolvedOverride != null) {
-                            resolvedOverride.registerImplementationInvokedCallback((analysisAccess) -> createMethod(resolvedOverride));
+                            resolvedOverride.registerImplementationInvokedCallback(_ -> createMethod(resolvedOverride));
                         }
                     }
-                }, baseType.getJavaClass());
+                }, baseType);
 
+                /*
+                 * With run-time debug info support enabled, ensure LocalVariableTables are
+                 * available in SubstrateMethods if possible.
+                 */
+                LocalVariableTable localVariableTable;
+                if (SubstrateDebugInfoInstaller.Options.hasRuntimeDebugInfoFormatSupport(SubstrateDebugInfoInstaller.DEBUG_INFO_OBJFILE_NAME)) {
+                    try {
+                        localVariableTable = createLocalVariableTable(aMethod.getLocalVariableTable());
+                    } catch (IllegalStateException e) {
+                        LogUtils.warning("Omit invalid local variable table from method %s", sMethod.getName());
+                        localVariableTable = null;
+                    }
+                } else {
+                    localVariableTable = null;
+                }
                 /*
                  * The links to other meta objects must be set after adding to the methods to avoid
                  * infinite recursion.
                  */
-                sMethod.setLinks(createSignature(aMethod.getSignature()), createType(aMethod.getDeclaringClass()));
+                sMethod.setLinks(createSignature(aMethod.getSignature()), createType(aMethod.getDeclaringClass()), localVariableTable);
             }
         }
         return sMethod;
@@ -292,8 +335,8 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
                 sField = newField;
 
                 sField.setLinks(createType(aField.getType()), createType(aField.getDeclaringClass()));
-                TruffleRuntimeCompilationSupport.rescan(aUniverse, sField.getType());
-                TruffleRuntimeCompilationSupport.rescan(aUniverse, sField.getDeclaringClass());
+                RuntimeCompilationSupport.rescan(aUniverse, sField.getType());
+                RuntimeCompilationSupport.rescan(aUniverse, sField.getDeclaringClass());
             }
         }
         return sField;
@@ -335,15 +378,15 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
             VMError.guarantee(!(forbidNewTypes || (original instanceof HostedType)), "Too late to create a new type: %s", aType);
             aType.registerAsReachable("type reachable from Graal graphs");
             DynamicHub hub = ((SVMHost) aUniverse.hostVM()).dynamicHub(aType);
-            SubstrateType newType = new SubstrateType(aType.getJavaKind(), hub);
+            SubstrateType newType = universeFactory.createType(aType, hub);
             sType = types.putIfAbsent(aType, newType);
             if (sType == null) {
                 sType = newType;
-                hub.setMetaType(sType);
-                TruffleRuntimeCompilationSupport.rescan(aUniverse, hub.getMetaType());
+                DynamicHubUtils.setMetaType(hub, sType);
+                RuntimeCompilationSupport.rescan(aUniverse, DynamicHubUtils.getMetaType(hub));
 
                 sType.setRawAllInstanceFields(createAllInstanceFields(aType));
-                TruffleRuntimeCompilationSupport.rescan(aUniverse, sType.getRawAllInstanceFields());
+                RuntimeCompilationSupport.rescan(aUniverse, sType.getRawAllInstanceFields());
                 createType(aType.getSuperclass());
                 createType(aType.getComponentType());
                 for (AnalysisType aInterface : aType.getInterfaces()) {
@@ -395,6 +438,31 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
         return sSignature;
     }
 
+    private synchronized LocalVariableTable createLocalVariableTable(LocalVariableTable original) {
+        if (original == null) {
+            return null;
+        }
+        try {
+            Local[] origLocals = original.getLocals();
+            Local[] newLocals = new Local[origLocals.length];
+            for (int i = 0; i < newLocals.length; ++i) {
+                Local origLocal = origLocals[i];
+                /*
+                 * Check if the local variable table is malformed. This throws an
+                 * IllegalStateException if the bci ranges of variables overlap and the malformed
+                 * local variable table is omitted from the image.
+                 */
+                original.getLocal(origLocal.getSlot(), origLocal.getStartBCI());
+                JavaType origType = origLocal.getType();
+                SubstrateType newType = createType(origType);
+                newLocals[i] = new Local(origLocal.getName(), newType, origLocal.getStartBCI(), origLocal.getEndBCI(), origLocal.getSlot());
+            }
+            return new LocalVariableTable(newLocals);
+        } catch (UnsupportedFeatureException e) {
+            return null;
+        }
+    }
+
     /**
      * Collect {@link SubstrateMethod} implementations.
      */
@@ -419,7 +487,6 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
      * Therefore all substrate VM related data has to be updated after building the substrate
      * universe.
      */
-    @SuppressWarnings("try")
     public void updateSubstrateDataAfterCompilation(HostedUniverse hUniverse, Providers providers) {
 
         if (Options.GuaranteeSubstrateTypesLinked.getValue()) {
@@ -438,8 +505,10 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
             }
             HostedType hType = hUniverse.lookup(aType);
 
-            if (hType.getUniqueConcreteImplementation() != null) {
-                sType.setTypeCheckData(hType.getUniqueConcreteImplementation().getHub());
+            sType.clearNameCache();
+
+            if (hType.getSingleImplementor() != null) {
+                sType.setSingleImplementor(hType.getSingleImplementor().getHub());
             }
 
             if (sType.getInstanceFieldCount() > 1) {
@@ -463,8 +532,19 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
                             ? providers.getConstantReflection().readFieldValue(hField, null)
                             : null;
             constantValue = SubstrateGraalUtils.hostedToRuntime(constantValue, providers.getConstantReflection());
-            sField.setSubstrateData(hField.getLocation(), hField.isAccessed(), hField.isWritten() || !hField.isValueAvailable(), constantValue);
+            sField.setSubstrateDataAfterCompilation(hField.getLocation(), hField.isAccessed(), hField.isWritten(), constantValue);
         }
+
+        methods.forEach((aMethod, sMethod) -> {
+            HostedMethod hMethod = hUniverse.lookup(aMethod);
+            SubstrateMethod indirectCallTarget = sMethod;
+            if (!hMethod.getIndirectCallTarget().equals(hMethod)) {
+                indirectCallTarget = methods.get(hMethod.getIndirectCallTarget().getWrapped());
+            }
+            int vTableIndex = (hMethod.hasVTableIndex() ? hMethod.getVTableIndex() : HostedMethod.MISSING_VTABLE_IDX);
+            sMethod.setSubstrateDataAfterCompilation(indirectCallTarget, vTableIndex);
+        });
+
     }
 
     public void updateSubstrateDataAfterHeapLayout(HostedUniverse hUniverse) {
@@ -472,14 +552,13 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
             AnalysisMethod aMethod = entry.getKey();
             SubstrateMethod sMethod = entry.getValue();
             HostedMethod hMethod = hUniverse.lookup(aMethod);
-            int vTableIndex = (hMethod.hasVTableIndex() ? hMethod.getVTableIndex() : -1);
 
             /*
              * We access the offset of methods in the image code section here. Therefore, this code
              * can only run after the heap and code cache layout was done.
              */
             int imageCodeOffset = hMethod.isCodeAddressOffsetValid() ? hMethod.getCodeAddressOffset() : 0;
-            sMethod.setSubstrateData(vTableIndex, imageCodeOffset, hMethod.getImageCodeDeoptOffset());
+            sMethod.setSubstrateDataAfterHeapLayout(imageCodeOffset, hMethod.getImageCodeDeoptOffset());
         }
     }
 
@@ -496,12 +575,18 @@ public class GraalGraphObjectReplacer implements Function<Object, Object> {
             access.registerAsImmutable(fieldLocationIdentity);
         }
         for (SubstrateType type : types.values()) {
-            access.registerAsImmutable(type);
             access.registerAsImmutable(type.getRawAllInstanceFields());
         }
         for (SubstrateSignature signature : signatures.values()) {
             access.registerAsImmutable(signature);
-            access.registerAsImmutable(signature.getRawParameterTypes());
+
+            /* SubstrateTypes are not registered as immutable since they cache their name. */
+            Object parameterType = signature.getRawParameterTypes();
+            if (parameterType instanceof SubstrateType[]) {
+                access.registerAsImmutable(parameterType);
+            } else {
+                assert parameterType == null || (parameterType instanceof SubstrateType) : parameterType;
+            }
         }
     }
 }

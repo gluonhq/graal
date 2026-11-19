@@ -37,6 +37,7 @@ import static jdk.graal.compiler.options.test.NestedBooleanOptionKeyTest.Options
 import static jdk.graal.compiler.options.test.NestedBooleanOptionKeyTest.Options.Parent1;
 import static jdk.graal.compiler.options.test.NestedBooleanOptionKeyTest.Options.Parent2;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Assert;
@@ -131,5 +132,17 @@ public class NestedBooleanOptionKeyTest {
         options = new OptionValues(null, Parent2, true, NestedOption2, true);
         assertTrue(Parent2.getValue(options));
         assertTrue(NestedOption2.getValue(options));
+    }
+
+    @Test
+    public void deriveKeepsComputedNestedOptionUnset() {
+        OptionValues options = new OptionValues(null, Parent1, true);
+        assertTrue(NestedOption1.getValue(options));
+        assertFalse(NestedOption1.hasBeenSet(options));
+
+        OptionValues derived = options.derive(NestedOption1, true);
+        assertSame(options, derived);
+        assertTrue(NestedOption1.getValue(derived));
+        assertFalse(NestedOption1.hasBeenSet(derived));
     }
 }

@@ -27,11 +27,11 @@ package com.oracle.svm.core.jfr;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
 import com.oracle.svm.core.thread.VMOperation;
+import org.graalvm.word.impl.Word;
 
 /**
  * Manages the global JFR buffers (see {@link JfrBufferType#GLOBAL_MEMORY}). The memory has a very
@@ -96,7 +96,7 @@ public class JfrGlobalMemory {
             try {
                 JfrBuffer buffer = JfrBufferNodeAccess.getBuffer(node);
                 JfrBufferAccess.free(buffer);
-                node.setBuffer(WordFactory.nullPointer());
+                node.setBuffer(Word.nullPointer());
             } finally {
                 JfrBufferNodeAccess.unlock(node);
             }
@@ -169,6 +169,6 @@ public class JfrGlobalMemory {
                 node = node.getNext();
             }
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 }

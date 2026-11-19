@@ -24,10 +24,13 @@
  */
 package com.oracle.svm.hosted.reflect;
 
+import java.lang.reflect.Executable;
+
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.graal.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
+import com.oracle.svm.core.nodes.SubstrateIndirectCallTargetNode;
 import com.oracle.svm.core.reflect.ReflectionAccessorHolder.MethodInvokeFunctionPointer;
 import com.oracle.svm.core.reflect.SubstrateConstructorAccessor;
 import com.oracle.svm.core.reflect.SubstrateMethodAccessor;
@@ -38,7 +41,6 @@ import jdk.graal.compiler.core.common.type.StampPair;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.CallTargetNode;
 import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
-import jdk.graal.compiler.nodes.IndirectCallTargetNode;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
@@ -52,13 +54,15 @@ public class ReflectionExpandSignatureMethod extends NonBytecodeMethod {
     private final Class<?>[] argTypes;
     private final JavaKind returnKind;
     private final boolean callerSensitiveAdapter;
+    private final Executable member;
 
-    public ReflectionExpandSignatureMethod(String name, ResolvedJavaMethod prototype, boolean isStatic, Class<?>[] argTypes, JavaKind returnKind, boolean callerSensitiveAdapter) {
+    public ReflectionExpandSignatureMethod(String name, ResolvedJavaMethod prototype, boolean isStatic, Class<?>[] argTypes, JavaKind returnKind, boolean callerSensitiveAdapter, Executable member) {
         super(name, true, prototype.getDeclaringClass(), prototype.getSignature(), prototype.getConstantPool());
         this.isStatic = isStatic;
         this.argTypes = argTypes;
         this.returnKind = returnKind;
         this.callerSensitiveAdapter = callerSensitiveAdapter;
+        this.member = member;
     }
 
     /**
@@ -111,7 +115,7 @@ public class ReflectionExpandSignatureMethod extends NonBytecodeMethod {
             signature[i + receiverOffset] = kit.getMetaAccess().lookupJavaType(argTypes[i]);
         }
 
-        CallTargetNode callTarget = kit.append(new IndirectCallTargetNode(invokedMethod, args, StampPair.createSingle(StampFactory.forKind(returnKind)), signature, null,
+        CallTargetNode callTarget = kit.append(new SubstrateIndirectCallTargetNode(invokedMethod, args, StampPair.createSingle(StampFactory.forKind(returnKind)), signature, null,
                         SubstrateCallingConventionKind.Java.toType(true), InvokeKind.Static));
 
         InvokeWithExceptionNode invoke = kit.startInvokeWithException(callTarget, kit.getFrameState(), kit.bci());
@@ -135,5 +139,9 @@ public class ReflectionExpandSignatureMethod extends NonBytecodeMethod {
         kit.emitInvocationTargetException();
 
         return kit.finalizeGraph();
+    }
+
+    public Executable getMember() {
+        return member;
     }
 }

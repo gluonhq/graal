@@ -24,22 +24,33 @@
  */
 package com.oracle.svm.core.graal.meta;
 
-import static com.oracle.svm.core.util.VMError.intentionallyUnimplemented;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.code.ImageCodeInfo;
-import com.oracle.svm.core.graal.code.SubstrateCallingConventionType;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.core.code.ImageCodeInfoProvider;
+import com.oracle.svm.core.deopt.DeoptimizedFrame.DeoptTargetTier;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionType;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.vm.ci.meta.annotation.AnnotationsInfo;
 
 /**
  * The method interface used at runtime.
  */
-public interface SharedRuntimeMethod extends SharedMethod {
+public interface SharedRuntimeMethod extends SharedMethod, ImageCodeInfoProvider {
 
     int getEncodedGraphStartOffset();
 
     default SharedRuntimeMethod getOriginal() {
         return this;
+    }
+
+    /**
+     * @return the tier this method deoptimizes to.
+     */
+    default DeoptTargetTier getDeoptTargetTier() {
+        return DeoptTargetTier.BaselineCompiledCode;
     }
 
     @Override
@@ -49,9 +60,15 @@ public interface SharedRuntimeMethod extends SharedMethod {
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    ImageCodeInfo getImageCodeInfo();
+    int getImageCodeDeoptOffset();
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    int getImageCodeDeoptOffset();
+    default AnnotationsInfo getParameterAnnotationInfo() {
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    default AnnotationsInfo getAnnotationDefaultInfo() {
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
 }

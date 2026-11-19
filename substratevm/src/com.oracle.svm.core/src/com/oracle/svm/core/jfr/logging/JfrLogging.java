@@ -1,6 +1,7 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2021, 2021, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2025, 2025, IBM Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,20 +26,27 @@
  */
 package com.oracle.svm.core.jfr.logging;
 
+import static com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess.Access.NO_ALLOCATION;
+
 import java.util.Locale;
 import java.util.Set;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 import jdk.jfr.internal.LogLevel;
 import jdk.jfr.internal.LogTag;
 
 public class JfrLogging {
+    private static final IllegalArgumentException verifyLogLevelException = PreallocatedExceptions.createIllegalArgumentException("LogLevel passed is outside valid range");
+    private static final IllegalArgumentException verifyLogTagSetIdException = PreallocatedExceptions.createIllegalArgumentException("LogTagSet id is outside valid range");
+
     private final String[] logLevels;
     private final String[] logTagSets;
     private int levelDecorationFill = 0;
@@ -54,11 +62,34 @@ public class JfrLogging {
         JfrLogConfiguration.parse(config);
     }
 
-    public void warnInternal(String message) {
-        int tagSetId = SubstrateUtil.cast(LogTag.JFR_SYSTEM, Target_jdk_jfr_internal_LogTag.class).id;
-        log(tagSetId, JfrLogConfiguration.JfrLogLevel.WARNING.level, message);
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
+    public void logJfrSystemError(String message) {
+        logIfEnabled(LogTag.JFR_SYSTEM, JfrLogConfiguration.JfrLogLevel.ERROR.level, message);
     }
 
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
+    public void logJfrInfo(String message) {
+        logIfEnabled(LogTag.JFR, JfrLogConfiguration.JfrLogLevel.INFO.level, message);
+    }
+
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
+    public void logJfrWarning(String message) {
+        logIfEnabled(LogTag.JFR, JfrLogConfiguration.JfrLogLevel.WARNING.level, message);
+    }
+
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
+    public void logJfrSettingWarning(String message) {
+        logIfEnabled(LogTag.JFR_SETTING, JfrLogConfiguration.JfrLogLevel.WARNING.level, message);
+    }
+
+    private void logIfEnabled(LogTag logTag, int level, String message) {
+        Target_jdk_jfr_internal_LogTag targetLogTag = SubstrateUtil.cast(logTag, Target_jdk_jfr_internal_LogTag.class);
+        if (level >= targetLogTag.tagSetLevel) {
+            log(targetLogTag.id, level, message);
+        }
+    }
+
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
     public void log(int tagSetId, int level, String message) {
         if (message == null) {
             return;
@@ -85,6 +116,7 @@ public class JfrLogging {
         log.string(message).newline();
     }
 
+    @RestrictHeapAccess(access = NO_ALLOCATION, reason = "May be used during OOME emergency dump.")
     public void logEvent(int level, String[] lines, boolean system) {
         if (lines == null) {
             return;
@@ -100,13 +132,13 @@ public class JfrLogging {
 
     private void verifyLogLevel(int level) {
         if (level < 0 || level >= logLevels.length || logLevels[level] == null) {
-            throw new IllegalArgumentException("LogLevel passed is outside valid range");
+            throw verifyLogLevelException;
         }
     }
 
     private void verifyLogTagSetId(int tagSetId) {
         if (tagSetId < 0 || tagSetId >= logTagSets.length) {
-            throw new IllegalArgumentException("LogTagSet id is outside valid range");
+            throw verifyLogTagSetIdException;
         }
     }
 
@@ -138,7 +170,7 @@ public class JfrLogging {
             Set<JfrLogTag> set = JfrLogConfiguration.LOG_TAG_SETS.get(logTagSet);
             if (set != null) {
                 for (JfrLogTag logTag : set) {
-                    if (builder.length() > 0) {
+                    if (!builder.isEmpty()) {
                         builder.append(",");
                     }
                     builder.append(logTag.toString().toLowerCase(Locale.ROOT));

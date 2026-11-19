@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,46 +26,39 @@ package com.oracle.svm.core.windows;
 
 import java.io.FileDescriptor;
 
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.Isolates;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
-import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.JNIPlatformNativeLibrarySupport;
 import com.oracle.svm.core.jdk.Jvm;
 import com.oracle.svm.core.jdk.NativeLibrarySupport;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.windows.WindowsUtils.WCharPointerHolder;
 import com.oracle.svm.core.windows.headers.FileAPI;
 import com.oracle.svm.core.windows.headers.LibLoaderAPI;
 import com.oracle.svm.core.windows.headers.WinBase.HMODULE;
 import com.oracle.svm.core.windows.headers.WinSock;
-
-@AutomaticallyRegisteredFeature
-@Platforms(Platform.WINDOWS.class)
-class WindowsNativeLibraryFeature implements InternalFeature {
-    @Override
-    public void duringSetup(DuringSetupAccess access) {
-        NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary("extnet");
-    }
-}
+import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 @AutomaticallyRegisteredImageSingleton(PlatformNativeLibrarySupport.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
 
     @Override
-    public boolean initializeBuiltinLibraries() {
+    public boolean initializeLibrariesDuringIsolateInit() {
         try {
-            loadJavaLibrary();
+            loadLibjava();
             loadNetLibrary();
         } catch (UnsatisfiedLinkError e) {
             Log.log().string("System.loadLibrary failed, " + e).newline();
@@ -75,8 +68,8 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
     }
 
     @Override
-    protected void loadJavaLibrary() {
-        super.loadJavaLibrary();
+    protected void loadLibjava() {
+        super.loadLibjava();
         Target_java_io_WinNTFileSystem.initIDs();
 
         /* Initialize the handles of standard FileDescriptors. */
@@ -85,6 +78,7 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
         WindowsUtils.setHandle(FileDescriptor.err, FileAPI.GetStdHandle(FileAPI.STD_ERROR_HANDLE()));
     }
 
+    @SuppressWarnings("restricted")
     private static void loadNetLibrary() {
         if (Isolates.isCurrentFirst()) {
             WinSock.init();
@@ -95,9 +89,9 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
              * isolate applies to all subsequently launched isolates.
              */
         } else {
-            NativeLibrarySupport.singleton().registerInitializedBuiltinLibrary("net");
+            NativeLibrarySupport.singleton().registerInitializedLibrary("net");
         }
-        NativeLibrarySupport.singleton().registerInitializedBuiltinLibrary("extnet");
+        NativeLibrarySupport.singleton().registerInitializedLibrary("extnet");
         System.loadLibrary("extnet");
     }
 
@@ -109,7 +103,7 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
     @Override
     public PointerBase findBuiltinSymbol(String name) {
         try (CCharPointerHolder symbol = CTypeConversion.toCString(name)) {
-            HMODULE builtinHandle = LibLoaderAPI.GetModuleHandleA(WordFactory.nullPointer());
+            HMODULE builtinHandle = LibLoaderAPI.GetModuleHandleA(Word.nullPointer());
             return LibLoaderAPI.GetProcAddress(builtinHandle, symbol.get());
         }
     }
@@ -151,7 +145,7 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
             }
             assert dlhandle.isNonNull();
             if (LibLoaderAPI.FreeLibrary(dlhandle) != 0) {
-                dlhandle = WordFactory.nullPointer();
+                dlhandle = Word.nullPointer();
                 return true;
             } else {
                 return false;
@@ -159,7 +153,7 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
         }
 
         private boolean doLoad() {
-            // Make sure the jvm.lib is available for linking
+            // Make sure the Native Image replacement JVM library is available for linking.
             // Need a better place to put this.
             Jvm.initialize();
 
@@ -167,13 +161,9 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
                 return true;
             }
             assert dlhandle.isNull();
-            try (CCharPointerHolder dllPathPin = CTypeConversion.toCString(canonicalIdentifier)) {
-                CCharPointer dllPathPtr = dllPathPin.get();
-                /*
-                 * WinBase.SetDllDirectoryA(dllpathPtr); CCharPointerHolder pathPin =
-                 * CTypeConversion.toCString(path); CCharPointer pathPtr = pathPin.get();
-                 */
-                dlhandle = LibLoaderAPI.LoadLibraryA(dllPathPtr);
+            try (WCharPointerHolder dllPathPin = WindowsUtils.toWideCString(canonicalIdentifier)) {
+                WCharPointer dllPathPtr = dllPathPin.get();
+                dlhandle = LibLoaderAPI.LoadLibraryW(dllPathPtr);
             }
             return dlhandle.isNonNull();
         }
@@ -197,7 +187,6 @@ class WindowsNativeLibrarySupport extends JNIPlatformNativeLibrarySupport {
 }
 
 @TargetClass(className = "java.io.WinNTFileSystem")
-@Platforms(Platform.WINDOWS.class)
 final class Target_java_io_WinNTFileSystem {
     @Alias
     static native void initIDs();

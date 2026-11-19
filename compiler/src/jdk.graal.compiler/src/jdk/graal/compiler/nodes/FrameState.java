@@ -302,9 +302,13 @@ public final class FrameState extends VirtualState implements IterableNodeType {
      * @param bci this must be {@link BytecodeFrame#AFTER_BCI}
      */
     public FrameState(int bci, ValueNode returnValueOrExceptionObject) {
-        this(null, null, bci, 0, returnValueOrExceptionObject.getStackKind().getSlotCount(), 0, returnValueOrExceptionObject instanceof ExceptionObjectNode ? StackState.Rethrow : StackState.BeforePop,
+        this(bci, returnValueOrExceptionObject, null, true);
+    }
+
+    public FrameState(int bci, ValueNode returnValueOrExceptionObject, Bytecode code, boolean checkBCI) {
+        this(null, code, bci, 0, returnValueOrExceptionObject.getStackKind().getSlotCount(), 0, returnValueOrExceptionObject instanceof ExceptionObjectNode ? StackState.Rethrow : StackState.BeforePop,
                         true, null, null);
-        assert (bci == BytecodeFrame.AFTER_BCI && !rethrowException()) || (bci == BytecodeFrame.AFTER_EXCEPTION_BCI && rethrowException()) : Assertions.errorMessage(bci);
+        assert !checkBCI || (bci == BytecodeFrame.AFTER_BCI && !rethrowException()) || (bci == BytecodeFrame.AFTER_EXCEPTION_BCI && rethrowException()) : Assertions.errorMessage(bci);
         ValueNode[] stack = {returnValueOrExceptionObject};
         this.values = new NodeInputList<>(this, stack);
     }
@@ -568,7 +572,7 @@ public final class FrameState extends VirtualState implements IterableNodeType {
                     ValueNode pushedValue,
                     List<EscapeObjectState> pushedVirtualObjectMappings) {
         assert pushedValue != null;
-        assert pushedValue.getStackKind() == popKind : Assertions.errorMessage(pushedValue, popKind, this);
+        assert pushedValue.getStackKind() == pushedSlotKind : Assertions.errorMessage(pushedValue, popKind, this);
         return duplicateModified(graph(), bci, stackState, popKind, new JavaKind[]{pushedSlotKind}, new ValueNode[]{pushedValue}, pushedVirtualObjectMappings);
     }
 
@@ -607,7 +611,6 @@ public final class FrameState extends VirtualState implements IterableNodeType {
             }
         }
         if (newStackState == StackState.Rethrow && stackState != StackState.Rethrow && popKind == JavaKind.Void) {
-            assert popKind == JavaKind.Void : Assertions.errorMessage(popKind);
             copyStackSize = 0;
         } else {
             if (popKind != JavaKind.Void) {
@@ -720,7 +723,7 @@ public final class FrameState extends VirtualState implements IterableNodeType {
 
                 /*
                  * The virtual object may be mapped to another virtual object. If this is the case,
-                 * we must ensure that that one is mapped too.
+                 * we must ensure that one is mapped too.
                  */
                 MaterializedObjectState materializedObjectState = (MaterializedObjectState) pushedEscapeObjectState;
                 if (materializedObjectState.materializedValue() instanceof VirtualObjectNode) {
@@ -890,7 +893,7 @@ public final class FrameState extends VirtualState implements IterableNodeType {
 
     @Override
     public String toString(Verbosity verbosity) {
-        if (verbosity == Verbosity.Debugger) {
+        if (verbosity == Verbosity.All) {
             return toString(this);
         } else if (verbosity == Verbosity.Name) {
             String res = super.toString(Verbosity.Name) + "@" + bci;
@@ -987,14 +990,15 @@ public final class FrameState extends VirtualState implements IterableNodeType {
 
     @Override
     public void applyToVirtual(VirtualClosure closure) {
-        closure.apply(this);
-        if (virtualObjectMappings != null) {
-            for (EscapeObjectState state : virtualObjectMappings) {
-                state.applyToVirtual(closure);
+        FrameState current = this;
+        while (current != null) {
+            closure.apply(current);
+            if (current.virtualObjectMappings != null) {
+                for (EscapeObjectState state : current.virtualObjectMappings) {
+                    state.applyToVirtual(closure);
+                }
             }
-        }
-        if (outerFrameState() != null) {
-            outerFrameState().applyToVirtual(closure);
+            current = current.outerFrameState();
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,14 +42,9 @@ package com.oracle.truffle.regex.tregex.buffer;
 
 import com.oracle.truffle.regex.RegexLanguage;
 import com.oracle.truffle.regex.RegexSource;
-import com.oracle.truffle.regex.charset.CodePointSet;
 import com.oracle.truffle.regex.charset.CodePointSetAccumulator;
 import com.oracle.truffle.regex.tregex.TRegexCompiler;
-import com.oracle.truffle.regex.tregex.matchers.CharMatcher;
-import com.oracle.truffle.regex.tregex.nodes.dfa.DFACaptureGroupPartialTransition;
-import com.oracle.truffle.regex.tregex.string.Encodings.Encoding;
-import com.oracle.truffle.regex.util.TBitSet;
-import org.graalvm.collections.EconomicMap;
+import com.oracle.truffle.regex.tregex.string.Encoding;
 
 /**
  * This class is instantiated once per compilation of a regular expression in
@@ -69,8 +64,11 @@ public class CompilationBuffer {
     private final Encoding encoding;
     private ObjectArrayBuffer<Object> objectBuffer1;
     private ObjectArrayBuffer<Object> objectBuffer2;
-    private ObjectArrayBuffer<Object> objectBuffer3;
     private ByteArrayBuffer byteArrayBuffer;
+    private ByteArrayBuffer byteArrayBuffer2;
+    private ByteArrayBuffer byteArrayBuffer3;
+    private ByteArrayBuffer byteArrayBuffer4;
+    private ByteArrayBuffer byteArrayBuffer5;
     private ShortArrayBuffer shortArrayBuffer1;
     private ShortArrayBuffer shortArrayBuffer2;
     private IntRangesBuffer intRangesBuffer1;
@@ -78,9 +76,6 @@ public class CompilationBuffer {
     private IntRangesBuffer intRangesBuffer3;
     private CodePointSetAccumulator codePointSetAccumulator1;
     private CodePointSetAccumulator codePointSetAccumulator2;
-    private TBitSet byteSizeBitSet;
-    private EconomicMap<CodePointSet, CharMatcher> matcherDeduplicationMap;
-    private EconomicMap<DFACaptureGroupPartialTransition, DFACaptureGroupPartialTransition> lazyTransitionDeduplicationMap;
 
     public CompilationBuffer(Encoding encoding) {
         this.encoding = encoding;
@@ -108,21 +103,44 @@ public class CompilationBuffer {
         return (ObjectArrayBuffer<T>) objectBuffer2;
     }
 
-    @SuppressWarnings("unchecked")
-    public <T> ObjectArrayBuffer<T> getObjectBuffer3() {
-        if (objectBuffer3 == null) {
-            objectBuffer3 = new ObjectArrayBuffer<>();
-        }
-        objectBuffer3.clear();
-        return (ObjectArrayBuffer<T>) objectBuffer3;
-    }
-
     public ByteArrayBuffer getByteArrayBuffer() {
         if (byteArrayBuffer == null) {
             byteArrayBuffer = new ByteArrayBuffer();
         }
         byteArrayBuffer.clear();
         return byteArrayBuffer;
+    }
+
+    public ByteArrayBuffer getByteArrayBuffer2() {
+        if (byteArrayBuffer2 == null) {
+            byteArrayBuffer2 = new ByteArrayBuffer();
+        }
+        byteArrayBuffer2.clear();
+        return byteArrayBuffer2;
+    }
+
+    public ByteArrayBuffer getByteArrayBuffer3() {
+        if (byteArrayBuffer3 == null) {
+            byteArrayBuffer3 = new ByteArrayBuffer();
+        }
+        byteArrayBuffer3.clear();
+        return byteArrayBuffer3;
+    }
+
+    public ByteArrayBuffer getByteArrayBuffer4() {
+        if (byteArrayBuffer4 == null) {
+            byteArrayBuffer4 = new ByteArrayBuffer();
+        }
+        byteArrayBuffer4.clear();
+        return byteArrayBuffer4;
+    }
+
+    public ByteArrayBuffer getByteArrayBuffer5() {
+        if (byteArrayBuffer5 == null) {
+            byteArrayBuffer5 = new ByteArrayBuffer();
+        }
+        byteArrayBuffer5.clear();
+        return byteArrayBuffer5;
     }
 
     public ShortArrayBuffer getShortArrayBuffer1() {
@@ -181,25 +199,4 @@ public class CompilationBuffer {
         return codePointSetAccumulator2;
     }
 
-    public TBitSet getByteSizeBitSet() {
-        if (byteSizeBitSet == null) {
-            byteSizeBitSet = new TBitSet(256);
-        }
-        byteSizeBitSet.clear();
-        return byteSizeBitSet;
-    }
-
-    public EconomicMap<CodePointSet, CharMatcher> getMatcherDeduplicationMap() {
-        if (matcherDeduplicationMap == null) {
-            matcherDeduplicationMap = EconomicMap.create();
-        }
-        return matcherDeduplicationMap;
-    }
-
-    public EconomicMap<DFACaptureGroupPartialTransition, DFACaptureGroupPartialTransition> getLazyTransitionDeduplicationMap() {
-        if (lazyTransitionDeduplicationMap == null) {
-            lazyTransitionDeduplicationMap = EconomicMap.create();
-        }
-        return lazyTransitionDeduplicationMap;
-    }
 }

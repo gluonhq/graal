@@ -1,0 +1,2876 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.api.bytecode.test;
+
+import static com.oracle.truffle.api.bytecode.test.BytecodeNodeWithLocalIntrospection.IterateBytecodeFrames;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+
+import org.graalvm.polyglot.Context;
+import org.junit.Assume;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameter;
+import org.junit.runners.Parameterized.Parameters;
+
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.TruffleStackTrace;
+import com.oracle.truffle.api.TruffleStackTraceElement;
+import com.oracle.truffle.api.bytecode.BytecodeConfig;
+import com.oracle.truffle.api.bytecode.BytecodeFrame;
+import com.oracle.truffle.api.bytecode.BytecodeLocal;
+import com.oracle.truffle.api.bytecode.BytecodeLocation;
+import com.oracle.truffle.api.bytecode.BytecodeNode;
+import com.oracle.truffle.api.bytecode.BytecodeParser;
+import com.oracle.truffle.api.bytecode.BytecodeRootNode;
+import com.oracle.truffle.api.bytecode.BytecodeRootNodes;
+import com.oracle.truffle.api.bytecode.ConstantOperand;
+import com.oracle.truffle.api.bytecode.ContinuationResult;
+import com.oracle.truffle.api.bytecode.ContinuationRootNode;
+import com.oracle.truffle.api.bytecode.GenerateBytecode;
+import com.oracle.truffle.api.bytecode.GenerateBytecodeTestVariants;
+import com.oracle.truffle.api.bytecode.GenerateBytecodeTestVariants.Variant;
+import com.oracle.truffle.api.bytecode.LocalAccessor;
+import com.oracle.truffle.api.bytecode.LocalRangeAccessor;
+import com.oracle.truffle.api.bytecode.MaterializedLocalAccessor;
+import com.oracle.truffle.api.bytecode.Operation;
+import com.oracle.truffle.api.bytecode.Variadic;
+import com.oracle.truffle.api.dsl.Bind;
+import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Cached.Shared;
+import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.exception.AbstractTruffleException;
+import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.FrameInstance;
+import com.oracle.truffle.api.frame.FrameSlotKind;
+import com.oracle.truffle.api.frame.FrameSlotTypeException;
+import com.oracle.truffle.api.frame.MaterializedFrame;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.DirectCallNode;
+import com.oracle.truffle.api.nodes.IndirectCallNode;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.nodes.UnexpectedResultException;
+
+@RunWith(Parameterized.class)
+public class LocalHelpersTest {
+    @Parameters(name = "{0}")
+    public static List<BytecodeNodeWithLocalIntrospectionBuilder.BytecodeVariant> getVariants() {
+        return BytecodeNodeWithLocalIntrospectionBuilder.variants();
+    }
+
+    @Parameter(0) public BytecodeNodeWithLocalIntrospectionBuilder.BytecodeVariant bytecode;
+
+    public static BytecodeLocal makeLocal(BytecodeNodeWithLocalIntrospectionBuilder b, String name) {
+        return b.createLocal(name, null);
+    }
+
+    private Object getLocalDefaultValue() {
+        Class<?> interpreterClass = bytecode.getGeneratedClass();
+        if (interpreterClass == BytecodeNodeWithLocalIntrospectionBaseDefault.class || interpreterClass == BytecodeNodeWithLocalIntrospectionWithBEObjectDefault.class) {
+            return BytecodeNodeWithLocalIntrospection.DEFAULT;
+        }
+        if (interpreterClass == BytecodeNodeWithLocalIntrospectionWithBENullDefault.class) {
+            return null;
+        }
+        throw new AssertionError();
+    }
+
+    private boolean hasLocalDefaultValue() {
+        Class<?> interpreterClass = bytecode.getGeneratedClass();
+        return interpreterClass == BytecodeNodeWithLocalIntrospectionBaseDefault.class || interpreterClass == BytecodeNodeWithLocalIntrospectionWithBEObjectDefault.class ||
+                        interpreterClass == BytecodeNodeWithLocalIntrospectionWithBENullDefault.class;
+    }
+
+    private boolean hasBoxingElimination() {
+        Class<?> interpreterClass = bytecode.getGeneratedClass();
+        return interpreterClass == BytecodeNodeWithLocalIntrospectionWithBEObjectDefault.class || interpreterClass == BytecodeNodeWithLocalIntrospectionWithBENullDefault.class ||
+                        interpreterClass == BytecodeNodeWithLocalIntrospectionWithBEIllegal.class;
+    }
+
+    private boolean capturesFrameForTrace() {
+        Class<?> interpreterClass = bytecode.getGeneratedClass();
+        return interpreterClass != BytecodeNodeWithLocalIntrospectionBaseNoCapturedFrames.class;
+    }
+
+    public BytecodeRootNodes<BytecodeNodeWithLocalIntrospection> parseNodes(BytecodeParser<BytecodeNodeWithLocalIntrospectionBuilder> builder) {
+        return bytecode.create(null, BytecodeConfig.DEFAULT, builder);
+    }
+
+    public BytecodeNodeWithLocalIntrospection parseNode(BytecodeParser<BytecodeNodeWithLocalIntrospectionBuilder> builder) {
+        return parseNodes(builder).getNode(0);
+    }
+
+    @Test
+    public void testGetLocalSimple() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = arg0
+         * return getLocal(arg1)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadArgument(0);
+            b.endStoreLocal();
+
+            b.beginIfThenElse();
+
+            b.beginSame();
+            b.emitLoadArgument(1);
+            b.emitLoadConstant(0);
+            b.endSame();
+            b.beginReturn();
+            b.emitGetLocal(foo.getLocalOffset());
+            b.endReturn();
+            b.beginReturn();
+            b.emitLoadArgument(0);
+            b.endReturn();
+            b.endIfThenElse();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertEquals(42, root.getCallTarget().call(123, 0));
+        assertEquals(123, root.getCallTarget().call(123, 1));
+    }
+
+    @Test
+    public void testGetLocalRangeAccessor() {
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal v0 = makeLocal(b, "v0");
+            BytecodeLocal v1 = makeLocal(b, "v1");
+            BytecodeLocal[] locals = new BytecodeLocal[]{v0, v1};
+
+            for (int offset = 0; offset < 2; offset++) {
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant(true);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Boolean, offset);
+
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant((byte) 2);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Byte, offset);
+
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant(42);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Int, offset);
+
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant(42L);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Long, offset);
+
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant(3.14f);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Float, offset);
+
+                b.beginStoreLocal(locals[offset]);
+                b.emitLoadConstant(4.0d);
+                b.endStoreLocal();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Double, offset);
+            }
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        root.getCallTarget().call();
+    }
+
+    @Test
+    public void testSetLocalRangeAccessor() {
+        /* @formatter:off
+         *
+         * foo = true
+         * getLocalTagged(BOOLEAN, 0)
+         * foo = (byte) 2
+         * getLocalTagged(BYTE, 0)
+         * ...
+         * foo = "hello"
+         * return getLocalTagged(OBJECT, 0)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal v0 = makeLocal(b, "v0");
+            BytecodeLocal v1 = makeLocal(b, "v1");
+            BytecodeLocal[] locals = new BytecodeLocal[]{v0, v1};
+
+            for (int offset = 0; offset < 2; offset++) {
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Boolean, offset);
+                b.emitLoadConstant(true);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Boolean, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Byte, offset);
+                b.emitLoadConstant((byte) 2);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Byte, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Int, offset);
+                b.emitLoadConstant(42);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Int, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Long, offset);
+                b.emitLoadConstant(42L);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Long, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Float, offset);
+                b.emitLoadConstant(3.14f);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Float, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Double, offset);
+                b.emitLoadConstant(4.0d);
+                b.endSetLocalRangeAccessor();
+                b.emitGetLocalRangeAccessor(locals, FrameSlotKind.Double, offset);
+
+                b.beginSetLocalRangeAccessor(locals, FrameSlotKind.Object, offset);
+                b.emitLoadConstant("hello");
+                b.endSetLocalRangeAccessor();
+
+            }
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        root.getCallTarget().call();
+    }
+
+    @Test
+    public void testGetLocalAccessor() {
+        /* @formatter:off
+         *
+         * foo = true
+         * getLocalTagged(BOOLEAN, 0)
+         * foo = (byte) 2
+         * getLocalTagged(BYTE, 0)
+         * ...
+         * foo = "hello"
+         * return getLocalTagged(OBJECT, 0)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(true);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Boolean);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant((byte) 2);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Byte);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Int);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42L);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Long);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(3.14f);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Float);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(4.0d);
+            b.endStoreLocal();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Double);
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant("hello");
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Object);
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertEquals("hello", root.getCallTarget().call());
+    }
+
+    @Test
+    public void testSetLocalAccessor() {
+        /* @formatter:off
+         *
+         * foo = true
+         * getLocalTagged(BOOLEAN, 0)
+         * foo = (byte) 2
+         * getLocalTagged(BYTE, 0)
+         * ...
+         * foo = "hello"
+         * return getLocalTagged(OBJECT, 0)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Boolean);
+            b.emitLoadConstant(true);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Boolean);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Byte);
+            b.emitLoadConstant((byte) 2);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Byte);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Int);
+            b.emitLoadConstant(42);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Int);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Long);
+            b.emitLoadConstant(42L);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Long);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Float);
+            b.emitLoadConstant(3.14f);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Float);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Double);
+            b.emitLoadConstant(4.0d);
+            b.endSetLocalAccessor();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Double);
+
+            b.beginSetLocalAccessor(foo, FrameSlotKind.Object);
+            b.emitLoadConstant("hello");
+            b.endSetLocalAccessor();
+
+            b.beginReturn();
+            b.emitGetLocalAccessor(foo, FrameSlotKind.Object);
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertEquals("hello", root.getCallTarget().call());
+    }
+
+    @Test
+    public void testGetSetMaterializedLocalAccessor() {
+        /* @formatter:off
+         * var foo
+         * function setValue(materialized, tag, value) {
+         *   setMaterializedLocal(foo, tag, materialized, value)
+         * }
+         * function getValue(materialized, tag) {
+         *   return getMaterializedLocal(foo, tag, materialized)
+         * }
+         * yield null
+         * return foo
+         * @formatter:on
+         */
+        BytecodeRootNodes<BytecodeNodeWithLocalIntrospection> roots = parseNodes(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+
+            b.beginRoot(); // setValue
+            b.beginSetMaterializedLocalAccessor(foo);
+            b.emitLoadArgument(0);
+            b.emitLoadArgument(1);
+            b.emitLoadArgument(2);
+            b.endSetMaterializedLocalAccessor();
+            b.endRoot();
+
+            b.beginRoot(); // getValue
+            b.beginReturn();
+            b.beginGetMaterializedLocalAccessor(foo);
+            b.emitLoadArgument(0);
+            b.emitLoadArgument(1);
+            b.endGetMaterializedLocalAccessor();
+            b.endReturn();
+            b.endRoot();
+
+            b.beginYield();
+            b.emitLoadNull();
+            b.endYield();
+
+            b.beginReturn();
+            b.emitLoadLocal(foo);
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+        RootCallTarget outer = roots.getNode(0).getCallTarget();
+        RootCallTarget setValue = roots.getNode(1).getCallTarget();
+        RootCallTarget getValue = roots.getNode(2).getCallTarget();
+
+        ContinuationResult cont = (ContinuationResult) outer.call();
+        MaterializedFrame frame = cont.getFrame();
+
+        setValue.call(FrameSlotKind.Boolean, frame, true);
+        assertEquals(true, getValue.call(FrameSlotKind.Boolean, frame));
+
+        setValue.call(FrameSlotKind.Byte, frame, (byte) 2);
+        assertEquals((byte) 2, getValue.call(FrameSlotKind.Byte, frame));
+
+        setValue.call(FrameSlotKind.Int, frame, 42);
+        assertEquals(42, getValue.call(FrameSlotKind.Int, frame));
+
+        setValue.call(FrameSlotKind.Long, frame, 42L);
+        assertEquals(42L, getValue.call(FrameSlotKind.Long, frame));
+
+        setValue.call(FrameSlotKind.Float, frame, 3.14f);
+        assertEquals(3.14f, getValue.call(FrameSlotKind.Float, frame));
+
+        setValue.call(FrameSlotKind.Double, frame, 4.0d);
+        assertEquals(4.0d, getValue.call(FrameSlotKind.Double, frame));
+
+        setValue.call(FrameSlotKind.Object, frame, "hello");
+        assertEquals("hello", getValue.call(FrameSlotKind.Object, frame));
+        assertEquals("hello", cont.continueWith(null));
+    }
+
+    @Test
+    public void testGetLocalUsingBytecodeLocalIndex() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = arg1
+         * return getLocal(reservedLocalIndex)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadArgument(1);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.emitGetLocalUsingBytecodeLocalIndex();
+            b.endReturn();
+
+            b.endBlock();
+
+            BytecodeNodeWithLocalIntrospection rootNode = b.endRoot();
+            rootNode.reservedLocalIndex = bar.getLocalOffset();
+        });
+
+        assertEquals(42, root.getCallTarget().call(123, 42));
+        assertEquals(1024, root.getCallTarget().call(123, 1024));
+    }
+
+    @Test
+    public void testGetLocalsSimple() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = arg0
+         * return getLocals()
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadArgument(0);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.emitGetLocals();
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertEquals(Map.of("foo", 42, "bar", 123), root.getCallTarget().call(123));
+    }
+
+    @Test
+    public void testGetLocalsNestedRootNode() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = 123
+         *
+         * def nested(a0) {
+         *   baz = 1337
+         *   qux = a0
+         *   return getLocals()
+         * }
+         *
+         * if (arg0) {
+         *   return getLocals()
+         * else {
+         *   return nested(4321)
+         * }
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal baz = makeLocal(b, "baz");
+            BytecodeLocal qux = makeLocal(b, "qux");
+
+            b.beginStoreLocal(baz);
+            b.emitLoadConstant(1337);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(qux);
+            b.emitLoadArgument(0);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.emitGetLocals();
+            b.endReturn();
+
+            b.endBlock();
+            BytecodeNodeWithLocalIntrospection nested = b.endRoot();
+
+            b.beginIfThenElse();
+
+            b.emitLoadArgument(0);
+
+            b.beginReturn();
+            b.emitGetLocals();
+            b.endReturn();
+
+            b.beginReturn();
+            b.beginInvoke();
+            b.emitLoadConstant(nested);
+            b.emitLoadConstant(4321);
+            b.endInvoke();
+            b.endReturn();
+
+            b.endIfThenElse();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertEquals(Map.of("foo", 42, "bar", 123), root.getCallTarget().call(true));
+        assertEquals(Map.of("baz", 1337, "qux", 4321), root.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testGetLocalsContinuation() {
+        /* @formatter:off
+         *
+         * def bar() {
+         *   y = yield 0
+         *   if (y) {
+         *     x = 42
+         *   } else {
+         *     x = 123
+         *   }
+         *   getLocals()
+         * }
+         *
+         * def foo(arg0) {
+         *   c = bar()
+         *   continue(c, arg0)
+         * }
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection bar = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal x = makeLocal(b, "x");
+            BytecodeLocal y = makeLocal(b, "y");
+
+            b.beginStoreLocal(y);
+            b.beginYield();
+            b.emitLoadConstant(0);
+            b.endYield();
+            b.endStoreLocal();
+
+            b.beginIfThenElse();
+
+            b.emitLoadLocal(y);
+
+            b.beginStoreLocal(x);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(x);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.endIfThenElse();
+
+            b.beginReturn();
+            b.emitGetLocals();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        BytecodeNodeWithLocalIntrospection foo = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal c = b.createLocal();
+
+            b.beginStoreLocal(c);
+            b.beginInvoke();
+            b.emitLoadConstant(bar);
+            b.endInvoke();
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.beginContinue();
+            b.emitLoadLocal(c);
+            b.emitLoadArgument(0);
+            b.endContinue();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        assertEquals(Map.of("x", 42, "y", true), foo.getCallTarget().call(true));
+        assertEquals(Map.of("x", 123, "y", false), foo.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testSetLocalSimple() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = 123
+         * if (arg0) setLocal(foo, arg1) else setLocal(bar, arg1)
+         * return makePair(foo, bar)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42L);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123L);
+            b.endStoreLocal();
+
+            b.beginIfThenElse();
+            b.emitLoadArgument(0);
+            b.beginSetLocal(foo.getLocalOffset());
+            b.emitLoadArgument(1);
+            b.endSetLocal();
+            b.beginSetLocal(bar.getLocalOffset());
+            b.emitLoadArgument(1);
+            b.endSetLocal();
+            b.endIfThenElse();
+
+            b.beginReturn();
+            b.beginMakePair();
+            b.emitLoadLocal(foo);
+            b.emitLoadLocal(bar);
+            b.endMakePair();
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        // Test uncached (if available).
+        assertEquals(new Pair(777L, 123L), root.getCallTarget().call(true, 777L));
+        assertEquals(new Pair(42L, 777L), root.getCallTarget().call(false, 777L));
+
+        // Then, test cached.
+        root.getBytecodeNode().setUncachedThreshold(0);
+        assertEquals(new Pair(777L, 123L), root.getCallTarget().call(true, 777L));
+        assertEquals(new Pair(42L, 777L), root.getCallTarget().call(false, 777L));
+        if (hasBoxingElimination()) {
+            assertEquals(FrameSlotKind.Long, root.getBytecodeNode().getLocals().get(0).getTypeProfile());
+            assertEquals(FrameSlotKind.Long, root.getBytecodeNode().getLocals().get(1).getTypeProfile());
+        }
+
+        // If BE is enabled, the bytecode should gracefully handle these new types.
+        assertEquals(new Pair(true, 123L), root.getCallTarget().call(true, true));
+        assertEquals(new Pair(42L, false), root.getCallTarget().call(false, false));
+        if (hasBoxingElimination()) {
+            assertEquals(FrameSlotKind.Object, root.getBytecodeNode().getLocals().get(0).getTypeProfile());
+            assertEquals(FrameSlotKind.Object, root.getBytecodeNode().getLocals().get(1).getTypeProfile());
+        }
+
+        assertEquals(new Pair(777L, 123L), root.getCallTarget().call(true, 777L));
+        assertEquals(new Pair(42L, 777L), root.getCallTarget().call(false, 777L));
+        if (hasBoxingElimination()) {
+            assertEquals(FrameSlotKind.Object, root.getBytecodeNode().getLocals().get(0).getTypeProfile());
+            assertEquals(FrameSlotKind.Object, root.getBytecodeNode().getLocals().get(1).getTypeProfile());
+        }
+    }
+
+    @Test
+    public void testSetLocalUsingBytecodeLocalIndex() {
+        /* @formatter:off
+         *
+         * foo = 42
+         * bar = 123
+         * setLocal(reservedLocalIndex, arg0)
+         * return makePair(foo, bar)
+         *
+         * @formatter:on
+         */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42L);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123L);
+            b.endStoreLocal();
+
+            b.beginSetLocalUsingBytecodeLocalIndex();
+            b.emitLoadArgument(0);
+            b.endSetLocalUsingBytecodeLocalIndex();
+
+            b.beginReturn();
+            b.beginMakePair();
+            b.emitLoadLocal(foo);
+            b.emitLoadLocal(bar);
+            b.endMakePair();
+            b.endReturn();
+
+            b.endBlock();
+
+            BytecodeNodeWithLocalIntrospection rootNode = b.endRoot();
+            rootNode.reservedLocalIndex = bar.getLocalOffset();
+        });
+
+        assertEquals(new Pair(42L, 777L), root.getCallTarget().call(777L));
+        // If BE enabled, local reads should succeed even if the type changes.
+        assertEquals(new Pair(42L, false), root.getCallTarget().call(false));
+        assertEquals(new Pair(42L, "cat"), root.getCallTarget().call("cat"));
+    }
+
+    @Test
+    public void testCreateMaterializedBytecodeFrame() {
+        /* @formatter:off
+        *
+        * foo = 42
+        * bar = 123
+        * yield createMaterializedFrame()
+        * return (arg0, foo)
+        *
+        * @formatter:on
+        */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginYield();
+            b.emitCreateMaterializedBytecodeFrame();
+            b.endYield();
+
+            b.beginReturn();
+            b.beginMakePair();
+            b.emitLoadArgument(0);
+            b.emitLoadLocal(foo);
+            b.endMakePair();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        ContinuationResult cont = (ContinuationResult) root.getCallTarget().call(444);
+        BytecodeFrame bytecodeFrame = (BytecodeFrame) cont.getResult();
+        assertEquals(2, bytecodeFrame.getLocalCount());
+        assertArrayEquals(new Object[]{"foo", "bar"}, bytecodeFrame.getLocalNames());
+        assertEquals(42, bytecodeFrame.getLocalValue(0));
+        assertEquals(123, bytecodeFrame.getLocalValue(1));
+        assertEquals(1, bytecodeFrame.getArgumentCount());
+        assertEquals(444, bytecodeFrame.getArgument(0));
+        // Updates to a materialized frame should be visible.
+        bytecodeFrame.setArgument(0, -444);
+        assertEquals(-444, bytecodeFrame.getArgument(0));
+        bytecodeFrame.setLocalValue(0, -42);
+        assertEquals(-42, bytecodeFrame.getLocalValue(0));
+        assertEquals(new Pair(-444, -42), cont.continueWith(null));
+    }
+
+    @Test
+    public void testCreateCopiedBytecodeFrame() {
+        /* @formatter:off
+        *
+        * foo = 42
+        * bar = 123
+        * yield createCopiedFrame()
+        * return (arg0, foo)
+        *
+        * @formatter:on
+        */
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginYield();
+            b.emitCreateCopiedBytecodeFrame();
+            b.endYield();
+
+            b.beginReturn();
+            b.beginMakePair();
+            b.emitLoadArgument(0);
+            b.emitLoadLocal(foo);
+            b.endMakePair();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        ContinuationResult cont = (ContinuationResult) root.getCallTarget().call(444);
+        BytecodeFrame bytecodeFrame = (BytecodeFrame) cont.getResult();
+        assertEquals(2, bytecodeFrame.getLocalCount());
+        assertArrayEquals(new Object[]{"foo", "bar"}, bytecodeFrame.getLocalNames());
+        assertEquals(42, bytecodeFrame.getLocalValue(0));
+        assertEquals(123, bytecodeFrame.getLocalValue(1));
+        assertEquals(1, bytecodeFrame.getArgumentCount());
+        assertEquals(444, bytecodeFrame.getArgument(0));
+        // Updates to a copied frame should not be visible.
+        bytecodeFrame.setArgument(0, -444);
+        assertEquals(-444, bytecodeFrame.getArgument(0));
+        bytecodeFrame.setLocalValue(0, -42);
+        assertEquals(-42, bytecodeFrame.getLocalValue(0));
+        assertEquals(new Pair(444, 42), cont.continueWith(null));
+    }
+
+    @Test
+    public void testIterateBytecodeFramesTopFrame() {
+        BytecodeNodeWithLocalIntrospection root = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, 0);
+        BytecodeFrame[] frames = (BytecodeFrame[]) root.getCallTarget().call();
+        assertEquals(1, frames.length);
+        checkCalleeBytecodeFrame(root, frames[0], "c.IterateBytecodeFrames");
+    }
+
+    @Test
+    public void testIterateBytecodeFramesTopFrameComputedBci() {
+        BytecodeNodeWithLocalIntrospection root = parseIterateBytecodeFramesCallee(-1, IterateBytecodeFrames.USE_CURRENT_LOCATION, 0);
+        BytecodeFrame[] frames = (BytecodeFrame[]) root.getCallTarget().call();
+        assertEquals(1, frames.length);
+        checkCalleeBytecodeFrame(root, frames[0], "c.IterateBytecodeFrames");
+    }
+
+    @Test
+    public void testGetTopTopFrame() {
+        BytecodeNodeWithLocalIntrospection root = parseGetTopCallee();
+        BytecodeFrame frame = (BytecodeFrame) root.getCallTarget().call();
+        checkCalleeBytecodeFrame(root, frame, "c.GetTop");
+    }
+
+    @Test
+    public void testIterateBytecodeFramesBadTopLocation() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            BytecodeNodeWithLocalIntrospection root = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_INVALID_LOCATION, 0);
+            root.getCallTarget().call();
+        });
+    }
+
+    @Test
+    public void testIterateBytecodeFramesBadTopBci() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            BytecodeNodeWithLocalIntrospection root = parseIterateBytecodeFramesCallee(-2, IterateBytecodeFrames.USE_CURRENT_LOCATION, 0);
+            root.getCallTarget().call();
+        });
+    }
+
+    @Test
+    public void testIterateBytecodeFramesBadSkipFrames() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            BytecodeNodeWithLocalIntrospection root = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, -1);
+            root.getCallTarget().call();
+        });
+    }
+
+    @Test
+    public void testIterateBytecodeFramesMismatchedTopLocation() {
+        BytecodeNodeWithLocalIntrospection callee = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.beginIterateBytecodeFrames();
+            b.emitLoadConstant(-1);
+            b.emitLoadArgument(0); // caller's location
+            b.emitLoadConstant(0);
+            b.endIterateBytecodeFrames();
+            b.endReturn();
+            b.endRoot();
+        });
+
+        BytecodeNodeWithLocalIntrospection caller = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.beginInvoke();
+            b.emitLoadConstant(callee);
+            b.emitGetCurrentLocation();
+            b.endInvoke();
+            b.endReturn();
+            b.endRoot();
+        });
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () -> caller.getCallTarget().call());
+        assertTrue(error.getMessage(), error.getMessage().contains("different root node"));
+    }
+
+    @Test
+    public void testIterateBytecodeFramesTopFrameContinuation() {
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginYield();
+            b.emitLoadConstant(0);
+            b.endYield();
+
+            b.beginReturn();
+            b.beginIterateBytecodeFrames();
+            b.emitLoadConstant(IterateBytecodeFrames.USE_CURRENT_BCI);
+            b.emitLoadConstant(IterateBytecodeFrames.USE_CURRENT_LOCATION);
+            b.emitLoadConstant(0);
+            b.endIterateBytecodeFrames();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        ContinuationResult cont = (ContinuationResult) root.getCallTarget().call(444);
+        BytecodeFrame[] frames = (BytecodeFrame[]) cont.continueWith(null);
+        assertEquals(1, frames.length);
+        checkCalleeBytecodeFrame(root, frames[0], "c.IterateBytecodeFrames");
+    }
+
+    @Test
+    public void testIterateBytecodeFramesShortCircuits() {
+        BytecodeNodeWithLocalIntrospection callee = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitIterateBytecodeFramesShortCircuit();
+            b.endReturn();
+            b.endRoot();
+        });
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        assertEquals(1, caller.getCallTarget().call());
+    }
+
+    @Test
+    public void testIterateBytecodeFramesAllFrames() {
+        BytecodeNodeWithLocalIntrospection callee = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, 0);
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        BytecodeFrame[] frames = (BytecodeFrame[]) caller.getCallTarget().call();
+        assertEquals(2, frames.length);
+        checkCalleeBytecodeFrame(callee, frames[0], "c.IterateBytecodeFrames");
+        checkCallerBytecodeFrame(caller, frames[1]);
+    }
+
+    @Test
+    public void testIterateBytecodeFramesNoFrames() {
+        BytecodeNodeWithLocalIntrospection callee = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, 2);
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        BytecodeFrame[] frames = (BytecodeFrame[]) caller.getCallTarget().call();
+        assertEquals(0, frames.length);
+    }
+
+    @Test
+    public void testIterateBytecodeFramesSkipTopFrame() {
+        BytecodeNodeWithLocalIntrospection callee = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, 1);
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        BytecodeNodeWithLocalIntrospection grandCaller = parseIterateBytecodeFramesGrandCaller(caller);
+        BytecodeFrame[] frames = (BytecodeFrame[]) grandCaller.getCallTarget().call();
+        assertEquals(2, frames.length);
+        checkCallerBytecodeFrame(caller, frames[0]);
+        checkGrandCallerBytecodeFrame(grandCaller, frames[1]);
+    }
+
+    @Test
+    public void testIterateBytecodeFramesSkipTopFrameIgnoresTopMetadata() {
+        BytecodeNodeWithLocalIntrospection callee = parseIterateBytecodeFramesCallee(-2, IterateBytecodeFrames.USE_INVALID_LOCATION, 1);
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        BytecodeNodeWithLocalIntrospection grandCaller = parseIterateBytecodeFramesGrandCaller(caller);
+        BytecodeFrame[] frames = (BytecodeFrame[]) grandCaller.getCallTarget().call();
+        assertEquals(2, frames.length);
+        checkCallerBytecodeFrame(caller, frames[0]);
+        checkGrandCallerBytecodeFrame(grandCaller, frames[1]);
+    }
+
+    @Test
+    public void testIterateBytecodeFramesSkipTwoFrames() {
+        BytecodeNodeWithLocalIntrospection callee = parseIterateBytecodeFramesCallee(IterateBytecodeFrames.USE_CURRENT_BCI, IterateBytecodeFrames.USE_CURRENT_LOCATION, 2);
+        BytecodeNodeWithLocalIntrospection caller = parseIterateBytecodeFramesCaller(callee);
+        BytecodeNodeWithLocalIntrospection grandCaller = parseIterateBytecodeFramesGrandCaller(caller);
+        BytecodeFrame[] frames = (BytecodeFrame[]) grandCaller.getCallTarget().call();
+        assertEquals(1, frames.length);
+        checkGrandCallerBytecodeFrame(grandCaller, frames[0]);
+    }
+
+    private BytecodeNodeWithLocalIntrospection parseIterateBytecodeFramesCallee(int topBytecodeIndex, Object topLocation, int skipFrames) {
+        return parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.beginIterateBytecodeFrames();
+            b.emitLoadConstant(topBytecodeIndex);
+            b.emitLoadConstant(topLocation);
+            b.emitLoadConstant(skipFrames);
+            b.endIterateBytecodeFrames();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+    }
+
+    private BytecodeNodeWithLocalIntrospection parseGetTopCallee() {
+        return parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            BytecodeLocal bar = makeLocal(b, "bar");
+
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(bar);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.emitGetTop();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+    }
+
+    private BytecodeNodeWithLocalIntrospection parseIterateBytecodeFramesCaller(BytecodeNodeWithLocalIntrospection callee) {
+        return parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal baz = makeLocal(b, "baz");
+
+            b.beginStoreLocal(baz);
+            b.emitLoadConstant(7);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.beginInvoke();
+            b.emitLoadConstant(callee);
+            b.endInvoke();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+    }
+
+    private BytecodeNodeWithLocalIntrospection parseIterateBytecodeFramesGrandCaller(BytecodeNodeWithLocalIntrospection caller) {
+        return parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal qux = makeLocal(b, "qux");
+
+            b.beginStoreLocal(qux);
+            b.emitLoadConstant(9);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            b.beginInvoke();
+            b.emitLoadConstant(caller);
+            b.endInvoke();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+    }
+
+    private static void checkCalleeBytecodeFrame(BytecodeNodeWithLocalIntrospection root, BytecodeFrame frame, String expectedInstruction) {
+        assertEquals(2, frame.getLocalCount());
+        assertArrayEquals(new Object[]{"foo", "bar"}, frame.getLocalNames());
+        assertEquals(42, frame.getLocalValue(0));
+        assertEquals(123, frame.getLocalValue(1));
+        BytecodeLocation frameLocation = frame.getLocation();
+        assertSame(root.getBytecodeNode(), frameLocation.getBytecodeNode());
+        assertEquals(expectedInstruction, frameLocation.getInstruction().getName());
+    }
+
+    private static void checkCallerBytecodeFrame(BytecodeNodeWithLocalIntrospection root, BytecodeFrame frame) {
+        assertEquals(1, frame.getLocalCount());
+        assertArrayEquals(new Object[]{"baz"}, frame.getLocalNames());
+        assertEquals(7, frame.getLocalValue(0));
+        BytecodeLocation frameLocation = frame.getLocation();
+        assertSame(root.getBytecodeNode(), frameLocation.getBytecodeNode());
+        assertEquals("c.Invoke", frameLocation.getInstruction().getName());
+    }
+
+    private static void checkGrandCallerBytecodeFrame(BytecodeNodeWithLocalIntrospection root, BytecodeFrame frame) {
+        assertEquals(1, frame.getLocalCount());
+        assertArrayEquals(new Object[]{"qux"}, frame.getLocalNames());
+        assertEquals(9, frame.getLocalValue(0));
+        BytecodeLocation frameLocation = frame.getLocation();
+        assertSame(root.getBytecodeNode(), frameLocation.getBytecodeNode());
+        assertEquals("c.Invoke", frameLocation.getInstruction().getName());
+    }
+
+    private void doTestBytecodeFrameGet(boolean yield, Function<Integer, Boolean> frameCaptured, boolean frameWritable, RootNode collectBytecodeFrames) {
+        /* @formatter:off
+        *
+        * def bar(arg0) {
+        *   y = 42
+        *   z = "hello"
+        *   if (yield) y = yield 0
+        *   return collectBytecodeFrames()
+        * }
+        *
+        * def foo(arg0) {
+        *   x = 123
+        *   if (yield) return continue(bar(444), 43)
+        *   else bar(444)
+        * }
+        *
+        * foo(222)
+        *
+        * @formatter:on
+        */
+
+        BytecodeNodeWithLocalIntrospection bar = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+
+            BytecodeLocal y = makeLocal(b, "y");
+            b.beginStoreLocal(y);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            BytecodeLocal z = makeLocal(b, "z");
+            b.beginStoreLocal(z);
+            b.emitLoadConstant("hello");
+            b.endStoreLocal();
+
+            if (yield) {
+                b.beginStoreLocal(y);
+                b.beginYield();
+                b.emitLoadConstant(0);
+                b.endYield();
+                b.endStoreLocal();
+            }
+
+            b.beginReturn();
+            b.beginInvoke();
+            b.emitLoadConstant(collectBytecodeFrames.getCallTarget());
+            b.endInvoke();
+            b.endReturn();
+
+            b.endBlock();
+            b.endRoot();
+        });
+
+        BytecodeNodeWithLocalIntrospection foo = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal x = makeLocal(b, "x");
+
+            b.beginStoreLocal(x);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginReturn();
+            if (yield) {
+                b.beginContinue();
+            }
+            b.beginInvoke();
+            b.emitLoadConstant(bar);
+            b.emitLoadConstant(444);
+            b.endInvoke();
+            if (yield) {
+                b.emitLoadConstant(43);
+                b.endContinue();
+            }
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        Object result = foo.getCallTarget().call(222);
+        assertTrue(result instanceof List<?>);
+
+        @SuppressWarnings("unchecked")
+        List<BytecodeFrame> frames = (List<BytecodeFrame>) result;
+        assertEquals(3, frames.size());
+
+        // <anon>
+        assertNull(frames.get(0));
+
+        // bar
+        BytecodeFrame barFrame = frames.get(1);
+        if (frameCaptured.apply(1)) {
+            assertEquals(2, barFrame.getLocalCount());
+            if (yield) {
+                assertEquals(43, barFrame.getLocalValue(0));
+            } else {
+                assertEquals(42, barFrame.getLocalValue(0));
+            }
+            assertEquals("hello", barFrame.getLocalValue(1));
+            if (frameWritable) {
+                barFrame.setLocalValue(0, -42);
+                assertEquals(-42, barFrame.getLocalValue(0));
+            }
+            assertArrayEquals(new Object[]{"y", "z"}, barFrame.getLocalNames());
+            assertEquals(1, barFrame.getArgumentCount());
+            assertEquals(444, barFrame.getArgument(0));
+            assertEquals(BytecodeNodeWithLocalIntrospection.FRAME_DESCRIPTOR_INFO, barFrame.getFrameDescriptorInfo());
+        } else {
+            assertNull(barFrame);
+        }
+
+        // foo
+        BytecodeFrame fooFrame = frames.get(2);
+        if (frameCaptured.apply(2)) {
+            assertEquals(1, fooFrame.getLocalCount());
+            assertEquals(123, fooFrame.getLocalValue(0));
+            if (frameWritable) {
+                barFrame.setLocalValue(0, 456);
+                assertEquals(456, barFrame.getLocalValue(0));
+            }
+            assertArrayEquals(new Object[]{"x"}, fooFrame.getLocalNames());
+            assertEquals(1, fooFrame.getArgumentCount());
+            assertEquals(222, fooFrame.getArgument(0));
+            assertEquals(BytecodeNodeWithLocalIntrospection.FRAME_DESCRIPTOR_INFO, fooFrame.getFrameDescriptorInfo());
+        } else {
+            assertNull(fooFrame);
+        }
+    }
+
+    @Test
+    public void testBytecodeFrameGetFrameInstances() {
+        doTestBytecodeFrameGet(false, LocalHelpersTest::alwaysCaptured, true, new RootNode(null) {
+            @Override
+            public Object execute(VirtualFrame frame) {
+                List<BytecodeFrame> frames = new ArrayList<>();
+                Truffle.getRuntime().iterateFrames(f -> {
+                    frames.add(BytecodeFrame.get(f, FrameInstance.FrameAccess.READ_WRITE));
+                    return null;
+                });
+                return frames;
+            }
+        });
+    }
+
+    @Test
+    public void testBytecodeFrameGetFrameInstancesContinuation() {
+        doTestBytecodeFrameGet(true, LocalHelpersTest::alwaysCaptured, true, new RootNode(null) {
+            @Override
+            public Object execute(VirtualFrame frame) {
+                List<BytecodeFrame> frames = new ArrayList<>();
+                Truffle.getRuntime().iterateFrames(f -> {
+                    frames.add(BytecodeFrame.get(f, FrameInstance.FrameAccess.READ_WRITE));
+                    return null;
+                });
+                return frames;
+            }
+        });
+    }
+
+    @Test
+    public void testBytecodeFrameGetNonVirtualFrameInstances() {
+        try (Context c = BytecodeDSLTestLanguage.createPolyglotContextWithCompilationDisabled()) {
+            doTestBytecodeFrameGet(false, LocalHelpersTest::alwaysCaptured, true, new RootNode(null) {
+                @Override
+                public Object execute(VirtualFrame frame) {
+                    List<BytecodeFrame> frames = new ArrayList<>();
+                    Truffle.getRuntime().iterateFrames(f -> {
+                        frames.add(BytecodeFrame.getNonVirtual(f));
+                        return null;
+                    });
+                    return frames;
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testBytecodeFrameGetNonVirtualFrameInstancesContinuation() {
+        try (Context c = BytecodeDSLTestLanguage.createPolyglotContextWithCompilationDisabled()) {
+            doTestBytecodeFrameGet(true, LocalHelpersTest::alwaysCaptured, true, new RootNode(null) {
+                @Override
+                public Object execute(VirtualFrame frame) {
+                    List<BytecodeFrame> frames = new ArrayList<>();
+                    Truffle.getRuntime().iterateFrames(f -> {
+                        frames.add(BytecodeFrame.getNonVirtual(f));
+                        return null;
+                    });
+                    return frames;
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testBytecodeFrameGetTruffleStackTraceElement() {
+        doTestBytecodeFrameGet(false, unused -> capturesFrameForTrace(), false, new RootNode(null) {
+            @Override
+            public Object execute(VirtualFrame frame) {
+                return getBytecodeFrames(new TestException(this));
+            }
+        });
+    }
+
+    @Test
+    public void testBytecodeFrameGetTruffleStackTraceElementContinuation() {
+        doTestBytecodeFrameGet(true, unused -> capturesFrameForTrace(), false, new RootNode(null) {
+            @Override
+            public Object execute(VirtualFrame frame) {
+                return getBytecodeFrames(new TestException(this));
+            }
+        });
+    }
+
+    @Test
+    public void testBytecodeFrameGetNonVirtualTruffleStackTraceElement() {
+        try (Context c = BytecodeDSLTestLanguage.createPolyglotContextWithCompilationDisabled()) {
+            // stack trace elements capture read-only copies, so getNonVirtual is always null.
+            doTestBytecodeFrameGet(false, LocalHelpersTest::neverCaptured, true, new RootNode(null) {
+                @Override
+                public Object execute(VirtualFrame frame) {
+                    return getNonVirtualBytecodeFrames(new TestException(this));
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testBytecodeFrameGetNonVirtualTruffleStackTraceElementContinuation() {
+        try (Context c = BytecodeDSLTestLanguage.createPolyglotContextWithCompilationDisabled()) {
+            // getNonVirtual returns a result for continuation frames because they're materialized.
+            Function<Integer, Boolean> frameCaptured = index -> index == 1 && capturesFrameForTrace();
+            doTestBytecodeFrameGet(true, frameCaptured, true, new RootNode(null) {
+                @Override
+                public Object execute(VirtualFrame frame) {
+                    return getNonVirtualBytecodeFrames(new TestException(this));
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testBytecodeFrameGetTruffleStackTraceElementInvalidBytecodeIndex() {
+        Assume.assumeTrue(capturesFrameForTrace());
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitCaptureFrameState();
+            b.endReturn();
+            b.endRoot();
+        });
+
+        CapturedFrameState state = (CapturedFrameState) root.getCallTarget().call();
+        TruffleStackTraceElement invalid = TruffleStackTraceElement.create(state.bytecode(), state.target(), state.frame(), -2);
+        // Invalid bci should be rejected.
+        assertThrows(IllegalArgumentException.class, () -> BytecodeFrame.get(invalid));
+    }
+
+    @Test
+    public void testFrameInstanceHelpersExplicitBytecodeIndex() {
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitCaptureFrameState();
+            b.endReturn();
+            b.endRoot();
+        });
+        CapturedFrameState state = (CapturedFrameState) root.getCallTarget().call();
+        int explicitBytecodeIndex = state.bytecode().getInstructions().iterator().next().getBytecodeIndex();
+        FrameInstance matching = createFrameInstance(state, state.bytecode(), explicitBytecodeIndex);
+
+        BytecodeLocation location = state.bytecode().getBytecodeLocation(matching);
+        assertNotNull(location);
+        assertEquals(explicitBytecodeIndex, location.getBytecodeIndex());
+        assertEquals(explicitBytecodeIndex, BytecodeLocation.get(matching).getBytecodeIndex());
+        assertEquals(explicitBytecodeIndex, BytecodeFrame.get(matching, FrameInstance.FrameAccess.READ_WRITE).getBytecodeIndex());
+        assertEquals(explicitBytecodeIndex, BytecodeFrame.getNonVirtual(matching).getBytecodeIndex());
+        assertArrayEquals(new Object[0], BytecodeNode.getLocalValues(matching));
+        assertArrayEquals(new Object[0], BytecodeNode.getLocalNames(matching));
+        assertTrue(BytecodeNode.setLocalValues(matching, new Object[0]));
+
+        BytecodeNodeWithLocalIntrospection otherRoot = parseNode(b -> {
+            b.beginRoot();
+            b.beginReturn();
+            b.emitLoadNull();
+            b.endReturn();
+            b.endRoot();
+        });
+        assertNull(otherRoot.getBytecodeNode().getBytecodeLocation(matching));
+
+        FrameInstance missingLocation = createFrameInstance(state, null, explicitBytecodeIndex);
+        assertNull(state.bytecode().getBytecodeLocation(missingLocation));
+        assertNull(BytecodeLocation.get(missingLocation));
+        assertNull(BytecodeFrame.get(missingLocation, FrameInstance.FrameAccess.READ_WRITE));
+        assertNull(BytecodeFrame.getNonVirtual(missingLocation));
+        assertNull(BytecodeNode.getLocalValues(missingLocation));
+        assertNull(BytecodeNode.getLocalNames(missingLocation));
+        assertFalse(BytecodeNode.setLocalValues(missingLocation, new Object[0]));
+
+        FrameInstance invalidBytecodeIndex = createFrameInstance(state, state.bytecode(), -2);
+        assertNull(state.bytecode().getBytecodeLocation(invalidBytecodeIndex));
+        assertNull(BytecodeLocation.get(invalidBytecodeIndex));
+        assertThrows(AssertionError.class, () -> BytecodeFrame.get(invalidBytecodeIndex, FrameInstance.FrameAccess.READ_WRITE));
+        assertThrows(AssertionError.class, () -> BytecodeFrame.getNonVirtual(invalidBytecodeIndex));
+        assertThrows(AssertionError.class, () -> BytecodeNode.getLocalValues(invalidBytecodeIndex));
+        assertThrows(AssertionError.class, () -> BytecodeNode.getLocalNames(invalidBytecodeIndex));
+        assertThrows(AssertionError.class, () -> BytecodeNode.setLocalValues(invalidBytecodeIndex, new Object[0]));
+
+        FrameInstance outOfRangeBytecodeIndex = createFrameInstance(state, state.bytecode(), Integer.MAX_VALUE);
+        assertThrows(IllegalArgumentException.class, () -> state.bytecode().getBytecodeLocation(outOfRangeBytecodeIndex));
+        assertThrows(IllegalArgumentException.class, () -> BytecodeLocation.get(outOfRangeBytecodeIndex));
+    }
+
+    private static FrameInstance createFrameInstance(CapturedFrameState state, Node location, int bytecodeIndex) {
+        return new FrameInstance() {
+            @Override
+            public Frame getFrame(FrameAccess access) {
+                return state.frame();
+            }
+
+            @Override
+            public boolean isVirtualFrame() {
+                return false;
+            }
+
+            @Override
+            public Node getCallNode() {
+                return location;
+            }
+
+            @Override
+            public CallTarget getCallTarget() {
+                return state.target();
+            }
+
+            @Override
+            public int getBytecodeIndex() {
+                return bytecodeIndex;
+            }
+        };
+    }
+
+    @Test
+    public void testFrameInstanceHelpersInvalidBytecodeIndex() {
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+            b.beginBlock();
+            BytecodeLocal foo = makeLocal(b, "foo");
+            b.beginStoreLocal(foo);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+            b.beginReturn();
+            b.emitCaptureFrameState();
+            b.endReturn();
+            b.endBlock();
+            b.endRoot();
+        });
+
+        root.getBytecodeNode().setUncachedThreshold(0);
+
+        CapturedFrameState state = (CapturedFrameState) root.getCallTarget().call();
+        FrameInstance invalid = new FrameInstance() {
+            @Override
+            public Frame getFrame(FrameAccess access) {
+                return state.frame();
+            }
+
+            @Override
+            public boolean isVirtualFrame() {
+                return false;
+            }
+
+            @Override
+            public Node getCallNode() {
+                return state.bytecode();
+            }
+
+            @Override
+            public CallTarget getCallTarget() {
+                return state.target();
+            }
+        };
+
+        assertThrows(AssertionError.class, () -> BytecodeNode.getLocalValues(invalid));
+        assertThrows(AssertionError.class, () -> BytecodeNode.getLocalNames(invalid));
+        assertThrows(AssertionError.class, () -> BytecodeNode.setLocalValues(invalid, new Object[]{43}));
+        assertThrows(AssertionError.class, () -> BytecodeFrame.get(invalid, FrameInstance.FrameAccess.READ_WRITE));
+        assertThrows(AssertionError.class, () -> BytecodeFrame.getNonVirtual(invalid));
+    }
+
+    @SuppressWarnings("unused")
+    private static boolean alwaysCaptured(int unused) {
+        return true;
+    }
+
+    @SuppressWarnings("unused")
+    private static boolean neverCaptured(int unused) {
+        return false;
+    }
+
+    @TruffleBoundary
+    private static List<BytecodeFrame> getBytecodeFrames(AbstractTruffleException ex) {
+        return TruffleStackTrace.getStackTrace(ex).stream().map(BytecodeFrame::get).toList();
+    }
+
+    @TruffleBoundary
+    private static List<BytecodeFrame> getNonVirtualBytecodeFrames(AbstractTruffleException ex) {
+        return TruffleStackTrace.getStackTrace(ex).stream().map(BytecodeFrame::getNonVirtual).toList();
+    }
+
+    @Test
+    public void testGetLocalNamesAndInfos() {
+        Object fooInfo = new Object();
+        Object bazInfo = new Object();
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+
+            b.createLocal("foo", fooInfo);
+            b.createLocal("bar", null);
+            b.createLocal(null, bazInfo);
+
+            b.beginReturn();
+            b.emitLoadConstant(42);
+            b.endReturn();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertArrayEquals(new Object[]{"foo", "bar", null}, root.getBytecodeNode().getLocalNames(0));
+        assertArrayEquals(new Object[]{fooInfo, null, bazInfo}, root.getBytecodeNode().getLocalInfos(0));
+    }
+
+    @Test
+    public void testGetLocalDefaultOrIllegalGetLocal() {
+        // @formatter:off
+        // // B0
+        // result;
+        // {
+        //   var l0;
+        //   if (arg0) {
+        //     result = getLocal(l0)
+        //   } else {
+        //     l0 = 42L
+        //   }
+        // }
+        // {
+        //   var l1;
+        //   result = getLocal(l1);
+        // }
+        // return result
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal result = makeLocal(b, "result");
+            b.beginBlock();
+            BytecodeLocal l = makeLocal(b, "l0");
+            b.beginIfThenElse();
+            b.emitLoadArgument(0);
+            b.beginStoreLocal(result);
+            b.emitGetLocal(l.getLocalOffset());
+            b.endStoreLocal();
+            b.beginStoreLocal(l);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+            b.endIfThenElse();
+            b.endBlock();
+
+            b.beginBlock();
+            l = makeLocal(b, "l1");
+            b.beginStoreLocal(result);
+            b.emitGetLocal(l.getLocalOffset());
+            b.endStoreLocal();
+            b.endBlock();
+
+            b.beginReturn();
+            b.emitLoadLocal(result);
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        if (hasLocalDefaultValue()) {
+            Object defaultLocal = getLocalDefaultValue();
+            assertSame(defaultLocal, root.getCallTarget().call(true));
+            assertSame(defaultLocal, root.getCallTarget().call(false));
+            root.getBytecodeNode().setUncachedThreshold(0);
+            assertSame(defaultLocal, root.getCallTarget().call(true));
+            assertSame(defaultLocal, root.getCallTarget().call(false));
+        } else {
+            // Illegal returns null for getLocal
+            assertNull(root.getCallTarget().call(true));
+            assertNull(root.getCallTarget().call(false));
+            root.getBytecodeNode().setUncachedThreshold(0);
+            assertNull(root.getCallTarget().call(true));
+            assertNull(root.getCallTarget().call(false));
+        }
+    }
+
+    @Test
+    public void testGetAccessorDefaultOrIllegal() {
+        // @formatter:off
+        // // B0
+        // result;
+        // {
+        //   var l0;
+        //   if (arg0) {
+        //     result = getLocal(l0)
+        //   } else {
+        //     l0 = 42L
+        //   }
+        // }
+        // {
+        //   var l1;
+        //   result = getLocal(l1);
+        // }
+        // return result
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal result = makeLocal(b, "result");
+            b.beginBlock();
+            BytecodeLocal l = makeLocal(b, "l0");
+            b.beginIfThenElse();
+            b.emitLoadArgument(0);
+            b.beginStoreLocal(result);
+            b.emitGetLocalAccessor(l, FrameSlotKind.Object);
+            b.endStoreLocal();
+            b.beginStoreLocal(l);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+            b.endIfThenElse();
+            b.endBlock();
+
+            b.beginBlock();
+            l = makeLocal(b, "l1");
+            b.beginStoreLocal(result);
+            b.emitGetLocalAccessor(l, FrameSlotKind.Object);
+            b.endStoreLocal();
+            b.endBlock();
+
+            b.beginReturn();
+            b.emitLoadLocal(result);
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        if (hasLocalDefaultValue()) {
+            Object defaultLocal = getLocalDefaultValue();
+            assertSame(defaultLocal, root.getCallTarget().call(true));
+            assertSame(defaultLocal, root.getCallTarget().call(false));
+            root.getBytecodeNode().setUncachedThreshold(0);
+            assertSame(defaultLocal, root.getCallTarget().call(true));
+            assertSame(defaultLocal, root.getCallTarget().call(false));
+        } else {
+            // Illegal returns FrameSlotTypeException
+
+            assertThrows(FrameSlotTypeException.class, () -> {
+                root.getCallTarget().call(false);
+            });
+            assertThrows(FrameSlotTypeException.class, () -> {
+                root.getCallTarget().call(true);
+            });
+            root.getBytecodeNode().setUncachedThreshold(0);
+            assertThrows(FrameSlotTypeException.class, () -> {
+                root.getCallTarget().call(false);
+            });
+            assertThrows(FrameSlotTypeException.class, () -> {
+                root.getCallTarget().call(true);
+            });
+        }
+    }
+
+    @Test
+    public void testClearAccessor() {
+        // @formatter:off
+        // var l0
+        // l0 = 42
+        // clear l0
+        // return l0
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal l = makeLocal(b, "l0");
+            b.beginStoreLocal(l);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.emitClearLocalAccessor(l);
+
+            b.beginReturn();
+            b.emitLoadLocal(l);
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        assertThrows(FrameSlotTypeException.class, () -> root.getCallTarget().call());
+    }
+
+    @Test
+    public void testClearAccessorRange() {
+        // @formatter:off
+        // var l0, l1
+        // l0, l1 = 42, 123
+        // if (arg0) clear l0 else clear l1
+        // clear l[arg0]
+        // return arg1 ? l0 : l1
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal l0 = makeLocal(b, "l0");
+            BytecodeLocal l1 = makeLocal(b, "l1");
+            b.beginStoreLocal(l0);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(l1);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginIfThenElse();
+            b.emitLoadArgument(0);
+            b.emitClearLocalRangeAccessor(new BytecodeLocal[]{l0, l1}, 0);
+            b.emitClearLocalRangeAccessor(new BytecodeLocal[]{l0, l1}, 1);
+            b.endIfThenElse();
+
+            b.beginReturn();
+            b.beginConditional();
+            b.emitLoadArgument(1);
+            b.emitLoadLocal(l0);
+            b.emitLoadLocal(l1);
+            b.endConditional();
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        assertThrows(FrameSlotTypeException.class, () -> root.getCallTarget().call(true, true));
+        assertEquals(123, root.getCallTarget().call(true, false));
+        assertEquals(42, root.getCallTarget().call(false, true));
+        assertThrows(FrameSlotTypeException.class, () -> root.getCallTarget().call(false, false));
+    }
+
+    @Test
+    public void testIsClearedAccessor() {
+        // @formatter:off
+        // var l0
+        // l0 = 42
+        // if (arg0) clear l0
+        // return isCleared l0
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal l = makeLocal(b, "l0");
+            b.beginStoreLocal(l);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginIfThen();
+            b.emitLoadArgument(0);
+            b.emitClearLocalAccessor(l);
+            b.endIfThen();
+
+            b.beginReturn();
+            b.emitIsClearedLocalAccessor(l);
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        assertEquals(true, root.getCallTarget().call(true));
+        assertEquals(false, root.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testIsClearedAccessorDefaultValues() {
+        // @formatter:off
+        // {
+        //   var l0
+        //   if (arg0) return isCleared l0
+        // }
+        // {
+        //   var l1  // with block scoping, l0 cleared and reused
+        //   return isCleared l1
+        // }
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            BytecodeLocal l0 = makeLocal(b, "l0");
+
+            b.beginIfThen();
+            b.emitLoadArgument(0);
+            b.beginReturn();
+            b.emitIsClearedLocalAccessor(l0);
+            b.endReturn();
+            b.endIfThen();
+            b.endBlock();
+
+            b.beginBlock();
+            BytecodeLocal l1 = makeLocal(b, "l1");
+            b.beginReturn();
+            b.emitIsClearedLocalAccessor(l1);
+            b.endReturn();
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        // The local should be cleared unless there's a default value.
+        assertEquals(!hasLocalDefaultValue(), root.getCallTarget().call(true));
+        assertEquals(!hasLocalDefaultValue(), root.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testIsClearedAccessorRange() {
+        // @formatter:off
+        // var l0, l1
+        // l0, l1 = 42, 123
+        // if (arg0) {
+        //   clear l0
+        // } else {
+        //   clear l1
+        // }
+        // return arg1 ? isCleared l0 : isCleared l1
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            BytecodeLocal l0 = makeLocal(b, "l0");
+            BytecodeLocal l1 = makeLocal(b, "l1");
+            b.beginStoreLocal(l0);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginStoreLocal(l1);
+            b.emitLoadConstant(123);
+            b.endStoreLocal();
+
+            b.beginIfThenElse();
+            b.emitLoadArgument(0);
+            b.emitClearLocalAccessor(l0);
+            b.emitClearLocalAccessor(l1);
+            b.endIfThenElse();
+
+            b.beginReturn();
+            b.beginConditional();
+            b.emitLoadArgument(1);
+            b.emitIsClearedLocalRangeAccessor(new BytecodeLocal[]{l0, l1}, 0);
+            b.emitIsClearedLocalRangeAccessor(new BytecodeLocal[]{l0, l1}, 1);
+            b.endConditional();
+            b.endReturn();
+
+            b.endRoot();
+        });
+
+        assertEquals(true, root.getCallTarget().call(true, true));
+        assertEquals(false, root.getCallTarget().call(true, false));
+        assertEquals(false, root.getCallTarget().call(false, true));
+        assertEquals(true, root.getCallTarget().call(false, false));
+    }
+
+    @Test
+    public void testIsClearedMaterializedAccessor() {
+        // @formatter:off
+        // var l0
+        // l0 = 42
+        // function clear(materialized) {
+        //   clearMaterializedLocal(l0, materialized);
+        // }
+        // function isCleared(materialized) {
+        //   return isClearedMaterializedLocal(l0, materialized);
+        // }
+        // yield null
+        // return isCleared l0
+        // @formatter:on
+
+        BytecodeRootNodes<BytecodeNodeWithLocalIntrospection> roots = parseNodes(b -> {
+            b.beginRoot();
+
+            BytecodeLocal l = makeLocal(b, "l0");
+            b.beginStoreLocal(l);
+            b.emitLoadConstant(42);
+            b.endStoreLocal();
+
+            b.beginRoot(); // clear
+            b.beginClearMaterializedLocalAccessor(l);
+            b.emitLoadArgument(0);
+            b.endClearMaterializedLocalAccessor();
+            b.endRoot();
+
+            b.beginRoot(); // isCleared
+            b.beginReturn();
+            b.beginIsClearedMaterializedLocalAccessor(l);
+            b.emitLoadArgument(0);
+            b.endIsClearedMaterializedLocalAccessor();
+            b.endReturn();
+            b.endRoot();
+
+            b.beginYield();
+            b.emitLoadNull();
+            b.endYield();
+
+            b.beginReturn();
+            b.emitIsClearedLocalAccessor(l);
+            b.endReturn();
+
+            b.endRoot();
+        });
+        RootCallTarget outer = roots.getNode(0).getCallTarget();
+        RootCallTarget clear = roots.getNode(1).getCallTarget();
+        RootCallTarget isCleared = roots.getNode(2).getCallTarget();
+
+        ContinuationResult cont = (ContinuationResult) outer.call();
+        MaterializedFrame frame = cont.getFrame();
+
+        assertEquals(false, isCleared.call(frame));
+        clear.call(frame);
+        assertEquals(true, isCleared.call(frame));
+        assertEquals(true, cont.continueWith(null));
+    }
+
+    @Test
+    public void testGetLocalMetadataAccessor() {
+        // @formatter:off
+        // {
+        //   var l0
+        // }
+        // {
+        //   var l1
+        //   var unnamed
+        //   return arg0 ? metadata(l1) : metadata(unnamed)
+        // }
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            b.createLocal("l0", "foo");
+            b.endBlock();
+
+            b.beginBlock();
+            BytecodeLocal l1 = b.createLocal("l1", "bar");
+            BytecodeLocal unnamed = b.createLocal(null, null);
+            b.beginReturn();
+            b.beginConditional();
+            b.emitLoadArgument(0);
+            b.emitGetLocalMetadataLocalAccessor(l1);
+            b.emitGetLocalMetadataLocalAccessor(unnamed);
+            b.endConditional();
+            b.endReturn();
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertArrayEquals(new Object[]{"l1", "bar"}, (Object[]) root.getCallTarget().call(true));
+        assertArrayEquals(new Object[]{null, null}, (Object[]) root.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testGetLocalMetadataAccessorRange() {
+        // @formatter:off
+        // {
+        //   var l0
+        // }
+        // {
+        //   var l1
+        //   var unnamed
+        //   return arg0 ? metadata(l1) : metadata(unnamed)
+        // }
+        // @formatter:on
+
+        BytecodeNodeWithLocalIntrospection root = parseNode(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            b.createLocal("l0", "foo");
+            b.endBlock();
+
+            b.beginBlock();
+            BytecodeLocal l1 = b.createLocal("l1", "bar");
+            BytecodeLocal unnamed = b.createLocal(null, null);
+            b.beginReturn();
+            b.beginConditional();
+            b.emitLoadArgument(0);
+            b.emitGetLocalMetadataLocalRangeAccessor(new BytecodeLocal[]{l1, unnamed}, 0);
+            b.emitGetLocalMetadataLocalRangeAccessor(new BytecodeLocal[]{l1, unnamed}, 1);
+            b.endConditional();
+            b.endReturn();
+            b.endBlock();
+
+            b.endRoot();
+        });
+
+        assertArrayEquals(new Object[]{"l1", "bar"}, (Object[]) root.getCallTarget().call(true));
+        assertArrayEquals(new Object[]{null, null}, (Object[]) root.getCallTarget().call(false));
+    }
+
+    @Test
+    public void testGetLocalMetadataMaterializedAccessor() {
+        // @formatter:off
+        // {
+        //   var l0
+        // }
+        // {
+        //   var l1
+        //   var unnamed
+        //   function inner(arg0) {
+        //     return arg0 ? metadata(l1) : metadata(unnamed)
+        //   }
+        // }
+        // @formatter:on
+
+        BytecodeRootNodes<BytecodeNodeWithLocalIntrospection> roots = parseNodes(b -> {
+            b.beginRoot();
+
+            b.beginBlock();
+            b.createLocal("l0", "foo");
+            b.endBlock();
+
+            b.beginBlock();
+            BytecodeLocal l1 = b.createLocal("l1", "bar");
+            BytecodeLocal unnamed = b.createLocal(null, null);
+
+            b.beginRoot(); // inner
+            b.beginReturn();
+            b.beginConditional();
+            b.emitLoadArgument(0);
+            b.emitGetLocalMetadataMaterializedLocalAccessor(l1);
+            b.emitGetLocalMetadataMaterializedLocalAccessor(unnamed);
+            b.endConditional();
+            b.endReturn();
+            b.endRoot();
+
+            b.endBlock();
+
+            b.endRoot();
+        });
+        RootCallTarget inner = roots.getNode(1).getCallTarget();
+
+        assertArrayEquals(new Object[]{"l1", "bar"}, (Object[]) inner.call(true));
+        assertArrayEquals(new Object[]{null, null}, (Object[]) inner.call(false));
+    }
+
+}
+
+@GenerateBytecodeTestVariants({
+                @Variant(suffix = "Base", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true)),
+                @Variant(suffix = "BaseDefault", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                defaultLocalValue = "DEFAULT", //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true)),
+                @Variant(suffix = "BaseNoCapturedFrames", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = false)),
+                @Variant(suffix = "WithBEIllegal", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableQuickening = true, //
+                                enableUncachedInterpreter = true, //
+                                boxingEliminationTypes = {boolean.class, long.class}, //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true)),
+                @Variant(suffix = "WithBEIllegalRootScoped", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableQuickening = true, //
+                                enableUncachedInterpreter = true, //
+                                boxingEliminationTypes = {boolean.class, long.class}, //
+                                enableBlockScoping = false, //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true)),
+                @Variant(suffix = "WithBEObjectDefault", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableQuickening = true, //
+                                boxingEliminationTypes = {boolean.class, long.class}, //
+                                enableUncachedInterpreter = true, //
+                                defaultLocalValue = "resolveDefault()", //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true)),
+                @Variant(suffix = "WithBENullDefault", configuration = @GenerateBytecode(languageClass = BytecodeDSLTestLanguage.class, //
+                                enableQuickening = true, //
+                                boxingEliminationTypes = {boolean.class, long.class}, //
+                                enableUncachedInterpreter = true, //
+                                defaultLocalValue = "null", //
+                                enableYield = true, //
+                                enableMaterializedLocalAccesses = true, //
+                                captureFramesForTrace = true))
+})
+abstract class BytecodeNodeWithLocalIntrospection extends DebugBytecodeRootNode implements BytecodeRootNode {
+    @CompilationFinal public int reservedLocalIndex = -1;
+
+    static final Object DEFAULT = new Object();
+    static final Object FRAME_DESCRIPTOR_INFO = new Object();
+
+    static Object resolveDefault() {
+        CompilerAsserts.neverPartOfCompilation("Must be cached and not triggered during compilation.");
+        return DEFAULT;
+    }
+
+    protected BytecodeNodeWithLocalIntrospection(BytecodeDSLTestLanguage language, FrameDescriptor.Builder frameDescriptorBuilder) {
+        super(language, frameDescriptorBuilder.info(FRAME_DESCRIPTOR_INFO).build());
+    }
+
+    @Operation
+    public static final class GetLocals {
+        @Specialization
+        public static Map<String, Object> getLocals(VirtualFrame frame,
+                        @Bind BytecodeNode node,
+                        @Bind("$bytecodeIndex") int bci) {
+            Object[] locals = node.getLocalValues(bci, frame);
+            return makeMap(node.getLocalNames(bci), locals);
+        }
+
+        @TruffleBoundary
+        private static Map<String, Object> makeMap(Object[] names, Object[] values) {
+            assert names.length == values.length;
+            Map<String, Object> result = new HashMap<>();
+            for (int i = 0; i < names.length; i++) {
+                result.put((String) names[i], values[i]);
+            }
+            return result;
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = int.class)
+    public static final class GetLocal {
+        @Specialization
+        public static Object perform(VirtualFrame frame, int i,
+                        @Bind BytecodeNode node,
+                        @Bind("$bytecodeIndex") int bci) {
+            return node.getLocalValue(bci, frame, i);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalRangeAccessor.class)
+    @ConstantOperand(type = FrameSlotKind.class)
+    @ConstantOperand(type = int.class)
+    public static final class GetLocalRangeAccessor {
+        @Specialization
+        public static Object perform(VirtualFrame frame, LocalRangeAccessor accessor, FrameSlotKind kind, int offset,
+                        @Bind BytecodeNode node) {
+            try {
+                switch (kind) {
+                    case Boolean:
+                        return accessor.getBoolean(node, frame, offset);
+                    case Byte:
+                        return accessor.getByte(node, frame, offset);
+                    case Int:
+                        return accessor.getInt(node, frame, offset);
+                    case Long:
+                        return accessor.getLong(node, frame, offset);
+                    case Double:
+                        return accessor.getDouble(node, frame, offset);
+                    case Float:
+                        return accessor.getFloat(node, frame, offset);
+                    case Object:
+                        return accessor.getObject(node, frame, offset);
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+            } catch (UnexpectedResultException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalAccessor.class)
+    @ConstantOperand(type = FrameSlotKind.class)
+    public static final class GetLocalAccessor {
+        @Specialization
+        public static Object perform(VirtualFrame frame, LocalAccessor accessor, FrameSlotKind kind,
+                        @Bind BytecodeNode node) {
+            try {
+                switch (kind) {
+                    case Boolean:
+                        return accessor.getBoolean(node, frame);
+                    case Byte:
+                        return accessor.getByte(node, frame);
+                    case Int:
+                        return accessor.getInt(node, frame);
+                    case Long:
+                        return accessor.getLong(node, frame);
+                    case Double:
+                        return accessor.getDouble(node, frame);
+                    case Float:
+                        return accessor.getFloat(node, frame);
+                    case Object:
+                        return accessor.getObject(node, frame);
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+            } catch (UnexpectedResultException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = MaterializedLocalAccessor.class)
+    public static final class GetMaterializedLocalAccessor {
+        @Specialization
+        public static Object perform(MaterializedLocalAccessor accessor, FrameSlotKind kind,
+                        MaterializedFrame materializedFrame,
+                        @Bind BytecodeNode node) {
+            try {
+                switch (kind) {
+                    case Boolean:
+                        return accessor.getBoolean(node, materializedFrame);
+                    case Byte:
+                        return accessor.getByte(node, materializedFrame);
+                    case Int:
+                        return accessor.getInt(node, materializedFrame);
+                    case Long:
+                        return accessor.getLong(node, materializedFrame);
+                    case Double:
+                        return accessor.getDouble(node, materializedFrame);
+                    case Float:
+                        return accessor.getFloat(node, materializedFrame);
+                    case Object:
+                        return accessor.getObject(node, materializedFrame);
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+            } catch (UnexpectedResultException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalRangeAccessor.class)
+    @ConstantOperand(type = FrameSlotKind.class)
+    @ConstantOperand(type = int.class)
+    public static final class SetLocalRangeAccessor {
+        @Specialization
+        public static Object doDefault(VirtualFrame frame, LocalRangeAccessor accessor, FrameSlotKind kind, int offset, Object value,
+                        @Bind BytecodeNode node) {
+            switch (kind) {
+                case Boolean:
+                    accessor.setBoolean(node, frame, offset, (boolean) value);
+                    break;
+                case Byte:
+                    accessor.setByte(node, frame, offset, (byte) value);
+                    break;
+                case Int:
+                    accessor.setInt(node, frame, offset, (int) value);
+                    break;
+                case Long:
+                    accessor.setLong(node, frame, offset, (long) value);
+                    break;
+                case Double:
+                    accessor.setDouble(node, frame, offset, (double) value);
+                    break;
+                case Float:
+                    accessor.setFloat(node, frame, offset, (float) value);
+                    break;
+                case Object:
+                    accessor.setObject(node, frame, offset, value);
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+            return value;
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalAccessor.class)
+    @ConstantOperand(type = FrameSlotKind.class)
+    public static final class SetLocalAccessor {
+        @Specialization
+        public static Object doDefault(VirtualFrame frame, LocalAccessor accessor, FrameSlotKind kind, Object value,
+                        @Bind BytecodeNode node) {
+            switch (kind) {
+                case Boolean:
+                    accessor.setBoolean(node, frame, (boolean) value);
+                    break;
+                case Byte:
+                    accessor.setByte(node, frame, (byte) value);
+                    break;
+                case Int:
+                    accessor.setInt(node, frame, (int) value);
+                    break;
+                case Long:
+                    accessor.setLong(node, frame, (long) value);
+                    break;
+                case Double:
+                    accessor.setDouble(node, frame, (double) value);
+                    break;
+                case Float:
+                    accessor.setFloat(node, frame, (float) value);
+                    break;
+                case Object:
+                    accessor.setObject(node, frame, value);
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+            return value;
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = MaterializedLocalAccessor.class)
+    public static final class SetMaterializedLocalAccessor {
+        @Specialization
+        public static Object doDefault(MaterializedLocalAccessor accessor, FrameSlotKind kind, MaterializedFrame materializedFrame, Object value,
+                        @Bind BytecodeNode node) {
+            switch (kind) {
+                case Boolean:
+                    accessor.setBoolean(node, materializedFrame, (boolean) value);
+                    break;
+                case Byte:
+                    accessor.setByte(node, materializedFrame, (byte) value);
+                    break;
+                case Int:
+                    accessor.setInt(node, materializedFrame, (int) value);
+                    break;
+                case Long:
+                    accessor.setLong(node, materializedFrame, (long) value);
+                    break;
+                case Double:
+                    accessor.setDouble(node, materializedFrame, (double) value);
+                    break;
+                case Float:
+                    accessor.setFloat(node, materializedFrame, (float) value);
+                    break;
+                case Object:
+                    accessor.setObject(node, materializedFrame, value);
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+            return value;
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalAccessor.class)
+    public static final class ClearLocalAccessor {
+        @Specialization
+        public static void perform(VirtualFrame frame, LocalAccessor accessor,
+                        @Bind BytecodeNode node) {
+            accessor.clear(node, frame);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalRangeAccessor.class)
+    @ConstantOperand(type = int.class)
+    public static final class ClearLocalRangeAccessor {
+        @Specialization
+        public static void perform(VirtualFrame frame, LocalRangeAccessor accessor, int offset,
+                        @Bind BytecodeNode node) {
+            accessor.clear(node, frame, offset);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = MaterializedLocalAccessor.class)
+    public static final class ClearMaterializedLocalAccessor {
+        @Specialization
+        public static void perform(MaterializedLocalAccessor accessor, MaterializedFrame materializedFrame,
+                        @Bind BytecodeNode node) {
+            accessor.clear(node, materializedFrame);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalAccessor.class)
+    public static final class IsClearedLocalAccessor {
+        @Specialization
+        public static boolean perform(VirtualFrame frame, LocalAccessor accessor,
+                        @Bind BytecodeNode node) {
+            return accessor.isCleared(node, frame);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalRangeAccessor.class)
+    @ConstantOperand(type = int.class)
+    public static final class IsClearedLocalRangeAccessor {
+        @Specialization
+        public static boolean perform(VirtualFrame frame, LocalRangeAccessor accessor, int offset,
+                        @Bind BytecodeNode node) {
+            return accessor.isCleared(node, frame, offset);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = MaterializedLocalAccessor.class)
+    public static final class IsClearedMaterializedLocalAccessor {
+        @Specialization
+        public static boolean perform(MaterializedLocalAccessor accessor, MaterializedFrame materializedFrame,
+                        @Bind BytecodeNode node) {
+            return accessor.isCleared(node, materializedFrame);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalAccessor.class)
+    public static final class GetLocalMetadataLocalAccessor {
+        @Specialization
+        public static Object[] perform(LocalAccessor accessor,
+                        @Bind BytecodeNode node) {
+            return new Object[]{accessor.getLocalName(node), accessor.getLocalInfo(node)};
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = LocalRangeAccessor.class)
+    @ConstantOperand(type = int.class)
+    public static final class GetLocalMetadataLocalRangeAccessor {
+        @Specialization
+        public static Object[] perform(LocalRangeAccessor accessor, int offset,
+                        @Bind BytecodeNode node) {
+            return new Object[]{accessor.getLocalName(node, offset), accessor.getLocalInfo(node, offset)};
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = MaterializedLocalAccessor.class)
+    public static final class GetLocalMetadataMaterializedLocalAccessor {
+        @Specialization
+        public static Object[] perform(MaterializedLocalAccessor accessor,
+                        @Bind BytecodeNode node) {
+            return new Object[]{accessor.getLocalName(node), accessor.getLocalInfo(node)};
+        }
+    }
+
+    @Operation
+    public static final class GetLocalUsingBytecodeLocalIndex {
+        @Specialization
+        public static Object perform(VirtualFrame frame,
+                        @Bind BytecodeNodeWithLocalIntrospection root,
+                        @Bind BytecodeNode node,
+                        @Bind("$bytecodeIndex") int bci) {
+            assert root.reservedLocalIndex != -1;
+            return node.getLocalValue(bci, frame, root.reservedLocalIndex);
+        }
+    }
+
+    @Operation
+    @ConstantOperand(type = int.class)
+    public static final class SetLocal {
+        @Specialization
+        public static void perform(VirtualFrame frame, int i, Object value,
+                        @Bind BytecodeNode node,
+                        @Bind("$bytecodeIndex") int bci) {
+            node.setLocalValue(bci, frame, i, value);
+        }
+    }
+
+    @Operation
+    public static final class SetLocalUsingBytecodeLocalIndex {
+        @Specialization
+        public static void perform(VirtualFrame frame, Object value,
+                        @Bind BytecodeNodeWithLocalIntrospection root,
+                        @Bind BytecodeNode node,
+                        @Bind("$bytecodeIndex") int bci) {
+            assert root.reservedLocalIndex != -1;
+            node.setLocalValue(bci, frame, root.reservedLocalIndex, value);
+        }
+    }
+
+    @Operation
+    public static final class CreateMaterializedBytecodeFrame {
+        @Specialization
+        public static BytecodeFrame perform(VirtualFrame frame, @Bind BytecodeNode node, @Bind("$bytecodeIndex") int bci) {
+            return node.createMaterializedFrame(bci, frame.materialize());
+        }
+    }
+
+    @Operation
+    public static final class CreateCopiedBytecodeFrame {
+        @Specialization
+        public static BytecodeFrame perform(VirtualFrame frame, @Bind BytecodeNode node, @Bind("$bytecodeIndex") int bci) {
+            return node.createCopiedFrame(bci, frame);
+        }
+    }
+
+    @Operation
+    public static final class GetCurrentLocation {
+        @Specialization
+        public static Node perform(@Bind Node currentLocation) {
+            return currentLocation;
+        }
+    }
+
+    @Operation
+    public static final class IterateBytecodeFrames {
+        public static final int USE_CURRENT_BCI = Integer.MIN_VALUE;
+        public static final Object USE_CURRENT_LOCATION = new Object();
+        public static final Object USE_INVALID_LOCATION = new Object();
+
+        @Specialization
+        public static BytecodeFrame[] perform(int topBytecodeIndex, Object topLocation, int skipBytecodeFrames, @Bind Node currentTopLocation, @Bind("$bytecodeIndex") int currentBytecodeIndex) {
+            int bci = topBytecodeIndex == USE_CURRENT_BCI ? currentBytecodeIndex : topBytecodeIndex;
+            Node location;
+            if (topLocation == USE_CURRENT_LOCATION) {
+                location = currentTopLocation;
+            } else if (topLocation == USE_INVALID_LOCATION) {
+                location = new Node() {
+                };
+            } else {
+                location = (Node) topLocation;
+            }
+            List<BytecodeFrame> frames = new ArrayList<>();
+            BytecodeFrame.iterateBytecodeFrames(frame -> {
+                frames.add(frame);
+                return null;
+            }, FrameInstance.FrameAccess.READ_WRITE, location, bci, skipBytecodeFrames);
+            return frames.toArray(BytecodeFrame[]::new);
+        }
+    }
+
+    // Validates short circuiting behaviour.
+    @Operation
+    public static final class IterateBytecodeFramesShortCircuit {
+        @Specialization
+        public static int perform(@Bind Node currentTopLocation, @Bind("$bytecodeIndex") int currentBytecodeIndex) {
+            CountingVisitor visitor = new CountingVisitor();
+            BytecodeFrame.iterateBytecodeFrames(visitor, FrameInstance.FrameAccess.READ_WRITE, currentTopLocation, currentBytecodeIndex, 0);
+            return visitor.invocations;
+        }
+
+        private static final class CountingVisitor implements Function<BytecodeFrame, String> {
+            int invocations = 0;
+
+            @Override
+            public String apply(BytecodeFrame frame) {
+                invocations++;
+                return "Done"; // terminates the stack walk.
+            }
+        }
+    }
+
+    @Operation
+    public static final class GetTop {
+        @Specialization
+        public static BytecodeFrame perform(@Bind Node currentTopLocation, @Bind("$bytecodeIndex") int currentBytecodeIndex) {
+            return BytecodeFrame.getTop(FrameInstance.FrameAccess.READ_WRITE, currentTopLocation, currentBytecodeIndex);
+        }
+    }
+
+    @Operation
+    public static final class Same {
+        @Specialization
+        public static boolean doDefault(int a, int b) {
+            return a == b;
+        }
+    }
+
+    @Operation
+    public static final class Invoke {
+        @Specialization(guards = {"callTargetMatches(root.getCallTarget(), callNode.getCallTarget())"}, limit = "1")
+        public static Object doCached(@SuppressWarnings("unused") BytecodeNodeWithLocalIntrospection root, @Variadic Object[] args,
+                        @Cached("create(root.getCallTarget())") DirectCallNode callNode) {
+            return callNode.call(args);
+        }
+
+        @Specialization(replaces = {"doCached"})
+        public static Object doUncached(BytecodeNodeWithLocalIntrospection root, @Variadic Object[] args, @Shared @Cached IndirectCallNode callNode) {
+            return callNode.call(root.getCallTarget(), args);
+        }
+
+        @Specialization(guards = {"callTargetMatches(callTarget, callNode.getCallTarget())"}, limit = "1")
+        public static Object doCallTarget(@SuppressWarnings("unused") CallTarget callTarget, @Variadic Object[] args, @Cached("create(callTarget)") DirectCallNode callNode) {
+            return callNode.call(args);
+        }
+
+        @Specialization(replaces = {"doCallTarget"})
+        public static Object doCallTargetUncached(CallTarget callTarget, @Variadic Object[] args, @Shared @Cached IndirectCallNode callNode) {
+            return callNode.call(callTarget, args);
+        }
+
+        protected static boolean callTargetMatches(CallTarget left, CallTarget right) {
+            return left == right;
+        }
+    }
+
+    @Operation
+    public static final class Continue {
+        public static final int LIMIT = 3;
+
+        @SuppressWarnings("unused")
+        @Specialization(guards = {"result.getContinuationRootNode() == rootNode"}, limit = "LIMIT")
+        public static Object invokeDirect(ContinuationResult result, Object value,
+                        @Cached(value = "result.getContinuationRootNode()") ContinuationRootNode rootNode,
+                        @Cached(value = "create(rootNode.getCallTarget())") DirectCallNode callNode) {
+            return callNode.call(result.getFrame(), value);
+        }
+
+        @Specialization(replaces = "invokeDirect")
+        public static Object invokeIndirect(ContinuationResult result, Object value,
+                        @Cached IndirectCallNode callNode) {
+            return callNode.call(result.getContinuationCallTarget(), result.getFrame(), value);
+        }
+    }
+
+    @Operation
+    public static final class MakePair {
+        @Specialization
+        public static Pair doMakePair(Object left, Object right) {
+            return new Pair(left, right);
+        }
+    }
+
+    @Operation
+    public static final class CaptureFrameState {
+        @Specialization
+        public static CapturedFrameState doCapture(VirtualFrame frame, @Bind BytecodeNode bytecode) {
+            return new CapturedFrameState(bytecode, frame.materialize());
+        }
+    }
+}
+
+record Pair(Object left, Object right) {
+}
+
+record CapturedFrameState(BytecodeNode bytecode, MaterializedFrame frame) {
+    RootCallTarget target() {
+        return bytecode.getRootNode().getCallTarget();
+    }
+}
+
+@SuppressWarnings("serial")
+class TestException extends AbstractTruffleException {
+
+    TestException(Node location) {
+        super(location);
+    }
+
+}

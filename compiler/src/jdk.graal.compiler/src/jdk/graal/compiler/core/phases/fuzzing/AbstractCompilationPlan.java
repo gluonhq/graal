@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -96,13 +96,13 @@ public abstract class AbstractCompilationPlan {
     public void verifyCompilationPlan(GraphState graphState) {
         GraphState simulationGraphState = graphState.copy();
         addInitialRequiredStages(simulationGraphState);
-        Optional<NotApplicable> tierNotApplicable = highTier.getPhaseSuite().notApplicableTo(simulationGraphState);
+        Optional<NotApplicable> tierNotApplicable = PhaseSuiteContractVerifier.verifiedNotApplicableTo(highTier.getPhaseSuite(), simulationGraphState);
         GraalError.guarantee(tierNotApplicable.isEmpty(), "Cannot apply the high tier of this compilation plan because %s.%n%s", tierNotApplicable.orElse(null), this);
         highTier.updateGraphState(simulationGraphState);
-        tierNotApplicable = midTier.getPhaseSuite().notApplicableTo(simulationGraphState);
+        tierNotApplicable = PhaseSuiteContractVerifier.verifiedNotApplicableTo(midTier.getPhaseSuite(), simulationGraphState);
         GraalError.guarantee(tierNotApplicable.isEmpty(), "Cannot apply the mid tier of this compilation plan because %s.%n%s", tierNotApplicable.orElse(null), this);
         midTier.updateGraphState(simulationGraphState);
-        tierNotApplicable = lowTier.getPhaseSuite().notApplicableTo(simulationGraphState);
+        tierNotApplicable = PhaseSuiteContractVerifier.verifiedNotApplicableTo(lowTier.getPhaseSuite(), simulationGraphState);
         GraalError.guarantee(tierNotApplicable.isEmpty(), "Cannot apply the low tier of this compilation plan because %s.%n%s", tierNotApplicable.orElse(null), this);
         lowTier.updateGraphState(simulationGraphState);
         GraalError.guarantee(simulationGraphState.hasAllMandatoryStages(getMandatoryStages()), "This compilation plan does not apply all mandatory stages.%n%s", this);

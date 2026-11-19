@@ -22,27 +22,54 @@
  */
 package com.oracle.truffle.espresso.impl;
 
+import java.util.Set;
+
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.dsl.Bind;
+import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.interop.ArityException;
+import com.oracle.truffle.api.interop.InteropLibrary;
+import com.oracle.truffle.api.interop.TruffleObject;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.api.library.ExportLibrary;
+import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
+import com.oracle.truffle.api.utilities.TriState;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.EspressoOptions;
+import com.oracle.truffle.espresso.classfile.ClassfileParser;
 import com.oracle.truffle.espresso.classfile.Constants;
-import com.oracle.truffle.espresso.classfile.RuntimeConstantPool;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.attributes.Attribute;
+import com.oracle.truffle.espresso.classfile.attributes.AttributedElement;
+import com.oracle.truffle.espresso.classfile.attributes.ConstantValueAttribute;
 import com.oracle.truffle.espresso.classfile.attributes.SignatureAttribute;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.ModifiedUTF8;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
+import com.oracle.truffle.espresso.classfile.descriptors.ModifiedUTF8;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.constantpool.RuntimeConstantPool;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
+import com.oracle.truffle.espresso.impl.LinkedKlassFieldLayout.HiddenField;
 import com.oracle.truffle.espresso.jdwp.api.FieldBreakpoint;
 import com.oracle.truffle.espresso.jdwp.api.FieldRef;
+import com.oracle.truffle.espresso.jdwp.api.TagConstants;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.runtime.Attribute;
 import com.oracle.truffle.espresso.runtime.EspressoException;
 import com.oracle.truffle.espresso.runtime.staticobject.FieldStorageObject;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.meta.FieldAccess;
+import com.oracle.truffle.espresso.substitutions.JavaType;
+import com.oracle.truffle.espresso.substitutions.standard.Target_sun_misc_Unsafe;
 
 /**
  * Represents a resolved Espresso field.
@@ -73,7 +100,8 @@ import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
  * value (this could be either an Original Field or a Redefine Added Field) a Delegation field is
  * assigned the underlying field as a Compatible Field.
  */
-public class Field extends Member<Type> implements FieldRef {
+@ExportLibrary(InteropLibrary.class)
+public class Field extends Member<Type> implements FieldRef, TruffleObject, FieldAccess<Klass, Method, Field>, AttributedElement {
 
     public static final Field[] EMPTY_ARRAY = new Field[0];
 
@@ -113,22 +141,34 @@ public class Field extends Member<Type> implements FieldRef {
         return !holder.getAssumption().isValid();
     }
 
+    @Override
     public final Attribute[] getAttributes() {
         return linkedField.getParserField().getAttributes();
     }
 
     public final Symbol<ModifiedUTF8> getGenericSignature() {
         if (genericSignature == null) {
-            SignatureAttribute attr = (SignatureAttribute) linkedField.getAttribute(SignatureAttribute.NAME);
-            if (attr == null) {
-                genericSignature = ModifiedUTF8.fromSymbol(getType());
-            } else {
-                genericSignature = pool.symbolAt(attr.getSignatureIndex());
-            }
+            Symbol<ModifiedUTF8> rawSignature = getRawGenericSignature();
+            genericSignature = rawSignature != null ? rawSignature : ModifiedUTF8.fromSymbol(getType());
         }
         return genericSignature;
     }
 
+    /**
+     * Returns the Signature attribute value, or {@code null} when the attribute is absent. Unlike
+     * {@link #getGenericSignature()}, this method does not substitute the field descriptor.
+     * Reflection mirrors require the nullable raw value to match HotSpot semantics and distinguish
+     * an absent Signature attribute from an explicitly present signature equal to the descriptor.
+     */
+    @SuppressWarnings("unchecked")
+    public final Symbol<ModifiedUTF8> getRawGenericSignature() {
+        SignatureAttribute attr = getAttribute(SignatureAttribute.NAME, SignatureAttribute.class);
+        return attr == null ? null : (Symbol<ModifiedUTF8>) pool.utf8At(attr.getSignatureIndex(), "generic signature");
+    }
+
+    /**
+     * @see HiddenField
+     */
     public final boolean isHidden() {
         return linkedField.isHidden();
     }
@@ -144,7 +184,11 @@ public class Field extends Member<Type> implements FieldRef {
 
     @Override
     public final int getModifiers() {
-        return linkedField.getFlags() & Constants.JVM_RECOGNIZED_FIELD_MODIFIERS;
+        return getFlags() & Constants.JVM_RECOGNIZED_FIELD_MODIFIERS;
+    }
+
+    public final int getFlags() {
+        return linkedField.getFlags();
     }
 
     @Override
@@ -190,25 +234,44 @@ public class Field extends Member<Type> implements FieldRef {
         }
     }
 
-    public final Attribute getAttribute(Symbol<Name> attrName) {
-        return linkedField.getAttribute(attrName);
-    }
-
-    public static Field getReflectiveFieldRoot(StaticObject seed, Meta meta) {
-        StaticObject curField = seed;
-        Field target = null;
-        while (target == null) {
-            target = (Field) meta.HIDDEN_FIELD_KEY.getHiddenObject(curField);
-            if (target == null) {
-                curField = meta.java_lang_reflect_Field_root.getObject(curField);
+    //@formatter:off
+    /// Gets the [Field] value associated with `reflectField`.
+    ///
+    /// ```
+    /// while (reflectField.0vmField == null) {
+    ///     reflectField = reflectField.root;
+    /// }
+    /// reflectField.0vmField
+    /// ```
+    //@formatter:on
+    public static Field getVMField(@JavaType(java.lang.reflect.Field.class) StaticObject reflectField, Meta meta) {
+        StaticObject curField = reflectField;
+        do {
+            Field target = (Field) meta.java_lang_reflect_Field_0vmField.getHiddenObject(curField);
+            if (target != null) {
+                return target;
             }
-        }
-        return target;
+            curField = meta.java_lang_reflect_Field_root.getObject(curField);
+        } while (StaticObject.notNull(curField));
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw EspressoError.shouldNotReachHere("Could not find non-null Field.0vmField");
     }
 
+    @Override
     public final void checkLoadingConstraints(StaticObject loader1, StaticObject loader2) {
         getDeclaringKlass().getContext().getRegistries().checkLoadingConstraint(getType(), loader1, loader2);
     }
+
+    // region FieldAccess impl
+
+    @Override
+    public final boolean shouldEnforceInitializerCheck() {
+        return (getDeclaringKlass().getMeta().getLanguage().getSpecComplianceMode() == EspressoOptions.SpecComplianceMode.STRICT) ||
+                        // HotSpot enforces this only for >= Java 9 (v53) .class files.
+                        getDeclaringClass().getMajorVersion() >= ClassfileParser.JAVA_9_VERSION;
+    }
+
+    // endregion FieldAccess impl
 
     // region Field accesses
 
@@ -399,7 +462,7 @@ public class Field extends Member<Type> implements FieldRef {
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
 
         if (getDeclaringKlass().getContext().anyHierarchyChanged()) {
-            checkSetValueValifity(value);
+            checkSetValueValidity(value);
         }
         if (isVolatile() || forceVolatile) {
             linkedField.setObjectVolatile(obj, value);
@@ -408,7 +471,7 @@ public class Field extends Member<Type> implements FieldRef {
         }
     }
 
-    protected void checkSetValueValifity(Object value) {
+    protected void checkSetValueValidity(Object value) {
         if (value != StaticObject.NULL && value instanceof StaticObject) {
             Klass klass = null;
             try {
@@ -480,6 +543,29 @@ public class Field extends Member<Type> implements FieldRef {
     public final void setHiddenObject(StaticObject obj, Object value, boolean forceVolatile) {
         assert isHidden() : this + " is not hidden, use setObject";
         setObjectHelper(obj, value, forceVolatile);
+    }
+
+    public final void setMaybeHiddenObject(StaticObject obj, StaticObject value) {
+        setMaybeHiddenObject(obj, value, false);
+    }
+
+    public final void setMaybeHiddenObject(StaticObject obj, StaticObject value, boolean forceVolatile) {
+        setObjectHelper(obj, value, forceVolatile);
+    }
+
+    public final StaticObject getMaybeHiddenObject(StaticObject obj) {
+        return getMaybeHiddenObject(obj, false);
+    }
+
+    public final StaticObject getMaybeHiddenObject(StaticObject obj, boolean forceVolatile) {
+        return (StaticObject) getObjectHelper(obj, forceVolatile);
+    }
+
+    public Object compareAndExchangeHiddenObject(StaticObject obj, Object before, Object after) {
+        obj.checkNotForeign();
+        assert isHidden() : this + " is not hidden";
+        assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+        return linkedField.compareAndExchangeObject(obj, before, after);
     }
     // endregion Hidden Object
     // endregion Object
@@ -841,7 +927,7 @@ public class Field extends Member<Type> implements FieldRef {
     // region jdwp-specific
     @Override
     public final byte getTagConstant() {
-        return getKind().toTagConstant();
+        return TagConstants.toTagConstant(getKind());
     }
 
     @Override
@@ -925,9 +1011,14 @@ public class Field extends Member<Type> implements FieldRef {
                     // remove index 1, but keep info at index 0
                     temp[0] = infos[0];
                     infos = temp;
-                    return;
                 }
         }
+    }
+
+    @Override
+    public void disposeFieldBreakpoint() {
+        hasActiveBreakpoints.set(false);
+        infos = null;
     }
 
     public void setCompatibleField(@SuppressWarnings("unused") Field field) {
@@ -946,17 +1037,17 @@ public class Field extends Member<Type> implements FieldRef {
     public StaticObject makeMirror(Meta meta) {
         StaticObject instance = meta.java_lang_reflect_Field.allocateInstance(meta.getContext());
 
-        Attribute rawRuntimeVisibleAnnotations = getAttribute(Name.RuntimeVisibleAnnotations);
+        Attribute rawRuntimeVisibleAnnotations = getAttribute(Names.RuntimeVisibleAnnotations);
         StaticObject runtimeVisibleAnnotations = rawRuntimeVisibleAnnotations != null
                         ? StaticObject.wrap(rawRuntimeVisibleAnnotations.getData(), meta)
                         : StaticObject.NULL;
 
-        Attribute rawRuntimeVisibleTypeAnnotations = getAttribute(Name.RuntimeVisibleTypeAnnotations);
+        Attribute rawRuntimeVisibleTypeAnnotations = getAttribute(Names.RuntimeVisibleTypeAnnotations);
         StaticObject runtimeVisibleTypeAnnotations = rawRuntimeVisibleTypeAnnotations != null
                         ? StaticObject.wrap(rawRuntimeVisibleTypeAnnotations.getData(), meta)
                         : StaticObject.NULL;
         if (meta.getJavaVersion().java15OrLater()) {
-            meta.java_lang_reflect_Field_init.invokeDirect(
+            meta.java_lang_reflect_Field_init.invokeDirectSpecial(
                             /* this */ instance,
                             /* declaringKlass */ getDeclaringKlass().mirror(),
                             /* name */ meta.getStrings().intern(getName()),
@@ -964,22 +1055,32 @@ public class Field extends Member<Type> implements FieldRef {
                             /* modifiers */ getModifiers(),
                             /* trustedFinal */ isTrustedFinal(),
                             /* slot */ getSlot(),
-                            /* signature */ meta.toGuestString(getGenericSignature()),
+                            /* signature */ meta.toGuestString(getRawGenericSignature()),
                             /* annotations */ runtimeVisibleAnnotations);
         } else {
-            meta.java_lang_reflect_Field_init.invokeDirect(
+            meta.java_lang_reflect_Field_init.invokeDirectSpecial(
                             /* this */ instance,
                             /* declaringKlass */ getDeclaringKlass().mirror(),
                             /* name */ meta.getStrings().intern(getName()),
                             /* type */ resolveTypeKlass().mirror(),
                             /* modifiers */ getModifiers(),
                             /* slot */ getSlot(),
-                            /* signature */ meta.toGuestString(getGenericSignature()),
+                            /* signature */ meta.toGuestString(getRawGenericSignature()),
                             /* annotations */ runtimeVisibleAnnotations);
         }
-        meta.HIDDEN_FIELD_KEY.setHiddenObject(instance, this);
-        meta.HIDDEN_FIELD_RUNTIME_VISIBLE_TYPE_ANNOTATIONS.setHiddenObject(instance, runtimeVisibleTypeAnnotations);
+        meta.java_lang_reflect_Field_0vmField.setHiddenObject(instance, this);
+        meta.java_lang_reflect_Field_0runtimeVisibleTypeAnnotations.setHiddenObject(instance, runtimeVisibleTypeAnnotations);
         return instance;
+    }
+
+    public int getConstantValueIndex() {
+        ConstantValueAttribute a = getAttribute(ConstantValueAttribute.NAME, ConstantValueAttribute.class);
+        if (a == null) {
+            return 0;
+        }
+        int constantValueIndex = a.getConstantValueIndex();
+        assert constantValueIndex != 0;
+        return constantValueIndex;
     }
 
     /**
@@ -1019,5 +1120,152 @@ public class Field extends Member<Type> implements FieldRef {
             }
         }
     }
+
     // endregion jdwp-specific
+    private static final KeysArray<String> ALL_MEMBERS;
+    private static final Set<String> READABLE_MEMBERS_SET;
+    private static final Set<String> INVOCABLE_MEMBERS_SET;
+
+    static {
+        String[] readableMembers = {
+                        ReadMember.FLAGS,
+                        ReadMember.OFFSET,
+                        ReadMember.NAME,
+                        ReadMember.TYPE,
+                        ReadMember.HOLDER,
+                        ReadMember.CONSTANT_VALUE_INDEX,
+        };
+        String[] invocableMembers = {
+                        InvokeMember.READ,
+        };
+        READABLE_MEMBERS_SET = Set.of(readableMembers);
+        INVOCABLE_MEMBERS_SET = Set.of(invocableMembers);
+        String[] allMembers = new String[readableMembers.length + invocableMembers.length];
+        System.arraycopy(readableMembers, 0, allMembers, 0, readableMembers.length);
+        System.arraycopy(invocableMembers, 0, allMembers, readableMembers.length, invocableMembers.length);
+        ALL_MEMBERS = new KeysArray<>(allMembers);
+    }
+
+    @ExportMessage
+    abstract static class ReadMember {
+        static final String FLAGS = "flags";
+        static final String OFFSET = "offset";
+        static final String NAME = "name";
+        static final String TYPE = "type";
+        static final String HOLDER = "holder";
+        static final String CONSTANT_VALUE_INDEX = "constantValueIndex";
+
+        @Specialization(guards = "FLAGS.equals(member)")
+        static int getFlags(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getFlags();
+        }
+
+        @Specialization(guards = "OFFSET.equals(member)")
+        static int getOffset(Field receiver, @SuppressWarnings("unused") String member,
+                        @Bind Node node) {
+            assert EspressoLanguage.get(node).isExternalJVMCIEnabled();
+            return Target_sun_misc_Unsafe.getGuestFieldOffset(receiver, EspressoLanguage.get(node));
+        }
+
+        @Specialization(guards = "NAME.equals(member)")
+        static String getName(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getNameAsString();
+        }
+
+        @Specialization(guards = "TYPE.equals(member)")
+        static String getType(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getType().toString();
+        }
+
+        @Specialization(guards = "HOLDER.equals(member)")
+        static ObjectKlass holder(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getDeclaringKlass();
+        }
+
+        @Specialization(guards = "CONSTANT_VALUE_INDEX.equals(member)")
+        static int getConstantValueIndex(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getConstantValueIndex();
+        }
+
+        @Fallback
+        @SuppressWarnings("unused")
+        public static Object doUnknown(Field receiver, String member) throws UnknownIdentifierException {
+            throw UnknownIdentifierException.create(member);
+        }
+    }
+
+    @ExportMessage
+    abstract static class InvokeMember {
+        static final String READ = "read";
+
+        @Specialization(guards = "READ.equals(member)")
+        static Object read(Field field, @SuppressWarnings("unused") String member, Object[] arguments,
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile typeError,
+                        @Cached InlinedBranchProfile arityError) throws ArityException, UnsupportedTypeException {
+            assert field != null;
+            assert EspressoLanguage.get(node).isExternalJVMCIEnabled();
+            if (arguments.length != 1) {
+                arityError.enter(node);
+                throw ArityException.create(1, 1, arguments.length);
+            }
+            StaticObject receiver;
+            if (field.isStatic()) {
+                receiver = field.getDeclaringKlass().getStatics();
+            } else if (arguments[0] instanceof StaticObject providedReceiver) {
+                receiver = providedReceiver;
+            } else {
+                typeError.enter(node);
+                throw UnsupportedTypeException.create(arguments, "Expected an espresso object");
+            }
+            return field.get(receiver);
+        }
+
+        @Fallback
+        @SuppressWarnings("unused")
+        static Object doUnknown(Field receiver, String member, Object[] arguments) throws UnknownIdentifierException {
+            throw UnknownIdentifierException.create(member);
+        }
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    @SuppressWarnings("static-method")
+    public boolean isMemberReadable(String member) {
+        return READABLE_MEMBERS_SET.contains(member);
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    @SuppressWarnings("static-method")
+    public boolean isMemberInvocable(String member) {
+        return INVOCABLE_MEMBERS_SET.contains(member);
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public boolean hasMembers() {
+        return true;
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public Object getMembers(@SuppressWarnings("unused") boolean includeInternal) {
+        return ALL_MEMBERS;
+    }
+
+    @ExportMessage
+    public TriState isIdenticalOrUndefined(Object other) {
+        return TriState.valueOf(this == other);
+    }
+
+    @ExportMessage
+    public int identityHashCode() {
+        return System.identityHashCode(this);
+    }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,9 +38,9 @@ import java.util.function.BiFunction;
 
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.AlwaysInline;
-import com.oracle.svm.core.NeverInline;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
@@ -48,9 +48,8 @@ import com.oracle.svm.core.jdk.NativeLibraries;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
 import com.oracle.svm.core.jdk.StackTraceUtils;
 import com.oracle.svm.core.jdk.Target_java_lang_Module;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
 
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 import jdk.internal.foreign.MemorySessionImpl;
 import jdk.internal.foreign.Utils;
 import jdk.internal.loader.NativeLibrary;
@@ -67,14 +66,19 @@ import jdk.internal.reflect.Reflection;
  * succeed. See
  * {@link com.oracle.svm.core.jdk.Target_java_lang_ClassLoader#loadLibrary(java.lang.Class, java.lang.String)}
  */
-@TargetClass(className = "java.lang.foreign.SymbolLookup", onlyWith = ForeignFunctionsEnabled.class)
+@SuppressWarnings("javadoc")
+@TargetClass(className = "java.lang.foreign.SymbolLookup", onlyWith = ForeignAPIPredicates.Enabled.class)
 public final class Target_java_lang_foreign_SymbolLookup {
 
     @Substitute
     @CallerSensitive
     @NeverInline("Starting a stack walk in the caller frame")
     static SymbolLookup libraryLookup(String name, Arena arena) {
-        Util_java_lang_foreign_SymbolLookup.ensureNativeAccess(StackTraceUtils.getCallerClass(KnownIntrinsics.readCallerStackPointer(), true), SymbolLookup.class, "libraryLookup");
+        /*
+         * The --illegal-native-access check must use the direct caller's module. The stack walk
+         * starts in that caller's frame, even if the caller was inlined, so do not skip it.
+         */
+        Util_java_lang_foreign_SymbolLookup.ensureNativeAccess(StackTraceUtils.getCallerClass(KnownIntrinsics.readCallerStackPointer(), false), SymbolLookup.class, "libraryLookup");
         if (Utils.containsNullChars(name)) {
             throw new IllegalArgumentException("Cannot open library: " + name);
         }
@@ -85,7 +89,11 @@ public final class Target_java_lang_foreign_SymbolLookup {
     @CallerSensitive
     @NeverInline("Starting a stack walk in the caller frame")
     static SymbolLookup libraryLookup(Path path, Arena arena) {
-        Util_java_lang_foreign_SymbolLookup.ensureNativeAccess(StackTraceUtils.getCallerClass(KnownIntrinsics.readCallerStackPointer(), true), SymbolLookup.class, "libraryLookup");
+        /*
+         * The --illegal-native-access check must use the direct caller's module. The stack walk
+         * starts in that caller's frame, even if the caller was inlined, so do not skip it.
+         */
+        Util_java_lang_foreign_SymbolLookup.ensureNativeAccess(StackTraceUtils.getCallerClass(KnownIntrinsics.readCallerStackPointer(), false), SymbolLookup.class, "libraryLookup");
         if (path.getFileSystem() != FileSystems.getDefault()) {
             throw new IllegalArgumentException("Path not in default file system: " + path);
         }
@@ -139,11 +147,7 @@ final class Util_java_lang_foreign_SymbolLookup {
          */
         Target_java_lang_Module module = SubstrateUtil.cast(currentClass != null ? currentClass.getModule() : ClassLoader.getSystemClassLoader().getUnnamedModule(),
                         Target_java_lang_Module.class);
-        if (JavaVersionUtil.JAVA_SPEC <= 21) {
-            module.ensureNativeAccess(owner, methodName);
-        } else {
-            module.ensureNativeAccess(owner, methodName, currentClass);
-        }
+        module.ensureNativeAccess(owner, methodName, currentClass, false);
 
     }
 

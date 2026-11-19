@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -112,6 +112,7 @@ import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
 import com.oracle.truffle.llvm.runtime.memory.LLVMStack;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMControlFlowNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
+import com.oracle.truffle.llvm.runtime.nodes.api.LLVMFrameNullerExpression;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMFrameNullerExpressionNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMFrameNullerNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMInstrumentableNode;
@@ -333,6 +334,11 @@ public final class LLVMBitcodeInstructionVisitor implements SymbolVisitor {
         SSAValue target = instructionTargets.get(instructionTargets.size() - 1);
         if (target == slot) {
             LLVMExpressionNode expression = (LLVMExpressionNode) instructionNodes.get(instructionNodes.size() - 1);
+            if (expression instanceof LLVMFrameNullerExpression) {
+                // Moving this expression into its consumer would also move the frame-slot clears
+                // into the middle of that instruction, before its remaining operands execute.
+                return null;
+            }
             instructionNodes.remove(instructionNodes.size() - 1);
             instructionTargets.remove(instructionTargets.size() - 1);
             return expression;
@@ -531,12 +537,7 @@ public final class LLVMBitcodeInstructionVisitor implements SymbolVisitor {
         debugInfo.add(new InitAggreateLocalVariable(0, variable));
     }
 
-    private void handleDebugIntrinsic(SymbolImpl value, SourceVariable variable, MDExpression expression, long index, boolean isDeclaration) {
-        if (index != 0) {
-            // this is unsupported, it doesn't appear in LLVM 3.8+
-            return;
-        }
-
+    private void handleDebugIntrinsic(SymbolImpl value, SourceVariable variable, MDExpression expression, boolean isDeclaration) {
         int valueFrameSlot = -1;
         Object valueObject = null;
 
@@ -607,13 +608,13 @@ public final class LLVMBitcodeInstructionVisitor implements SymbolVisitor {
 
     @Override
     public void visit(DbgDeclareInstruction inst) {
-        handleDebugIntrinsic(inst.getValue(), inst.getVariable(), inst.getExpression(), 0L, true);
+        handleDebugIntrinsic(inst.getValue(), inst.getVariable(), inst.getExpression(), true);
         handleNullerInfo();
     }
 
     @Override
     public void visit(DbgValueInstruction inst) {
-        handleDebugIntrinsic(inst.getValue(), inst.getVariable(), inst.getExpression(), inst.getIndex(), false);
+        handleDebugIntrinsic(inst.getValue(), inst.getVariable(), inst.getExpression(), false);
         handleNullerInfo();
     }
 

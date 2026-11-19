@@ -27,6 +27,30 @@ package com.oracle.svm.core;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.svm.core.jdk.SystemPropertiesSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+/**
+ * {@code com.oracle.svm.hosted.VMFeature} registers an instance of this class in
+ * {@link org.graalvm.nativeimage.ImageSingletons} to allow images to use Strings provided by its
+ * fields at image run-time but also during image build-time. It allows us to persist the provided
+ * field values at image build-time to image run-time. A custom GraalVM distribution should provide
+ * different field values to differentiate itself from our builds by providing custom values for the
+ * org.graalvm.* system properties used below.
+ *
+ * {@link SystemPropertiesSupport} exposes these field values as system properties (to be available
+ * at image runtime) as:
+ * <ul>
+ * <li>{@link VM#info} as {@code java.vm.info}</li>
+ * <li>{@link VM#version} as {@code java.vm.version}</li>
+ * <li>{@link VM#vendor} as {@code java.vendor} and {@code java.vm.vendor}</li>
+ * <li>{@link VM#vendorUrl} as {@code java.vendor.url}</li>
+ * <li>{@link VM#vendorVersion} as {@code java.vendor.version}</li>
+ * </ul>
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class VM {
 
     public final String info;
@@ -35,6 +59,10 @@ public final class VM {
     public final String vendorUrl;
     public final String vendorVersion;
 
+    /* Preformatted version strings based on the values above. */
+    public final String formattedVmVersion;
+    public final String formattedJdkVersion;
+
     @Platforms(Platform.HOSTED_ONLY.class)
     public VM(String vmInfo) {
         info = vmInfo;
@@ -42,6 +70,9 @@ public final class VM {
         vendor = getVendor();
         vendorUrl = getVendorUrl();
         vendorVersion = getVendorVersion();
+
+        formattedVmVersion = vendorVersion + " (" + info + ")";
+        formattedJdkVersion = "JDK " + version;
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)

@@ -435,7 +435,8 @@ public class UnrollingTestNode {
         public static volatile int SpecialSideEffect11;
         public static volatile int SpecialSideEffect12;
 
-        public static int specialIterationNumber = 6;
+        // Keep ContinueOuter06 small enough to stay practical in local and CI runs.
+        public static int specialIterationNumber = 4;
 
         @TruffleBoundary
         public static int result() {

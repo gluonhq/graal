@@ -27,7 +27,7 @@ We recommend to check [Native Image Basics](NativeImageBasics.md) for a detailed
 To be suitable for closed-world assumption, the following Java features generally require metadata to pass to `native-image` at build time. 
 This metadata ensures that a native image uses the minimum amount of space necessary.
 
-The compatibility of Native Image with the most popular Java libraries was recently enhanced by publishing [shared reachability metadata on GitHub](https://github.com/oracle/graalvm-reachability). The users can share the burden of maintaining metadata for third-party dependencies and reuse it.
+The compatibility of Native Image with the most popular Java libraries was recently enhanced by publishing [shared reachability metadata on GitHub](https://github.com/oracle/graalvm-reachability-metadata). Users can share the burden of maintaining metadata for third-party dependencies and reuse it.
 See [Reachability Metadata](ReachabilityMetadata.md) to learn more.
 
 ## Features Incompatible with Closed-World Assumption
@@ -50,15 +50,6 @@ Native Image implements some Java features differently to the Java VM.
 `java.lang.System#getSecurityManager()` always returns `null` even if the security manager is set via `-Djava.security.manager` at startup.
 
 `java.lang.System#setSecurityManager(SecurityManager)` invoked with a non-null argument throws a `java.lang.SecurityException` if `-Djava.security.manager` is set to anything but `disallow` at program startup.
-
-### Signal Handlers
-
-Registering a signal handler requires a new thread to start that handles the signal and invokes shutdown hooks.
-By default, no signal handlers are registered when building a native image, unless they are registered explicitly by the user.
-For example, it is not recommended to register the default signal handlers when building a shared library, but it is desirable to include signal handlers when building a native executable for containerized environments, such as Docker containers.
-
-To register the default signal handlers, pass the `--install-exit-handlers` option to the `native-image` builder.
-This option gives you the same signal handlers as a Java VM.
 
 ### Class Initializers
 
@@ -111,7 +102,6 @@ Mostly all Native Image features are supported on Linux AArch64 architecture, ex
 
 * `-R:[+|-]WriteableCodeCache`: must be disabled.
 * `--libc=<value>`: `musl` is not supported.
-* `--gc=<value>`: The G1 garbage collector (`G1`) is not supported.
 
 Find a list of options for the `native-image` builder [here](BuildOptions.md).
 
@@ -119,4 +109,4 @@ Find a list of options for the `native-image` builder [here](BuildOptions.md).
 
 * [Class Initialization in Native Image](ClassInitialization.md)
 * [Reachability Metadata](ReachabilityMetadata.md)
-* [GraalVM Reachability Metadata Repository](https://github.com/oracle/graalvm-reachability)
+* [GraalVM Reachability Metadata Repository](https://github.com/oracle/graalvm-reachability-metadata)

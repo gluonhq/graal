@@ -25,14 +25,16 @@
 package jdk.graal.compiler.hotspot.stubs;
 
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
-import static jdk.graal.compiler.hotspot.GraalHotSpotVMConfig.INJECTED_VMCONFIG;
 import static jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor.Transition.LEAF_NO_VZERO;
 import static jdk.graal.compiler.hotspot.meta.HotSpotForeignCallsProviderImpl.NO_LOCATIONS;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotFieldLocationIdentity.METASPACE_ARRAY_LENGTH_LOCATION;
+import static jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil.HotSpotWordArrayLocationIdentity.SECONDARY_SUPERS_ELEMENT_LOCATION;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.FAST_PATH_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.NOT_FREQUENT_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.NOT_LIKELY_PROBABILITY;
 import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
@@ -41,12 +43,10 @@ import jdk.graal.compiler.graph.Node.NodeIntrinsic;
 import jdk.graal.compiler.hotspot.HotSpotForeignCallLinkage;
 import jdk.graal.compiler.hotspot.meta.HotSpotForeignCallDescriptor;
 import jdk.graal.compiler.hotspot.meta.HotSpotProviders;
-import jdk.graal.compiler.hotspot.replacements.HotSpotReplacementsUtil;
 import jdk.graal.compiler.hotspot.word.KlassPointer;
 import jdk.graal.compiler.lir.SyncPort;
 import jdk.graal.compiler.nodes.extended.ForeignCallNode;
 import jdk.graal.compiler.options.OptionValues;
-import jdk.graal.compiler.word.Word;
 
 /**
  * Stub for secondary supers table lookup in the case of collision.
@@ -55,7 +55,6 @@ public class LookUpSecondarySupersTableStub extends SnippetStub {
 
     public static final int SECONDARY_SUPERS_TABLE_SIZE = 64;
     public static final int SECONDARY_SUPERS_TABLE_MASK = SECONDARY_SUPERS_TABLE_SIZE - 1;
-    public static final long SECONDARY_SUPERS_BITMAP_FULL = ~0L;
 
     public static final HotSpotForeignCallDescriptor LOOKUP_SECONDARY_SUPERS_TABLE_SLOW_PATH = new HotSpotForeignCallDescriptor(LEAF_NO_VZERO, NO_SIDE_EFFECT, NO_LOCATIONS,
                     "lookupSecondarySupersTableSlowPath", boolean.class, KlassPointer.class, Word.class, long.class, long.class);
@@ -65,17 +64,19 @@ public class LookUpSecondarySupersTableStub extends SnippetStub {
     }
 
     // @formatter:off
-    @SyncPort(from = "https://github.com/openjdk/jdk/blob/8032d640c0d34fe507392a1d4faa4ff2005c771d/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L4883-L4992",
-              sha1 = "555f4e42531f3f1fc32bac28b2f4e3337b42374f")
+    @SyncPort(from = "https://github.com/openjdk/jdk25u/blob/58853f39377ea6168c4570327347294899d51f95/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L4475-L4581",
+              sha1 = "573099757de85d90c3cf8cee8ff332e195fe68c7")
     // @formatter:on
     @Snippet
     private static boolean lookupSecondarySupersTableSlowPath(KlassPointer t, Word secondarySupers, long bitmap, long index) {
-        int length = secondarySupers.readInt(HotSpotReplacementsUtil.metaspaceArrayLengthOffset(INJECTED_VMCONFIG), HotSpotReplacementsUtil.METASPACE_ARRAY_LENGTH_LOCATION);
+        int length = METASPACE_ARRAY_LENGTH_LOCATION.readInt(secondarySupers);
 
-        if (probability(NOT_FREQUENT_PROBABILITY, bitmap == SECONDARY_SUPERS_BITMAP_FULL)) {
-            // Degenerate case: more than 64 secondary supers.
-            for (int i = 0; i < length; i++) {
-                if (probability(NOT_LIKELY_PROBABILITY, t.equal(loadSecondarySupersElement(secondarySupers, i)))) {
+        if (probability(NOT_FREQUENT_PROBABILITY, length > SECONDARY_SUPERS_TABLE_SIZE - 2)) {
+            // The runtime does not use a hash table when length is greater than or equal to
+            // SECONDARY_SUPERS_TABLE_SIZE. For SECONDARY_SUPERS_TABLE_SIZE - 1, the hashed
+            // search would not be faster than linear probing.
+            for (int i = 0; probability(FAST_PATH_PROBABILITY, i < length); i++) {
+                if (probability(NOT_LIKELY_PROBABILITY, t.equal(SECONDARY_SUPERS_ELEMENT_LOCATION.readKlassPointer(secondarySupers, i)))) {
                     return true;
                 }
             }
@@ -90,7 +91,7 @@ public class LookUpSecondarySupersTableStub extends SnippetStub {
                 i = 0;
             }
 
-            if (probability(NOT_LIKELY_PROBABILITY, t.equal(loadSecondarySupersElement(secondarySupers, i)))) {
+            if (probability(NOT_LIKELY_PROBABILITY, t.equal(SECONDARY_SUPERS_ELEMENT_LOCATION.readKlassPointer(secondarySupers, i)))) {
                 return true;
             }
 
@@ -101,11 +102,6 @@ public class LookUpSecondarySupersTableStub extends SnippetStub {
         } while (probability(NOT_LIKELY_PROBABILITY, (currentBitmap & 0b10) != 0));
 
         return false;
-    }
-
-    public static KlassPointer loadSecondarySupersElement(Word metaspaceArray, long index) {
-        return KlassPointer.fromWord(metaspaceArray.readWord(WordFactory.signed(HotSpotReplacementsUtil.metaspaceArrayBaseOffset(INJECTED_VMCONFIG) + index * HotSpotReplacementsUtil.wordSize()),
-                        HotSpotReplacementsUtil.SECONDARY_SUPERS_ELEMENT_LOCATION));
     }
 
     @NodeIntrinsic(ForeignCallNode.class)

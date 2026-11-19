@@ -22,8 +22,16 @@
  */
 package com.oracle.truffle.espresso.runtime;
 
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.graalvm.nativeimage.PinnedObject;
+
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.espresso.impl.ClassRegistry;
+import com.oracle.truffle.espresso.impl.Field;
 import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.vm.VM;
 
@@ -43,10 +51,19 @@ public class EspressoThreadLocalState {
 
     private int singleSteppingDisabledCounter;
 
+    private boolean stepInProgress;
+
+    private boolean inTransformer;
+
+    private WeakReference<Thread> hostThread;
+
+    private List<PinnedObject> pinnedObjects;
+
     @SuppressWarnings("unused")
-    public EspressoThreadLocalState(EspressoContext context) {
+    public EspressoThreadLocalState(EspressoContext context, Thread t) {
         typeStack = new ClassRegistry.TypeStack();
         privilegedStack = new VM.PrivilegedStack(context);
+        assert ((hostThread = new WeakReference<>(t)) != null);
     }
 
     public StaticObject getPendingExceptionObject() {
@@ -72,8 +89,7 @@ public class EspressoThreadLocalState {
 
     public void setCurrentPlatformThread(StaticObject t) {
         assert t != null && StaticObject.notNull(t);
-        assert t.getKlass().getContext().getThreadAccess().getHost(t) == Thread.currentThread() : "Current thread fast access set by non-current thread";
-        assert currentPlatformThread == null || currentPlatformThread == t : currentPlatformThread + " vs " + t;
+        assert diagnose(t);
         currentPlatformThread = t;
     }
 
@@ -83,6 +99,7 @@ public class EspressoThreadLocalState {
     }
 
     public void initializeCurrentThread(StaticObject t) {
+        assert diagnose(t);
         setCurrentPlatformThread(t);
         setCurrentVirtualThread(t);
     }
@@ -124,8 +141,20 @@ public class EspressoThreadLocalState {
         return privilegedStack;
     }
 
-    public void disableSingleStepping() {
-        singleSteppingDisabledCounter++;
+    public void setSteppingInProgress(boolean value) {
+        stepInProgress = value;
+    }
+
+    public boolean isSteppingInProgress() {
+        return stepInProgress;
+    }
+
+    public boolean disableSingleStepping(boolean forceDisable) {
+        if (forceDisable || stepInProgress) {
+            singleSteppingDisabledCounter++;
+            return true;
+        }
+        return false;
     }
 
     public void enableSingleStepping() {
@@ -159,6 +188,28 @@ public class EspressoThreadLocalState {
         return inContinuation;
     }
 
+    @TruffleBoundary
+    public void pushPinnedObject(PinnedObject pinnedObject) {
+        if (pinnedObjects == null) {
+            pinnedObjects = new ArrayList<>();
+        }
+        pinnedObjects.add(pinnedObject);
+    }
+
+    @TruffleBoundary
+    public PinnedObject popPinnedObject(long addressOfFirstElement) {
+        if (pinnedObjects == null) {
+            return null;
+        }
+        for (int i = pinnedObjects.size() - 1; i >= 0; i--) {
+            PinnedObject pinnedObject = pinnedObjects.get(i);
+            if (pinnedObject.addressOfArrayElement(0).rawValue() == addressOfFirstElement) {
+                return pinnedObjects.remove(i);
+            }
+        }
+        return null;
+    }
+
     public final class ContinuationScope implements AutoCloseable {
         private final int startBlocks;
 
@@ -180,5 +231,79 @@ public class EspressoThreadLocalState {
         // Why one and not zero here? Because the fact we reached here means we're inside the
         // suspend intrinsic, and we don't want to consider that as blocking the suspend.
         return suspensionBlocks > 1;
+    }
+
+    public TransformerScope transformerScope() {
+        return new TransformerScope();
+    }
+
+    public boolean isInTransformer() {
+        return inTransformer;
+    }
+
+    public final class TransformerScope implements AutoCloseable {
+
+        private TransformerScope() {
+            inTransformer = true;
+        }
+
+        @Override
+        public void close() {
+            inTransformer = false;
+        }
+    }
+
+    // Helper methods for assertions
+    private boolean diagnose(StaticObject t) {
+        // @formatter:off
+        // Ensure we work from the thread used for this local creation.
+        assert Thread.currentThread() == hostThread.get() : //
+                "Initializing current thread in EspressoThreadLocalState for a different thread than current:\n" +
+                "    Current: " + Thread.currentThread() + "\n" +
+                "    Registered: " + hostThread.get();
+
+        // Ensure the registered guest thread is and stays linked to the corresponding host thread.
+        if (currentPlatformThread != null) {
+            assert getHost(currentPlatformThread) == Thread.currentThread() : //
+                    "Registered platform thread not associated with current host thread.";
+        }
+
+        // Ensure we are consistently registering guest threads.
+        if (t != null) {
+            // The thread we are registering is linked to the current thread.
+            assert getHost(t) == Thread.currentThread() : //
+                    "Current thread fast access set by non-current thread";
+
+            EspressoContext ctx = EspressoContext.get(null);
+            Field managedBit = ctx.getMeta().java_lang_Thread_0espressoManaged;
+
+            // Ensure we are not registering multiple guest threads for the same host thread.
+            assert currentPlatformThread == null || currentPlatformThread == t : //
+                    /*- Report these threads names */
+                    getHost(currentPlatformThread).getName() + " vs " + getHost(t).getName() + "\n" +
+                    /*- Report these threads identities */
+                    "Guest identities: " + System.identityHashCode(currentPlatformThread) + " vs " + System.identityHashCode(t) + "\n" +
+                    /*- Checks if our host threads are actually different, or if it is simply a renamed one. */
+                    "Host identities: " + System.identityHashCode(getHost(currentPlatformThread)) + " vs " + System.identityHashCode(getHost(t)) + "/n" +
+                    /*- Obtain the `managed` bits to know the origin of these threads */
+                    "Managed by espresso: " + managedBit.getBoolean(currentPlatformThread) + " vs " + managedBit.getBoolean(t);
+        }
+        // @formatter:on
+        /*
+         * Current theory for GR-50089:
+         *
+         * Lack of synchronization in `ThreadAccess.createJavaThread()` makes it so the polyglot
+         * thread is started and can reach `EspressoLanguage.initializeThread()` before the store to
+         * the thread registry can be observed.
+         *
+         * Now that a `synchronize` block has been added to `EspressoThreadRegistry`, this assertion
+         * should no longer trigger.
+         */
+        return true;
+    }
+
+    private static Thread getHost(StaticObject t) {
+        assert t != null && StaticObject.notNull(t);
+        return t.getKlass().getContext().getThreadAccess().getHost(t);
     }
 }

@@ -29,7 +29,7 @@ import java.util.List;
 
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.util.ModuleSupport;
+import com.oracle.svm.shared.util.ModuleSupport;
 
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaUtil;
@@ -78,6 +78,19 @@ public class SignatureUtil {
             sb.append(MetaUtil.toInternalName(type.toString()));
         }
         return sb.append(')').toString();
+    }
+
+    public static String toInternalSignature(Class<?>[] parameters) {
+        List<String> names;
+        if (parameters == null) {
+            names = List.of();
+        } else {
+            names = new ArrayList<>(parameters.length);
+            for (Class<?> parameter : parameters) {
+                names.add(parameter.getName());
+            }
+        }
+        return toInternalSignature(names);
     }
 
     public static String toInternalClassName(String qualifiedForNameString) {

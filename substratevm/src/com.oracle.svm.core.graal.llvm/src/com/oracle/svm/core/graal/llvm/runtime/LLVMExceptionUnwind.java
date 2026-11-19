@@ -24,11 +24,11 @@
  */
 package com.oracle.svm.core.graal.llvm.runtime;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
+import static org.graalvm.nativeimage.c.function.CFunction.Transition.NO_TRANSITION;
 
 import java.util.function.BooleanSupplier;
 
-import jdk.graal.compiler.core.common.NumUtil;
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.c.CContext;
@@ -37,18 +37,25 @@ import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.struct.CField;
 import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.WordFactory;
 
 import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.c.InitializeReservedRegistersPrologue;
 import com.oracle.svm.core.graal.llvm.util.LLVMDirectives;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.snippets.ExceptionUnwind;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
 import com.oracle.svm.hosted.code.CEntryPointCallStubSupport;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -82,26 +89,36 @@ public class LLVMExceptionUnwind {
      * NodeLLVMBuilder.emitReadExceptionObject).
      */
     @CEntryPoint(include = IncludeForLLVMOnly.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(prologue = InitializeReservedRegistersPrologue.class, epilogue = CEntryPointOptions.NoEpilogue.class)
     @Uninterruptible(reason = "Must not execute a recurring callback before returning", calleeMustBe = false)
     @SuppressWarnings("unused")
     public static int personality(int version, int action, IsolateThread thread, _Unwind_Exception unwindException, _Unwind_Context context) {
-        Pointer ip = getIP(context);
+        CIntPointer ipBeforeInstruction = UnsafeStackValue.get(Integer.BYTES);
+        Pointer ip = getIPInfo(context, ipBeforeInstruction);
+        if (ipBeforeInstruction.read() == 0) {
+            ip = ip.subtract(1);
+        }
         Pointer functionStart = getRegionStart(context);
-        int pcOffset = NumUtil.safeToInt(ip.rawValue() - functionStart.rawValue());
+        long pcOffset = ip.rawValue() - functionStart.rawValue();
 
         Pointer lsda = getLanguageSpecificData(context);
-        Long handlerOffset = GCCExceptionTable.getHandlerOffset(lsda, pcOffset);
+        long handlerInfo = GCCExceptionTable.getHandlerInfo(lsda, pcOffset);
 
-        if (handlerOffset == null || handlerOffset == 0) {
+        if (handlerInfo == GCCExceptionTable.NO_HANDLER) {
             return _URC_CONTINUE_UNWIND();
         }
 
         if ((action & _UA_SEARCH_PHASE()) != 0) {
+            if (GCCExceptionTable.isCleanup(handlerInfo)) {
+                return _URC_CONTINUE_UNWIND();
+            }
             return _URC_HANDLER_FOUND();
         } else if ((action & _UA_CLEANUP_PHASE()) != 0) {
-            setIP(context, functionStart.add(handlerOffset.intValue()));
-
-            StackOverflowCheck.singleton().protectYellowZone();
+            setIP(context, functionStart.add((int) GCCExceptionTable.getHandlerOffset(handlerInfo)));
+            Throwable exception = ExceptionUnwind.currentException.get();
+            if (!GCCExceptionTable.isCleanup(handlerInfo) && exception instanceof StackOverflowError && StackOverflowCheck.singleton().isYellowZoneAvailable()) {
+                StackOverflowCheck.singleton().protectYellowZone();
+            }
             return _URC_INSTALL_CONTEXT();
         } else {
             return _URC_FATAL_PHASE1_ERROR();
@@ -115,7 +132,7 @@ public class LLVMExceptionUnwind {
         return exception;
     }
 
-    private static class IncludeForLLVMOnly implements BooleanSupplier {
+    private static final class IncludeForLLVMOnly implements BooleanSupplier {
         @Override
         public boolean getAsBoolean() {
             return SubstrateOptions.useLLVMBackend();
@@ -140,15 +157,19 @@ public class LLVMExceptionUnwind {
     }
 
     public static ExceptionUnwind createRaiseExceptionHandler() {
-        return new ExceptionUnwind() {
-            @Override
-            protected void customUnwindException(Pointer callerSP) {
-                _Unwind_Exception exceptionStructure = UnsafeStackValue.get(_Unwind_Exception.class);
-                exceptionStructure.set_exception_class(CurrentIsolate.getCurrentThread());
-                exceptionStructure.set_exception_cleanup(WordFactory.nullPointer());
-                raiseException(exceptionStructure);
-            }
-        };
+        return new LLVMExceptionUnwindHandler();
+    }
+
+    @SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
+    private static final class LLVMExceptionUnwindHandler extends ExceptionUnwind {
+        @Override
+        @Uninterruptible(reason = "Code that is fully uninterruptible may throw and catch exceptions. Therefore, the exception handling must be fully uninterruptible as well.")
+        protected void customUnwindException(Pointer callerSP) {
+            _Unwind_Exception exceptionStructure = UnsafeStackValue.get(_Unwind_Exception.class);
+            exceptionStructure.set_exception_class(CurrentIsolate.getCurrentThread());
+            exceptionStructure.set_exception_cleanup(WordFactory.nullPointer());
+            raiseException(exceptionStructure);
+        }
     }
 
     // Allow methods with non-standard names: Checkstyle: stop
@@ -198,19 +219,22 @@ public class LLVMExceptionUnwind {
     private interface _Unwind_Context extends PointerBase {
     }
 
-    @CFunction(value = "_Unwind_RaiseException")
+    @CFunction(value = "_Unwind_RaiseException", transition = NO_TRANSITION)
     public static native int raiseException(_Unwind_Exception exception);
 
-    @CFunction(value = "_Unwind_GetIP")
+    @CFunction(value = "_Unwind_GetIP", transition = NO_TRANSITION)
     public static native Pointer getIP(_Unwind_Context context);
 
-    @CFunction(value = "_Unwind_SetIP")
+    @CFunction(value = "_Unwind_GetIPInfo", transition = NO_TRANSITION)
+    public static native Pointer getIPInfo(_Unwind_Context context, CIntPointer ipBeforeInstruction);
+
+    @CFunction(value = "_Unwind_SetIP", transition = NO_TRANSITION)
     public static native Pointer setIP(_Unwind_Context context, Pointer ip);
 
-    @CFunction(value = "_Unwind_GetRegionStart")
+    @CFunction(value = "_Unwind_GetRegionStart", transition = NO_TRANSITION)
     public static native Pointer getRegionStart(_Unwind_Context context);
 
-    @CFunction(value = "_Unwind_GetLanguageSpecificData")
+    @CFunction(value = "_Unwind_GetLanguageSpecificData", transition = NO_TRANSITION)
     public static native Pointer getLanguageSpecificData(_Unwind_Context context);
 }
 

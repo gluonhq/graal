@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -70,6 +70,7 @@ public final class CacheExpression extends MessageContainer {
     private boolean alwaysInitialized;
     private boolean eagerInitialize;
     private Message uncachedExpressionError;
+    private boolean requiresFrame;
     private boolean requiresBoundary;
     private boolean mergedLibrary;
     private boolean isWeakReferenceGet;
@@ -81,6 +82,7 @@ public final class CacheExpression extends MessageContainer {
 
     private LibraryData cachedlibrary;
     private boolean usedInGuard;
+    private boolean usedInCache;
 
     private AnnotationMirror sharedGroupMirror;
     private AnnotationValue sharedGroupValue;
@@ -118,12 +120,59 @@ public final class CacheExpression extends MessageContainer {
         return copy;
     }
 
+    public boolean isSameCache(Object obj) {
+        if (obj instanceof CacheExpression e) {
+            if (!ElementUtils.typeEquals(sourceAnnotationMirror.getAnnotationType(), e.sourceAnnotationMirror.getAnnotationType())) {
+                return false;
+            } else if (!ElementUtils.typeEquals(getParameter().getType(), e.getParameter().getType())) {
+                return false;
+            } else if (this.dimensions != e.dimensions) {
+                return false;
+            } else if (this.alwaysInitialized != e.alwaysInitialized) {
+                return false;
+            } else if (this.eagerInitialize != e.eagerInitialize) {
+                return false;
+            } else if (this.requiresBoundary != e.requiresBoundary) {
+                return false;
+            } else if (this.mergedLibrary != e.mergedLibrary) {
+                return false;
+            } else if (this.isWeakReferenceGet != e.isWeakReferenceGet) {
+                return false;
+            } else if (this.isWeakReference != e.isWeakReference) {
+                return false;
+            } else if (this.adopt != e.adopt) {
+                return false;
+            } else if (this.usedInGuard != e.usedInGuard) {
+                return false;
+            } else if (this.neverDefault != e.neverDefault) {
+                return false;
+            } else if (this.neverDefaultGuaranteed != e.neverDefaultGuaranteed) {
+                return false;
+            } else if (!Objects.equals(defaultExpression, e.defaultExpression)) {
+                return false;
+            } else if (!Objects.equals(uncachedExpression, e.uncachedExpression)) {
+                return false;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public void setIsUsedInGuard(boolean b) {
         this.usedInGuard = b;
     }
 
+    public void setUsedInCache(boolean usedInCache) {
+        this.usedInCache = usedInCache;
+    }
+
     public boolean isUsedInGuard() {
         return usedInGuard;
+    }
+
+    public boolean isUsedInCache() {
+        return usedInCache;
     }
 
     public boolean isNeverDefault() {
@@ -164,6 +213,28 @@ public final class CacheExpression extends MessageContainer {
         this.sharedGroupValue = null;
     }
 
+    private String disabledSharingGroup;
+
+    /**
+     * Disabling sharing is different from just clearing sharing as it makes sure that the node
+     * still compiles correctly after automatically disabling sharing for an individual cache. There
+     * might be new warnings, but no new errors for disabled caches.
+     */
+    public void disableSharing() {
+        if (getInlinedNode() == null) {
+            throw new IllegalStateException("We do not support disabling sharing for non-inlined nodes.");
+        }
+
+        if (this.disabledSharingGroup == null) {
+            this.disabledSharingGroup = this.sharedGroup;
+        }
+        clearSharing();
+    }
+
+    public String getDisabledSharingGroup() {
+        return disabledSharingGroup;
+    }
+
     public AnnotationMirror getSharedGroupMirror() {
         return sharedGroupMirror;
     }
@@ -195,7 +266,7 @@ public final class CacheExpression extends MessageContainer {
         this.uncachedExpression = getUncachedExpression;
     }
 
-    public Message getUncachedExpresionError() {
+    public Message getUncachedExpressionError() {
         return uncachedExpressionError;
     }
 
@@ -265,6 +336,14 @@ public final class CacheExpression extends MessageContainer {
     @Override
     public AnnotationMirror getMessageAnnotation() {
         return sourceAnnotationMirror;
+    }
+
+    public void setRequiresFrame(boolean requiresFrame) {
+        this.requiresFrame = requiresFrame;
+    }
+
+    public boolean isRequiresFrame() {
+        return this.requiresFrame;
     }
 
     public void setRequiresBoundary(boolean requiresBoundary) {

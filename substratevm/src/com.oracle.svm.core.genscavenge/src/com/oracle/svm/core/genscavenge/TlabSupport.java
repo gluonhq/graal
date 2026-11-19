@@ -1,0 +1,550 @@
+/*
+ * Copyright (c) 2025, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.genscavenge;
+
+import static com.oracle.svm.core.genscavenge.ThreadLocalAllocation.Descriptor;
+import static com.oracle.svm.core.genscavenge.ThreadLocalAllocation.allocatedAlignedBytes;
+import static com.oracle.svm.core.genscavenge.ThreadLocalAllocation.getTlab;
+import static com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.TLAB_END_IDENTITY;
+import static com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.TLAB_START_IDENTITY;
+import static com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.TLAB_TOP_IDENTITY;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.IsolateThread;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.WordPointer;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.core.SubstrateDiagnostics;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.core.thread.ThreadsLock;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.core.thread.VMThreads;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalBytes;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalWord;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.NumUtil;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.replacements.Fold;
+
+/**
+ * Provides methods for initializing, calculating the size and retiring TLABs used in
+ * {@link ThreadLocalAllocation}. Additionally, it provides the functionality to resize the TLAB
+ * after a GC, based on {@link #allocatedBytesAvg}, the average a thread allocated in TLABs.
+ * Therefore, different threads may have TLABs of different size.
+ * <p>
+ * Below is an example for the dynamic resizing of the TLAB. One thread allocates lots of objects
+ * and another thread allocates nothing. Between GC 23 and GC 24 the allocation behaviour of these
+ * two threads switches. The allocation average and the TLAB size adapt to the new allocation
+ * behavior.
+ *
+ * <pre>
+ * +-----+---------------------------------------++---------------------------------------+
+ * | #GC | Thread 1                              || Thread 2                              |
+ * |     | alloc. bytes | alloc. avg | TLAB size || alloc. bytes | alloc. avg | TLAB size |
+ * +-----+--------------+------------+-----------++--------------+------------+-----------+
+ * |  22 |       3,54MB |     3,25MB |   66,66kB ||           0B |   402,35kB |    8,05kB |
+ * |  23 |       3,55MB |     3,36MB |   68,77kB ||           0B |   261,53kB |    5,23kB |
+ * +-----+--------------+------------+-----------++--------------+------------+-----------+ <-- allocation behaviour
+ * |  24 |       0,27MB |     2,28MB |   46,62kB ||       3,20MB |     1,29MB |   26,37kB |     switched
+ * |  25 |           0B |     1,48MB |   30,30kB ||       3,51MB |     2,06MB |   42,29kB |
+ * |  26 |           0B |   984,75kB |   19,70kB ||       3,52MB |     2,58MB |   52,75kB |
+ * |  27 |           0B |   640,09kB |   12,80kB ||       3,54MB |     2,91MB |   59,64kB |
+ * |  28 |           0B |   416,06kB |    8,32kB ||       3,54MB |     3,13MB |   64,16kB |
+ * |  29 |           0B |   270,44kB |    5,41kB ||       3,55MB |     3,28MB |   67,14kB |
+ * +-----+--------------+------------+-----------++--------------+------------+-----------+
+ * </pre>
+ * <p>
+ * A thread allocating a very large amount of memory will also have a high
+ * {@link #allocatedBytesAvg}. If such a thread later changes its allocation behaviour and only
+ * allocates a small amount of memory the {@link #allocatedBytesAvg} starts decreasing with the next
+ * GC. But the {@link #desiredSize} will only change after the {@link #allocatedBytesAvg} decreased
+ * enough, which may take a few GCs.
+ */
+public class TlabSupport {
+
+    /*
+     * Constants for tuning the resizing of TLABs. These constants match certain option values in
+     * HotSpot.
+     */
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/tlab_globals.hpp#L65-L67")//
+    private static final long TLAB_ALLOCATION_WEIGHT = 35L;
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/tlab_globals.hpp#L69-L76")//
+    private static final long TLAB_WASTE_TARGET_PERCENT = 1L;
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/tlab_globals.hpp#L78-L80")//
+    private static final long TLAB_REFILL_WASTE_FRACTION = 64L;
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/tlab_globals.hpp#L82-L85")//
+    private static final long TLAB_WASTE_INCREMENT = 4;
+
+    /* The desired size of the TLAB, including the reserve for filling the unused memory. */
+    private static final FastThreadLocalWord<UnsignedWord> desiredSize = FastThreadLocalFactory.createWord("TlabSupport.desiredSize");
+    private static final FastThreadLocalWord<UnsignedWord> tlabAllocatedAlignedBytesBeforeLastGC = FastThreadLocalFactory.createWord("TlabSupport.tlabAllocatedAlignedBytesBeforeLastGC");
+    private static final FastThreadLocalInt numberOfRefills = FastThreadLocalFactory.createInt("TlabSupport.numberOfRefills");
+    private static final FastThreadLocalInt refillWaste = FastThreadLocalFactory.createInt("TlabSupport.refillWaste");
+    private static final FastThreadLocalInt gcWaste = FastThreadLocalFactory.createInt("TlabSupport.gcWaste");
+
+    /* Average of allocated bytes in TLABs of this thread. */
+    private static final FastThreadLocalBytes<AdaptiveWeightedAverageStruct.Data> allocatedBytesAvg = FastThreadLocalFactory
+                    .createBytes(() -> SizeOf.get(AdaptiveWeightedAverageStruct.Data.class), "TlabSupport.allocatedBytesAvg");
+
+    /* Hold onto the TLAB if availableTlabMemory() is larger than this. */
+    private static final FastThreadLocalWord<UnsignedWord> refillWasteLimit = FastThreadLocalFactory.createWord("TlabSupport.refillWasteLimit");
+
+    private static final FastThreadLocalInt slowAllocations = FastThreadLocalFactory.createInt("TlabSupport.slowAllocations");
+
+    /* Expected number of refills between GCs. */
+    private static UnsignedWord targetRefills = Word.unsigned(1);
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+8/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L226-L267")
+    @Uninterruptible(reason = "Accesses TLAB")
+    public static void startupInitialization() {
+        TlabOptionCache.singleton().cacheOptionValues();
+
+        // Assuming each thread's active tlab is, on average, 1/2 full at a GC.
+        targetRefills = Word.unsigned(100 / (2 * TLAB_WASTE_TARGET_PERCENT));
+        // The value has to be at least one as it is used in a division.
+        targetRefills = UnsignedUtils.max(targetRefills, Word.unsigned(1));
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L208-L225")
+    @Uninterruptible(reason = "Accesses TLAB")
+    public static void initialize(IsolateThread thread) {
+        initialize(getTlab(thread), Word.nullPointer(), Word.nullPointer(), Word.nullPointer());
+        desiredSize.set(thread, initialDesiredSize());
+
+        AdaptiveWeightedAverageStruct.initialize(allocatedBytesAvg.getAddress(thread), TLAB_ALLOCATION_WEIGHT);
+
+        refillWasteLimit.set(initialRefillWasteLimit());
+
+        resetStatistics(thread);
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+25/src/hotspot/share/gc/shared/memAllocator.cpp#L257-L329")
+    @Uninterruptible(reason = "Holds uninitialized memory.")
+    static Pointer allocateRawMemoryInTlabSlow(UnsignedWord size) {
+        ThreadLocalAllocation.Descriptor tlab = getTlab();
+        assert availableTlabMemory(tlab).belowThan(size);
+
+        /*
+         * If there is a lot of free memory in the current TLAB, retain the TLAB and allocate the
+         * object outside the TLAB.
+         */
+        if (shouldRetainTlab(tlab)) {
+            recordSlowAllocation();
+            return Word.nullPointer();
+        }
+
+        /* Retire the current TLAB. */
+        recordRefillWaste();
+        retireTlab(CurrentIsolate.getCurrentThread(), false);
+
+        /* Compute the size of the new TLAB. */
+        UnsignedWord min = computeMinSizeOfNewTlab(size);
+        UnsignedWord desired = computeDesiredSizeOfNewTlab(size);
+        if (desired.belowThan(min)) {
+            /* New TLAB would be too small. */
+            return Word.nullPointer();
+        }
+
+        /* Try to allocate a new TLAB. Any size between min and desired is accepted. */
+        WordPointer actualSizePtr = StackValue.get(WordPointer.class);
+        actualSizePtr.write(0, Word.zero());
+
+        Pointer memory = YoungGeneration.getEdenAllocation().allocateNewTlab(min, desired, actualSizePtr);
+        UnsignedWord actual = actualSizePtr.read();
+        if (memory.isNull()) {
+            assert actual.equal(Word.zero()) : "Allocation failed, but actual size was updated.";
+            return Word.nullPointer();
+        }
+
+        assert actual.aboveOrEqual(min);
+        refillTlab(memory, memory.add(size), actual);
+        return memory;
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+25/src/hotspot/share/runtime/thread.cpp#L168-L174")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L183-L195")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void refillTlab(Pointer start, Pointer top, UnsignedWord size) {
+        numberOfRefills.set(numberOfRefills.get() + 1);
+
+        /* Refill the TLAB. */
+        Pointer hardEnd = start.add(size);
+        Pointer end = hardEnd.subtract(getFillerObjectSize());
+        assert top.belowOrEqual(end) : "size too small";
+
+        initialize(getTlab(), start, top, end);
+
+        /* Reset amount of internal fragmentation. */
+        refillWasteLimit.set(initialRefillWasteLimit());
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+25/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L143-L145")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void recordRefillWaste() {
+        long availableTlabMemory = availableTlabMemory(getTlab()).rawValue();
+        refillWaste.set(refillWaste.get() + NumUtil.safeToInt(availableTlabMemory));
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+25/src/hotspot/share/runtime/thread.cpp#L157-L166")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+25/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L131-L141")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void retireTlab(IsolateThread thread, boolean updateStats) {
+        /* Track total size of Java objects that were allocated in TLABs. */
+        ThreadLocalAllocation.Descriptor tlab = getTlab(thread);
+        if (tlab.getAllocationEnd(TLAB_END_IDENTITY).isNonNull()) {
+            UnsignedWord usedBytes = getUsedTlabSize(tlab);
+            allocatedAlignedBytes.set(thread, allocatedAlignedBytes.get(thread).add(usedBytes));
+        }
+
+        /* Update TLAB statistics for each thread at the start of a GC. */
+        if (updateStats) {
+            accumulateAndResetStatistics(thread);
+        }
+
+        /* Make the TLAB look full and reset the data of the TLAB descriptor to null. */
+        if (tlab.getAllocationEnd(TLAB_END_IDENTITY).isNonNull()) {
+            assert checkInvariants(tlab);
+            insertFiller(tlab);
+            initialize(tlab, Word.nullPointer(), Word.nullPointer(), Word.nullPointer());
+        }
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static UnsignedWord getUsedTlabSize(Descriptor tlab) {
+        UnsignedWord start = tlab.getAlignedAllocationStart(TLAB_START_IDENTITY);
+        UnsignedWord top = tlab.getAllocationTop(TLAB_TOP_IDENTITY);
+
+        assert top.aboveOrEqual(start);
+        return top.subtract(start);
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L197-L206")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void initialize(ThreadLocalAllocation.Descriptor tlab, Pointer start, Pointer top, Pointer end) {
+        VMError.guarantee(top.belowOrEqual(end), "top greater end during initialization");
+
+        tlab.setAlignedAllocationStart(start, TLAB_START_IDENTITY);
+        tlab.setAllocationTop(top, TLAB_TOP_IDENTITY);
+        tlab.setAllocationEnd(end, TLAB_END_IDENTITY);
+
+        assert checkInvariants(tlab);
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.hpp#L90")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static boolean checkInvariants(Descriptor tlab) {
+        return tlab.getAllocationTop(TLAB_TOP_IDENTITY).aboveOrEqual(tlab.getAlignedAllocationStart(TLAB_START_IDENTITY)) &&
+                        tlab.getAllocationTop(TLAB_TOP_IDENTITY).belowOrEqual(tlab.getAllocationEnd(TLAB_END_IDENTITY));
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    static void suspendAllocationInCurrentThread() {
+        retireTlab(CurrentIsolate.getCurrentThread(), false);
+    }
+
+    @Uninterruptible(reason = "Tear-down in progress.")
+    static void tearDown() {
+        // no other thread is alive, so it is always safe to access the first thread
+        IsolateThread thread = VMThreads.firstThreadUnsafe();
+        VMError.guarantee(VMThreads.nextThread(thread).isNull(), "Other isolate threads are still active");
+
+        // Aligned chunks are handled in EdenAllocation.
+        HeapChunkProvider.freeUnalignedChunkList(getTlab(thread).getUnalignedChunk());
+    }
+
+    static void disableAndFlushForAllThreads() {
+        VMOperation.guaranteeInProgressAtSafepoint("TlabSupport.disableAndFlushForAllThreads");
+
+        for (IsolateThread vmThread = VMThreads.firstThread(); vmThread.isNonNull(); vmThread = VMThreads.nextThread(vmThread)) {
+            disableAndFlushForThread(vmThread);
+        }
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    static void disableAndFlushForThread(IsolateThread vmThread) {
+        retireTlabToEden(vmThread);
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void retireTlabToEden(IsolateThread thread) {
+        /*
+         * This method is used both during a VM operation and while detaching a thread. So, it
+         * cannot check more than that there is some mutual exclusion.
+         */
+        VMError.guarantee(ThreadsLock.hasWriteAccess(), "Otherwise, we wouldn't be allowed to access the space.");
+
+        boolean updateStats = VMOperation.isGCInProgress();
+        retireTlab(thread, updateStats);
+
+        Descriptor tlab = getTlab(thread);
+        UnalignedHeapChunk.UnalignedHeader unalignedChunk = tlab.getUnalignedChunk();
+        tlab.setUnalignedChunk(Word.nullPointer());
+
+        Space eden = HeapImpl.getHeapImpl().getYoungGeneration().getEden();
+        while (unalignedChunk.isNonNull()) {
+            UnalignedHeapChunk.UnalignedHeader next = HeapChunk.getNext(unalignedChunk);
+            HeapChunk.setNext(unalignedChunk, Word.nullPointer());
+            eden.appendUnalignedHeapChunk(unalignedChunk);
+            unalignedChunk = next;
+        }
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static UnsignedWord availableTlabMemory(Descriptor tlab) {
+        Pointer top = tlab.getAllocationTop(TLAB_TOP_IDENTITY);
+        Pointer end = tlab.getAllocationEnd(TLAB_END_IDENTITY);
+        assert top.belowOrEqual(end);
+
+        if (top.isNull() || end.isNull()) {
+            return Word.unsigned(0);
+        }
+        return end.subtract(top);
+    }
+
+    /**
+     * If the minimum object size is greater than {@link ObjectLayout#getAlignment()}, we can end up
+     * with a shard at the end of the buffer that's smaller than the smallest object (see
+     * {@link com.oracle.svm.core.heap.FillerObject}). We can't allow that because the buffer must
+     * look like it's full of objects when we retire it, so we make sure we always have enough space
+     * for a filler object.
+     */
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/collectedHeap.cpp#L253-L259")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord getFillerObjectSize() {
+        int minSize = FillerObjectUtil.instanceMinSize();
+        int alignment = ObjectLayout.singleton().getAlignment();
+        assert FillerObjectUtil.arrayMinSize() - minSize <= alignment : "all sizes above min instance size must be fillable";
+        return (minSize > alignment) ? Word.unsigned(minSize) : Word.zero();
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L119-L124")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void insertFiller(ThreadLocalAllocation.Descriptor tlab) {
+        assert tlab.getAllocationTop(TLAB_TOP_IDENTITY).isNonNull() : "Must not be retired";
+        assert tlab.getAllocationEnd(TLAB_END_IDENTITY).isNonNull() : "Must not be retired";
+
+        Pointer top = tlab.getAllocationTop(TLAB_TOP_IDENTITY);
+        UnsignedWord hardEnd = tlab.getAllocationEnd(TLAB_END_IDENTITY).add(getFillerObjectSize());
+        UnsignedWord size = hardEnd.subtract(top);
+
+        if (top.belowThan(hardEnd)) {
+            FillerObjectUtil.writeFillerObjectAt(top, size, false, true);
+        }
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L175-L181")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void resetStatistics(IsolateThread thread) {
+        numberOfRefills.set(thread, 0);
+        refillWaste.set(thread, 0);
+        gcWaste.set(thread, 0);
+        slowAllocations.set(thread, 0);
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L270-L289")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord initialDesiredSize() {
+        return Word.unsigned(TlabOptionCache.singleton().getTlabSize());
+    }
+
+    /**
+     * Compute the next tlab size using expected allocation amount.
+     */
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+11/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L154-L172")
+    public static void resize(IsolateThread thread) {
+        assert SubstrateGCOptions.ResizeTLAB.getValue();
+        assert VMOperation.isGCInProgress();
+
+        UnsignedWord allocatedAvg = Word.unsigned((long) AdaptiveWeightedAverageStruct.getAverage(allocatedBytesAvg.getAddress(thread)));
+        UnsignedWord newSize = allocatedAvg.unsignedDivide(targetRefills);
+
+        long minTlabSize = TlabOptionCache.getMinTlabSize();
+        newSize = UnsignedUtils.clamp(newSize, Word.unsigned(minTlabSize), maxSize());
+        UnsignedWord alignedNewSize = Word.unsigned(ObjectLayout.singleton().alignUp(newSize.rawValue()));
+
+        if (SerialAndEpsilonGCOptions.PrintTLAB.getValue()) {
+            Log.log().string("TLAB new size: thread ").zhex(thread)
+                            .string(", target refills: ").unsigned(targetRefills)
+                            .string(", alloc avg.: ").unsigned(allocatedAvg)
+                            .string(", desired size: ").unsigned(desiredSize.get(thread))
+                            .string(" -> ").unsigned(alignedNewSize).newline();
+        }
+
+        desiredSize.set(thread, alignedNewSize);
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L64")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord initialRefillWasteLimit() {
+        return desiredSize.get().unsignedDivide(Word.unsigned(TLAB_REFILL_WASTE_FRACTION));
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+8/src/hotspot/share/gc/shared/threadLocalAllocBuffer.inline.hpp#L54-L71")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord computeDesiredSizeOfNewTlab(UnsignedWord allocationSize) {
+        assert UnsignedUtils.isAMultiple(allocationSize, Word.unsigned(ObjectLayout.singleton().getAlignment()));
+
+        /*
+         * Compute the size of the new TLAB. To minimize fragmentation, the last TLAB that fits into
+         * a heap chunk may be smaller than the desired size.
+         */
+        UnsignedWord availableSize = YoungGeneration.getEdenAllocation().availableSizeForNewTlab();
+        UnsignedWord newTlabSize = UnsignedUtils.min(availableSize, desiredSize.get().add(allocationSize));
+        assert newTlabSize.belowOrEqual(maxSize());
+        return newTlabSize;
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.inline.hpp#L73-L77")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static UnsignedWord computeMinSizeOfNewTlab(UnsignedWord allocationSize) {
+        assert ObjectLayout.singleton().isAligned(allocationSize);
+
+        UnsignedWord sizeWithReserve = allocationSize.add(getFillerObjectSize());
+        UnsignedWord minTlabSize = Word.unsigned(TlabOptionCache.getMinTlabSize());
+        return UnsignedUtils.max(sizeWithReserve, minTlabSize);
+    }
+
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static boolean shouldRetainTlab(Descriptor tlab) {
+        return availableTlabMemory(tlab).aboveThan(refillWasteLimit.get());
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25+11/src/hotspot/share/gc/shared/threadLocalAllocBuffer.inline.hpp#L79-L94")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void recordSlowAllocation() {
+        /*
+         * Raise size required to bypass TLAB next time. Else there's a risk that a thread that
+         * repeatedly allocates objects of one size will get stuck on this slow path.
+         */
+        refillWasteLimit.set(refillWasteLimit.get().add(Word.unsigned(TLAB_WASTE_INCREMENT)));
+        slowAllocations.set(slowAllocations.get() + 1);
+    }
+
+    @Fold
+    static UnsignedWord maxSize() {
+        return AlignedHeapChunk.getUsableSizeForObjects();
+    }
+
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23-ga/src/hotspot/share/gc/shared/threadLocalAllocBuffer.cpp#L76-L117")
+    @Uninterruptible(reason = "Accesses TLAB")
+    private static void accumulateAndResetStatistics(IsolateThread thread) {
+        assert VMOperation.isGCInProgress();
+
+        UnsignedWord remaining = availableTlabMemory(getTlab(thread));
+        gcWaste.set(thread, gcWaste.get(thread) + UnsignedUtils.safeToInt(remaining));
+
+        UnsignedWord totalAlignedAllocated = ThreadLocalAllocation.getAlignedAllocatedBytes(thread);
+        UnsignedWord allocatedAlignedSinceLastGC = totalAlignedAllocated.subtract(tlabAllocatedAlignedBytesBeforeLastGC.get(thread));
+        tlabAllocatedAlignedBytesBeforeLastGC.set(thread, totalAlignedAllocated);
+
+        AdaptiveWeightedAverageStruct.sample(allocatedBytesAvg.getAddress(thread), allocatedAlignedSinceLastGC.rawValue());
+
+        printStats(thread, allocatedAlignedSinceLastGC);
+        resetStatistics(thread);
+    }
+
+    @Uninterruptible(reason = "Bridge between uninterruptible and interruptible code", calleeMustBe = false)
+    private static void printStats(IsolateThread thread, UnsignedWord allocatedBytesSinceLastGC) {
+        if (!SerialAndEpsilonGCOptions.PrintTLAB.getValue()) {
+            return;
+        }
+
+        Log.log().string("TLAB: thread: ").zhex(thread)
+                        .string(", slow allocs: ").unsigned(slowAllocations.get(thread))
+                        .string(", refills: ").unsigned(numberOfRefills.get(thread))
+                        .string(", alloc bytes: ").unsigned(allocatedBytesSinceLastGC)
+                        .string(", alloc avg.: ").unsigned((long) allocatedBytesAvg.getAddress(thread).getAverage())
+                        .string(", GC waste: ").unsigned(gcWaste.get(thread))
+                        .string(", refill waste: ").unsigned(refillWaste.get(thread)).newline();
+    }
+
+    static void logTlabChunks(Log log, IsolateThread thread, String shortSpaceName) {
+        ThreadLocalAllocation.Descriptor tlab = getTlabUnsafe(thread);
+
+        // Aligned chunks are handled in EdenAllocation.
+        UnalignedHeapChunk.UnalignedHeader uChunk = tlab.getUnalignedChunk();
+        HeapChunkLogging.logChunks(log, uChunk, shortSpaceName, false);
+    }
+
+    static boolean printTlabInfo(Log log, Pointer ptr) {
+        for (IsolateThread thread = VMThreads.firstThreadUnsafe(); thread.isNonNull(); thread = VMThreads.nextThread(thread)) {
+            if (printTlabInfo(log, ptr, thread)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean printTlabInfo(Log log, Pointer ptr, IsolateThread thread) {
+        ThreadLocalAllocation.Descriptor tlab = getTlabUnsafe(thread);
+        Pointer start = tlab.getAlignedAllocationStart(SubstrateAllocationSnippets.TLAB_START_IDENTITY);
+        Pointer end = tlab.getAllocationEnd(SubstrateAllocationSnippets.TLAB_END_IDENTITY);
+        if (start.belowOrEqual(ptr) && ptr.belowOrEqual(end)) {
+            /* top may be null for a thread's current TLAB. */
+            Pointer top = tlab.getAllocationTop(SubstrateAllocationSnippets.TLAB_TOP_IDENTITY);
+            boolean unusablePart = top.isNonNull() && ptr.aboveOrEqual(top);
+            printTlabMemoryInfo(log, thread, start, "aligned TLAB", unusablePart);
+            return true;
+        }
+
+        UnalignedHeapChunk.UnalignedHeader uChunk = tlab.getUnalignedChunk();
+        while (uChunk.isNonNull()) {
+            if (HeapChunk.asPointer(uChunk).belowOrEqual(ptr) && ptr.belowThan(HeapChunk.getEndPointer(uChunk))) {
+                boolean unusablePart = ptr.aboveOrEqual(HeapChunk.getTopPointer(uChunk));
+                printTlabMemoryInfo(log, thread, HeapChunk.asPointer(uChunk), "unaligned chunk", unusablePart);
+                return true;
+            }
+            uChunk = HeapChunk.getNext(uChunk);
+        }
+
+        return false;
+    }
+
+    private static void printTlabMemoryInfo(Log log, IsolateThread thread, Pointer start, String memoryType, boolean unusablePart) {
+        String unusable = unusablePart ? "unusable part of " : "";
+        log.string("points into ").string(unusable).string(memoryType).spaces(1).zhex(start).spaces(1);
+        log.string("(TLAB of thread ").zhex(thread).string(")");
+    }
+
+    @Uninterruptible(reason = "This whole method is unsafe, so it is only uninterruptible to satisfy the checks.")
+    private static Descriptor getTlabUnsafe(IsolateThread thread) {
+        assert SubstrateDiagnostics.isFatalErrorHandlingThread() : "can cause crashes, so it may only be used while printing diagnostics";
+        return ThreadLocalAllocation.getTlab(thread);
+    }
+
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,15 +47,18 @@ import java.io.Reader;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
+import org.graalvm.polyglot.Engine.ToStringSupport;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractSourceDispatch;
 import org.graalvm.polyglot.io.ByteSequence;
 
 /**
  * Representation of a source code unit and its contents that can be evaluated in an execution
- * {@link Context context}. Each source is associated with the the ID of the language.
+ * {@link Context context}. Each source is associated with the ID of the language.
  *
  * <h3>From a file on disk</h3>
  *
@@ -533,7 +536,7 @@ public final class Source {
      * <pre>
      *
      * </pre>
-     * 
+     *
      * @param language the language id, must not be <code>null</code>
      * @param bytes the byte sequence or string, must not be <code>null</code>
      * @param name the name of the source, if <code>null</code> then <code>"Unnamed"</code> will be
@@ -551,7 +554,7 @@ public final class Source {
      * language, the {@link Builder#content(ByteSequence) contents} or the specified
      * {@link Builder#mimeType(String) MIME type}. A language may be detected from an existing file
      * using {@link #findLanguage(File)}.
-     * 
+     *
      * <pre>
      * File file = new File(dir, name);
      * assert name.endsWith(".java") : "Imagine proper file";
@@ -581,7 +584,7 @@ public final class Source {
      * using {@link #findLanguage(URL)}.
      * <p>
      * Example usage:
-     * 
+     *
      * <pre>
      * URL resource = relativeClass.getResource("sample.js");
      * Source source = Source.newBuilder("js", resource).build();
@@ -741,7 +744,7 @@ public final class Source {
      * Represents a builder to build {@link Source} objects.
      * <p>
      * To load a source from disk one can use:
-     * 
+     *
      * <pre>
      * File file = new File(dir, name);
      * assert name.endsWith(".java") : "Imagine proper file";
@@ -753,9 +756,9 @@ public final class Source {
      * assert file.getPath().equals(source.getPath());
      * assert file.toURI().equals(source.getURI());
      * </pre>
-     * 
+     *
      * To load source from a {@link URL} one can use:
-     * 
+     *
      * <pre>
      * URL resource = relativeClass.getResource("sample.js");
      * Source source = Source.newBuilder("js", resource).build();
@@ -763,25 +766,25 @@ public final class Source {
      * assert "sample.js".equals(source.getName());
      * assert resource.toURI().equals(source.getURI());
      * </pre>
-     * 
+     *
      * To create a source representing characters:
-     * 
+     *
      * <pre>
      * Source source = Source.newBuilder("js", "function() {\n" + "  return 'Hi';\n" + "}\n", "hi.js").buildLiteral();
      * assert "hi.js".equals(source.getName());
      * </pre>
-     * 
+     *
      * or read a source from a {@link Reader}:
-     * 
+     *
      * <pre>
      * Reader stream = new InputStreamReader(
      *                 relativeClass.getResourceAsStream("sample.js"));
      * Source source = Source.newBuilder("js", stream, "sample.js").build();
      * assert "sample.js".equals(source.getName());
      * </pre>
-     * 
+     *
      * To create a source representing bytes:
-     * 
+     *
      * <pre>
      * byte[] bytes = new byte[]{ /* Binary &#42;/ };
      * Source source = Source.newBuilder("llvm",
@@ -806,6 +809,7 @@ public final class Source {
         private Object content;
         private String mimeType;
         private Charset fileEncoding;
+        private Map<String, String> options;
 
         Builder(String language, Object origin) {
             Objects.requireNonNull(language);
@@ -1017,6 +1021,132 @@ public final class Source {
         }
 
         /**
+         * Sets a source option key and value for the built source. Source options allow you to
+         * attach language- or instrument-specific configuration to a source. These options are
+         * parsed and validated only when {@link Context#eval(Source)} or
+         * {@link Context#parse(Source)} is invoked, rather than when the source is created.
+         * <p>
+         * If the source is validated, all source options will be validated. Therefore, each
+         * language or instrument associated with a source option must be installed.
+         * <p>
+         * Source options of any language or instrument can be supplied to all sources. Some source
+         * options may only have an effect when provided to sources of the language with the same
+         * id. The available source option keys can be found in the respective language or
+         * instrument documentation, or at runtime via {@link Language#getSourceOptions()} or
+         * {@link Instrument#getSourceOptions()}.
+         *
+         * @param key the option key (must not be null)
+         * @param value the option value (must not be null)
+         * @see Context#eval(Source)
+         * @see Context#parse(Source)
+         * @see Language#getSourceOptions()
+         * @see Instrument#getSourceOptions()
+         * @since 25.0
+         */
+        public Builder option(String key, String value) {
+            Objects.requireNonNull(key);
+            Objects.requireNonNull(value);
+            if (this.options == null) {
+                this.options = new HashMap<>();
+            }
+            this.options.put(key, value);
+            return this;
+        }
+
+        /**
+         * Shortcut for setting multiple {@link #option(String, String) options} using a map. All
+         * values of the provided map must be non-null.
+         *
+         * @since 25.0
+         */
+        public Builder options(@SuppressWarnings("hiding") Map<String, String> options) {
+            for (var entry : options.entrySet()) {
+                option(entry.getKey(), entry.getValue());
+            }
+            return this;
+        }
+
+        /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("Source.newBuilder(");
+            b.append(ToStringSupport.quote(language));
+            b.append(", ");
+            if (origin instanceof File file) {
+                b.append("new File(");
+                b.append(ToStringSupport.quote(file.getPath()));
+                b.append(")");
+                b.append(')');
+                if (name != null) {
+                    ToStringSupport.appendCall(b, "name", ToStringSupport.quote(name));
+                }
+            } else if (origin instanceof URL url) {
+                b.append("URI.create(");
+                b.append(ToStringSupport.quote(url.toExternalForm()));
+                b.append(").toURL()");
+                b.append(')');
+                if (name != null) {
+                    ToStringSupport.appendCall(b, "name", ToStringSupport.quote(name));
+                }
+            } else {
+                b.append(summarizeOrigin(origin));
+                b.append(", ");
+                b.append(ToStringSupport.quote(name));
+                b.append(')');
+            }
+            if (content != null) {
+                ToStringSupport.appendCall(b, "content", summarizeContent(content));
+            }
+            if (uri != null) {
+                ToStringSupport.appendCall(b, "uri", "URI.create(" + ToStringSupport.quote(uri.toString()) + ")");
+            }
+            if (mimeType != null) {
+                ToStringSupport.appendCall(b, "mimeType", ToStringSupport.quote(mimeType));
+            }
+            if (fileEncoding != null) {
+                ToStringSupport.appendCall(b, "encoding", "Charset.forName(" + ToStringSupport.quote(fileEncoding.name()) + ")");
+            }
+            if (interactive) {
+                ToStringSupport.appendCall(b, "interactive", true);
+            }
+            if (internal) {
+                ToStringSupport.appendCall(b, "internal", true);
+            }
+            if (!cached) {
+                ToStringSupport.appendCall(b, "cached", false);
+            }
+            if (options != null) {
+                for (Map.Entry<String, String> entry : options.entrySet()) {
+                    ToStringSupport.appendCall(b, "option", ToStringSupport.quote(entry.getKey()), ToStringSupport.quote(entry.getValue()));
+                }
+            }
+            return b.toString();
+        }
+
+        private static String summarizeOrigin(Object value) {
+            if (value instanceof CharSequence || value instanceof ByteSequence) {
+                return summarizeContent(value);
+            } else if (value instanceof Reader) {
+                return "<reader: " + value.getClass().getName() + ">";
+            }
+            return String.valueOf(value);
+        }
+
+        private static String summarizeContent(Object value) {
+            if (value instanceof CharSequence characters) {
+                return "<characters: length=" + characters.length() + ">";
+            } else if (value instanceof ByteSequence bytes) {
+                return "<bytes: length=" + bytes.length() + ">";
+            } else {
+                return "<content: " + value.getClass().getName() + ">";
+            }
+        }
+
+        /**
          * Uses configuration of this builder to create new {@link Source} object. The method throws
          * an {@link IOException} if an error loading the source occurred.
          *
@@ -1024,7 +1154,7 @@ public final class Source {
          * @since 19.0
          */
         public Source build() throws IOException {
-            Source source = (Source) getImpl().buildSource(language, origin, uri, name, mimeType, content, interactive, internal, cached, fileEncoding, null, null);
+            Source source = (Source) getImpl().buildSource(language, origin, uri, name, mimeType, content, interactive, internal, cached, fileEncoding, null, null, options);
 
             // make sure origin is not consumed again if builder is used twice
             if (source.hasBytes()) {

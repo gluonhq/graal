@@ -25,7 +25,7 @@
 package jdk.graal.compiler.replacements.processor;
 
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -67,7 +67,7 @@ public class ReplacementsAnnotationProcessor extends AbstractProcessor {
             }
             generator.generateAll(this);
         }
-        return false;
+        return true;
     }
 
     public List<AnnotationHandler> getHandlers() {
@@ -81,7 +81,7 @@ public class ReplacementsAnnotationProcessor extends AbstractProcessor {
 
     @Override
     public Set<String> getSupportedAnnotationTypes() {
-        Set<String> annotationTypes = new HashSet<>();
+        Set<String> annotationTypes = new LinkedHashSet<>();
         for (AnnotationHandler handler : getHandlers()) {
             annotationTypes.add(handler.annotationTypeName);
         }

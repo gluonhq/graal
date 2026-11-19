@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,25 +24,55 @@
  */
 package com.oracle.svm.hosted.jdk;
 
-import org.graalvm.nativeimage.ImageSingletons;
+import java.security.CodeSource;
+
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.impl.RuntimeClassInitializationSupport;
+import org.graalvm.nativeimage.impl.InternalPlatform;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
-import com.oracle.svm.core.TypeResult;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
+import com.oracle.svm.core.FutureDefaultsOptions;
+import com.oracle.svm.core.OS;
+import com.oracle.svm.core.ParsingReason;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.hosted.FeatureImpl.AfterRegistrationAccessImpl;
-import com.oracle.svm.hosted.ImageClassLoader;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.jdk.JNIRegistrationUtil;
+import com.oracle.svm.guest.staging.jdk.ProtectionDomainSupport;
+import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeJNIAccess;
 
-import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
+import jdk.graal.compiler.nodes.util.ConstantFoldUtil;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.vm.ci.meta.JavaConstant;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 @AutomaticallyRegisteredFeature
-public class JDKInitializationFeature implements InternalFeature {
+public class JDKInitializationFeature extends JNIRegistrationUtil implements InternalFeature {
     private static final String JDK_CLASS_REASON = "Core JDK classes are initialized at build time";
 
     @Override
+    public void duringSetup(DuringSetupAccess access) {
+        initializeAtRunTime(access, "java.util.zip.Inflater", "java.util.zip.Deflater");
+        /* These classes have class initializers that lazily load the zip library. */
+        initializeAtRunTime(access, "java.util.zip.Adler32", "java.util.zip.CRC32");
+        initializeAtRunTime(access, "sun.net.www.protocol.jar.JarFileFactory", "sun.net.www.protocol.jar.JarURLConnection");
+    }
+
+    @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        RuntimeClassInitializationSupport rci = ImageSingletons.lookup(RuntimeClassInitializationSupport.class);
+        JVMCIRuntimeClassInitializationSupport rci = JVMCIRuntimeClassInitializationSupport.singleton();
         rci.initializeAtBuildTime("com.sun.java.util.jar.pack", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.management", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.naming.internal", JDK_CLASS_REASON);
@@ -57,9 +87,18 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("java.net", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("java.nio", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("java.text", JDK_CLASS_REASON);
+        if (FutureDefaultsOptions.resourceBundlesInitializedAtRunTime()) {
+            rci.initializeAtRunTime("java.text.BreakIterator", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+            rci.initializeAtRunTime("java.text.BreakIterator$BreakIteratorCache", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+        }
         rci.initializeAtBuildTime("java.time", JDK_CLASS_REASON);
+        // see HijrahChronologyFeature for more details
+        rci.initializeAtBuildTime("java.time.chrono.HijrahChronology", "Needs to be fully initialized at build time");
         rci.initializeAtBuildTime("java.util", JDK_CLASS_REASON);
         rci.initializeAtRunTime("java.util.concurrent.SubmissionPublisher", "Executor service must be recomputed");
+
+        rci.initializeAtBuildTime("java.beans.Introspector", JDK_CLASS_REASON);
+        rci.initializeAtBuildTime("java.beans.Introspector$1", JDK_CLASS_REASON);
 
         rci.initializeAtBuildTime("javax.annotation.processing", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("javax.lang.model", JDK_CLASS_REASON);
@@ -69,8 +108,16 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("javax.tools", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("javax.xml", JDK_CLASS_REASON);
 
+        rci.initializeAtBuildTime("jdk.management.jfr.internal.FlightRecorderMXBeanProvider$SingleMBeanComponent", "Ends up in the image heap with -H:Preserve=all");
+
         rci.initializeAtBuildTime("jdk.internal", JDK_CLASS_REASON);
+        // FileSystemImpl loads management_agent in its static initializer.
+        rci.initializeAtRunTime("jdk.internal.agent.FileSystemImpl", "Loads the management_agent library at run time");
         rci.initializeAtBuildTime("jdk.jfr", "Needed for Native Image substitutions");
+        rci.initializeAtRunTime("jdk.jfr.snippets.Snippets$HelloWorld", "Fails build-time initialization");
+        rci.initializeAtRunTime("jdk.jfr.snippets.Snippets$HTTPPostRequest", "Fails build-time initialization");
+        rci.initializeAtRunTime("jdk.jfr.snippets.Snippets$TransactionBlocked", "Fails build-time initialization");
+        rci.initializeAtRunTime("jdk.jfr.snippets.Snippets$HTTPGetRequest", "Fails build-time initialization");
         rci.initializeAtBuildTime("jdk.net", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("jdk.nio", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("jdk.vm.ci", "Native Image classes are always initialized at build time");
@@ -87,13 +134,17 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("sun.invoke", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.launcher", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.management", JDK_CLASS_REASON);
+        rci.initializeAtRunTime("sun.management.ManagementFactoryHelper$PlatformLoggingImpl", "Holds instances of LoggingMXBeanAccess");
         rci.initializeAtBuildTime("sun.misc", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.net", JDK_CLASS_REASON);
 
         rci.initializeAtBuildTime("sun.nio", JDK_CLASS_REASON);
-        if (Platform.includedIn(Platform.WINDOWS.class)) {
+        if (OS.WINDOWS.isCurrent()) {
             rci.initializeAtRunTime("sun.nio.ch.PipeImpl", "Contains SecureRandom reference, therefore can't be included in the image heap");
+        } else {
+            rci.initializeAtRunTime("sun.nio.ch.UnixAsynchronousSocketChannelImpl", "Runtime-loaded asynchronous sockets need runtime native-dispatcher state");
         }
+        rci.initializeAtRunTime("sun.nio.ch.AsynchronousChannelGroupImpl", "Default asynchronous channel group state is runtime process specific");
 
         rci.initializeAtRunTime("sun.net.PortConfig", "Calls PortConfig.getLower0() and PortConfig.getUpper0()");
 
@@ -116,6 +167,21 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("sun.security.mscapi", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.text", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.util", JDK_CLASS_REASON);
+        if (FutureDefaultsOptions.resourceBundlesInitializedAtRunTime()) {
+            if (RuntimeClassLoading.isSupported()) {
+                /*
+                 * Without runtime class loading, PropertyResourceBundle is covered by the existing
+                 * java.util build-time initialization policy and by statically registered bundle
+                 * metadata. Runtime class loading can execute the JDK PropertyResourceBundle path
+                 * for classes loaded after image build, so only those images need its cache state in
+                 * the runtime process.
+                 */
+                rci.initializeAtRunTime("java.util.PropertyResourceBundle", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+            }
+            rci.initializeAtRunTime("sun.util.locale.provider.LocaleProviderAdapter", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+            rci.initializeAtRunTime("sun.util.locale.provider.LocaleServiceProviderPool", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+            rci.initializeAtRunTime("sun.util.locale.provider.LocaleServiceProviderPool$AllAvailableLocales", FutureDefaultsOptions.RUN_TIME_INITIALIZE_RESOURCE_BUNDLES_REASON);
+        }
 
         /* Minor fixes to make the list work */
         rci.initializeAtRunTime("com.sun.naming.internal.ResourceManager$AppletParameter", "Initializes AWT");
@@ -123,7 +189,43 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("java.awt.font.NumericShaper", "Required for sun.text.bidi.BidiBase.NumericShapings");
         rci.initializeAtBuildTime("java.awt.font.JavaAWTFontAccessImpl", "Required for sun.text.bidi.BidiBase.NumericShapings");
 
-        /* XML-related */
+        /* FileSystemProviders related */
+        if (FutureDefaultsOptions.fileSystemProvidersInitializedAtRunTime()) {
+            rci.initializeAtRunTime("java.nio.file.spi", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("sun.nio.fs", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            /* Extended*Option need to be registered at run time. */
+            rci.initializeAtRunTime("com.sun.nio.file", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            /* Static references to ExtendedOptions. Needs to be run-time initialized. */
+            rci.initializeAtRunTime("jdk.internal.misc.FileSystemOption", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+
+            rci.initializeAtRunTime("java.nio.file.FileSystems", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("java.nio.file.FileSystems$DefaultFileSystemHolder", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+
+            rci.initializeAtRunTime("java.util.zip.ZipFile$Source", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("java.util.zip.ZipFile$Source", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+
+            rci.initializeAtRunTime("java.io.FileSystem", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("java.io.FileSystem$CurrentWorkingDirectoryHolder", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("java.io.UnixFileSystem", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+            rci.initializeAtRunTime("java.io.WindowsFileSystem", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+
+            /* Holder for the default file system. */
+            rci.initializeAtRunTime("com.oracle.svm.core.jdk.runtimeinit.DefaultFileSystemHolder", FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON);
+
+            /*
+             * The following need to be build-time initialized because they can end up in the image
+             * heap. There are substitutions to patch the links to run-time initialized classes like
+             * FileSystem or FileSystemProvider.
+             */
+
+            /*
+             * Require explicit initializeAtBuildTime because the sun.nio.fs is registered for
+             * run-time initialization.
+             */
+            rci.initializeAtBuildTime("sun.nio.fs.UnixPath", "Allow UnixPath objects in the image heap (" + FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON + ")");
+            rci.initializeAtBuildTime("sun.nio.fs.WindowsPath", "Allow WindowsPath objects in the image heap (" + FutureDefaultsOptions.RUN_TIME_INITIALIZE_FILE_SYSTEM_PROVIDERS_REASON + ")");
+        }
+
         rci.initializeAtBuildTime("com.sun.xml", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.org.apache", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.org.slf4j.internal", JDK_CLASS_REASON);
@@ -132,11 +234,12 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("com.sun.crypto.provider", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.security.auth", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.security.jgss", JDK_CLASS_REASON);
+        rci.initializeAtRunTime("sun.security.jgss.wrapper.Krb5Util", "Holds the cleaner thread");
         rci.initializeAtBuildTime("com.sun.security.cert.internal.x509", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.security.ntlm", JDK_CLASS_REASON);
-        rci.initializeAtBuildTime("com.sun.security.sasl", JDK_CLASS_REASON);
 
         rci.initializeAtBuildTime("java.security", JDK_CLASS_REASON);
+        rci.initializeAtRunTime("sun.security.pkcs11.P11Util", "Cleaner reference");
 
         rci.initializeAtBuildTime("javax.crypto", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("javax.security.auth", JDK_CLASS_REASON);
@@ -155,7 +258,6 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("sun.security.krb5", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.pkcs", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.pkcs10", JDK_CLASS_REASON);
-        rci.initializeAtBuildTime("sun.security.pkcs11", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.pkcs12", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.provider", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.rsa", JDK_CLASS_REASON);
@@ -165,9 +267,16 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtBuildTime("sun.security.util", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.validator", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("sun.security.x509", JDK_CLASS_REASON);
-        rci.initializeAtBuildTime("sun.security.smartcardio", JDK_CLASS_REASON);
         rci.initializeAtBuildTime("com.sun.jndi", JDK_CLASS_REASON);
-        if (Platform.includedIn(Platform.DARWIN.class)) {
+        if (FutureDefaultsOptions.securityProvidersInitializedAtRunTime()) {
+            rci.initializeAtRunTime("sun.security.ssl.SSLContextImpl", JDK_CLASS_REASON);
+            rci.initializeAtRunTime("sun.security.ssl.SSLAlgorithmConstraints", JDK_CLASS_REASON);
+        } else {
+            rci.initializeAtBuildTime("sun.security.pkcs11", JDK_CLASS_REASON);
+            rci.initializeAtBuildTime("sun.security.smartcardio", JDK_CLASS_REASON);
+            rci.initializeAtBuildTime("com.sun.security.sasl", JDK_CLASS_REASON);
+        }
+        if (OS.DARWIN.isCurrent()) {
             rci.initializeAtBuildTime("apple.security", JDK_CLASS_REASON);
         }
 
@@ -186,7 +295,10 @@ public class JDKInitializationFeature implements InternalFeature {
         rci.initializeAtRunTime("java.lang.Math$RandomNumberGeneratorHolder", "Contains random seeds");
         rci.initializeAtRunTime("java.lang.StrictMath$RandomNumberGeneratorHolder", "Contains random seeds");
 
+        rci.initializeAtRunTime("java.lang.ProcessImpl", "launchMechanism and helperpath for jspawnhelper should be computed at run-time");
+
         rci.initializeAtRunTime("jdk.internal.misc.InnocuousThread", "Contains a thread group INNOCUOUSTHREADGROUP.");
+        rci.initializeAtRunTime("jdk.internal.util.StaticProperty", "Contains run time specific values.");
 
         rci.initializeAtRunTime("sun.nio.ch.Poller", "Contains an InnocuousThread.");
         rci.initializeAtRunTime("jdk.internal.jimage", "Pulls in direct byte buffers");
@@ -210,9 +322,14 @@ public class JDKInitializationFeature implements InternalFeature {
 
         rci.initializeAtRunTime("jdk.internal.logger.LoggerFinderLoader", "Contains a static field with a FilePermission value");
 
-        if (JavaVersionUtil.JAVA_SPEC >= 23) {
-            rci.initializeAtRunTime("jdk.internal.markdown.MarkdownTransformer", "Contains a static field with a DocTreeScanner which is initialized at run time");
-        }
+        rci.initializeAtRunTime("jdk.internal.markdown.MarkdownTransformer", "Contains a static field with a DocTreeScanner which is initialized at run time");
+
+        rci.initializeAtRunTime("jdk.internal.org.jline.terminal.impl.ffm", "Contains multiple classes with static fields referencing native memory segments");
+
+        /* Ensure "enhanced exception messages" are initialized (JDK 25+26, JDK-8348986). */
+        var exceptionsClass = GuestAccess.get().lookupType("jdk.internal.util.Exceptions");
+        var exceptionsSetup = JVMCIReflectionUtil.getUniqueDeclaredMethod(exceptionsClass, "setup");
+        GuestAccess.get().invokeStatic(exceptionsSetup);
 
         /*
          * The local class Holder in FallbackLinker#getInstance fails the build time initialization
@@ -220,12 +337,111 @@ public class JDKInitializationFeature implements InternalFeature {
          * are thus accessed by name. According to the code in Check.localClassName, the identifier
          * in the name should be continuous.
          */
-        ImageClassLoader imageClassLoader = ((AfterRegistrationAccessImpl) access).getImageClassLoader();
         int i = 1;
-        TypeResult<Class<?>> currentHolderClass = imageClassLoader.findClass("jdk.internal.foreign.abi.fallback.FallbackLinker$%dHolder".formatted(i));
-        while (currentHolderClass.isPresent()) {
-            rci.initializeAtRunTime(currentHolderClass.get(), "Fails build-time initialization");
-            currentHolderClass = imageClassLoader.findClass("jdk.internal.foreign.abi.fallback.FallbackLinker$%dHolder".formatted(i++));
+        GuestAccess guestAccess = GuestAccess.get();
+        ResolvedJavaType currentHolderClass = guestAccess.lookupType("jdk.internal.foreign.abi.fallback.FallbackLinker$%dHolder".formatted(i));
+        while (currentHolderClass != null) {
+            rci.initializeAtRunTime(currentHolderClass.toJavaName(), "Fails build-time initialization");
+            currentHolderClass = guestAccess.lookupType("jdk.internal.foreign.abi.fallback.FallbackLinker$%dHolder".formatted(i++));
+        }
+    }
+
+    @Override
+    public void registerInvocationPlugins(Providers providers, GraphBuilderConfiguration.Plugins plugins, ParsingReason reason) {
+        InvocationPlugins.Registration r = new InvocationPlugins.Registration(plugins.getInvocationPlugins(), "java.lang.Module$EnableNativeAccess");
+        r.register(new ModuleEnableNativeAccessPlugin());
+    }
+
+    /**
+     * For modules in the image heap, {@code Module#enableNativeAccess} is fixed at build time. We
+     * want to fold native access checks for build time modules to avoid run-time overheads as well
+     * as pulling in the error handling code unnecessarily. For example: not folding this would
+     * increase the size of hello worlds by 2x.
+     * <p>
+     * Why does this field impact the number of reachable methods so much?
+     * {@link ProtectionDomainSupport} and related {@code ProtectionDomainFeature} have a
+     * reachability handler for {@link CodeSource#getLocation}, which is not reachable by default in
+     * helloworld, but becomes reachable if {@code Module#enableNativeAccess} is not folded. The
+     * difference comes from {@code PosixNativeLibrarySupport#initializeBuiltinLibraries}, which
+     * transitively calls into {@code Module#ensureNativeAccess} and if {@code enableNativeAccess}
+     * is folded, the call to {@link CodeSource#getLocation} inside
+     * {@code Module#ensureNativeAccess} can be removed as dead code during inlining before
+     * analysis.
+     * <p>
+     * The modules for which this folding matters are {@code java.base} and
+     * {@code org.graalvm.nativeimage.builder}), both of which have {@code enableNativeAccess}
+     * already set by the time the builder starts running.
+     */
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess a) {
+        var access = (FeatureImpl.BeforeAnalysisAccessImpl) a;
+        access.allowStableFieldFoldingBeforeAnalysis(ModuleEnableNativeAccessPlugin.ENABLE_NATIVE_ACCESS_FIELD);
+
+        // We force all Enum.hash fields to be eagerly computed.
+        GuestAccess guestAccess = GuestAccess.get();
+        access.allowStableFieldFoldingBeforeAnalysis(JVMCIReflectionUtil.getUniqueDeclaredField(guestAccess.lookupType(Enum.class), "hash"));
+
+        // The fields below are initialized in their static initializers or as a part of vm startup.
+        access.allowStableFieldFoldingBeforeAnalysis(JVMCIReflectionUtil.getUniqueDeclaredField(guestAccess.lookupType(ModuleLayer.class), "EMPTY_LAYER"));
+        ResolvedJavaType systemClass = guestAccess.lookupType(System.class);
+        access.allowStableFieldFoldingBeforeAnalysis(JVMCIReflectionUtil.getUniqueDeclaredField(systemClass, "initialIn"));
+        access.allowStableFieldFoldingBeforeAnalysis(JVMCIReflectionUtil.getUniqueDeclaredField(systemClass, "initialErr"));
+        access.allowStableFieldFoldingBeforeAnalysis(JVMCIReflectionUtil.getUniqueDeclaredField(guestAccess.lookupType("java.util.jar.Attributes$Name"), "KNOWN_NAMES"));
+
+        if (Platform.includedIn(InternalPlatform.PLATFORM_JNI.class)) {
+            a.registerReachabilityHandler(JDKInitializationFeature::registerInflaterInitIDs, method(a, "java.util.zip.Inflater", "initIDs"));
+        }
+    }
+
+    private static void registerInflaterInitIDs(DuringAnalysisAccess a) {
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.util.zip.Inflater", "inputConsumed", "outputConsumed"));
+    }
+
+    /**
+     * Inlines calls to {@code Module$EnableNativeAccess#isNativeAccessEnabled()} if and only if
+     * {@code Module#enableNativeAccess} is true. This is ok because the field is {@code @Stable},
+     * meaning that a non-default value (i.e., {@code true}, will never change again. Thus, we can
+     * constant-fold the call to enable optimizations, most importantly dead code elimination.
+     */
+    private static final class ModuleEnableNativeAccessPlugin extends InvocationPlugin.InlineOnlyInvocationPlugin {
+
+        private static final ResolvedJavaField ENABLE_NATIVE_ACCESS_FIELD = JVMCIReflectionUtil.getUniqueDeclaredField(true, GuestAccess.get().lookupType(Module.class), "enableNativeAccess");
+
+        ModuleEnableNativeAccessPlugin() {
+            super("isNativeAccessEnabled", Module.class);
+        }
+
+        /**
+         * See {@code java.lang.Module$EnableNativeAccess#isNativeAccessEnabled(Module target)}.
+         */
+        @Override
+        public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode targetNode) {
+            JavaConstant moduleConstant = targetNode.asJavaConstant();
+            if (moduleConstant != null) {
+                if (ENABLE_NATIVE_ACCESS_FIELD != null) {
+                    AnalysisField enableNativeAccessField = ((AnalysisMetaAccess) b.getMetaAccess()).getUniverse().lookup(ENABLE_NATIVE_ACCESS_FIELD);
+                    var constant = ConstantFoldUtil.tryConstantFold(b.getConstantFieldProvider(), b.getConstantReflection(), b.getMetaAccess(),
+                                    enableNativeAccessField, moduleConstant, b.getOptions(), targetMethod);
+                    /*
+                     * ConstantFoldUtil.tryConstantFold adheres to the @Stable field semantics,
+                     * i.e., it only constant folds if the field has a non-default value (in this
+                     * case `true`). See
+                     * jdk.graal.compiler.core.common.spi.JavaConstantFieldProvider#
+                     * readConstantField. In other words, if the field is `false`, `constant` would
+                     * be null.
+                     */
+                    if (constant != null) {
+                        /*
+                         * Booleans are represented as int on the VM level so checking for int 1
+                         * instead of boolean true.
+                         */
+                        assert constant.isJavaConstant() && constant.asJavaConstant().asInt() == 1 : "Must not constant fold if enableNativeAccess is false (@Stable semantics)";
+                        b.push(JavaKind.Boolean, b.add(constant));
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 }

@@ -29,6 +29,7 @@ import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probabilit
 import static jdk.graal.compiler.replacements.SnippetTemplate.DEFAULT_REPLACER;
 
 import org.graalvm.collections.UnmodifiableEconomicMap;
+import org.graalvm.word.impl.Word;
 
 import jdk.graal.compiler.api.replacements.Snippet;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
@@ -54,7 +55,6 @@ import jdk.graal.compiler.replacements.SnippetTemplate.AbstractTemplates;
 import jdk.graal.compiler.replacements.SnippetTemplate.Arguments;
 import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
 import jdk.graal.compiler.replacements.Snippets;
-import jdk.graal.compiler.word.Word;
 
 public class ObjectSnippets implements Snippets {
 
@@ -111,7 +111,7 @@ public class ObjectSnippets implements Snippets {
                 StructuredGraph graph = (StructuredGraph) n.graph();
                 FrameState stateDuringCall = fn.stateDuring();
                 assert stateDuringCall != null : "Must have valid state for snippet recursive notify call";
-                Arguments args = new Arguments(fn.isNotifyAll() ? notifyAllSnippet : notifySnippet, graph.getGuardsStage(), tool.getLoweringStage());
+                Arguments args = new Arguments(fn.isNotifyAll() ? notifyAllSnippet : notifySnippet, graph, tool.getLoweringStage());
                 args.add("thisObj", fn.object);
                 SnippetTemplate template = template(tool, fn, args);
                 graph.getDebug().log("Lowering fast notify in %s: node=%s, template=%s, arguments=%s", graph, fn, template, args);

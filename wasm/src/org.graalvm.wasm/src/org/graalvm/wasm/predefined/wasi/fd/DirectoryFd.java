@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,15 +45,25 @@ import static org.graalvm.wasm.predefined.wasi.FlagUtils.isSet;
 import static org.graalvm.wasm.predefined.wasi.FlagUtils.isSubsetOf;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemLoopException;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.NotLinkException;
 import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.graalvm.wasm.memory.WasmMemory;
+import org.graalvm.wasm.memory.WasmMemoryLibrary;
 import org.graalvm.wasm.predefined.wasi.WasiClockTimeGetNode;
+import org.graalvm.wasm.predefined.wasi.types.Dirent;
 import org.graalvm.wasm.predefined.wasi.types.Errno;
 import org.graalvm.wasm.predefined.wasi.types.Fdflags;
 import org.graalvm.wasm.predefined.wasi.types.Filetype;
@@ -71,6 +81,12 @@ import com.oracle.truffle.api.nodes.Node;
  */
 class DirectoryFd extends Fd {
 
+    private enum FinalSymlinkPolicy {
+        NoFollow,
+        Follow,
+        FollowAllowMissingTarget
+    }
+
     private final FdManager fdManager;
     private final PreopenedDirectory preopenedRoot;
     private final TruffleFile virtualFile;
@@ -82,61 +98,173 @@ class DirectoryFd extends Fd {
         this.preopenedRoot = preopenedRoot;
     }
 
+    /**
+     * Reads a guest path string from memory, resolves it relative to this directory fd's virtual
+     * location, and rejects lexical escapes from the preopened virtual root.
+     */
     private TruffleFile resolveVirtualFile(Node node, WasmMemory memory, int pathAddress, int pathLength) {
+        FdUtils.validateU32MemoryRange(memory, pathAddress, pathLength);
         final String path = memory.readString(pathAddress, pathLength, node);
         return preopenedRoot.containedVirtualFile(virtualFile.resolve(path));
     }
 
-    private static TruffleFile resolveVirtualFile(Node node, WasmMemory memory, DirectoryFd fd, int pathAddress, int pathLength) {
-        final String path = memory.readString(pathAddress, pathLength, node);
-        return fd.preopenedRoot.containedVirtualFile(fd.virtualFile.resolve(path));
+    /**
+     * Maps a virtual child path to a host path according to the requested final-symlink policy.
+     * <p>
+     * Intermediate components are resolved on the host and must stay inside the preopened root. The
+     * final component is either kept unresolved, followed, or followed with a missing target
+     * allowed for {@code path_open(O_CREAT)}.
+     */
+    private TruffleFile resolveHostFile(TruffleFile virtualChildFile, FinalSymlinkPolicy finalSymlinkPolicy) throws IOException, SecurityException {
+        final TruffleFile lexicalHostChildFile = preopenedRoot.virtualFileToHostFile(virtualChildFile);
+        if (lexicalHostChildFile == null) {
+            return null;
+        }
+        final TruffleFile hostChildFile = resolveWithCanonicalParent(lexicalHostChildFile);
+        if (hostChildFile == null) {
+            return null;
+        }
+
+        if (finalSymlinkPolicy == FinalSymlinkPolicy.NoFollow) {
+            return hostChildFile;
+        }
+        if (isSymbolicLink(hostChildFile)) {
+            // Canonicalize the parent chain first, then resolve the final symlink from that real
+            // parent so relative targets and escape checks both match the host filesystem.
+            final boolean allowMissingTargetOfFinalSymlink = finalSymlinkPolicy == FinalSymlinkPolicy.FollowAllowMissingTarget;
+            return resolveFollowedFinalSymlink(hostChildFile, allowMissingTargetOfFinalSymlink);
+        }
+        if (hostChildFile.exists()) {
+            return preopenedRoot.containedHostFile(hostChildFile.getCanonicalFile());
+        }
+        return hostChildFile;
     }
 
-    private TruffleFile resolveHostFile(Node node, WasmMemory memory, int pathAddress, int pathLength) {
+    /**
+     * Resolves a final symlink explicitly, following chains of final symlinks while preserving the
+     * distinction between missing targets, actual symlink loops, and other host failures.
+     */
+    private TruffleFile resolveFollowedFinalSymlink(TruffleFile hostSymlinkFile, boolean allowMissingTarget) throws IOException, SecurityException {
+        final Set<String> visitedPaths = new HashSet<>();
+        TruffleFile currentFile = hostSymlinkFile;
+        while (true) {
+            final String currentPath = currentFile.normalize().getPath();
+            if (!visitedPaths.add(currentPath)) {
+                throw new FileSystemLoopException(hostSymlinkFile.getPath());
+            }
+            final TruffleFile linkTarget;
+            try {
+                linkTarget = currentFile.readSymbolicLink();
+            } catch (NoSuchFileException e) {
+                if (!allowMissingTarget) {
+                    throw new NoSuchFileException(hostSymlinkFile.getPath());
+                }
+                return currentFile;
+            } catch (NotLinkException | UnsupportedOperationException e) {
+                if (currentFile.exists()) {
+                    return preopenedRoot.containedHostFile(currentFile.getCanonicalFile());
+                }
+                if (!allowMissingTarget) {
+                    throw new NoSuchFileException(hostSymlinkFile.getPath());
+                }
+                return currentFile;
+            }
+            final TruffleFile currentParent = currentFile.getParent();
+            currentFile = linkTarget.isAbsolute() || currentParent == null ? linkTarget : currentParent.resolve(linkTarget.getPath());
+            currentFile = resolveWithCanonicalParent(currentFile.normalize());
+            if (currentFile == null) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Canonicalizes the parent chain of a host path, verifies that parent stays inside the
+     * preopened root, and then reattaches the final path segment without resolving it. Paths that
+     * already denote the preopened root itself are returned unchanged.
+     */
+    private TruffleFile resolveWithCanonicalParent(TruffleFile hostChildFile) throws IOException, SecurityException {
+        if (preopenedRoot.isHostRoot(hostChildFile)) {
+            // Paths like "." or "dir/.." may normalize to the preopened root itself. Treat that
+            // as an in-sandbox result instead of canonicalizing the parent one level above it.
+            return hostChildFile;
+        }
+
+        final TruffleFile hostParent = hostChildFile.getParent();
+        if (hostParent == null) {
+            // No parent component to canonicalize. This is effectively just a containment check on
+            // the path itself.
+            return preopenedRoot.containedHostFile(hostChildFile);
+        }
+        final TruffleFile canonicalParent = preopenedRoot.containedHostFile(hostParent.getCanonicalFile());
+        if (canonicalParent == null) {
+            // The parent resolves outside the preopened root, so the requested path must be
+            // rejected as an escape.
+            return null;
+        }
+        return preopenedRoot.containedHostFile(canonicalParent.resolve(hostChildFile.getName()));
+    }
+
+    /**
+     * Convenience wrapper that reads a guest path from memory and resolves it using the default
+     * no-follow sandboxing policy.
+     */
+    private TruffleFile resolveHostFile(Node node, WasmMemory memory, int pathAddress, int pathLength) throws IOException, SecurityException {
         final TruffleFile virtualChildFile = resolveVirtualFile(node, memory, pathAddress, pathLength);
         if (virtualChildFile == null) {
             return null;
         }
 
-        return preopenedRoot.virtualFileToHostFile(virtualChildFile);
+        return resolveHostFile(virtualChildFile, FinalSymlinkPolicy.NoFollow);
     }
 
-    private static TruffleFile resolveHostFile(Node node, WasmMemory memory, DirectoryFd fd, int pathAddress, int pathLength) {
-        final TruffleFile virtualChildFile = resolveVirtualFile(node, memory, fd, pathAddress, pathLength);
-        if (virtualChildFile == null) {
-            return null;
-        }
-        return fd.preopenedRoot.virtualFileToHostFile(virtualChildFile);
-    }
-
+    /**
+     * Reads a guest path from memory and resolves it according to the provided WASI lookup flags.
+     * <p>
+     * Without {@code LOOKUP_SYMLINK_FOLLOW}, this applies the default no-follow policy. With that
+     * flag set, the host path is canonicalized and then rechecked for containment in the preopened
+     * root.
+     */
     private TruffleFile resolveHostFile(Node node, WasmMemory memory, int pathAddress, int pathLength, int lookupFlags) throws IOException, SecurityException {
-        TruffleFile hostFile = resolveHostFile(node, memory, pathAddress, pathLength);
-        if (hostFile == null) {
-            return null;
-        }
-
-        if (isSet(lookupFlags, Lookupflags.SymlinkFollow) && hostFile.exists()) {
-            // Follow symbolic links, and make sure that the target is still contained in
-            // preopenedRoot.
-            hostFile = preopenedRoot.containedHostFile(hostFile.getCanonicalFile());
-        }
-        return hostFile;
-    }
-
-    private TruffleFile resolveHostFile(TruffleFile virtualChildFile, int lookupFlags) throws IOException, SecurityException {
+        final TruffleFile virtualChildFile = resolveVirtualFile(node, memory, pathAddress, pathLength);
         if (virtualChildFile == null) {
             return null;
         }
-        TruffleFile hostFile = preopenedRoot.virtualFileToHostFile(virtualChildFile);
+        if (!isSet(lookupFlags, Lookupflags.SymlinkFollow)) {
+            return resolveHostFile(virtualChildFile, FinalSymlinkPolicy.NoFollow);
+        }
+        return resolveHostFile(virtualChildFile, FinalSymlinkPolicy.Follow);
+    }
+
+    private static Errno errnoForIoException(IOException e) {
+        if (e instanceof NoSuchFileException) {
+            return Errno.Noent;
+        }
+        if (e instanceof FileSystemLoopException) {
+            return Errno.Loop;
+        }
+        if (e instanceof FileAlreadyExistsException) {
+            return Errno.Exist;
+        }
+        if (e instanceof NotLinkException) {
+            return Errno.Nolink;
+        }
+        if (e instanceof DirectoryNotEmptyException) {
+            return Errno.Notempty;
+        }
+        return Errno.Io;
+    }
+
+    @Override
+    public Errno filestatGet(Node node, WasmMemory memory, int resultAddress) {
+        if (!isSet(fsRightsBase, Rights.FdFilestatGet)) {
+            return Errno.Notcapable;
+        }
+        final TruffleFile hostFile = preopenedRoot.virtualFileToHostFile(virtualFile);
         if (hostFile == null) {
-            return null;
+            return Errno.Noent;
         }
-        if (isSet(lookupFlags, Lookupflags.SymlinkFollow) && hostFile.exists()) {
-            // Follow symbolic links, and make sure that the target is still contained in
-            // preopenedRoot.
-            hostFile = preopenedRoot.containedHostFile(hostFile.getCanonicalFile());
-        }
-        return hostFile;
+        return FdUtils.writeFilestat(node, memory, resultAddress, hostFile, FdUtils.FOLLOW_LINKS);
     }
 
     @Override
@@ -145,15 +273,17 @@ class DirectoryFd extends Fd {
             return Errno.Notcapable;
         }
 
-        final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
-        if (hostChildFile == null) {
-            return Errno.Noent;
-        }
         try {
+            final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
+            if (hostChildFile == null) {
+                return Errno.Noent;
+            }
             hostChildFile.createDirectory();
-        } catch (FileAlreadyExistsException e) {
-            return Errno.Exist;
-        } catch (IOException | UnsupportedOperationException e) {
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IOException e) {
+            return errnoForIoException(e);
+        } catch (UnsupportedOperationException e) {
             return Errno.Io;
         } catch (SecurityException e) {
             return Errno.Acces;
@@ -167,18 +297,21 @@ class DirectoryFd extends Fd {
             return Errno.Notcapable;
         }
 
+        final boolean followSymlinks = isSet(flags, Lookupflags.SymlinkFollow);
         final TruffleFile hostChildFile;
         try {
             hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength, flags);
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
         } catch (IOException e) {
-            return Errno.Io;
+            return errnoForIoException(e);
         } catch (SecurityException e) {
             return Errno.Acces;
         }
         if (hostChildFile == null) {
             return Errno.Noent;
         }
-        return FdUtils.writeFilestat(node, memory, resultAddress, hostChildFile);
+        return FdUtils.writeFilestat(node, memory, resultAddress, hostChildFile, FdUtils.linkOptions(followSymlinks));
     }
 
     @Override
@@ -186,32 +319,29 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathFilestatSetTimes)) {
             return Errno.Notcapable;
         }
-        final TruffleFile hostChildFile;
+        final boolean followSymlinks = isSet(flags, Lookupflags.SymlinkFollow);
+        final LinkOption[] linkOptions = FdUtils.linkOptions(followSymlinks);
         try {
-            hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength, flags);
-        } catch (IOException e) {
-            return Errno.Io;
-        } catch (SecurityException e) {
-            return Errno.Acces;
-        }
-        if (hostChildFile == null) {
-            return Errno.Noent;
-        }
-        try {
+            final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength, flags);
+            if (hostChildFile == null) {
+                return Errno.Noent;
+            }
             if (isSet(fstFlags, Fstflags.Atim)) {
-                hostChildFile.setLastAccessTime(FileTime.from(atim, TimeUnit.NANOSECONDS));
+                hostChildFile.setLastAccessTime(FileTime.from(atim, TimeUnit.NANOSECONDS), linkOptions);
             }
             if (isSet(fstFlags, Fstflags.AtimNow)) {
-                hostChildFile.setLastAccessTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS));
+                hostChildFile.setLastAccessTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS), linkOptions);
             }
             if (isSet(fstFlags, Fstflags.Mtim)) {
-                hostChildFile.setLastModifiedTime(FileTime.from(mtim, TimeUnit.NANOSECONDS));
+                hostChildFile.setLastModifiedTime(FileTime.from(mtim, TimeUnit.NANOSECONDS), linkOptions);
             }
             if (isSet(fstFlags, Fstflags.MtimNow)) {
-                hostChildFile.setLastModifiedTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS));
+                hostChildFile.setLastModifiedTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS), linkOptions);
             }
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
         } catch (IOException e) {
-            return Errno.Io;
+            return errnoForIoException(e);
         } catch (SecurityException e) {
             return Errno.Acces;
         }
@@ -223,31 +353,24 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathLinkSource) || !isSet(newFd.fsRightsBase, Rights.PathLinkTarget)) {
             return Errno.Notcapable;
         }
-
-        final TruffleFile oldHostChildFile;
         try {
-            oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength, oldFlags);
-        } catch (IOException e) {
-            return Errno.Io;
-        } catch (SecurityException e) {
-            return Errno.Acces;
-        }
-        if (oldHostChildFile == null) {
-            return Errno.Noent;
-        }
-
-        if (!(newFd instanceof DirectoryFd)) {
-            return Errno.Notdir;
-        }
-        final TruffleFile newHostChildFile = resolveHostFile(node, memory, (DirectoryFd) newFd, newPathAddress, newPathLength);
-        if (newHostChildFile == null) {
-            return Errno.Noent;
-        }
-        try {
+            final TruffleFile oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength, oldFlags);
+            if (oldHostChildFile == null) {
+                return Errno.Noent;
+            }
+            if (!(newFd instanceof DirectoryFd newDirFd)) {
+                return Errno.Notdir;
+            }
+            final TruffleFile newHostChildFile = newDirFd.resolveHostFile(node, memory, newPathAddress, newPathLength);
+            if (newHostChildFile == null) {
+                return Errno.Noent;
+            }
             newHostChildFile.createLink(oldHostChildFile);
-        } catch (FileAlreadyExistsException e) {
-            return Errno.Exist;
-        } catch (IOException | UnsupportedOperationException e) {
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IOException e) {
+            return errnoForIoException(e);
+        } catch (UnsupportedOperationException e) {
             return Errno.Io;
         } catch (SecurityException e) {
             return Errno.Acces;
@@ -258,82 +381,204 @@ class DirectoryFd extends Fd {
     @Override
     public Errno pathOpen(Node node, WasmMemory memory, int dirFlags, int pathAddress, int pathLength, short childOflags, long childFsRightsBase, long childFsRightsInheriting, short childFdFlags,
                     int fdAddress) {
-        // Check that the rights of the newly created fd are both a subset of fsRightsBase and
-        // fsRightsInheriting.
-        if (!isSet(fsRightsBase, Rights.PathOpen) || !isSubsetOf(childFsRightsBase, fsRightsBase) || !isSubsetOf(childFsRightsBase, fsRightsInheriting)) {
+        // Check that the rights of the newly created fd and any derived fd are both a subset of
+        // fsRightsInheriting. Note that childFsRightsInheriting is not necessarily a subset of
+        // childFsRightsBase. See the javadoc for Fd#fsRightsInheriting.
+        if (!isSet(fsRightsBase, Rights.PathOpen) || !isSubsetOf(childFsRightsBase, fsRightsInheriting) || !isSubsetOf(childFsRightsInheriting, fsRightsInheriting)) {
             return Errno.Notcapable;
         }
 
-        final TruffleFile virtualChildFile = resolveVirtualFile(node, memory, pathAddress, pathLength);
-        if (virtualChildFile == null) {
-            return Errno.Noent;
-        }
-
-        final TruffleFile hostChildFile;
+        final boolean followSymlinks = isSet(dirFlags, Lookupflags.SymlinkFollow);
         try {
-            hostChildFile = resolveHostFile(virtualChildFile, dirFlags);
-        } catch (IOException e) {
-            return Errno.Io;
+            final TruffleFile virtualChildFile = resolveVirtualFile(node, memory, pathAddress, pathLength);
+            if (virtualChildFile == null) {
+                return Errno.Noent;
+            }
+            final boolean createRequested = isSet(childOflags, Oflags.Creat);
+            final boolean exclusiveRequested = isSet(childOflags, Oflags.Excl);
+            final FinalSymlinkPolicy finalSymlinkPolicy;
+            if (followSymlinks && createRequested) {
+                finalSymlinkPolicy = FinalSymlinkPolicy.FollowAllowMissingTarget;
+            } else if (followSymlinks) {
+                finalSymlinkPolicy = FinalSymlinkPolicy.Follow;
+            } else {
+                finalSymlinkPolicy = FinalSymlinkPolicy.NoFollow;
+            }
+            final TruffleFile resolvedHostChildFile = resolveHostFile(virtualChildFile, finalSymlinkPolicy);
+            if (resolvedHostChildFile == null) {
+                return Errno.Noent;
+            }
+            if (followSymlinks && exclusiveRequested) {
+                final TruffleFile lexicalHostChildFile = resolveHostFile(virtualChildFile, FinalSymlinkPolicy.NoFollow);
+                if (lexicalHostChildFile == null) {
+                    return Errno.Noent;
+                }
+                if (isSymbolicLink(lexicalHostChildFile)) {
+                    return Errno.Exist;
+                }
+            }
+            // As they are non-null, virtualChildFile and resolvedHostChildFile are guaranteed to be
+            // contained in preopenedRoot.
+
+            if (isSet(childFdFlags, Fdflags.Rsync)) {
+                // Not supported.
+                return Errno.Inval;
+            }
+
+            if (!followSymlinks && isSymbolicLink(resolvedHostChildFile)) {
+                return Errno.Loop;
+            }
+
+            if (isSet(childOflags, Oflags.Directory)) {
+                final boolean isDirectory = resolvedHostChildFile.exists() &&
+                                resolvedHostChildFile.getAttribute(TruffleFile.IS_DIRECTORY, FdUtils.linkOptions(followSymlinks));
+                if (isDirectory) {
+                    final TruffleFile directoryVirtualFile = followSymlinks ? preopenedRoot.hostFileToVirtualFile(resolvedHostChildFile) : virtualChildFile;
+                    if (directoryVirtualFile == null) {
+                        return Errno.Noent;
+                    }
+                    final int fd = fdManager.put(new DirectoryFd(fdManager, directoryVirtualFile, preopenedRoot, childFsRightsBase, childFsRightsInheriting, childFdFlags));
+                    WasmMemoryLibrary.getUncached().store_i32(memory, node, fdAddress, fd);
+                    return Errno.Success;
+                } else {
+                    return Errno.Notdir;
+                }
+            } else {
+                final int fd = fdManager.put(new FileFd(resolvedHostChildFile, childOflags, childFsRightsBase, childFsRightsInheriting, childFdFlags, followSymlinks));
+                WasmMemoryLibrary.getUncached().store_i32(memory, node, fdAddress, fd);
+                return Errno.Success;
+            }
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IllegalArgumentException e) {
+            return Errno.Inval;
         } catch (SecurityException e) {
             return Errno.Acces;
+        } catch (IOException e) {
+            return errnoForIoException(e);
+        } catch (UnsupportedOperationException e) {
+            return Errno.Io;
         }
-        if (hostChildFile == null) {
-            return Errno.Noent;
-        }
+    }
 
-        // As they are non-null, virtualChildFile and hostChildFile are guaranteed to be
-        // contained in preopenedRoot.
-
-        if (isSet(childFdFlags, Fdflags.Rsync)) {
-            // Not supported.
-            return Errno.Inval;
-        }
-
-        if (isSet(childOflags, Oflags.Directory)) {
-            if (hostChildFile.isDirectory()) {
-                final int fd = fdManager.put(new DirectoryFd(fdManager, virtualChildFile, preopenedRoot, childFsRightsBase, childFsRightsInheriting, childFdFlags));
-                memory.store_i32(node, fdAddress, fd);
-                return Errno.Success;
-            } else {
-                return Errno.Notdir;
-            }
-        } else {
-            try {
-                final int fd = fdManager.put(new FileFd(hostChildFile, childOflags, childFsRightsBase, childFsRightsInheriting, childFdFlags));
-                memory.store_i32(node, fdAddress, fd);
-                return Errno.Success;
-            } catch (FileAlreadyExistsException e) {
-                return Errno.Exist;
-            } catch (IOException | UnsupportedOperationException e) {
-                return Errno.Io;
-            } catch (IllegalArgumentException e) {
-                return Errno.Inval;
-            } catch (SecurityException e) {
-                return Errno.Acces;
-            }
+    /**
+     * Best-effort symlink probe used for errno shaping in path operations. It relies on readlink
+     * instead of basic:isSymbolicLink metadata so plain opens keep working on custom file systems
+     * that do not expose that attribute.
+     */
+    private static boolean isSymbolicLink(TruffleFile file) throws IOException, SecurityException {
+        try {
+            file.readSymbolicLink();
+            return true;
+        } catch (NotLinkException | NoSuchFileException | UnsupportedOperationException e) {
+            return false;
         }
     }
 
     @Override
-    public int pathReadLink(Node node, WasmMemory memory, int pathAddress, int pathLength, int buf, int bufLen) {
+    public Errno readdir(Node node, WasmMemory memory, int bufAddress, int bufLength, long cookie, int sizeAddress) {
+        if (!isSet(fsRightsBase, Rights.FdReaddir)) {
+            return Errno.Notcapable;
+        }
+        try {
+            FdUtils.validateU32MemoryRange(memory, bufAddress, bufLength);
+            Collection<TruffleFile> children = virtualFile.list();
+            List<TruffleFile> entries = new ArrayList<>(children.size() + 2);
+            entries.add(virtualFile.resolve("."));
+            entries.add(virtualFile.resolve(".."));
+            entries.addAll(children);
+            final LinkOption[] linkOptions = FdUtils.NOFOLLOW_LINKS;
+
+            int bufPointer = bufAddress;
+            int bufEnd = bufAddress + bufLength;
+            long currentEntry = 0;
+
+            WasmMemoryLibrary memories = WasmMemoryLibrary.getUncached();
+
+            for (TruffleFile file : entries) {
+                // Only write entries whose index is past the received "cookie"
+                if (currentEntry >= cookie) {
+                    byte[] name = file.getName().getBytes(StandardCharsets.UTF_8);
+                    final boolean syntheticDirectoryEntry = ".".equals(file.getName()) || "..".equals(file.getName());
+                    final TruffleFile metadataFile = syntheticDirectoryEntry ? null : preopenedRoot.virtualFileToHostFile(file);
+                    final long syntheticInode = syntheticDirectoryEntry ? inodeOrZero(preopenedRoot.virtualFileToHostFile(file)) : 0;
+
+                    if (bufEnd - bufPointer >= Dirent.BYTES) {
+                        bufPointer += syntheticDirectoryEntry
+                                        ? FdUtils.writeSyntheticDirent(node, memory, bufPointer, name.length, currentEntry + 1, syntheticInode, Filetype.Directory)
+                                        : FdUtils.writeDirent(node, memory, bufPointer, metadataFile, name.length, currentEntry + 1, linkOptions);
+                    } else {
+                        // Write dirent to temp buffer and truncate
+                        byte[] dirent = syntheticDirectoryEntry
+                                        ? FdUtils.writeSyntheticDirentToByteArray(name.length, currentEntry + 1, syntheticInode, Filetype.Directory)
+                                        : FdUtils.writeDirentToByteArray(metadataFile, name.length, currentEntry + 1, linkOptions);
+                        for (int i = 0; bufPointer < bufEnd; i++, bufPointer++) {
+                            assert i < dirent.length;
+                            memories.store_i32_8(memory, node, bufPointer, dirent[i]);
+                        }
+                        assert bufPointer == bufEnd;
+                        break;
+                    }
+
+                    if (bufEnd - bufPointer >= name.length) {
+                        bufPointer += memory.writeString(node, file.getName(), bufPointer);
+                    } else {
+                        // Truncate file name
+                        for (int i = 0; bufPointer < bufEnd; i++, bufPointer++) {
+                            assert i < name.length;
+                            memories.store_i32_8(memory, node, bufPointer, name[i]);
+                        }
+                        assert bufPointer == bufEnd;
+                        break;
+                    }
+                }
+                currentEntry++;
+            }
+            memories.store_i32(memory, node, sizeAddress, bufPointer - bufAddress);
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IOException e) {
+            return Errno.Io;
+        }
+        return Errno.Success;
+    }
+
+    private static long inodeOrZero(TruffleFile file) throws IOException {
+        if (file == null) {
+            return 0;
+        }
+        try {
+            return file.getAttribute(TruffleFile.UNIX_INODE, FdUtils.NOFOLLOW_LINKS);
+        } catch (UnsupportedOperationException e) {
+            return 0;
+        }
+    }
+
+    @Override
+    public int pathReadLink(Node node, WasmMemory memory, int pathAddress, int pathLength, int buf, int bufLen, int sizeAddress) {
         if (!isSet(fsRightsBase, Rights.PathReadlink)) {
             return Errno.Notcapable.ordinal();
         }
-        final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
-        if (hostChildFile == null) {
-            return Errno.Noent.ordinal();
-        }
         try {
+            final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
+            if (hostChildFile == null) {
+                return Errno.Noent.ordinal();
+            }
             final TruffleFile link = hostChildFile.readSymbolicLink();
             final TruffleFile virtualLink = preopenedRoot.hostFileToVirtualFile(link);
             if (virtualLink == null) {
                 return Errno.Noent.ordinal();
             }
+            FdUtils.validateU32MemoryRange(memory, buf, bufLen);
             final String content = virtualLink.getPath();
-            return memory.writeString(node, content, buf, bufLen);
-        } catch (NotLinkException e) {
-            return Errno.Nolink.ordinal();
-        } catch (IOException | UnsupportedOperationException e) {
+            int bytesWritten = memory.writeString(node, content, buf, bufLen);
+            WasmMemoryLibrary.getUncached().store_i32(memory, node, sizeAddress, bytesWritten);
+            return Errno.Success.ordinal();
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault.ordinal();
+        } catch (IOException e) {
+            return errnoForIoException(e).ordinal();
+        } catch (UnsupportedOperationException e) {
             return Errno.Io.ordinal();
         } catch (SecurityException e) {
             return Errno.Acces.ordinal();
@@ -345,21 +590,19 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathRemoveDirectory)) {
             return Errno.Notcapable;
         }
-        final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
-        if (hostChildFile == null) {
-            return Errno.Noent;
-        }
-        if (!hostChildFile.isDirectory()) {
-            return Errno.Notdir;
-        }
         try {
+            final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
+            if (hostChildFile == null) {
+                return Errno.Noent;
+            }
+            if (!hostChildFile.getAttribute(TruffleFile.IS_DIRECTORY, FdUtils.NOFOLLOW_LINKS)) {
+                return Errno.Notdir;
+            }
             hostChildFile.delete();
-        } catch (DirectoryNotEmptyException e) {
-            return Errno.Notempty;
-        } catch (NoSuchFileException e) {
-            return Errno.Noent;
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
         } catch (IOException e) {
-            return Errno.Io;
+            return errnoForIoException(e);
         } catch (SecurityException e) {
             return Errno.Acces;
         }
@@ -372,25 +615,24 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathRenameSource) || !isSet(newFd.fsRightsBase, Rights.PathRenameTarget)) {
             return Errno.Notcapable;
         }
-        final TruffleFile oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength);
-        if (oldHostChildFile == null) {
-            return Errno.Noent;
-        }
-
-        if (!(newFd instanceof DirectoryFd)) {
-            return Errno.Notdir;
-        }
-
-        final TruffleFile newHostChildFile = resolveHostFile(node, memory, (DirectoryFd) newFd, newPathAddress, newPathLength);
-        if (newHostChildFile == null) {
-            return Errno.Noent;
-        }
-
         try {
+            final TruffleFile oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength);
+            if (oldHostChildFile == null) {
+                return Errno.Noent;
+            }
+            if (!(newFd instanceof DirectoryFd newDirFd)) {
+                return Errno.Notdir;
+            }
+            final TruffleFile newHostChildFile = newDirFd.resolveHostFile(node, memory, newPathAddress, newPathLength);
+            if (newHostChildFile == null) {
+                return Errno.Noent;
+            }
             oldHostChildFile.move(newHostChildFile);
-        } catch (FileAlreadyExistsException e) {
-            return Errno.Exist;
-        } catch (IOException | UnsupportedOperationException e) {
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IOException e) {
+            return errnoForIoException(e);
+        } catch (UnsupportedOperationException e) {
             return Errno.Io;
         } catch (SecurityException e) {
             return Errno.Acces;
@@ -403,22 +645,21 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathSymlink)) {
             return Errno.Notcapable;
         }
-
-        final TruffleFile oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength);
-        if (oldHostChildFile == null) {
-            return Errno.Noent;
-        }
-
-        final TruffleFile newHostChildFile = resolveHostFile(node, memory, newPathAddress, newPathLength);
-        if (newHostChildFile == null) {
-            return Errno.Noent;
-        }
-
         try {
+            final TruffleFile oldHostChildFile = resolveHostFile(node, memory, oldPathAddress, oldPathLength);
+            if (oldHostChildFile == null) {
+                return Errno.Noent;
+            }
+            final TruffleFile newHostChildFile = resolveHostFile(node, memory, newPathAddress, newPathLength);
+            if (newHostChildFile == null) {
+                return Errno.Noent;
+            }
             newHostChildFile.createSymbolicLink(oldHostChildFile);
-        } catch (FileAlreadyExistsException e) {
-            return Errno.Exist;
-        } catch (IOException | UnsupportedOperationException e) {
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
+        } catch (IOException e) {
+            return errnoForIoException(e);
+        } catch (UnsupportedOperationException e) {
             return Errno.Io;
         } catch (SecurityException e) {
             return Errno.Acces;
@@ -431,20 +672,19 @@ class DirectoryFd extends Fd {
         if (!isSet(fsRightsBase, Rights.PathUnlinkFile)) {
             return Errno.Notcapable;
         }
-
-        final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
-        if (hostChildFile == null) {
-            return Errno.Noent;
-        }
-        if (hostChildFile.isDirectory()) {
-            return Errno.Isdir;
-        }
         try {
+            final TruffleFile hostChildFile = resolveHostFile(node, memory, pathAddress, pathLength);
+            if (hostChildFile == null) {
+                return Errno.Noent;
+            }
+            if (hostChildFile.getAttribute(TruffleFile.IS_DIRECTORY, FdUtils.NOFOLLOW_LINKS)) {
+                return Errno.Isdir;
+            }
             hostChildFile.delete();
-        } catch (NoSuchFileException e) {
-            return Errno.Noent;
+        } catch (IndexOutOfBoundsException e) {
+            return Errno.Fault;
         } catch (IOException e) {
-            return Errno.Io;
+            return errnoForIoException(e);
         } catch (SecurityException e) {
             return Errno.Acces;
         }

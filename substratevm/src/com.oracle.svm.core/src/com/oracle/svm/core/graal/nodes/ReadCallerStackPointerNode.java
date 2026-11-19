@@ -24,6 +24,7 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
+import com.oracle.svm.core.SubstrateTarget;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeCycles;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
@@ -32,8 +33,6 @@ import jdk.graal.compiler.nodes.FixedWithNextNode;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 
-import com.oracle.svm.core.FrameAccess;
-
 import jdk.vm.ci.meta.Value;
 
 @NodeInfo(cycles = NodeCycles.CYCLES_1, size = NodeSize.SIZE_1)
@@ -41,12 +40,12 @@ public final class ReadCallerStackPointerNode extends FixedWithNextNode implemen
     public static final NodeClass<ReadCallerStackPointerNode> TYPE = NodeClass.create(ReadCallerStackPointerNode.class);
 
     public ReadCallerStackPointerNode() {
-        super(TYPE, FrameAccess.getWordStamp());
+        super(TYPE, SubstrateTarget.getWordStamp());
     }
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
-        Value result = gen.getLIRGeneratorTool().emitReadCallerStackPointer(FrameAccess.getWordStamp());
+        Value result = gen.getLIRGeneratorTool().emitReadCallerStackPointer(SubstrateTarget.getWordStamp());
         gen.setResult(this, result);
     }
 }

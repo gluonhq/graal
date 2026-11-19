@@ -24,15 +24,16 @@
  */
 package com.oracle.svm.hosted.c.query;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import com.oracle.svm.hosted.RawStructureGuestValue;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.IntUnaryOperator;
 
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 
-import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.c.CInterfaceError;
 import com.oracle.svm.hosted.c.NativeLibraries;
@@ -45,8 +46,9 @@ import com.oracle.svm.hosted.c.info.SizableInfo.ElementKind;
 import com.oracle.svm.hosted.c.info.SizableInfo.SignednessValue;
 import com.oracle.svm.hosted.c.info.StructBitfieldInfo;
 import com.oracle.svm.hosted.c.info.StructFieldInfo;
-import com.oracle.svm.util.ReflectionUtil;
-import com.oracle.svm.util.ReflectionUtil.ReflectionUtilError;
+import com.oracle.svm.util.OriginalClassProvider;
+import com.oracle.svm.shared.util.ReflectionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil.ReflectionUtilError;
 
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -121,7 +123,7 @@ public final class RawStructureLayoutPlanner extends NativeInfoTreeVisitor {
     private void computeSize(StructFieldInfo info) {
         final int declaredSize;
         if (info.isObject()) {
-            declaredSize = ConfigurationValues.getObjectLayout().getReferenceSize();
+            declaredSize = ObjectLayout.singleton().getReferenceSize();
         } else {
             /*
              * Resolve field size using the declared type in its accessors. Note that the field
@@ -176,7 +178,13 @@ public final class RawStructureLayoutPlanner extends NativeInfoTreeVisitor {
         }
 
         int totalSize;
-        Class<? extends IntUnaryOperator> sizeProviderClass = info.getAnnotatedElement().getAnnotation(RawStructure.class).sizeProvider();
+        /*
+         * GR-78934: The builder callback API still requires a host IntUnaryOperator class. Remove
+         * this conversion when size providers execute in the guest context.
+         */
+        @SuppressWarnings("unchecked")
+        Class<? extends IntUnaryOperator> sizeProviderClass = (Class<? extends IntUnaryOperator>) OriginalClassProvider.getJavaClass(
+                        RawStructureGuestValue.get(info.getAnnotatedElement()).sizeProvider());
         if (sizeProviderClass == IntUnaryOperator.class) {
             /* No sizeProvider specified in the annotation, so no adjustment necessary. */
             totalSize = currentOffset;

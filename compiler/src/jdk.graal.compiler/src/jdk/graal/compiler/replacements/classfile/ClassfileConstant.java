@@ -35,11 +35,13 @@ import java.io.IOException;
 import jdk.graal.compiler.bytecode.Bytecodes;
 import jdk.graal.compiler.debug.Assertions;
 import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.options.LibGraalSupport;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
+@LibGraalSupport.HostedOnly
 abstract class ClassfileConstant {
 
     // @formatter:off

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,19 +31,22 @@ import static com.oracle.svm.core.Isolates.IMAGE_HEAP_RELOCATABLE_BEGIN;
 import static com.oracle.svm.core.Isolates.IMAGE_HEAP_RELOCATABLE_END;
 import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_BEGIN;
 import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_END;
-import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_ANY_RELOCATABLE_POINTER;
+import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_PATCHED_BEGIN;
+import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_PATCHED_END;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_BEGIN;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_END;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_RELOCATABLE_BEGIN;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_RELOCATABLE_END;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_WRITEABLE_BEGIN;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_WRITEABLE_END;
+import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_WRITEABLE_PATCHED_BEGIN;
+import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.HEAP_WRITEABLE_PATCHED_END;
 import static com.oracle.svm.core.imagelayer.ImageLayerSection.SectionEntries.NEXT_SECTION;
 import static com.oracle.svm.core.posix.linux.ProcFSSupport.findMapping;
 import static com.oracle.svm.core.util.PointerUtils.roundDown;
-import static com.oracle.svm.core.util.UnsignedUtils.isAMultiple;
-import static com.oracle.svm.core.util.UnsignedUtils.roundUp;
-import static org.graalvm.word.WordFactory.signed;
+import static com.oracle.svm.shared.util.UnsignedUtils.roundUp;
+import static org.graalvm.word.impl.Word.signed;
+import static org.graalvm.word.impl.Word.unsigned;
 
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -56,29 +59,36 @@ import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.function.CEntryPointErrors;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.code.DynamicMethodAddressResolutionHeapSupport;
-import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.headers.LibC;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.imagelayer.ImageLayerSection;
 import com.oracle.svm.core.os.AbstractImageHeapProvider;
+import com.oracle.svm.core.os.LayeredImageHeapSupport;
 import com.oracle.svm.core.os.VirtualMemoryProvider;
 import com.oracle.svm.core.os.VirtualMemoryProvider.Access;
 import com.oracle.svm.core.posix.PosixUtils;
+import com.oracle.svm.core.posix.headers.Errno;
 import com.oracle.svm.core.posix.headers.Fcntl;
 import com.oracle.svm.core.posix.headers.Unistd;
 import com.oracle.svm.core.util.PointerUtils;
-import com.oracle.svm.core.util.UnsignedUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.graal.compiler.word.Word;
+import jdk.graal.compiler.nodes.PauseNode;
 
 /**
  * An optimal image heap provider for Linux which creates isolate image heaps that retain the
@@ -94,113 +104,81 @@ import jdk.graal.compiler.word.Word;
  * The implementation avoids dirtying the pages of the original, and only referencing what is
  * strictly required.
  */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
     /** Magic value to verify that a located image file matches our loaded image. */
-    public static final CGlobalData<Pointer> MAGIC = CGlobalDataFactory.createWord(WordFactory.<Word> signed(ThreadLocalRandom.current().nextLong()));
+    public static final CGlobalData<Pointer> MAGIC = CGlobalDataFactory.createWord(Word.<Word> signed(ThreadLocalRandom.current().nextLong()));
 
     private static final CGlobalData<CCharPointer> PROC_SELF_MAPS = CGlobalDataFactory.createCString("/proc/self/maps");
 
     private static final SignedWord UNASSIGNED_FD = signed(-1);
     private static final SignedWord CANNOT_OPEN_FD = signed(-2);
 
-    private static final CGlobalData<WordPointer> CACHED_IMAGE_FDS = CGlobalDataFactory.createWord(UNASSIGNED_FD);
-    private static final CGlobalData<WordPointer> CACHED_IMAGE_HEAP_OFFSETS = CGlobalDataFactory.createWord();
+    private static final SignedWord COPY_RELOCATIONS_IN_PROGRESS = signed(-1);
+
+    private static final CGlobalData<WordPointer> CACHED_IMAGE_FD = CGlobalDataFactory.createWord(UNASSIGNED_FD);
+    private static final CGlobalData<WordPointer> CACHED_IMAGE_HEAP_OFFSET = CGlobalDataFactory.createWord();
+    private static final CGlobalData<WordPointer> CACHED_IMAGE_HEAP_RELOCATIONS = CGlobalDataFactory.createWord();
 
     private static final int MAX_PATHLEN = 4096;
 
-    /**
-     * Used for caching heap address space size when using layered images. Within layered images
-     * calculating this value requires iterating through multiple sections.
-     */
-    static final CGlobalData<WordPointer> CACHED_LAYERED_IMAGE_HEAP_ADDRESS_SPACE_SIZE = CGlobalDataFactory.createWord();
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static UnsignedWord getLayeredImageHeapAddressSpaceSize() {
-        // check if value is cached
-        Word currentValue = CACHED_LAYERED_IMAGE_HEAP_ADDRESS_SPACE_SIZE.get().read();
-        if (currentValue.isNonNull()) {
-            return currentValue;
-        }
-        int imageHeapOffset = Heap.getHeap().getImageHeapOffsetInAddressSpace();
-        assert imageHeapOffset >= 0;
-        UnsignedWord size = WordFactory.unsigned(imageHeapOffset);
-        UnsignedWord granularity = VirtualMemoryProvider.get().getGranularity();
-        assert isAMultiple(size, granularity);
-
-        /*
-         * Walk through the sections and add up the layer image heap sizes.
-         */
-
-        Pointer currentSection = ImageLayerSection.getInitialLayerSection().get();
-        while (currentSection.isNonNull()) {
-            Word heapBegin = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_BEGIN));
-            Word heapEnd = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_END));
-            size = size.add(getImageHeapSizeInFile(heapBegin, heapEnd));
-            size = roundUp(size, granularity);
-            currentSection = currentSection.readWord(ImageLayerSection.getEntryOffset(NEXT_SECTION));
-        }
-
-        // cache the value
-        CACHED_LAYERED_IMAGE_HEAP_ADDRESS_SPACE_SIZE.get().write(size);
-        return size;
-    }
-
-    @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected UnsignedWord getImageHeapAddressSpaceSize() {
-        if (ImageLayerBuildingSupport.buildingImageLayer()) {
-            return getLayeredImageHeapAddressSpaceSize();
-        } else {
-            return super.getImageHeapAddressSpaceSize();
-        }
-    }
-
     @Uninterruptible(reason = "Called during isolate initialization.")
-    protected int initializeLayeredImage(Pointer firstHeapStart, Pointer selfReservedHeapBase, UnsignedWord initialRemainingSize, WordPointer endPointer) {
-        int result = -1;
-        UnsignedWord remainingSize = initialRemainingSize;
+    protected int initializeLayeredImage(Pointer imageHeapStart, Pointer imageHeapEnd, Pointer selfReservedHeapBase) {
+        UnsignedWord imageHeapAlignment = unsigned(Heap.getHeap().getImageHeapAlignment());
+        assert PointerUtils.isAMultiple(imageHeapStart, imageHeapAlignment);
 
+        LayeredImageHeapSupport.patchLayeredImageHeap();
+
+        int result = -1;
         int layerCount = 0;
         Pointer currentSection = ImageLayerSection.getInitialLayerSection().get();
-        Pointer currentHeapStart = firstHeapStart;
+        Pointer currentHeapStart = imageHeapStart;
         while (currentSection.isNonNull()) {
             var cachedFDPointer = ImageLayerSection.getCachedImageFDs().get().addressOf(layerCount);
             var cachedOffsetsPointer = ImageLayerSection.getCachedImageHeapOffsets().get().addressOf(layerCount);
+            var cachedImageHeapRelocationsPtr = ImageLayerSection.getCachedImageHeapRelocations().get().addressOf(layerCount);
             Word heapBegin = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_BEGIN));
             Word heapEnd = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_END));
             Word heapRelocBegin = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_RELOCATABLE_BEGIN));
             Word heapRelocEnd = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_RELOCATABLE_END));
-            Word heapAnyRelocPointer = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_ANY_RELOCATABLE_POINTER));
+            /* This value is not used for layered images. */
+            Word heapAnyRelocPointer = Word.nullPointer();
             Word heapWritableBegin = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_WRITEABLE_BEGIN));
             Word heapWritableEnd = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_WRITEABLE_END));
+            Word heapWritablePatchedBegin = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_WRITEABLE_PATCHED_BEGIN));
+            Word heapWritablePatchedEnd = currentSection.readWord(ImageLayerSection.getEntryOffset(HEAP_WRITEABLE_PATCHED_END));
 
-            result = initializeImageHeap(currentHeapStart, remainingSize, endPointer,
-                            cachedFDPointer, cachedOffsetsPointer, MAGIC.get(),
+            /* Each layer's image heap starts at an aligned offset. */
+            currentHeapStart = PointerUtils.roundUp(currentHeapStart, imageHeapAlignment);
+
+            UnsignedWord imageHeapSize = getImageHeapSizeInFile(heapBegin, heapEnd);
+            result = initializeImageHeap(currentHeapStart, imageHeapSize,
+                            cachedFDPointer, cachedOffsetsPointer, cachedImageHeapRelocationsPtr, MAGIC.get(),
                             heapBegin, heapEnd,
                             heapRelocBegin, heapAnyRelocPointer, heapRelocEnd,
-                            heapWritableBegin, heapWritableEnd);
+                            heapWritablePatchedBegin, heapWritablePatchedEnd, heapWritableBegin, heapWritableEnd);
             if (result != CEntryPointErrors.NO_ERROR) {
                 freeImageHeap(selfReservedHeapBase);
                 return result;
             }
-            Pointer newHeapStart = endPointer.read(); // aligned
-            remainingSize = remainingSize.subtract(newHeapStart.subtract(currentHeapStart));
-            currentHeapStart = newHeapStart;
+
+            currentHeapStart = currentHeapStart.add(imageHeapSize);
 
             // read the next layer
             currentSection = currentSection.readWord(ImageLayerSection.getEntryOffset(NEXT_SECTION));
             layerCount++;
         }
+        assert imageHeapEnd == currentHeapStart;
         return result;
     }
 
     @Override
     @Uninterruptible(reason = "Called during isolate initialization.")
-    public int initialize(Pointer reservedAddressSpace, UnsignedWord reservedSize, WordPointer basePointer, WordPointer endPointer) {
-        Pointer selfReservedMemory = WordFactory.nullPointer();
+    public int initialize(Pointer reservedAddressSpace, UnsignedWord reservedSize, WordPointer heapBaseOut, WordPointer imageHeapEndOut) {
+        Pointer selfReservedMemory = Word.nullPointer();
         UnsignedWord requiredSize = getTotalRequiredAddressSpaceSize();
         if (reservedAddressSpace.isNull()) {
-            UnsignedWord alignment = WordFactory.unsigned(Heap.getHeap().getPreferredAddressSpaceAlignment());
+            UnsignedWord alignment = Word.unsigned(Heap.getHeap().getHeapBaseAlignment());
             selfReservedMemory = VirtualMemoryProvider.get().reserve(requiredSize, alignment, false);
             if (selfReservedMemory.isNull()) {
                 return CEntryPointErrors.RESERVE_ADDRESS_SPACE_FAILED;
@@ -208,7 +186,6 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
         } else if (reservedSize.belowThan(requiredSize)) {
             return CEntryPointErrors.INSUFFICIENT_ADDRESS_SPACE;
         }
-        UnsignedWord remainingSize = requiredSize;
 
         Pointer heapBase;
         Pointer selfReservedHeapBase;
@@ -219,9 +196,8 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
                 heapBase = selfReservedHeapBase;
             } else {
                 heapBase = reservedAddressSpace.add(preHeapRequiredBytes);
-                selfReservedHeapBase = WordFactory.nullPointer();
+                selfReservedHeapBase = Word.nullPointer();
             }
-            remainingSize = remainingSize.subtract(preHeapRequiredBytes);
 
             int error = DynamicMethodAddressResolutionHeapSupport.get().initialize();
             if (error != CEntryPointErrors.NO_ERROR) {
@@ -239,31 +215,39 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
             selfReservedHeapBase = selfReservedMemory;
         }
 
-        int imageHeapOffsetInAddressSpace = Heap.getHeap().getImageHeapOffsetInAddressSpace();
-        basePointer.write(heapBase);
-        Pointer imageHeapStart = heapBase.add(imageHeapOffsetInAddressSpace);
-        remainingSize = remainingSize.subtract(imageHeapOffsetInAddressSpace);
-        if (!ImageLayerBuildingSupport.buildingImageLayer()) {
-            int result = initializeImageHeap(imageHeapStart, remainingSize, endPointer,
-                            CACHED_IMAGE_FDS.get(), CACHED_IMAGE_HEAP_OFFSETS.get(), MAGIC.get(),
+        /* Update heap base and image heap end. */
+        assert PointerUtils.isAMultiple(heapBase, Word.unsigned(Heap.getHeap().getHeapBaseAlignment()));
+        heapBaseOut.write(heapBase);
+
+        Pointer imageHeapEnd = getImageHeapEnd(heapBase);
+        assert PointerUtils.isAMultiple(imageHeapEnd, VirtualMemoryProvider.get().getGranularity());
+        imageHeapEndOut.write(imageHeapEnd);
+
+        /* Map the image heap. */
+        Pointer imageHeapStart = getImageHeapBegin(heapBase);
+        if (ImageLayerBuildingSupport.buildingImageLayer()) {
+            return initializeLayeredImage(imageHeapStart, imageHeapEnd, selfReservedHeapBase);
+        } else {
+            int result = initializeImageHeap(imageHeapStart, getImageHeapSizeInFile(),
+                            CACHED_IMAGE_FD.get(), CACHED_IMAGE_HEAP_OFFSET.get(), CACHED_IMAGE_HEAP_RELOCATIONS.get(), MAGIC.get(),
                             IMAGE_HEAP_BEGIN.get(), IMAGE_HEAP_END.get(),
                             IMAGE_HEAP_RELOCATABLE_BEGIN.get(), IMAGE_HEAP_A_RELOCATABLE_POINTER.get(), IMAGE_HEAP_RELOCATABLE_END.get(),
-                            IMAGE_HEAP_WRITABLE_BEGIN.get(), IMAGE_HEAP_WRITABLE_END.get());
+                            IMAGE_HEAP_WRITABLE_PATCHED_BEGIN.get(), IMAGE_HEAP_WRITABLE_PATCHED_END.get(), IMAGE_HEAP_WRITABLE_BEGIN.get(), IMAGE_HEAP_WRITABLE_END.get());
             if (result != CEntryPointErrors.NO_ERROR) {
                 freeImageHeap(selfReservedHeapBase);
             }
             return result;
-        } else {
-            return initializeLayeredImage(imageHeapStart, selfReservedHeapBase, remainingSize, endPointer);
         }
     }
 
     @Uninterruptible(reason = "Called during isolate initialization.")
-    private static int initializeImageHeap(Pointer imageHeap, UnsignedWord reservedSize, WordPointer endPointer, WordPointer cachedFd, WordPointer cachedOffsetInFile,
-                    Pointer magicAddress, Word heapBeginSym, Word heapEndSym, Word heapRelocsSym, Pointer heapAnyRelocPointer, Word heapRelocsEndSym, Word heapWritableSym, Word heapWritableEndSym) {
+    private static int initializeImageHeap(Pointer imageHeap, UnsignedWord imageHeapSize, WordPointer cachedFd, WordPointer cachedOffsetInFile, WordPointer cachedImageHeapRelocationsPtr,
+                    Pointer magicAddress, Word heapBeginSym, Word heapEndSym, Word heapRelocsSym, Pointer heapAnyRelocPointer, Word heapRelocsEndSym, Word heapWritablePatchedSym,
+                    Word heapWritablePatchedEndSym, Word heapWritableSym, Word heapWritableEndSym) {
         assert heapBeginSym.belowOrEqual(heapWritableSym) && heapWritableSym.belowOrEqual(heapWritableEndSym) && heapWritableEndSym.belowOrEqual(heapEndSym);
         assert heapBeginSym.belowOrEqual(heapRelocsSym) && heapRelocsSym.belowOrEqual(heapRelocsEndSym) && heapRelocsEndSym.belowOrEqual(heapEndSym);
-        assert heapAnyRelocPointer.isNull() || (heapRelocsSym.belowOrEqual(heapAnyRelocPointer) && heapAnyRelocPointer.belowThan(heapRelocsEndSym));
+        assert ImageLayerBuildingSupport.buildingImageLayer() || heapRelocsSym.belowOrEqual(heapAnyRelocPointer) && heapAnyRelocPointer.belowThan(heapRelocsEndSym);
+        assert heapRelocsSym.belowOrEqual(heapRelocsEndSym) && heapRelocsEndSym.belowOrEqual(heapWritablePatchedSym) && heapWritablePatchedSym.belowOrEqual(heapWritableEndSym);
 
         SignedWord fd = cachedFd.read();
 
@@ -285,19 +269,22 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
             }
         }
 
-        UnsignedWord pageSize = VirtualMemoryProvider.get().getGranularity();
-        UnsignedWord imageHeapSize = getImageHeapSizeInFile(heapBeginSym, heapEndSym);
-        assert reservedSize.aboveOrEqual(imageHeapSize);
-        if (endPointer.isNonNull()) {
-            endPointer.write(roundUp(imageHeap.add(imageHeapSize), pageSize));
-        }
-
         /*
          * If we cannot find or open the image file, fall back to copy it from memory (the image
          * heap must be in pristine condition for that).
          */
+        UnsignedWord pageSize = VirtualMemoryProvider.get().getGranularity();
         if (fd.equal(CANNOT_OPEN_FD)) {
-            return initializeImageHeapByCopying(imageHeap, imageHeapSize, pageSize, heapBeginSym, heapWritableSym, heapWritableEndSym);
+            int result = initializeImageHeapWithMremap(imageHeap, imageHeapSize, pageSize, cachedImageHeapRelocationsPtr, heapBeginSym, heapRelocsSym, heapAnyRelocPointer, heapRelocsEndSym,
+                            heapWritablePatchedSym, heapWritablePatchedEndSym, heapWritableSym, heapWritableEndSym);
+            if (result == CEntryPointErrors.MREMAP_NOT_SUPPORTED) {
+                /*
+                 * MREMAP_DONTUNMAP is not supported, fall back to copying it from memory (the image
+                 * heap must be in pristine condition for that).
+                 */
+                return initializeImageHeapByCopying(imageHeap, imageHeapSize, pageSize, heapBeginSym, heapWritableSym, heapWritableEndSym);
+            }
+            return result;
         }
 
         // Create memory mappings from the image file.
@@ -307,36 +294,183 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
             return CEntryPointErrors.MAP_HEAP_FAILED;
         }
 
-        if (heapAnyRelocPointer.isNonNull()) {
-            ComparableWord relocatedValue = heapAnyRelocPointer.readWord(0);
-            ComparableWord mappedValue = imageHeap.readWord(heapAnyRelocPointer.subtract(heapBeginSym));
-            if (relocatedValue.notEqual(mappedValue)) {
-                Pointer linkedRelocsBoundary = roundDown(heapRelocsSym, pageSize);
-                UnsignedWord relocsAlignedSize = roundUp(heapRelocsEndSym.subtract(linkedRelocsBoundary), pageSize);
-                Pointer relocsBoundary = imageHeap.add(linkedRelocsBoundary.subtract(heapBeginSym));
-                /*
-                 * Addresses were relocated by the dynamic linker, so copy them, but first remap the
-                 * pages to avoid swapping them in from disk. We need to round to page boundaries,
-                 * and so we copy some extra data.
-                 *
-                 * NOTE: while objects with relocations are considered read-only, some of them might
-                 * be part of a chunk with writable objects, in which case the chunk header must
-                 * also be writable, and all the chunk's pages will be unprotected below.
-                 */
-                Pointer committedRelocsBegin = VirtualMemoryProvider.get().commit(relocsBoundary, relocsAlignedSize, Access.READ | Access.WRITE);
-                if (committedRelocsBegin.isNull() || committedRelocsBegin != relocsBoundary) {
-                    return CEntryPointErrors.PROTECT_HEAP_FAILED;
+        int result = copyRelocations(imageHeap, pageSize, heapBeginSym, heapRelocsSym, heapAnyRelocPointer, heapRelocsEndSym, heapWritablePatchedSym, heapWritablePatchedEndSym,
+                        Word.nullPointer());
+        if (result != CEntryPointErrors.NO_ERROR) {
+            return result;
+        }
+
+        return unprotectWritablePages(imageHeap, pageSize, heapBeginSym, heapWritableSym, heapWritableEndSym);
+    }
+
+    @Uninterruptible(reason = "Called during isolate initialization.")
+    private static int initializeImageHeapWithMremap(Pointer imageHeap, UnsignedWord imageHeapSizeInFile, UnsignedWord pageSize, WordPointer cachedImageHeapRelocationsPtr, Word heapBeginSym,
+                    Word heapRelocsSym, Pointer heapAnyRelocPointer, Word heapRelocsEndSym, Word heapWritablePatchedSym, Word heapWritablePatchedEndSym, Word heapWritableSym,
+                    Word heapWritableEndSym) {
+        if (!SubstrateOptions.MremapImageHeap.getValue()) {
+            return CEntryPointErrors.MREMAP_NOT_SUPPORTED;
+        }
+
+        Pointer cachedImageHeapRelocations = getCachedImageHeapRelocations((Pointer) cachedImageHeapRelocationsPtr, pageSize, heapRelocsSym,
+                        heapWritablePatchedEndSym);
+        assert cachedImageHeapRelocations.notEqual(0);
+        if (cachedImageHeapRelocations.rawValue() < 0) {
+            return (int) -cachedImageHeapRelocations.rawValue(); // value is a negated error code
+        }
+
+        // Map the image heap for the new isolate from the template
+        int mremapFlags = LinuxLibCHelper.MREMAP_FIXED() | LinuxLibCHelper.MREMAP_MAYMOVE() | LinuxLibCHelper.MREMAP_DONTUNMAP();
+        PointerBase res = LinuxLibCHelper.NoTransitions.mremapP(heapBeginSym, imageHeapSizeInFile, imageHeapSizeInFile, mremapFlags, imageHeap);
+        if (res.notEqual(imageHeap)) {
+            return CEntryPointErrors.MAP_HEAP_FAILED;
+        }
+
+        int result = copyRelocations(imageHeap, pageSize, heapBeginSym, heapRelocsSym, heapAnyRelocPointer, heapRelocsEndSym, heapWritablePatchedSym, heapWritablePatchedEndSym,
+                        cachedImageHeapRelocations);
+        if (result != CEntryPointErrors.NO_ERROR) {
+            return result;
+        }
+
+        if (VirtualMemoryProvider.get().protect(imageHeap, imageHeapSizeInFile, Access.READ) != 0) {
+            return CEntryPointErrors.PROTECT_HEAP_FAILED;
+        }
+
+        return unprotectWritablePages(imageHeap, pageSize, heapBeginSym, heapWritableSym, heapWritableEndSym);
+    }
+
+    /**
+     * Returns a valid pointer if successful; otherwise, returns a negated
+     * {@linkplain CEntryPointErrors error code}.
+     *
+     * It is necessary to cache the image heap relocations because when we remap a file-backed
+     * memory region, we observe that the "old" virtual address space is reinitialized to its
+     * original state w/o relocations.
+     */
+    @Uninterruptible(reason = "Called during isolate initialization.")
+    private static Pointer getCachedImageHeapRelocations(Pointer cachedImageHeapRelocationsPtr, UnsignedWord pageSize, Word heapRelocsSym, Word heapWritablePatchedEndSym) {
+        Pointer imageHeapRelocations = cachedImageHeapRelocationsPtr.readWord(0, LocationIdentity.ANY_LOCATION);
+        if (imageHeapRelocations.isNull() || imageHeapRelocations.equal(COPY_RELOCATIONS_IN_PROGRESS)) {
+            if (!cachedImageHeapRelocationsPtr.logicCompareAndSwapWord(0, Word.nullPointer(), COPY_RELOCATIONS_IN_PROGRESS, LocationIdentity.ANY_LOCATION)) {
+                /* Wait for other thread to initialize heap relocations. */
+                while ((imageHeapRelocations = cachedImageHeapRelocationsPtr.readWordVolatile(0, LocationIdentity.ANY_LOCATION)).equal(COPY_RELOCATIONS_IN_PROGRESS)) {
+                    PauseNode.pause();
                 }
-                LibC.memcpy(relocsBoundary, linkedRelocsBoundary, relocsAlignedSize);
-                if (VirtualMemoryProvider.get().protect(relocsBoundary, relocsAlignedSize, Access.READ) != 0) {
+            } else {
+                /*
+                 * This is the first time mapping the heap. Create a private copy of the relocated
+                 * image heap symbols, as these may be reverted during subsequent mremaps.
+                 */
+
+                Pointer linkedRelocsBoundary = roundDown(heapRelocsSym, pageSize);
+                UnsignedWord heapRelocsLength = roundUp(heapWritablePatchedEndSym.subtract(linkedRelocsBoundary), pageSize);
+                int mremapFlags = LinuxLibCHelper.MREMAP_MAYMOVE() | LinuxLibCHelper.MREMAP_DONTUNMAP();
+                imageHeapRelocations = LinuxLibCHelper.NoTransitions.mremapP(linkedRelocsBoundary, heapRelocsLength, heapRelocsLength, mremapFlags, Word.nullPointer());
+
+                if (imageHeapRelocations.equal(-1)) {
+                    if (LibC.errno() == Errno.EINVAL()) {
+                        /*
+                         * MREMAP_DONTUNMAP with non-anonymous mappings is only supported from
+                         * kernel version 5.13 onwards, and fails with EINVAL otherwise.
+                         *
+                         * https://github.com/torvalds/linux/commit/
+                         * a4609387859f0281951f5e476d9f76d7fb9ab321
+                         */
+                        imageHeapRelocations = Word.pointer(-CEntryPointErrors.MREMAP_NOT_SUPPORTED);
+                    } else {
+                        imageHeapRelocations = Word.pointer(-CEntryPointErrors.MAP_HEAP_FAILED);
+                    }
+                } else {
+                    if (VirtualMemoryProvider.get().protect(imageHeapRelocations, heapRelocsLength, Access.READ) != 0) {
+                        imageHeapRelocations = Word.pointer(-CEntryPointErrors.PROTECT_HEAP_FAILED);
+                    }
+                }
+
+                cachedImageHeapRelocationsPtr.writeWordVolatile(0, imageHeapRelocations);
+            }
+        }
+
+        assert imageHeapRelocations.isNonNull() && imageHeapRelocations.notEqual(COPY_RELOCATIONS_IN_PROGRESS);
+        return imageHeapRelocations;
+    }
+
+    @Uninterruptible(reason = "Called during isolate initialization.")
+    private static int copyRelocations(Pointer imageHeap, UnsignedWord pageSize, Word heapBeginSym, Word heapRelocsSym, Pointer heapAnyRelocPointer, Word heapRelocsEndSym,
+                    Word heapWritablePatchedSym, Word heapWritablePatchedEndSym, Pointer cachedRelocsBoundary) {
+        Pointer linkedRelocsBoundary = roundDown(heapRelocsSym, pageSize);
+        Pointer sourceRelocsBoundary = cachedRelocsBoundary.isNonNull() ? cachedRelocsBoundary : linkedRelocsBoundary;
+        Pointer linkedCopyStart = Word.nullPointer();
+        if (heapRelocsEndSym.subtract(heapRelocsSym).isNonNull()) {
+            boolean copyRequired;
+            if (ImageLayerBuildingSupport.buildingImageLayer()) {
+                assert heapAnyRelocPointer.isNull();
+                /*
+                 * The relocatable section with layered images will normally contain relocations
+                 * referring to both the same and different layers. Hence, it is not possible to use
+                 * a representative pointer to determine whether copying is necessary.
+                 */
+                copyRequired = true;
+            } else {
+                /*
+                 * Use a representative pointer to determine whether it is necessary to copy over
+                 * the relocations from the original image, or if it has already been performed
+                 * during build-link time.
+                 */
+                ComparableWord relocatedValue = sourceRelocsBoundary.readWord(heapAnyRelocPointer.subtract(linkedRelocsBoundary));
+                ComparableWord mappedValue = imageHeap.readWord(heapAnyRelocPointer.subtract(heapBeginSym));
+                copyRequired = relocatedValue.notEqual(mappedValue);
+            }
+            if (copyRequired) {
+                linkedCopyStart = heapRelocsSym;
+            }
+        }
+        if (linkedCopyStart.isNull() && heapWritablePatchedEndSym.subtract(heapWritablePatchedSym).isNonNull()) {
+            /*
+             * When they exist, patched entries always need to be copied over from the original
+             * image.
+             */
+            linkedCopyStart = heapWritablePatchedSym;
+        }
+        if (linkedCopyStart.isNonNull()) {
+            /*
+             * A portion of the image heap needs to be manually copied over from the original image.
+             * This is needed whenever:
+             *
+             * 1. Relocations resolved by the dynamic linker are present.
+             *
+             * 2. (For layered images only): Heap relative relocations are present (i.e. the
+             * heapWritablePatched section is non-zero).
+             *
+             * To preserve this information, we must copy over this data from the original image
+             * heap and not reload it from disk. Note this copying must be performed at a page
+             * granularity, and hence may copy some extra data which could be copy-on-write.
+             */
+            Pointer linkedCopyStartBoundary = roundDown(linkedCopyStart, pageSize);
+            UnsignedWord copyAlignedSize = roundUp(heapWritablePatchedEndSym.subtract(linkedCopyStartBoundary), pageSize);
+            Pointer destCopyStartBoundary = imageHeap.add(linkedCopyStartBoundary.subtract(heapBeginSym));
+
+            Pointer committedCopyBegin = VirtualMemoryProvider.get().commit(destCopyStartBoundary, copyAlignedSize, Access.READ | Access.WRITE);
+            if (committedCopyBegin.isNull() || committedCopyBegin != destCopyStartBoundary) {
+                return CEntryPointErrors.PROTECT_HEAP_FAILED;
+            }
+
+            Pointer sourceCopyStartBoundary = sourceRelocsBoundary.add(linkedCopyStartBoundary.subtract(linkedRelocsBoundary));
+            LibC.memcpy(destCopyStartBoundary, sourceCopyStartBoundary, copyAlignedSize);
+
+            // make the relocations read-only again
+            if (linkedRelocsBoundary.belowOrEqual(heapRelocsEndSym) && heapRelocsEndSym.subtract(heapRelocsSym).isNonNull()) {
+                UnsignedWord relocsAlignedSize = roundUp(heapRelocsEndSym.subtract(linkedRelocsBoundary), pageSize);
+                if (VirtualMemoryProvider.get().protect(destCopyStartBoundary, relocsAlignedSize, Access.READ) != 0) {
                     return CEntryPointErrors.PROTECT_HEAP_FAILED;
                 }
             }
         }
 
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    @Uninterruptible(reason = "Called during isolate initialization.")
+    private static int unprotectWritablePages(Pointer imageHeap, UnsignedWord pageSize, Word heapBeginSym, Word heapWritableSym, Word heapWritableEndSym) {
         /*
-         * Unprotect writable pages.
-         *
          * The last page might be shared with the subsequent read-only huge objects partition, in
          * which case we make some of its data writable, which we consider acceptable.
          */
@@ -421,7 +555,7 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
 
         // Find the offset of the magic word in the image file. We cannot reliably compute it
         // from the image heap offset below because it might be in a different file segment.
-        int wordSize = ConfigurationValues.getTarget().wordSize;
+        int wordSize = SubstrateTarget.getWordSize();
         WordPointer magicMappingStart = StackValue.get(WordPointer.class);
         WordPointer magicMappingFileOffset = StackValue.get(WordPointer.class);
         boolean found = findMapping(mapfd, buffer, bufferSize, magicAddress, magicAddress.add(wordSize), magicMappingStart, magicMappingFileOffset, false);
@@ -435,7 +569,7 @@ public class LinuxImageHeapProvider extends AbstractImageHeapProvider {
             return false;
         }
 
-        if (PosixUtils.readBytes(imagefd, buffer, wordSize, 0) != wordSize) {
+        if (PosixUtils.readUninterruptibly(imagefd, (Pointer) buffer, wordSize) != wordSize) {
             return false;
         }
         Word fileMagic = ((WordPointer) buffer).read();

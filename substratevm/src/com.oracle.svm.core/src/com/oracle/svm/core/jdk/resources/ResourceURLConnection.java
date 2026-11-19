@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,8 @@
 
 package com.oracle.svm.core.jdk.resources;
 
+import static com.oracle.svm.core.SubstrateOptions.ResourceProtocol;
+
 import java.io.ByteArrayInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -37,10 +39,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
 
-import com.oracle.svm.core.jdk.JavaNetSubstitutions;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
 import com.oracle.svm.core.jdk.Resources;
 
 import sun.net.www.MessageHeader;
+import sun.net.www.ParseUtil;
 import sun.net.www.URLConnection;
 
 public final class ResourceURLConnection extends URLConnection {
@@ -66,36 +69,39 @@ public final class ResourceURLConnection extends URLConnection {
         connected = true;
 
         String urlHost = url.getHost();
-        String hostNameOrNull = urlHost != null && !urlHost.isEmpty() ? urlHost : null;
-        String urlPath = url.getPath();
+        String hostName = urlHost != null && !urlHost.isEmpty() ? ParseUtil.decode(urlHost) : null;
+        String urlPath = ParseUtil.decode(url.getPath());
         if (urlPath.isEmpty()) {
-            throw new IllegalArgumentException("Empty URL path not allowed in " + JavaNetSubstitutions.RESOURCE_PROTOCOL + " URL");
+            throw new IllegalArgumentException("Empty URL path not allowed in " + ResourceProtocol.getValue() + " URL");
         }
-        String resourceName = urlPath.substring(1);
+        NativeImageResourceFileSystemUtil.RootedResourcePath resourcePath = NativeImageResourceFileSystemUtil.parseRootedResourcePath(urlPath, "URL", urlPath);
+        String resourceName = resourcePath.resourceName();
 
-        Module module = hostNameOrNull != null ? ModuleLayer.boot().findModule(hostNameOrNull).orElse(null) : null;
-        Object entry = Resources.singleton().getAtRuntime(module, resourceName, true);
-        if (entry != null) {
-            ResourceStorageEntry resourceStorageEntry = (ResourceStorageEntry) entry;
-            List<byte[]> bytes = resourceStorageEntry.getData();
-            isDirectory = resourceStorageEntry.isDirectory();
-            String urlRef = url.getRef();
-            int index = 0;
-            if (urlRef != null) {
-                try {
-                    index = Integer.parseInt(urlRef);
-                } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("URL anchor '#" + urlRef + "' not allowed in " + JavaNetSubstitutions.RESOURCE_PROTOCOL + " URL");
-                }
+        Object entry;
+        if (ClassRegistries.respectClassLoader()) {
+            if (hostName == null) {
+                throw new IllegalArgumentException("Host required in " + ResourceProtocol.getValue() + " URL");
             }
-            if (index < bytes.size()) {
-                this.data = bytes.get(index);
+            String moduleName = url.getUserInfo();
+            Module resourceModule = moduleName != null ? ModuleLayer.boot().findModule(ParseUtil.decode(moduleName)).orElse(null) : null;
+            entry = Resources.getAtRuntime(hostName, resourceModule, resourceName, false);
+        } else {
+            Module module = hostName != null ? ModuleLayer.boot().findModule(hostName).orElse(null) : null;
+            entry = Resources.getAtRuntime(module, resourceName, false);
+        }
+        if (entry != null && entry != Resources.MISSING_METADATA_MARKER) {
+            ResourceStorageEntry resourceStorageEntry = (ResourceStorageEntry) entry;
+            byte[][] bytes = resourceStorageEntry.getData();
+            isDirectory = resourceStorageEntry.isDirectory();
+            int index = resourceStorageEntry.getDataIndexForRootId(resourcePath.rootId());
+            if (index >= 0) {
+                assert index < bytes.length;
+                this.data = bytes[index];
             } else {
-                // This will happen only in case that we are creating one URL with the second URL as
-                // a context.
-                this.data = bytes.get(0);
+                this.data = null;
             }
         } else {
+            // Preserve FileNotFoundException after a warned missing-metadata access.
             this.data = null;
         }
     }
@@ -174,7 +180,7 @@ public final class ResourceURLConnection extends URLConnection {
                     properties.add(CONTENT_LENGTH, String.valueOf(data.length));
                 }
 
-                long lastModified = Resources.singleton().getLastModifiedTime();
+                long lastModified = Resources.getLastModifiedTime();
                 Date date = new Date(lastModified);
                 SimpleDateFormat fo = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
                 fo.setTimeZone(TimeZone.getTimeZone("GMT"));

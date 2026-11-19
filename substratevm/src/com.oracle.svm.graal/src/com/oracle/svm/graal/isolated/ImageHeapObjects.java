@@ -24,15 +24,14 @@
  */
 package com.oracle.svm.graal.isolated;
 
-import jdk.graal.compiler.word.Word;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.Uninterruptible;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Functionality for referring to an image heap object using its isolate-independent location.
@@ -45,33 +44,27 @@ public final class ImageHeapObjects {
 
     /**
      * Provides the image heap location of the specified image heap object that is independent of a
-     * specific isolate. Java {@code null} becomes {@link WordFactory#nullPointer() NULL}.
+     * specific isolate. Java {@code null} becomes {@link Word#nullPointer() NULL}.
      */
     @SuppressWarnings("unchecked")
     public static <T> ImageHeapRef<T> ref(T t) {
         if (t == null) {
-            return WordFactory.nullPointer();
+            return Word.nullPointer();
         }
         VMError.guarantee(isInImageHeap(t));
-        Word result = Word.objectToUntrackedPointer(t);
-        if (SubstrateOptions.SpawnIsolates.getValue()) {
-            result = result.subtract(KnownIntrinsics.heapBase());
-        }
+        UnsignedWord result = Word.objectToUntrackedWord(t).subtract(KnownIntrinsics.heapBase());
         return (ImageHeapRef<T>) result;
     }
 
     /**
      * Provides the object instance in the current isolate at the given image heap location.
-     * {@link WordFactory#nullPointer() NULL} becomes Java {@code null}.
+     * {@link Word#nullPointer() NULL} becomes Java {@code null}.
      */
     public static <T> T deref(ImageHeapRef<T> ref) {
-        if (ref.equal(WordFactory.nullPointer())) {
+        if (ref.equal(Word.nullPointer())) {
             return null;
         }
-        Pointer objectAddress = (Pointer) ref;
-        if (SubstrateOptions.SpawnIsolates.getValue()) {
-            objectAddress = objectAddress.add(KnownIntrinsics.heapBase());
-        }
+        Pointer objectAddress = ((Pointer) ref).add(KnownIntrinsics.heapBase());
         Object obj = objectAddress.toObject();
         VMError.guarantee(Heap.getHeap().isInImageHeap(obj));
 

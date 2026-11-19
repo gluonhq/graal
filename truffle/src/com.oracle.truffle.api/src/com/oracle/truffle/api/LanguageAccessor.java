@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -71,7 +71,6 @@ import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.nodes.ExecutableNode;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
 
 final class LanguageAccessor extends Accessor {
@@ -86,6 +85,7 @@ final class LanguageAccessor extends Accessor {
     static final RuntimeSupport RUNTIME = ACCESSOR.runtimeSupport();
     static final ExceptionSupport EXCEPTIONS = ACCESSOR.exceptionSupport();
     static final HostSupport HOST = ACCESSOR.hostSupport();
+    static final PolyglotIsolateSupport ISOLATE = ACCESSOR.polyglotIsolateSupport();
 
     private LanguageAccessor() {
     }
@@ -134,6 +134,16 @@ final class LanguageAccessor extends Accessor {
         @Override
         public Throwable getOrCreateLazyStackTrace(Throwable t) {
             return TruffleStackTrace.getOrCreateLazyStackTrace(t);
+        }
+
+        @Override
+        public boolean isEmptyStackTrace(Throwable t) {
+            if (t instanceof TruffleStackTrace.LazyStackTrace lazyStackTrace) {
+                return lazyStackTrace.getInternalStackTrace() == TruffleStackTrace.EMPTY;
+            } else {
+                throw new IllegalArgumentException(t);
+            }
+
         }
 
         @Override
@@ -202,7 +212,7 @@ final class LanguageAccessor extends Accessor {
             } else {
                 Object result = env.getSpi().getLanguageView(c, value);
                 if (result == null) {
-                    return LanguageAccessor.engineAccess().getDefaultLanguageView(env.spi, value);
+                    return LanguageAccessor.engineAccess().getDefaultLanguageView(env.polyglotLanguageContext, value);
                 } else {
                     return result;
                 }
@@ -279,8 +289,8 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public TruffleContext createTruffleContext(Object impl, boolean creator) {
-            return new TruffleContext(impl, creator);
+        public TruffleContext createTruffleContext(Object impl, TruffleContext parentContext) {
+            return new TruffleContext(impl, parentContext);
         }
 
         @Override
@@ -295,13 +305,13 @@ final class LanguageAccessor extends Accessor {
 
         @Override
         @SuppressWarnings("unused")
-        public CallTarget parse(TruffleLanguage.Env env, Source code, Node context, String... argumentNames) {
-            return env.getSpi().parse(code, argumentNames);
+        public CallTarget parse(TruffleLanguage.Env env, Source code, OptionValues optionValues, Node context, String... argumentNames) {
+            return env.getSpi().parse(code, optionValues, argumentNames);
         }
 
         @Override
-        public ExecutableNode parseInline(TruffleLanguage.Env env, Source code, Node context, MaterializedFrame frame) {
-            return env.getSpi().parseInline(code, context, frame);
+        public ExecutableNode parseInline(TruffleLanguage.Env env, Source code, OptionValues optionValues, Node context, MaterializedFrame frame) {
+            return env.getSpi().parseInline(code, optionValues, context, frame);
         }
 
         @Override
@@ -312,6 +322,11 @@ final class LanguageAccessor extends Accessor {
         @Override
         public void addStackFrameInfo(Node callNode, RootCallTarget root, Throwable e, Frame frame) {
             TruffleStackTrace.addStackFrameInfo(callNode, root, e, frame);
+        }
+
+        @Override
+        public void addStackFrameInfo(Node callNode, RootCallTarget root, Throwable e, Frame frame, int bytecodeIndex) {
+            TruffleStackTrace.addStackFrameInfo(callNode, root, e, frame, bytecodeIndex);
         }
 
         @Override
@@ -350,24 +365,6 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public Object evalInContext(Source source, Node node, final MaterializedFrame mFrame) {
-            CallTarget target = ACCESSOR.nodeSupport().getLanguage(node.getRootNode()).parse(source);
-            try {
-                if (target instanceof RootCallTarget) {
-                    RootNode exec = ((RootCallTarget) target).getRootNode();
-                    return exec.execute(mFrame);
-                } else {
-                    throw new IllegalStateException("" + target);
-                }
-            } catch (Exception ex) {
-                if (ex instanceof RuntimeException) {
-                    throw (RuntimeException) ex;
-                }
-                throw new RuntimeException(ex);
-            }
-        }
-
-        @Override
         public LanguageInfo getLanguageInfo(TruffleLanguage<?> language) {
             return language.languageInfo;
         }
@@ -393,6 +390,16 @@ final class LanguageAccessor extends Accessor {
         @Override
         public OptionDescriptors describeOptions(TruffleLanguage<?> language, String requiredGroup) {
             OptionDescriptors descriptors = language.getOptionDescriptors();
+            if (descriptors == null) {
+                return OptionDescriptors.EMPTY;
+            }
+            assert verifyDescriptors(language, requiredGroup, descriptors);
+            return descriptors;
+        }
+
+        @Override
+        public OptionDescriptors describeSourceOptions(TruffleLanguage<?> language, String requiredGroup) {
+            OptionDescriptors descriptors = language.getSourceOptionDescriptors();
             if (descriptors == null) {
                 return OptionDescriptors.EMPTY;
             }
@@ -567,6 +574,15 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
+        public void notifyTLActionBlocked(ThreadLocalAction action, ThreadLocalAction.Access access, boolean blocked) {
+            if (blocked) {
+                action.notifyBlocked(access);
+            } else {
+                action.notifyUnblocked(access);
+            }
+        }
+
+        @Override
         public OptionDescriptors createOptionDescriptorsUnion(OptionDescriptors... descriptors) {
             return switch (descriptors.length) {
                 case 0 -> OptionDescriptors.EMPTY;
@@ -588,8 +604,8 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public InternalResource.Env createInternalResourceEnv(InternalResource resource, BooleanSupplier contextPreinitializationCheck) {
-            return new InternalResource.Env(resource, contextPreinitializationCheck);
+        public InternalResource.Env createInternalResourceEnv(InternalResource resource, BooleanSupplier contextPreinitializationCheck, boolean forNativeImageBuild) {
+            return new InternalResource.Env(resource, contextPreinitializationCheck, forNativeImageBuild);
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -87,6 +87,7 @@ import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.ExceptionType;
+import com.oracle.truffle.api.interop.HeapIsolationException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
 import com.oracle.truffle.api.interop.TruffleObject;
@@ -94,13 +95,13 @@ import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
-import com.oracle.truffle.api.test.polyglot.ProxyLanguage.LanguageContext;
 import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class HostExceptionTest {
@@ -121,6 +122,7 @@ public class HostExceptionTest {
     private static final String RUNNER = "runner";
     private static final String RETHROWER = "rethrower";
     private static final String THROW_EXCEPTION = "throwException";
+    private static final String THROW_EXCEPTION_UNCACHED = "throwExceptionUncached";
     private static final String TRY_CATCH = "catchException";
     private static final String GET_STACK = "getStack";
 
@@ -162,6 +164,7 @@ public class HostExceptionTest {
                         case RUNNER -> new RunnerRootNode();
                         case RETHROWER -> new RethrowerRootNode();
                         case THROW_EXCEPTION -> new ThrowExceptionRootNode();
+                        case THROW_EXCEPTION_UNCACHED -> new ThrowExceptionRootNode(true);
                         case TRY_CATCH -> new TryCatchRootNode();
                         case GET_STACK -> new GetStackRootNode();
                         default -> throw new IllegalArgumentException(requestedSource);
@@ -186,12 +189,14 @@ public class HostExceptionTest {
     }
 
     @Test(expected = IllegalArgumentException.class)
+    @SuppressWarnings("deprecation")
     public void testAsHostExceptionIllegalArgument() {
         TruffleTestAssumptions.assumeWeakEncapsulation();
         env.asHostException(new Exception());
     }
 
     @Test(expected = IllegalArgumentException.class)
+    @SuppressWarnings("deprecation")
     public void testAsHostExceptionNull() {
         TruffleTestAssumptions.assumeWeakEncapsulation();
         env.asHostException(null);
@@ -444,10 +449,15 @@ public class HostExceptionTest {
             runner.execute(throwerOuterWrap);
             shouldHaveThrown(PolyglotException.class);
         } catch (PolyglotException outer) {
-            assertNull("cause must be null", outer.getCause());
+            assertNotNull("there must be a cause", outer.getCause());
+            assertThat(outer.getCause(), instanceOf(PolyglotException.class));
+
             assertTrue(outer.isHostException());
             assertThat(outer.asHostException(), instanceOf(expectedException));
             assertThat(outer.asHostException().getCause(), instanceOf(PolyglotException.class));
+
+            assertEquals(((PolyglotException) outer.getCause()).asHostException(), outer.asHostException().getCause());
+
             PolyglotException inner = (PolyglotException) outer.asHostException().getCause();
             assertTrue(inner.isHostException());
             assertThat(inner.asHostException(), instanceOf(expectedException));
@@ -528,7 +538,7 @@ public class HostExceptionTest {
         TruffleTestAssumptions.assumeWeakEncapsulation();
         expectedException = RuntimeException.class;
         customExceptionVerifier = (t) -> {
-            assertFalse(env.isHostSymbol(t));
+            assertFalse(INTEROP.isHostObject(t) && INTEROP.isScope(t));
         };
         Value catcher = context.eval(ProxyLanguage.ID, CATCHER);
         Runnable thrower = HostExceptionTest::thrower;
@@ -577,7 +587,7 @@ public class HostExceptionTest {
                 assertTrue("should have exception cause", INTEROP.hasExceptionCause(hostEx));
                 Object cause = INTEROP.getExceptionCause(hostEx);
                 assertTrue("cause should be an exception", INTEROP.isException(cause));
-                assertTrue("cause should be a host exception", env.isHostObject(cause));
+                assertTrue("cause should be a host exception", INTEROP.isHostObject(cause));
                 Class<? extends Throwable> causeClass = NoSuchFieldException.class;
                 assertTrue("cause should be instanceof " + causeClass.getSimpleName(), INTEROP.isMetaInstance(env.asHostSymbol(causeClass), cause));
                 assertFalse("cause should not have another cause", INTEROP.hasExceptionCause(cause));
@@ -628,7 +638,7 @@ public class HostExceptionTest {
                 assertTrue("should have exception cause", INTEROP.hasExceptionCause(hostEx));
                 Object cause = INTEROP.getExceptionCause(hostEx);
                 assertTrue("cause should be an exception", INTEROP.isException(cause));
-                assertTrue("cause should be a host exception", env.isHostObject(cause));
+                assertTrue("cause should be a host exception", INTEROP.isHostObject(cause));
                 Class<? extends Throwable> causeClass = NoSuchFieldException.class;
                 assertTrue("cause should be instanceof " + causeClass.getSimpleName(), INTEROP.isMetaInstance(env.asHostSymbol(causeClass), cause));
                 assertFalse("cause should not have another cause", INTEROP.hasExceptionCause(cause));
@@ -680,6 +690,70 @@ public class HostExceptionTest {
         assertEquals(expectedMessage, polyglotException.getMessage());
         assertEquals(expectedStack, getProxyLanguageStackTrace(polyglotException));
         assertThat(polyglotException.getPolyglotStackTrace().iterator().next().getRootName(), containsString("newExceptionWithCause"));
+    }
+
+    @Test
+    public void testThrowHostExceptionObjectUncachedLocation() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+        expectedException = NoSuchElementException.class;
+        Callable<Object> instantiate = NoSuchElementException::new;
+
+        Value catcher = context.eval(ProxyLanguage.ID, CATCHER);
+        Value throwException = context.eval(ProxyLanguage.ID, THROW_EXCEPTION_UNCACHED);
+        Value result = catcher.execute(throwException, instantiate);
+        assertHostException(result, expectedException);
+
+        PolyglotException polyglotException = result.as(PolyglotException.class);
+        StackFrame firstFrame = getProxyLanguageFrames(polyglotException).get(0);
+        assertEquals(THROW_EXCEPTION_UNCACHED, firstFrame.getRootName());
+        assertNotNull(firstFrame.getSourceLocation());
+    }
+
+    @Test
+    public void testHostExceptionStackTraceElementWithLineZeroSourceLocation() {
+        @SuppressWarnings("serial")
+        final class LineZeroStackTraceException extends RuntimeException {
+            @Override
+            public StackTraceElement[] getStackTrace() {
+                return new StackTraceElement[]{new StackTraceElement(HostExceptionTest.class.getName(), "lineZeroHostFrame", "HostExceptionTest.java", 0)};
+            }
+        }
+
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+        expectedException = LineZeroStackTraceException.class;
+        Value catcher = context.eval(ProxyLanguage.ID, CATCHER);
+        Runnable thrower = () -> {
+            throw new LineZeroStackTraceException();
+        };
+
+        customExceptionVerifier = (hostEx) -> {
+            assertTrue(INTEROP.isException(hostEx));
+            try {
+                Object stackTrace = INTEROP.getExceptionStackTrace(hostEx);
+                long length = INTEROP.getArraySize(stackTrace);
+                boolean foundLineZeroHostFrame = false;
+                for (long i = 0; i < length; i++) {
+                    Object stackTraceElement = INTEROP.readArrayElement(stackTrace, i);
+                    if (!INTEROP.hasDeclaringMetaObject(stackTraceElement) || !INTEROP.hasExecutableName(stackTraceElement)) {
+                        continue;
+                    }
+                    String className = INTEROP.asString(INTEROP.getMetaQualifiedName(INTEROP.getDeclaringMetaObject(stackTraceElement)));
+                    String methodName = INTEROP.asString(INTEROP.getExecutableName(stackTraceElement));
+                    if (!HostExceptionTest.class.getName().equals(className) || !"lineZeroHostFrame".equals(methodName)) {
+                        continue;
+                    }
+                    foundLineZeroHostFrame = true;
+                    assertTrue(INTEROP.hasSourceLocation(stackTraceElement));
+                    assertNotNull(INTEROP.getSourceLocation(stackTraceElement));
+                    break;
+                }
+                assertTrue("Expected a host stack trace element with line number 0", foundLineZeroHostFrame);
+            } catch (UnsupportedMessageException | InvalidArrayIndexException e) {
+                throw new AssertionError(e);
+            }
+        };
+
+        assertHostException(catcher.execute(thrower), LineZeroStackTraceException.class);
     }
 
     private static Value hostApply(Value[] args) {
@@ -897,7 +971,7 @@ public class HostExceptionTest {
 
         hostExceptionVerifier = null;
         customExceptionVerifier = (guestEx) -> {
-            assertFalse(guestEx.toString(), env.isHostException(guestEx));
+            assertFalse(guestEx.toString(), INTEROP.isHostObject(guestEx) && INTEROP.isException(guestEx));
             assertTrue(guestEx.toString(), INTEROP.isException(guestEx));
 
             assertEquals(List.of(expectedMessage,
@@ -960,9 +1034,35 @@ public class HostExceptionTest {
     }
 
     @Test
-    public void testHideHostStackFrames() {
+    public void testHideHostStackFramesInHostAccessExplicit() {
+        testHostStackFrames(HostAccess.EXPLICIT, false);
+    }
+
+    @Test
+    public void testShowHostStackFramesInHostAccessAll() {
+        testHostStackFrames(HostAccess.ALL, true);
+    }
+
+    @Test
+    public void testDisabledStackFramesInHostAccessAll() {
+        HostAccess baseHostAccess = HostAccess.newBuilder(HostAccess.ALL).//
+                        allowAccessAnnotatedBy(HostAccess.Export.class).//
+                        allowPublicAccess(false).//
+                        build();
+        testHostStackFrames(baseHostAccess, false);
+    }
+
+    @Test
+    public void testEnabledStackFramesInHostAccessExplicit() {
+        HostAccess baseHostAccess = HostAccess.newBuilder(HostAccess.EXPLICIT).//
+                        allowPublicAccess(true).//
+                        build();
+        testHostStackFrames(baseHostAccess, true);
+    }
+
+    private void testHostStackFrames(HostAccess baseHostAccess, boolean interopIncludesHostFrames) {
         TruffleTestAssumptions.assumeWeakEncapsulation();
-        hostAccess = HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(true).build();
+        hostAccess = HostAccess.newBuilder(baseHostAccess).allowAccessInheritance(true).build();
         before();
 
         String expectedMessage = "oh";
@@ -976,18 +1076,32 @@ public class HostExceptionTest {
 
         hostExceptionVerifier = null;
         customExceptionVerifier = (guestEx) -> {
-            assertFalse(guestEx.toString(), env.isHostException(guestEx));
+            assertFalse(guestEx.toString(), INTEROP.isHostObject(guestEx) && INTEROP.isException(guestEx));
             assertTrue(guestEx.toString(), INTEROP.isException(guestEx));
-
-            List<String> expectedStack = List.of(expectedMessage,
-                            THROW_EXCEPTION,
-                            RUNNER,
-                            RUNNER,
-                            RUNNER,
-                            CATCHER);
-
-            assertEquals(expectedStack, formatInteropExceptionStackTrace(guestEx, true, true));
-            assertEquals(expectedStack, formatInteropExceptionStackTrace(guestEx, false, true));
+            List<String> expectedStackFromInterop;
+            if (interopIncludesHostFrames) {
+                expectedStackFromInterop = List.of(expectedMessage,
+                                THROW_EXCEPTION,
+                                RUNNER,
+                                VALUE_EXECUTE,
+                                hostQualify("hostApply"),
+                                RUNNER,
+                                VALUE_EXECUTE,
+                                hostQualify("hostApply"),
+                                RUNNER,
+                                CATCHER);
+            } else {
+                expectedStackFromInterop = List.of(expectedMessage,
+                                THROW_EXCEPTION,
+                                RUNNER,
+                                RUNNER,
+                                RUNNER,
+                                CATCHER);
+            }
+            if (!interopIncludesHostFrames) {
+                assertEquals(expectedStackFromInterop, formatInteropExceptionStackTrace(guestEx, true, true));
+            }
+            assertEquals(expectedStackFromInterop, formatInteropExceptionStackTrace(guestEx, false, true));
         };
 
         Value result = catcher.execute(runner, proxyRunner, runner, hostRunner, runner, throwException, expectedMessage);
@@ -1218,10 +1332,10 @@ public class HostExceptionTest {
     }
 
     private void verifyHostException(Throwable ex) {
-        assertTrue(env.isHostObject(ex));
+        assertTrue(INTEROP.isHostObject(ex));
         assertNotNull("Unexpected exception: " + ex, expectedException);
-        assertThat(env.asHostObject(ex), instanceOf(expectedException));
-        assertThat(LanguageContext.get(null).getEnv().asHostException(ex), instanceOf(expectedException));
+        assertThat(asHostObject(ex), instanceOf(expectedException));
+        assertThat(asHostObject(ex), instanceOf(expectedException));
         try {
             assertTrue(InteropLibrary.getUncached().isMetaInstance(env.asHostSymbol(Throwable.class), ex));
         } catch (UnsupportedMessageException e) {
@@ -1229,11 +1343,19 @@ public class HostExceptionTest {
         }
     }
 
+    private static Object asHostObject(Object guestObject) {
+        try {
+            return INTEROP.asHostObject(guestObject);
+        } catch (UnsupportedMessageException | HeapIsolationException e) {
+            throw CompilerDirectives.shouldNotReachHere(e);
+        }
+    }
+
     @TruffleBoundary
     Object checkAndUnwrapException(Throwable ex) {
         // Avoid catching an AssertionError wrapped as a host exception.
-        if (env.isHostException(ex)) {
-            Throwable t = env.asHostException(ex);
+        if (INTEROP.isHostObject(ex) && INTEROP.isException(ex)) {
+            Throwable t = (Throwable) asHostObject(ex);
             if (t instanceof AssertionError) {
                 throw (AssertionError) t;
             }
@@ -1314,7 +1436,7 @@ public class HostExceptionTest {
                 throw CompilerDirectives.shouldNotReachHere(e);
             } catch (Exception ex) {
                 if (interop.isException(ex)) {
-                    assertTrue(env.isHostObject(ex));
+                    assertTrue(INTEROP.isHostObject(ex));
                     try {
                         throw interop.throwException(ex);
                     } catch (UnsupportedMessageException e) {
@@ -1327,25 +1449,47 @@ public class HostExceptionTest {
     }
 
     class ThrowExceptionRootNode extends RootNode {
-        @Child InteropLibrary interop = InteropLibrary.getFactory().createDispatched(5);
+        @Child private InteropLibrary interop;
+        private final String name;
+        private final boolean uncached;
 
         ThrowExceptionRootNode() {
+            this(false);
+        }
+
+        ThrowExceptionRootNode(boolean uncached) {
             super(ProxyLanguage.get(null));
+            this.uncached = uncached;
+            this.name = uncached ? THROW_EXCEPTION_UNCACHED : THROW_EXCEPTION;
+            this.interop = uncached ? InteropLibrary.getUncached() : InteropLibrary.getFactory().createDispatched(5);
         }
 
         @TruffleBoundary
         @Override
         public SourceSection getSourceSection() {
-            return Source.newBuilder(ProxyLanguage.ID, "throwException", THROW_EXCEPTION).build().createSection(1);
+            return Source.newBuilder(ProxyLanguage.ID, name, name).build().createSection(1);
         }
 
         @Override
         public String getName() {
-            return THROW_EXCEPTION;
+            return name;
         }
 
         @Override
         public Object execute(VirtualFrame frame) {
+            if (uncached) {
+                EncapsulatingNodeReference encapsulatingNode = EncapsulatingNodeReference.getCurrent();
+                Node previous = encapsulatingNode.set(this);
+                try {
+                    return executeImpl(frame);
+                } finally {
+                    encapsulatingNode.set(previous);
+                }
+            }
+            return executeImpl(frame);
+        }
+
+        private Object executeImpl(VirtualFrame frame) {
             Object exceptionSupplier = frame.getArguments()[0];
             Object[] args = Arrays.copyOfRange(frame.getArguments(), 1, frame.getArguments().length);
             try {

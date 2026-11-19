@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,8 +31,12 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.jdk.InternalVMMethod;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.core.meta.MethodRefUtils;
+import com.oracle.svm.guest.staging.jdk.InternalVMMethod;
 
+import jdk.internal.vm.annotation.Hidden;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 @InternalVMMethod
@@ -57,13 +61,13 @@ public abstract class SubstrateAccessor {
      * The first-level function that is invoked. It expands the boxed Object[] signature to the
      * expanded real signature.
      */
-    final CFunctionPointer expandSignature;
+    private final MethodRef expandSignature;
     /**
      * The direct call target, if there is any. For non-virtual invokes, this is the second-level
      * function that is invoked. For virtual invokes, this value is ignored and the actual target
      * function is loaded from the vtable.
      */
-    final CFunctionPointer directTarget;
+    private final MethodRef directTarget;
     /**
      * Class that needs to be initialized before invoking the target method. Null when no
      * initialization is necessary, i.e., when invoking non-static methods or when the class is
@@ -72,7 +76,7 @@ public abstract class SubstrateAccessor {
     final DynamicHub initializeBeforeInvoke;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    SubstrateAccessor(Executable member, CFunctionPointer expandSignature, CFunctionPointer directTarget, ResolvedJavaMethod targetMethod, DynamicHub initializeBeforeInvoke) {
+    SubstrateAccessor(Executable member, MethodRef expandSignature, MethodRef directTarget, ResolvedJavaMethod targetMethod, DynamicHub initializeBeforeInvoke) {
         this.member = member;
         this.expandSignature = expandSignature;
         this.directTarget = directTarget;
@@ -84,8 +88,9 @@ public abstract class SubstrateAccessor {
         return member;
     }
 
-    public CFunctionPointer getExpandSignature() {
-        return expandSignature;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public ResolvedJavaMethod getExpandSignatureMethod() {
+        return MethodRefSupport.getMethod(expandSignature);
     }
 
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -93,11 +98,24 @@ public abstract class SubstrateAccessor {
         return targetMethod;
     }
 
-    public Object invokeSpecial(Object obj, Object[] args) {
-        CFunctionPointer target = directTarget;
+    protected final <T extends CFunctionPointer> T getDirectTarget() {
+        return MethodRefUtils.asCodePointer(directTarget);
+    }
+
+    protected final <T extends CFunctionPointer> T getExpandSignature() {
+        return MethodRefUtils.asCodePointer(expandSignature);
+    }
+
+    /*
+     * This is @Hidden. This is important as this is called as part of the method handle
+     * implementation where this frame is not expected to appear.
+     */
+    @Hidden
+    public Object methodHandleInvokeSpecial(Object obj, Object[] args) {
+        CFunctionPointer target = getDirectTarget();
         if (target.isNull()) {
             throw new IllegalArgumentException("Cannot do invokespecial for an abstract method");
         }
-        return ((ReflectionAccessorHolder.MethodInvokeFunctionPointer) expandSignature).invoke(obj, args, target);
+        return ((ReflectionAccessorHolder.MethodInvokeFunctionPointer) getExpandSignature()).invoke(obj, args, target);
     }
 }

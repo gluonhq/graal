@@ -427,12 +427,10 @@ public final class LSStackSlotAllocator extends AllocationPhase {
 
         private void assignStackSlots(EconomicSet<LIRInstruction> usePos) {
             for (LIRInstruction op : usePos) {
-                op.forEachInput(assignSlot);
-                op.forEachAlive(assignSlot);
+                // Stack-slot assignment rewrites operand buckets at the instruction boundary, so
+                // it uses the canonical forward operand walk.
+                op.forEachValue(assignSlot);
                 op.forEachState(assignSlot);
-
-                op.forEachTemp(assignSlot);
-                op.forEachOutput(assignSlot);
             }
         }
 
@@ -444,12 +442,7 @@ public final class LSStackSlotAllocator extends AllocationPhase {
                     StackInterval interval = get(virtualSlot);
                     assert interval != null;
                     StackSlot slot = interval.location();
-                    if (virtualSlot instanceof SimpleVirtualStackSlotAlias) {
-                        GraalError.guarantee(mode == LIRInstruction.OperandMode.USE || mode == LIRInstruction.OperandMode.ALIVE, "Invalid application of SimpleVirtualStackSlotAlias");
-                        // return the same slot, but with the alias's kind.
-                        return StackSlot.get(virtualSlot.getValueKind(), slot.getRawOffset(), slot.getRawAddFrameSize());
-                    }
-                    return slot;
+                    return StackSlotAllocatorUtil.toStackSlot(virtualSlot, slot, mode);
                 }
                 return value;
             }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,8 @@
 
 package com.oracle.svm.core.jdk.resources;
 
+import static com.oracle.svm.core.SubstrateOptions.ResourceProtocol;
+
 import static java.nio.file.StandardCopyOption.COPY_ATTRIBUTES;
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 import static java.nio.file.StandardOpenOption.CREATE;
@@ -48,7 +50,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
-import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
@@ -62,72 +63,66 @@ import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileTime;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.Set;
 
-/**
- * <p>
- * Most of the code from this class is a copy of jdk.nio.zipfs.ZipPath with small tweaks. The main
- * reason why we cannot reuse this class is that this class is final in its original implementation.
- * </p>
- */
-public class NativeImageResourcePath implements Path {
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.util.NativeImageResourcePathRepresentation;
+
+/// Native Image resource file-system path. A resource path carries enough identity to address one
+/// variant of a resource that appears in multiple classpath or module roots (for example, two jars
+/// on the application classpath, two exploded classpath directories, or two module-path entries).
+/// For loader-aware resource URIs, the loader key from the URI host is folded into the internal
+/// path bytes so that the file system can keep a single tree keyed by loader and resource name.
+/// For example, `resource://java.base@boot/2!/java/lang/uniName.dat` is stored internally as the
+/// path `/boot/java/lang/uniName.dat`; the resolved lookup path used to query resource storage
+/// drops the leading slash and is therefore `boot/java/lang/uniName.dat`.
+///
+/// The module name is not folded into the path bytes. It is stored separately as `moduleName`
+/// because named-module resource lookup needs the module identity in addition to the loader/root
+/// identity. For example, `resource://org.graalvm.nativeimage.driver/0!/com/oracle/...` in
+/// non-loader-aware mode keeps `org.graalvm.nativeimage.driver` as `moduleName`, while the visible
+/// path remains `/com/oracle/...`.
+///
+/// `rootId` is either the dense per-loader ID of the source root encoded in resource URLs and URIs,
+/// for example the `2` in class-path resource URLs such as
+/// `resource://app/2!/META-INF/services/A`, or [NativeImageResourceFileSystem#ANY_ROOT_ID] for paths
+/// in the aggregate `resource:/` filesystem.
+/// `resourceIndex` is the local data-array index used by this exact path's resolved
+/// [ResourceStorageEntry]. In the common compact case `rootId == resourceIndex`; when entries are
+/// registered from roots whose IDs are sparse for a particular resource,
+/// [ResourceStorageEntry#getDataIndexForRootId(int)] maps `rootId` to the local `resourceIndex`.
+///
+/// Paths keep `rootId`, `resourceIndex`, and optional `moduleName` because `rootId` is stable URL
+/// identity, while the usable local data index depends on the current resolved resource path and
+/// module. Each path resolves and caches its local index when an operation first needs it. Once
+/// resolved, structural directory nodes have no data array to index, so they use
+/// [NativeImageResourceFileSystem#NO_RESOURCE_INDEX] and only preserve `rootId` while walking toward
+/// complete child entries. If a complete path has no data in the selected root, the operation should
+/// fail for that root instead of silently falling back to a different resource variant. Aggregate
+/// paths deliberately select the first variant for each resource.
+public class NativeImageResourcePath extends NativeImageResourcePathRepresentation implements Path {
+    private static final int RESOURCE_INDEX_UNINITIALIZED = -2;
 
     private final NativeImageResourceFileSystem fileSystem;
-    private final byte[] path;
-    private volatile int[] offsets;
-    private byte[] resolved;
-    private int hashcode = 0;
+    private final int rootId;
+    private final String moduleName;
+    private int resourceIndex;
 
-    public NativeImageResourcePath(NativeImageResourceFileSystem fileSystem, byte[] resourcePath) {
-        this(fileSystem, resourcePath, false);
+    NativeImageResourcePath(NativeImageResourceFileSystem fileSystem, byte[] resourcePath, boolean normalized, int rootId) {
+        this(fileSystem, resourcePath, normalized, rootId, null);
     }
 
-    public NativeImageResourcePath(NativeImageResourceFileSystem fileSystem, byte[] resourcePath, boolean normalized) {
+    NativeImageResourcePath(NativeImageResourceFileSystem fileSystem, byte[] resourcePath, boolean normalized, int rootId, String moduleName) {
+        super(resourcePath, normalized);
         this.fileSystem = fileSystem;
-        if (normalized) {
-            this.path = resourcePath;
-        } else {
-            this.path = normalize(resourcePath);
-        }
-    }
-
-    private void initOffsets() {
-        if (this.offsets == null) {
-            int count = 0;
-            int index = 0;
-            while (index < path.length) {
-                byte c = path[index++];
-                if (c != '/') {
-                    count++;
-                    while (index < path.length && path[index] != '/') {
-                        index++;
-                    }
-                }
-            }
-            int[] result = new int[count];
-            count = 0;
-            index = 0;
-            while (index < path.length) {
-                int m = path[index];
-                if (m == '/') {
-                    index++;
-                } else {
-                    result[count++] = index++;
-                    while (index < path.length && path[index] != '/') {
-                        index++;
-                    }
-                }
-            }
-
-            synchronized (this) {
-                if (offsets == null) {
-                    offsets = result;
-                }
-            }
-        }
+        this.rootId = rootId;
+        this.moduleName = moduleName;
+        this.resourceIndex = RESOURCE_INDEX_UNINITIALIZED;
     }
 
     @Override
@@ -147,7 +142,7 @@ public class NativeImageResourcePath implements Path {
     @Override
     public NativeImageResourcePath getRoot() {
         if (isAbsolute()) {
-            return new NativeImageResourcePath(fileSystem, new byte[]{this.path[0]});
+            return new NativeImageResourcePath(fileSystem, new byte[]{this.path[0]}, false, rootId, moduleName);
         }
         return null;
     }
@@ -166,7 +161,7 @@ public class NativeImageResourcePath implements Path {
         int length = path.length - offset;
         byte[] newPath = new byte[length];
         System.arraycopy(this.path, offset, newPath, 0, length);
-        return new NativeImageResourcePath(fileSystem, newPath);
+        return new NativeImageResourcePath(fileSystem, newPath, false, rootId, moduleName);
     }
 
     @Override
@@ -182,13 +177,7 @@ public class NativeImageResourcePath implements Path {
         }
         byte[] newPath = new byte[length];
         System.arraycopy(this.path, 0, newPath, 0, length);
-        return new NativeImageResourcePath(fileSystem, newPath);
-    }
-
-    @Override
-    public int getNameCount() {
-        initOffsets();
-        return offsets.length;
+        return new NativeImageResourcePath(fileSystem, newPath, false, rootId, moduleName);
     }
 
     @Override
@@ -207,7 +196,7 @@ public class NativeImageResourcePath implements Path {
 
         byte[] result = new byte[len];
         System.arraycopy(path, begin, result, 0, len);
-        return new NativeImageResourcePath(fileSystem, result);
+        return new NativeImageResourcePath(fileSystem, result, false, rootId, moduleName);
     }
 
     @Override
@@ -230,7 +219,7 @@ public class NativeImageResourcePath implements Path {
 
         byte[] result = new byte[len];
         System.arraycopy(path, begin, result, 0, len);
-        return new NativeImageResourcePath(fileSystem, result);
+        return new NativeImageResourcePath(fileSystem, result, false, rootId, moduleName);
     }
 
     @Override
@@ -288,11 +277,11 @@ public class NativeImageResourcePath implements Path {
 
     @Override
     public Path normalize() {
-        byte[] p = getResolved();
+        byte[] p = getResolvedPathBytes();
         if (p == this.path) {
             return this;
         }
-        return new NativeImageResourcePath(fileSystem, p, true);
+        return new NativeImageResourcePath(fileSystem, p, true, rootId, moduleName);
     }
 
     @Override
@@ -313,7 +302,7 @@ public class NativeImageResourcePath implements Path {
             result[p1.path.length] = '/';
             System.arraycopy(p2.path, 0, result, p1.path.length + 1, p2.path.length);
         }
-        return new NativeImageResourcePath(fileSystem, result);
+        return new NativeImageResourcePath(fileSystem, result, false, rootId, moduleName);
     }
 
     private static NativeImageResourcePath checkPath(Path paramPath) {
@@ -350,7 +339,7 @@ public class NativeImageResourcePath implements Path {
         NativeImageResourcePath p1 = this;
         NativeImageResourcePath p2 = checkPath(other);
         if (p2.equals(p1)) {
-            return new NativeImageResourcePath(fileSystem, new byte[0], true);
+            return new NativeImageResourcePath(fileSystem, new byte[0], true, rootId, moduleName);
         }
         if (p1.isAbsolute() != p2.isAbsolute()) {
             throw new IllegalArgumentException();
@@ -362,6 +351,9 @@ public class NativeImageResourcePath implements Path {
         int nbCommon = 0;
         while (nbCommon < l && equalsNameAt(p1, p2, nbCommon)) {
             nbCommon++;
+        }
+        if (nbCommon == nbNames1 && nbCommon == nbNames2) {
+            throw new IllegalArgumentException("Cannot relativize resource paths with the same path but different resource indexes.");
         }
         int nbUp = nbNames1 - nbCommon;
         // Compute the resulting length.
@@ -383,19 +375,38 @@ public class NativeImageResourcePath implements Path {
         if (nbCommon < nbNames2) {
             System.arraycopy(p2.path, p2.offsets[nbCommon], result, idx, p2.path.length - p2.offsets[nbCommon]);
         }
-        return new NativeImageResourcePath(fileSystem, result);
+        return new NativeImageResourcePath(fileSystem, result, false, rootId, moduleName);
     }
 
     @Override
     public URI toUri() {
         try {
-            return new URI(
-                            "resource",
-                            fileSystem.getString(toAbsolutePath().path),
-                            null);
+            NativeImageResourcePath absolute = toAbsolutePath();
+            int uriRootId = fileSystem.resolveRootIdForUri(absolute.getResolvedPath(), rootId, moduleName);
+            if (ClassRegistries.respectClassLoader()) {
+                byte[] resolvedPath = absolute.getResolvedPath();
+                int separator = indexOf(resolvedPath, (byte) '/');
+                if (separator <= 0 || separator == resolvedPath.length - 1) {
+                    throw new IllegalArgumentException("Loader-aware " + ResourceProtocol.getValue() + " paths require a loader key and resource name.");
+                }
+                String host = NativeImageResourceFileSystem.getString(Arrays.copyOf(resolvedPath, separator));
+                String resourcePath = NativeImageResourceFileSystem.getString(Arrays.copyOfRange(resolvedPath, separator, resolvedPath.length));
+                return new URI(ResourceProtocol.getValue(), moduleName, host, -1, NativeImageResourceFileSystemUtil.formatRootedResourcePathFromAbsolute(uriRootId, resourcePath), null, null);
+            }
+            return new URI(ResourceProtocol.getValue(), moduleName, NativeImageResourceFileSystemUtil.formatRootedResourcePathFromAbsolute(uriRootId, NativeImageResourceFileSystem.getString(
+                            absolute.path)), null, null);
         } catch (URISyntaxException e) {
             throw new AssertionError(e);
         }
+    }
+
+    private static int indexOf(byte[] bytes, byte value) {
+        for (int i = 0; i < bytes.length; i++) {
+            if (bytes[i] == value) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     @Override
@@ -406,12 +417,12 @@ public class NativeImageResourcePath implements Path {
         byte[] result = new byte[path.length + 1];
         result[0] = '/';
         System.arraycopy(path, 0, result, 1, path.length);
-        return new NativeImageResourcePath(fileSystem, result, true);
+        return new NativeImageResourcePath(fileSystem, result, true, rootId, moduleName);
     }
 
     @Override
     public Path toRealPath(LinkOption... options) throws IOException {
-        NativeImageResourcePath absolute = new NativeImageResourcePath(fileSystem, getResolvedPath()).toAbsolutePath();
+        NativeImageResourcePath absolute = new NativeImageResourcePath(fileSystem, getResolvedPath(), true, rootId, moduleName).toAbsolutePath();
         fileSystem.provider().checkAccess(absolute);
         return absolute;
     }
@@ -474,32 +485,42 @@ public class NativeImageResourcePath implements Path {
                 return b1 - b2;
             }
         }
-        return l1 - l2;
-    }
-
-    @Override
-    public int hashCode() {
-        int h = hashcode;
-        if (h == 0) {
-            hashcode = h = Arrays.hashCode(path);
+        int diff = l1 - l2;
+        if (diff != 0) {
+            return diff;
         }
-        return h;
+        int moduleDiff = Comparator.nullsFirst(String::compareTo).compare(p1.moduleName, p2.moduleName);
+        if (moduleDiff != 0) {
+            return moduleDiff;
+        }
+        return Integer.compare(p1.rootId, p2.rootId);
     }
 
     @Override
     public boolean equals(Object obj) {
-        return obj instanceof NativeImageResourcePath &&
-                        this.fileSystem == ((NativeImageResourcePath) obj).fileSystem &&
-                        compareTo((Path) obj) == 0;
+        if (!(obj instanceof NativeImageResourcePath)) {
+            return false;
+        }
+        NativeImageResourcePath other = (NativeImageResourcePath) obj;
+        return fileSystem == other.fileSystem && rootId == other.rootId && Objects.equals(moduleName, other.moduleName) && Arrays.equals(path, other.path);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = System.identityHashCode(fileSystem);
+        result = 31 * result + Arrays.hashCode(path);
+        result = 31 * result + rootId;
+        result = 31 * result + Objects.hashCode(moduleName);
+        return result;
     }
 
     @Override
     public String toString() {
-        return fileSystem.getString(path);
+        return NativeImageResourceFileSystem.getString(path);
     }
 
     SeekableByteChannel newByteChannel(Set<? extends OpenOption> options) throws IOException {
-        return fileSystem.newByteChannel(getResolvedPath(), options);
+        return fileSystem.newByteChannel(getResolvedPath(), getResourceIndex(), moduleName, options);
     }
 
     DirectoryStream<Path> newDirectoryStream(DirectoryStream.Filter<? super Path> filter) throws IOException {
@@ -507,7 +528,7 @@ public class NativeImageResourcePath implements Path {
     }
 
     NativeImageResourceFileAttributes getAttributes() throws NoSuchFileException {
-        NativeImageResourceFileAttributes nativeImageResourceFileAttributes = fileSystem.getFileAttributes(getResolvedPath());
+        NativeImageResourceFileAttributes nativeImageResourceFileAttributes = fileSystem.getFileAttributes(getResolvedPath(), getResourceIndex(), moduleName);
         if (nativeImageResourceFileAttributes == null) {
             throw new NoSuchFileException(toString());
         }
@@ -535,129 +556,64 @@ public class NativeImageResourcePath implements Path {
     byte[] getResolvedPath() {
         byte[] r = resolved;
         if (r == null) {
-            if (isAbsolute()) {
-                r = getResolved();
-            } else {
-                r = toAbsolutePath().getResolvedPath();
-            }
-            if (r[0] == '/' && r.length > 1) {
-                r = Arrays.copyOfRange(r, 1, r.length);
-            }
+            r = getResolvedResourceLookupPath(path);
             resolved = r;
         }
         return resolved;
     }
 
-    private byte[] normalize(byte[] resourcePath) {
-        if (resourcePath.length == 0) {
-            return resourcePath;
-        }
-        int i = 0;
-        for (int j = 0; j < resourcePath.length; j++) {
-            int k = resourcePath[j];
-            if (k == '\\' || (k == '/' && j == resourcePath.length - 1)) {
-                return normalize(resourcePath, j);
-            }
-            if ((k == '/') && (i == '/')) {
-                return normalize(resourcePath, j - 1);
-            }
-            if (k == 0) {
-                throw new InvalidPathException(fileSystem.getString(resourcePath), "Path: nul character not allowed");
-            }
-            i = k;
-        }
-        return resourcePath;
+    int getRootId() {
+        return rootId;
     }
 
-    private byte[] normalize(byte[] resourcePath, int index) {
-        byte[] arrayOfByte = new byte[resourcePath.length];
-        int i = 0;
-        while (i < index) {
-            arrayOfByte[i] = resourcePath[i];
-            i++;
-        }
-        int j = i;
-        int k = 0;
-        while (i < resourcePath.length) {
-            int m = resourcePath[i++];
-            if (m == '\\') {
-                m = '/';
-            }
-            if ((m != '/') || (k != '/')) {
-                if (m == 0) {
-                    throw new InvalidPathException(fileSystem.getString(resourcePath), "Path: nul character not allowed");
-                }
-                arrayOfByte[j++] = (byte) m;
-                k = m;
-            }
-        }
-        if ((j > 1) && (arrayOfByte[j - 1] == '/')) {
-            j--;
-        }
-        return j == arrayOfByte.length ? arrayOfByte : Arrays.copyOf(arrayOfByte, j);
+    String getModuleName() {
+        return moduleName;
     }
 
-    private byte[] getResolved() {
+    int getResourceIndex() {
+        if (resourceIndex == RESOURCE_INDEX_UNINITIALIZED) {
+            int resolvedResourceIndex = fileSystem.resolveResourceIndex(getResolvedPath(), rootId, moduleName);
+            assert resolvedResourceIndex != RESOURCE_INDEX_UNINITIALIZED;
+            resourceIndex = resolvedResourceIndex;
+        }
+        return resourceIndex;
+    }
+
+    private byte[] getResolvedPathBytes() {
         if (path.length == 0) {
             return path;
         }
         for (byte c : path) {
             if (c == '.') {
-                return getResolved(this);
+                return resolveDots(path);
             }
         }
         return path;
     }
 
-    public static byte[] getResolved(NativeImageResourcePath p) {
-        int nc = p.getNameCount();
-        byte[] path = p.path;
-        int[] offsets = p.offsets;
-        byte[] to = new byte[path.length];
-        int[] lastM = new int[nc];
-        int lastMOff = -1;
-        int m = 0;
-        for (int i = 0; i < nc; i++) {
-            int n = offsets[i];
-            int len = (i == offsets.length - 1) ? (path.length - n) : (offsets[i + 1] - n - 1);
-            if (len == 1 && path[n] == (byte) '.') {
-                if (m == 0 && path[0] == '/') { // absolute path
-                    to[m++] = '/';
-                }
-                continue;
-            }
-            if (len == 2 && path[n] == '.' && path[n + 1] == '.') {
-                if (lastMOff >= 0) {
-                    m = lastM[lastMOff--];  // retreat
-                    continue;
-                }
-                if (path[0] == '/') {  // "/../xyz" skip
-                    if (m == 0) {
-                        to[m++] = '/';
-                    }
-                } else {               // "../xyz" -> "../xyz"
-                    if (m != 0 && to[m - 1] != '/') {
-                        to[m++] = '/';
-                    }
-                    while (len-- > 0) {
-                        to[m++] = path[n++];
-                    }
-                }
-                continue;
-            }
-            if (m == 0 && path[0] == '/' ||   // absolute path
-                            m != 0 && to[m - 1] != '/') {   // not the first name
-                to[m++] = '/';
-            }
-            lastM[++lastMOff] = m;
-            while (len-- > 0) {
-                to[m++] = path[n++];
+    private static byte[] getResolvedResourceLookupPath(byte[] path) {
+        byte[] r;
+        if (path.length > 0 && path[0] == '/') {
+            r = resolveDots(path);
+        } else {
+            byte[] absolute = new byte[path.length + 1];
+            absolute[0] = '/';
+            System.arraycopy(path, 0, absolute, 1, path.length);
+            r = resolveDots(absolute);
+        }
+        if (r[0] == '/' && r.length > 1) {
+            return Arrays.copyOfRange(r, 1, r.length);
+        }
+        return r;
+    }
+
+    private static byte[] resolveDots(byte[] path) {
+        for (byte c : path) {
+            if (c == '.') {
+                return getResolved(new NativeImageResourcePathRepresentation(path, true));
             }
         }
-        if (m > 1 && to[m - 1] == '/') {
-            m--;
-        }
-        return (m == to.length) ? to : Arrays.copyOf(to, m);
+        return path;
     }
 
     private static boolean equalsNameAt(NativeImageResourcePath p1, NativeImageResourcePath p2, int index) {
@@ -687,14 +643,14 @@ public class NativeImageResourcePath implements Path {
     }
 
     boolean exists() {
-        return fileSystem.exists(getResolvedPath());
+        return fileSystem.exists(getResolvedPath(), getResourceIndex());
     }
 
     FileStore getFileStore() throws IOException {
         if (exists()) {
-            return NativeImageResourceFileSystem.getFileStore(this);
+            return new NativeImageResourceFileStore(this);
         }
-        throw new NoSuchFileException(fileSystem.getString(path));
+        throw new NoSuchFileException(NativeImageResourceFileSystem.getString(path));
     }
 
     boolean isSameFile(Path other) throws IOException {
@@ -706,7 +662,8 @@ public class NativeImageResourcePath implements Path {
         }
         this.checkAccess();
         ((NativeImageResourcePath) other).checkAccess();
-        return Arrays.equals(this.getResolvedPath(), ((NativeImageResourcePath) other).getResolvedPath());
+        NativeImageResourcePath otherResourcePath = (NativeImageResourcePath) other;
+        return rootId == otherResourcePath.rootId && getResourceIndex() == otherResourcePath.getResourceIndex() && Arrays.equals(this.getResolvedPath(), otherResourcePath.getResolvedPath());
     }
 
     void checkAccess(AccessMode... modes) throws IOException {
@@ -723,7 +680,7 @@ public class NativeImageResourcePath implements Path {
                     throw new UnsupportedOperationException();
             }
         }
-        fileSystem.checkAccess(getResolvedPath());
+        fileSystem.checkAccess(getResolvedPath(), getResourceIndex());
         if (x) {
             throw new AccessDeniedException(toString());
         }
@@ -813,7 +770,7 @@ public class NativeImageResourcePath implements Path {
             // Create directory or file.
             target.createDirectory();
         } else {
-            try (InputStream is = fileSystem.newInputStream(getResolvedPath())) {
+            try (InputStream is = fileSystem.newInputStream(getResolvedPath(), getResourceIndex(), moduleName)) {
                 try (OutputStream os = target.newOutputStream()) {
                     byte[] buf = new byte[8192];
                     int n;
@@ -846,7 +803,7 @@ public class NativeImageResourcePath implements Path {
                 }
             }
         }
-        return fileSystem.newInputStream(getResolvedPath());
+        return fileSystem.newInputStream(getResolvedPath(), getResourceIndex(), moduleName);
     }
 
     OutputStream newOutputStream(OpenOption... options) throws IOException {
@@ -857,7 +814,7 @@ public class NativeImageResourcePath implements Path {
     }
 
     FileChannel newFileChannel(Set<? extends OpenOption> options, FileAttribute<?>... attrs) throws IOException {
-        return fileSystem.newFileChannel(getResolvedPath(), options, attrs);
+        return fileSystem.newFileChannel(getResolvedPath(), getResourceIndex(), moduleName, options, attrs);
     }
 
     boolean isHidden() {

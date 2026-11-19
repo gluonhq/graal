@@ -150,18 +150,15 @@ public final class LibGraalScope implements AutoCloseable {
 
     /**
      * Enters a scope for making calls into libgraal. If there is no existing libgraal scope for the
-     * current thread, the current thread is attached to libgraal. When the outer most scope is
+     * current thread, the current thread is attached to libgraal. When the outermost scope is
      * closed, the current thread is detached from libgraal.
      *
      * This must be used in a try-with-resources statement.
      *
-     * This cannot be called from {@linkplain LibGraal#inLibGraal() within} libgraal.
-     *
      * @throws IllegalStateException if libgraal is {@linkplain LibGraal#isAvailable() unavailable}
-     *             or {@link LibGraal#inLibGraal()} returns true
      */
     public LibGraalScope(DetachAction detachAction) {
-        if (LibGraal.inLibGraal() || !LibGraal.isAvailable()) {
+        if (!LibGraal.isAvailable()) {
             throw new IllegalStateException();
         }
         id = nextId.getAndIncrement();
@@ -192,19 +189,10 @@ public final class LibGraalScope implements AutoCloseable {
     }
 
     /**
-     * Attaches the current thread to the isolate at {@code isolateAddress}.
-     *
-     * @return the address of the attached IsolateThread
-     */
-    // Implementation:
-    // com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints.attachThreadTo
-    static native long attachThreadTo(long isolateAddress);
-
-    /**
      * Detaches the current thread from the isolate at {@code isolateAddress}.
      */
     // Implementation:
-    // com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints.detachThreadFrom
+    // jdk.graal.compiler.libgraal.truffle.LibGraalTruffleScopeEntryPoints.detachThreadFrom
     static native void detachThreadFrom(long isolateThreadAddress);
 
     /**
@@ -213,16 +201,16 @@ public final class LibGraalScope implements AutoCloseable {
      * @return 0L if the current thread is not attached to the isolate at {@code isolateAddress}
      */
     // Implementation:
-    // com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints.getIsolateThreadIn
+    // jdk.graal.compiler.libgraal.truffle.LibGraalTruffleScopeEntryPoints.getIsolateThreadIn
     @SuppressWarnings("unused")
     static native long getIsolateThreadIn(long isolateAddress);
 
     /**
-     * Gets an unique identifier for the current thread's isolate. The returned value is guaranteed
+     * Gets a unique identifier for the current thread's isolate. The returned value is guaranteed
      * to be unique for the first {@code 2^64 - 1} isolates in the process.
      */
     // Implementation:
-    // com.oracle.svm.graal.hotspot.libgraal.LibGraalEntryPoints.getIsolateId
+    // jdk.graal.compiler.libgraal.truffle.LibGraalTruffleScopeEntryPoints.getIsolateId
     private static native long getIsolateId(long isolateThreadAddress);
 
     /**

@@ -20,9 +20,9 @@ Using Native Image bundles is a safe solution to encapsulate all this input requ
 
 * [Creating Bundles](#creating-bundles)
 * [Building with Bundles](#building-with-bundles)
-* [Environment Variables](#capturing-environment-variables)
-* [Creating New Bundles from Existing Bundles](#combining---bundle-create-and---bundle-apply)
-* [Executing the bundled application](#executing-the-bundled-application)
+* [Capturing Environment Variables](#capturing-environment-variables)
+* [Creating New Bundles from Existing Bundles](#combining-bundle-create-and-bundle-apply)
+* [Executing a Bundled Application](#executing-a-bundled-application)
 * [Bundle File Format](#bundle-file-format)
 
 ## Creating Bundles
@@ -157,6 +157,21 @@ native-image --bundle-apply=application.nib -g
 
 After running this command, the executable is rebuilt from the bundle with debug info enabled.
 
+When replaying a stored `-o` argument, Native Image uses only its source-platform filename because bundle processing redirects the output directory.
+This applies to both absolute and relative output paths.
+
+Bundle path substitution preserves an input recorded as unavailable when you apply the bundle or create a derived bundle, even if a file later appears at its original location.
+This also applies to uncaptured inputs recorded as identity substitutions in bundle formats older than 1.0, and to missing manifest dependencies.
+The Native Image driver represents these inputs with guaranteed-missing paths instead of consulting their original locations.
+
+For an input without a recorded substitution, replay uses its recorded canonical location when one is available.
+On a platform with the same path syntax, the original path retains its root semantics.
+On a platform with different path syntax, an uncaptured rooted path, such as a Windows drive path replayed on Linux, is represented by a guaranteed-missing path inside the bundle.
+This lets missing class path and module path entries remain ignorable without accidentally selecting unrelated files on the replay machine.
+
+Manifest `Class-Path` entries are resolved as URI references against the original JAR location, using its source platform's file URI semantics.
+Entries that cannot be converted to filesystem paths are ignored without preventing later entries from being processed.
+
 The full option help of `--bundle-apply` shows a more advanced use case that will be discussed [later](#combining---bundle-create-and---bundle-apply) in detail:
 ```
 --bundle-apply=some-bundle.nib[,dry-run][,container[=<container-tool>][,dockerfile=<Dockerfile>]]
@@ -175,7 +190,7 @@ The full option help of `--bundle-apply` shows a more advanced use case that wil
 ### Building in a Container
 
 Another addition to the `--bundle-create` and `--bundle-apply` options is to perform image building inside a container image.
-This ensures that during the image build `native-image` can not access any resources that were not explicitly specified via the classpath or module path.
+This ensures that during the image build `native-image` can not access any resources that were not explicitly specified via the class path or module path.
 
 Modify the `--bundle-create` argument in the Maven / Gradle Native Image plugin configuration above to `<buildArg>--bundle-create,container<buildArg>`.
 This still creates the same bundle as before. 
@@ -299,17 +314,14 @@ The new bundle should be larger than the original.
 The reason, as can be guessed, is that now the bundle contains the _default.iprof_ file.
 Using a tool to compare directories, you can inspect the differences in detail.
 
-As you can see that _application-pgo-optimized.nib_ contains _default.iprof_ in the directory _input/auxiliary_, and there are also changes in other files. 
+The bundle _application-pgo-optimized.nib_ contains _default.iprof_ beneath a numbered directory in _input/auxiliary_, and there are also changes in other files.
 The contents of _META-INF/nibundle.properties_, _input/stage/path_substitutions.json_ and _input/stage/path_canonicalizations.json_ will be explained [later](#bundle-file-format). 
-For now, look at the diff in _build.json_:
-```
-@@ -4,5 +4,6 @@
-   "--no-fallback",
-   "-H:Name=application",
-   "-H:Class=example.com.Application",
--  "--no-fallback"
-+  "--no-fallback",
-+  "--pgo"
+Creating _application-pgo-optimized.nib_ on Linux AMD64 adds the following argument group to _build.json_:
+```json
+{
+  "platform": "linux-amd64",
+  "args": ["--pgo"]
+}
 ```
 
 As expected, the new bundle contains the `--pgo` option that you passed to `native-image` to build an optimized bundle.
@@ -322,7 +334,7 @@ native-image --bundle-apply=application-pgo-optimized.nib
 
 As described later in [Bundle File Format](#bundle-file-format), a bundle file is a JAR file with a contained launcher for launching the bundled application.
 This means you can use a native image bundle with any JDK and execute it as a JAR file with `<jdk>/bin/java -jar [bundle-file.nib]`.
-The launcher uses the command line arguments stored in _run.json_ and adds all JAR files and folders in _input/classes/cp_ and _input/classes/p_ to the classpath and module path respectively.
+The launcher uses the command line arguments stored in _run.json_ and adds the captured entries recorded in _path_substitutions.json_ under _input/classes/cp/_ and _input/classes/p/_ to the class path and module path, respectively.
 
 The launcher also comes with a separate command-line interface described in its help text:
 ```
@@ -334,7 +346,7 @@ where options include:
 
     --with-native-image-agent[,update-bundle[=<new-bundle-name>]]
                 runs the application with a native-image-agent attached
-                'update-bundle' adds the agents output to the bundle-files classpath.
+                'update-bundle' adds the agents output to the bundle-files class path.
                 '=<new-bundle-name>' creates a new bundle with the agent output instead.
                 Note 'update-bundle' requires native-image to be installed
 
@@ -369,7 +381,7 @@ All remaining arguments are then also passed on to the bundled application.
 A bundle file is a JAR file with a well-defined internal layout.
 Inside a bundle you can find the following inner structure:
 
-```
+```text
 [bundle-file.nib]
 ├── META-INF
 │   ├── MANIFEST.MF
@@ -381,9 +393,19 @@ Inside a bundle you can find the following inner structure:
 ├── input <- All information required to rebuild the image
 │   ├── auxiliary <- Contains auxiliary files passed to native-image via arguments
 │   │                (for example, external `config-*.json` files or PGO `*.iprof`-files)
+│   │   └── 0
+│   │       └── config.json
 │   ├── classes   <- Contains all class-path and module-path entries passed to the builder
 │   │   ├── cp
+│   │   │   ├── 0
+│   │   │   │   └── application.jar
+│   │   │   └── 1
+│   │   │       └── classes <- Captured class directory
+│   │   │           └── example
+│   │   │               └── Main.class
 │   │   └── p
+│   │       └── 0
+│   │           └── module.jar
 │   └── stage
 │       ├── build.json          <- Full native-image command line (minus --bundle options)
 │       ├── container.json            <- Containerization tool, tool version and container
@@ -395,31 +417,67 @@ Inside a bundle you can find the following inner structure:
 │       ├── path_substitutions.json          <- Record of path-substitutions that happened
 │       │                                       during bundle creation for the input files                                        
 │       └── run.json            <- Full command line for executing the bundled application
-│                                                        (minus classpath and module path)
+│                                                        (minus class path and module path)
 └── output
     ├── default
     │   ├── myimage         <- Created image and other output created by the image builder 
     │   ├── myimage.debug
     |   └── sources
     └── other      <- Other output created by the builder (not relative to image location)
+        └── build-output.json
 ```
 ### META-INF
 
-The layout of a bundle file itself is versioned.
-There are two properties in _META-INF/nibundle.properties_ that declare which version of the layout a given bundle file is based on.
-Bundles currently use the following layout version:
-```
-BundleFileVersionMajor=0
-BundleFileVersionMinor=9
+The bundle format version covers both the directory layout and the JSON representation of paths and build arguments.
+Two properties in _META-INF/nibundle.properties_ declare the format version of a bundle.
+Native Image writes the following bundle format version:
+
+```properties
+BundleFileVersionMajor=3
+BundleFileVersionMinor=0
 ```
 
-Future versions of GraalVM might alter or extend the internal structure of bundle files.
-The versioning enables us to evolve the bundle format with backwards compatibility in mind.
+The properties file also records the producer's `NativeImageVersion`, `NativeImageVendor`, and `NativeImagePlatform`.
+The bundle format version is independent of the GraalVM version.
+
+### Format Version History
+
+The following table lists format changes and the GraalVM versions that introduced them:
+
+| Bundle Format | Introduced In | Changes |
+| --- | --- | --- |
+| 3.0 | GraalVM 25.6 (internal version 25.6.5) | Added numbered directories for captured inputs and Windows filename materialization. Output destinations are allocated independently of input substitutions. |
+| 2.0 | GraalVM 25.5 (internal version 25.5.5) | Added explicit path root kinds, source-platform groups for build arguments, and unavailable-input markers. |
+| 1.0 | [GraalVM 25.1.3](https://www.graalvm.org/release-notes/25.1/); also backported to [Oracle GraalVM 25.0.4](https://docs.oracle.com/en/graalvm/jdk/25/docs/release-notes/) | Added portable path maps with path style information for replay across platforms. |
+| 0.9 | [GraalVM for JDK 17](https://www.graalvm.org/release-notes/JDK_17/) and [GraalVM for JDK 20](https://www.graalvm.org/release-notes/JDK_20/), internal version 23.0.0 | Initial bundle format. |
+
+### Compatibility
+
+Newer Native Image versions can read and use bundles created with older bundle formats.
+Native Image reads both the untyped path maps used before format 1.0 and the portable path objects without `kind` used in format 1.0.
+It also reads the flat build argument arrays used before format 2.0, interpreting their paths using the bundle's recorded platform.
+Flat input layouts from formats through 2.0 remain supported when you apply or derive a bundle.
+
+Native Image rejects a bundle whose major format version is newer than the version it supports.
+A higher minor version within the same major version produces a warning, after which Native Image attempts to read the bundle.
+
+Support for older file formats does not restore removed build modes or make obsolete build options compatible with a newer Native Image version.
+Bundles with `BuilderOnClasspath=true` are permanently unsupported because running the image builder on the class path has been removed.
+This mode will not be restored.
+Application and dependency compatibility with the JDK used for rebuilding must also be considered.
+
+When you combine `--bundle-apply` and `--bundle-create`, the new bundle uses the format written by the Native Image version creating it.
+It does not retain the original bundle's format version.
 
 ### Input Data
 
 This directory contains all input data that gets passed to the `native-image` builder. 
 The file _input/stage/build.json_ holds the original command line that was passed to `native-image` when the bundle was created.
+Starting with format 2.0, this file contains an ordered array of argument groups.
+Each group has a `platform` string and an `args` array of argument strings.
+When you create a new bundle from an existing one, additional arguments form a new group with the platform on which you added them.
+The group order preserves the command line order, and each platform determines how paths and path list separators in that group are interpreted.
+The file _input/stage/run.json_ continues to store a flat array of argument strings.
 
 Parameters that make no sense to get reapplied in a bundle-build are already filtered out.
 These include:
@@ -429,7 +487,28 @@ These include:
 
 The state of environment variables that are relevant for the build are captured in _input/stage/environment.json_.
 For every `-E` argument that was seen when the bundle was created, a snapshot of its key-value pair is recorded in the file.
-The remaining files _path_canonicalizations.json_ and _path_substitutions.json_ contain a record of the file-path transformations that were performed by the `native-image` tool based on the input file paths as specified by the original command line arguments.
+The remaining files _path_canonicalizations.json_ and _path_substitutions.json_ record source-path canonicalizations and substitutions for captured or unavailable inputs, respectively.
+Each file contains an array of mappings with `src` and `dst` paths.
+Starting with format 2.0, available paths have a `style`, a `kind`, and a `text` field.
+The `style` identifies Unix, Windows, or bundle-relative path syntax.
+The `kind` identifies the root semantics, including absolute and relative paths, Windows drive paths, and Windows network share paths.
+The `text` holds the path payload.
+For example, a captured JAR can have the following substitution:
+```json
+[
+  {
+    "src": {"style": "Unix", "kind": "Absolute", "text": "work/application.jar"},
+    "dst": {"style": "BundleRelative", "kind": "Relative", "text": "input/classes/cp/0/application.jar"}
+  }
+]
+```
+
+An unavailable input has a destination with `style: BundleRelative`, `kind: Unavailable`, and no `text` field in _path_substitutions.json_.
+The unavailable marker is valid only as a substitution destination:
+```json
+{"style": "BundleRelative", "kind": "Unavailable"}
+```
+This marker preserves the input's absence across replay and derivation without storing a replay-specific placeholder path.
 
 ### Output Data
 
@@ -437,6 +516,31 @@ If a native executable is built as part of building the bundle (for example, the
 It contains the executable that was built along with any other files that were generated as part of building.
 Most output files are located in the directory _output/default_ (the executable, its debug info, and debug sources).
 Builder output files, that would have been written to arbitrary absolute paths if the executable had not been built in the bundle mode, can be found in _output/other_.
+Auxiliary outputs are placed directly beneath _output/other_.
+They retain their basenames when those names are available; otherwise, a numeric suffix is added before the extension, such as _report_1.json_.
+When you apply a bundle, output locations are allocated again from the saved output options.
+
+### Numbered Entries
+
+Bundle format 3.0 stores each captured class-path, module-path, or auxiliary input in a separate numbered directory, preserving its original basename.
+When replaying on Windows, literal backslashes within filenames become U+FFFD replacement characters (`�`).
+Each category has an independent sequence:
+
+| Category | Bundle Path |
+| --- | --- |
+| Class path | `input/classes/cp/<number>/<basename>` |
+| Module path | `input/classes/p/<number>/<basename>` |
+| Auxiliary input | `input/auxiliary/<number>/<basename>` |
+
+Different inputs with the same basename receive different numbers.
+A captured directory occupies one numbered entry, with its contents preserved beneath it.
+Repeated `-cp` or `-p` options continue the corresponding sequence, and dependencies discovered through JAR manifest `Class-Path` attributes use the class-path sequence.
+The default image output directory remains _output/default_.
+
+The saved path substitutions retain each path's assigned location across replay and derivation.
+New inputs receive unused numbers, including when a previously assigned directory is empty.
+Derived bundles can contain both flat entries retained from older bundles and new numbered entries.
+The launcher supports both layouts.
 
 ### Related Documentation
 

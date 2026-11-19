@@ -24,9 +24,8 @@
  */
 package com.oracle.svm.hosted.analysis;
 
+import com.oracle.svm.hosted.SuppressSVMWarningsGuestValue;
 import java.util.regex.Pattern;
-
-import jdk.graal.compiler.core.common.SuppressSVMWarnings;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
@@ -70,14 +69,14 @@ public class CallChecker {
         if (illegalCalleesPattern.matcher(calleeName).find()) {
             String callerName = caller.getQualifiedName();
             if (targetCallersPattern.matcher(callerName).find()) {
-                SuppressSVMWarnings suppress = caller.getAnnotation(SuppressSVMWarnings.class);
+                SuppressSVMWarningsGuestValue suppress = SuppressSVMWarningsGuestValue.get(caller);
                 AnalysisType callerType = caller.getDeclaringClass();
                 while (suppress == null && callerType != null) {
-                    suppress = callerType.getAnnotation(SuppressSVMWarnings.class);
+                    suppress = SuppressSVMWarningsGuestValue.get(callerType);
                     callerType = callerType.getEnclosingType();
                 }
                 if (suppress != null) {
-                    String[] reasons = suppress.value();
+                    var reasons = suppress.value();
                     for (String r : reasons) {
                         if (r.equals("AllowUseOfStreamAPI")) {
                             return true;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,16 +26,12 @@ package com.oracle.svm.processor;
 
 import java.io.PrintWriter;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
-import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
-import javax.lang.model.type.TypeMirror;
 
 import jdk.graal.compiler.processor.AbstractProcessor;
 
@@ -47,21 +43,17 @@ import jdk.graal.compiler.processor.AbstractProcessor;
 @SupportedAnnotationTypes(AutomaticallyRegisteredImageSingletonProcessor.ANNOTATION_CLASS_NAME)
 public class AutomaticallyRegisteredImageSingletonProcessor extends AbstractProcessor {
 
-    static final String ANNOTATION_CLASS_NAME = "com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton";
-    static final String LAYERED_SINGLETON_INFO = "com.oracle.svm.core.layeredimagesingleton.LoadedLayeredImageSingletonInfo";
-    static final String FEATURE_SINGLETON_NAME = "com.oracle.svm.core.layeredimagesingleton.FeatureSingleton";
-    static final String UNSAVED_SINGLETON_NAME = "com.oracle.svm.core.layeredimagesingleton.UnsavedSingleton";
+    static final String ANNOTATION_CLASS_NAME = "com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton";
+    static final String SERVICE_REGISTRATION_INTERFACE_NAME = "com.oracle.svm.core.singleton.AutomaticallyRegisteredImageSingletonServiceRegistration";
 
-    private final Set<Element> processed = new HashSet<>();
+    private final Set<Element> processed = new HashSet<>(); // noEconomicSet(dependency)
 
     private void processElement(TypeElement annotatedType) {
-        String featureClassName = getTypeNameWithEnclosingClasses(annotatedType, "Feature");
+        String serviceRegistrationImplClassName = getTypeNameWithEnclosingClasses(annotatedType, "_ServiceRegistration");
         String packageName = getPackage(annotatedType).getQualifiedName().toString();
+        String annotatedTypeClassName = processingEnv.getElementUtils().getBinaryName(annotatedType).toString();
 
-        AnnotationMirror singletonAnnotation = getAnnotation(annotatedType, getType(ANNOTATION_CLASS_NAME));
-        AnnotationMirror platformsAnnotation = getAnnotation(annotatedType, getType("org.graalvm.nativeimage.Platforms"));
-
-        try (PrintWriter out = createSourceFile(packageName, featureClassName, processingEnv.getFiler(), annotatedType)) {
+        try (PrintWriter out = createSourceFile(packageName, serviceRegistrationImplClassName, processingEnv.getFiler(), annotatedType)) {
             out.println("// CheckStyle: stop header check");
             out.println("// CheckStyle: stop line length check");
             out.println("package " + packageName + ";");
@@ -71,63 +63,20 @@ public class AutomaticallyRegisteredImageSingletonProcessor extends AbstractProc
             out.println("// Annotation: " + ANNOTATION_CLASS_NAME);
             out.println("// Annotation processor: " + getClass().getName());
             out.println("");
-            out.println("import org.graalvm.nativeimage.ImageSingletons;");
-            out.println("import " + AutomaticallyRegisteredFeatureProcessor.ANNOTATION_CLASS_NAME + ";");
-            if (platformsAnnotation != null) {
-                out.println("import org.graalvm.nativeimage.Platforms;");
-            }
+            out.println("import " + SERVICE_REGISTRATION_INTERFACE_NAME + ";");
+            out.println("import org.graalvm.nativeimage.Platform;");
+            out.println("import org.graalvm.nativeimage.Platforms;");
             out.println("");
-
-            if (platformsAnnotation != null) {
-                String platforms = getAnnotationValueList(platformsAnnotation, "value", TypeMirror.class).stream().map(type -> type.toString() + ".class").collect(Collectors.joining(", "));
-                out.println("@Platforms({" + platforms + "})");
-            }
-            out.println("@" + getSimpleName(AutomaticallyRegisteredFeatureProcessor.ANNOTATION_CLASS_NAME));
-            out.println("public final class " + featureClassName + " implements " +
-                            String.join(", ", new String[]{AutomaticallyRegisteredFeatureProcessor.FEATURE_INTERFACE_CLASS_NAME, FEATURE_SINGLETON_NAME, UNSAVED_SINGLETON_NAME}) + " {");
+            out.println("@Platforms(Platform.HOSTED_ONLY.class)");
+            out.println("public final class " + serviceRegistrationImplClassName + " implements " + getSimpleName(SERVICE_REGISTRATION_INTERFACE_NAME) + " {");
             out.println("    @Override");
-            out.println("    public void afterRegistration(AfterRegistrationAccess access) {");
-
-            List<TypeMirror> onlyWithList = getAnnotationValueList(singletonAnnotation, "onlyWith", TypeMirror.class);
-            if (!onlyWithList.isEmpty()) {
-                for (var onlyWith : onlyWithList) {
-                    out.println("        if (!new " + onlyWith + "().getAsBoolean()) {");
-                    out.println("            return;");
-                    out.println("        }");
-                }
-            }
-
-            List<TypeMirror> keysFromAnnotation = getAnnotationValueList(singletonAnnotation, "value", TypeMirror.class);
-            if (keysFromAnnotation.isEmpty()) {
-                String keyname = "" + annotatedType + ".class";
-                out.println("        if (ImageSingletons.lookup(" + LAYERED_SINGLETON_INFO + ".class).handledDuringLoading(" + keyname + ")){");
-                out.println("            return;");
-                out.println("        }");
-            } else {
-                out.println("        boolean match = false;");
-                for (var keyFromAnnotation : keysFromAnnotation) {
-                    String keyname = keyFromAnnotation.toString() + ".class";
-                    out.println("        match = match || !ImageSingletons.lookup(" + LAYERED_SINGLETON_INFO + ".class).handledDuringLoading(" + keyname + ");");
-                }
-                out.println("        if (!match) { return; }");
-            }
-
-            out.println("        var singleton = new " + annotatedType + "();");
-
-            if (keysFromAnnotation.isEmpty()) {
-                String keyname = "" + annotatedType + ".class";
-                out.println("        ImageSingletons.add(" + keyname + ", singleton);");
-            } else {
-                for (var keyFromAnnotation : keysFromAnnotation) {
-                    String keyname = keyFromAnnotation.toString() + ".class";
-                    out.println("        if (!ImageSingletons.lookup(" + LAYERED_SINGLETON_INFO + ".class).handledDuringLoading(" + keyname + ")){");
-                    out.println("            ImageSingletons.add(" + keyname + ", singleton);");
-                    out.println("        }");
-                }
-            }
+            out.println("    public String getClassName() {");
+            out.println("        return \"" + annotatedTypeClassName + "\";");
             out.println("    }");
             out.println("}");
         }
+
+        createProviderFile(packageName + "." + serviceRegistrationImplClassName, SERVICE_REGISTRATION_INTERFACE_NAME, annotatedType);
     }
 
     /**

@@ -32,20 +32,24 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateUtil;
 import com.oracle.svm.core.c.libc.GLibC;
 import com.oracle.svm.core.c.libc.LibCBase;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
 import com.oracle.svm.core.posix.PosixUtils;
 import com.oracle.svm.core.posix.headers.Dlfcn;
 import com.oracle.svm.core.posix.headers.Dlfcn.GNUExtensions.Lmid_t;
 import com.oracle.svm.core.posix.headers.Dlfcn.GNUExtensions.Lmid_tPointer;
 import com.oracle.svm.core.posix.headers.PosixLibC;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.truffle.nfi.Target_com_oracle_truffle_nfi_backend_libffi_NFIUnsatisfiedLinkError;
 import com.oracle.svm.truffle.nfi.TruffleNFIFeature;
 import com.oracle.svm.truffle.nfi.TruffleNFISupport;
@@ -65,6 +69,7 @@ public final class PosixTruffleNFIFeature implements InternalFeature {
     }
 }
 
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 final class PosixTruffleNFISupport extends TruffleNFISupport {
 
     private static final int ISOLATED_NAMESPACE_FLAG = 0x10000;
@@ -121,8 +126,8 @@ final class PosixTruffleNFISupport extends TruffleNFISupport {
             synchronized (context) {
                 namespaceId = context.isolatedNamespaceId;
                 if (namespaceId == 0) {
-                    PointerBase handle = dlmopen(WordFactory.signed(LM_ID_NEWLM()), name, mode);
-                    if (handle.equal(WordFactory.zero())) {
+                    PointerBase handle = dlmopen(Word.signed(LM_ID_NEWLM()), name, mode);
+                    if (handle.equal(Word.zero())) {
                         return handle;
                     }
 
@@ -143,7 +148,7 @@ final class PosixTruffleNFISupport extends TruffleNFISupport {
 
         // Namespace already created.
         assert namespaceId != 0;
-        return dlmopen(WordFactory.signed(namespaceId), name, mode);
+        return dlmopen(Word.signed(namespaceId), name, mode);
     }
 
     @Override
@@ -154,7 +159,7 @@ final class PosixTruffleNFISupport extends TruffleNFISupport {
         } else {
             handle = PosixUtils.dlopen(name, flags);
         }
-        if (handle.equal(WordFactory.zero())) {
+        if (handle.equal(Word.zero())) {
             CompilerDirectives.transferToInterpreter();
             String error = PosixUtils.dlerror();
             throw SubstrateUtil.cast(new Target_com_oracle_truffle_nfi_backend_libffi_NFIUnsatisfiedLinkError(error), AbstractTruffleException.class);
@@ -164,7 +169,7 @@ final class PosixTruffleNFISupport extends TruffleNFISupport {
 
     @Override
     protected void freeLibraryImpl(long library) {
-        Dlfcn.dlclose(WordFactory.pointer(library));
+        Dlfcn.dlclose(Word.pointer(library));
     }
 
     @Override
@@ -177,10 +182,10 @@ final class PosixTruffleNFISupport extends TruffleNFISupport {
         if (library == 0) {
             ret = nativeLibrarySupport.findBuiltinSymbol(name);
         } else {
-            ret = PosixUtils.dlsym(WordFactory.pointer(library), name);
+            ret = PosixUtils.dlsym(Word.pointer(library), name);
         }
 
-        if (ret.equal(WordFactory.zero())) {
+        if (ret.equal(Word.zero())) {
             CompilerDirectives.transferToInterpreter();
             String error = PosixUtils.dlerror();
             if (error != null) {

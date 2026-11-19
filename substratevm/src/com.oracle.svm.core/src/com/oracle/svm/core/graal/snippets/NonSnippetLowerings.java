@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,43 +26,50 @@ package com.oracle.svm.core.graal.snippets;
 
 import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.HAS_SIDE_EFFECT;
 
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Predicate;
 
-import org.graalvm.collections.Pair;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.word.LocationIdentity;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.c.BoxedRelocatedPointer;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.graal.code.CGlobalDataInfo;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.code.ImageCodeInfoProvider;
 import com.oracle.svm.core.graal.code.SubstrateBackend;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
 import com.oracle.svm.core.graal.meta.KnownOffsets;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.nodes.CGlobalDataLoadAddressNode;
+import com.oracle.svm.core.graal.nodes.FloatingWordCastNode;
+import com.oracle.svm.core.graal.nodes.LoadMethodByIndexNode;
 import com.oracle.svm.core.graal.nodes.LoadOpenTypeWorldDispatchTableStartingOffset;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
+import com.oracle.svm.core.graal.nodes.MethodOffsetToPointerNode;
 import com.oracle.svm.core.graal.nodes.ThrowBytecodeExceptionNode;
+import com.oracle.svm.core.hub.crema.CremaSupport;
 import com.oracle.svm.core.imagelayer.DynamicImageLayerInfo;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.core.meta.SubstrateMethodRefStamp;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.core.nodes.SubstrateIndirectCallTargetNode;
+import com.oracle.svm.core.nodes.SubstrateMethodCallTargetNode;
 import com.oracle.svm.core.snippets.ImplicitExceptions;
 import com.oracle.svm.core.snippets.SnippetRuntime;
-import com.oracle.svm.core.snippets.SubstrateForeignCallTarget;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.graal.compiler.core.common.memory.BarrierType;
 import jdk.graal.compiler.core.common.memory.MemoryOrderMode;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
+import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampPair;
 import jdk.graal.compiler.core.common.type.TypeReference;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.graph.NodeInputList;
 import jdk.graal.compiler.nodes.BeginNode;
@@ -87,6 +94,8 @@ import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.calc.AddNode;
 import jdk.graal.compiler.nodes.calc.IsNullNode;
+import jdk.graal.compiler.nodes.calc.MulNode;
+import jdk.graal.compiler.nodes.calc.ZeroExtendNode;
 import jdk.graal.compiler.nodes.extended.BranchProbabilityNode;
 import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
 import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode.BytecodeExceptionKind;
@@ -94,6 +103,7 @@ import jdk.graal.compiler.nodes.extended.FixedValueAnchorNode;
 import jdk.graal.compiler.nodes.extended.ForeignCallNode;
 import jdk.graal.compiler.nodes.extended.GetClassNode;
 import jdk.graal.compiler.nodes.extended.LoadHubNode;
+import jdk.graal.compiler.nodes.extended.LoadMethodNode;
 import jdk.graal.compiler.nodes.extended.OpaqueValueNode;
 import jdk.graal.compiler.nodes.java.InstanceOfNode;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
@@ -112,6 +122,7 @@ import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaMethodProfile;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -119,7 +130,6 @@ public abstract class NonSnippetLowerings {
 
     public static final SnippetRuntime.SubstrateForeignCallDescriptor REPORT_VERIFY_TYPES_ERROR = SnippetRuntime.findForeignCall(NonSnippetLowerings.class, "reportVerifyTypesError", HAS_SIDE_EFFECT,
                     LocationIdentity.any());
-    public static final Field boxedRelocatedPointerField = ReflectionUtil.lookupField(BoxedRelocatedPointer.class, "pointer");
 
     private final Predicate<ResolvedJavaMethod> mustNotAllocatePredicate;
 
@@ -130,15 +140,22 @@ public abstract class NonSnippetLowerings {
                     Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings, boolean hosted) {
         this.mustNotAllocatePredicate = mustNotAllocatePredicate;
 
-        if (hosted) {
+        if (hosted || SubstrateOptions.useRistretto()) {
             // These nodes create a FrameState which cannot be deoptimized from
             lowerings.put(BytecodeExceptionNode.class, new BytecodeExceptionLowering());
             lowerings.put(ThrowBytecodeExceptionNode.class, new ThrowBytecodeExceptionLowering());
         }
+
         lowerings.put(GetClassNode.class, new GetClassLowering());
-        InvokeLowering invokeLowering = new InvokeLowering(runtimeConfig, verifyTypes, KnownOffsets.singleton());
+
+        KnownOffsets knownOffsets = KnownOffsets.singleton();
+        InvokeLowering invokeLowering = new InvokeLowering(runtimeConfig, verifyTypes, knownOffsets);
         lowerings.put(InvokeNode.class, invokeLowering);
         lowerings.put(InvokeWithExceptionNode.class, invokeLowering);
+
+        LoadMethodLowering loadMethodLowering = new LoadMethodLowering(runtimeConfig, knownOffsets);
+        lowerings.put(LoadMethodNode.class, loadMethodLowering);
+        lowerings.put(LoadMethodByIndexNode.class, loadMethodLowering);
     }
 
     private static final EnumMap<BytecodeExceptionKind, ForeignCallDescriptor> getCachedExceptionDescriptors;
@@ -229,12 +246,12 @@ public abstract class NonSnippetLowerings {
             }
             outArguments.addAll(exceptionArguments);
         }
-        VMError.guarantee(descriptor != null, "No ForeignCallDescriptor for ByteCodeExceptionKind %s", exceptionKind);
+        GraalError.guarantee(descriptor != null, "No ForeignCallDescriptor for ByteCodeExceptionKind %s", exceptionKind);
         assert descriptor.getArgumentTypes().length == outArguments.size();
         return descriptor;
     }
 
-    private class BytecodeExceptionLowering implements NodeLoweringProvider<BytecodeExceptionNode> {
+    private final class BytecodeExceptionLowering implements NodeLoweringProvider<BytecodeExceptionNode> {
         @Override
         public void lower(BytecodeExceptionNode node, LoweringTool tool) {
             if (tool.getLoweringStage() == StandardLoweringStage.HIGH_TIER) {
@@ -255,7 +272,7 @@ public abstract class NonSnippetLowerings {
         }
     }
 
-    private class ThrowBytecodeExceptionLowering implements NodeLoweringProvider<ThrowBytecodeExceptionNode> {
+    private final class ThrowBytecodeExceptionLowering implements NodeLoweringProvider<ThrowBytecodeExceptionNode> {
         @Override
         public void lower(ThrowBytecodeExceptionNode node, LoweringTool tool) {
             if (tool.getLoweringStage() == StandardLoweringStage.HIGH_TIER) {
@@ -278,7 +295,7 @@ public abstract class NonSnippetLowerings {
         }
     }
 
-    private static class GetClassLowering implements NodeLoweringProvider<GetClassNode> {
+    private static final class GetClassLowering implements NodeLoweringProvider<GetClassNode> {
         @Override
         public void lower(GetClassNode node, LoweringTool tool) {
             StampProvider stampProvider = tool.getStampProvider();
@@ -293,11 +310,17 @@ public abstract class NonSnippetLowerings {
         protected final RuntimeConfiguration runtimeConfig;
         protected final boolean verifyTypes;
         protected final KnownOffsets knownOffsets;
+        private final boolean isClosedTypeWorld;
+        private final boolean haveClosedTypeWorldHubLayout;
+        private final LoadMethodTool loadMethodTool;
 
         public InvokeLowering(RuntimeConfiguration runtimeConfig, boolean verifyTypes, KnownOffsets knownOffsets) {
             this.runtimeConfig = runtimeConfig;
             this.verifyTypes = verifyTypes;
             this.knownOffsets = knownOffsets;
+            this.isClosedTypeWorld = SubstrateOptions.useClosedTypeWorld();
+            this.haveClosedTypeWorldHubLayout = SubstrateOptions.useClosedTypeWorldHubLayout();
+            this.loadMethodTool = new LoadMethodTool(runtimeConfig, knownOffsets);
         }
 
         @Override
@@ -318,7 +341,8 @@ public abstract class NonSnippetLowerings {
                 }
                 SharedMethod method = (SharedMethod) callTarget.targetMethod();
                 JavaType[] signature = method.getSignature().toParameterTypes(callTarget.isStatic() ? null : method.getDeclaringClass());
-                CallingConvention.Type callType = method.getCallingConventionKind().toType(true);
+                SubstrateCallingConventionKind callKind = method.getCallingConventionKind();
+                CallingConvention.Type callType = callKind.isCustom() ? method.getCustomCallingConventionType() : callKind.toType(true);
                 InvokeKind invokeKind = callTarget.invokeKind();
                 SharedMethod[] implementations = method.getImplementations();
 
@@ -366,7 +390,7 @@ public abstract class NonSnippetLowerings {
                 }
 
                 CallTargetNode loweredCallTarget;
-                if (invokeKind.isDirect() || implementations.length == 1) {
+                if (invokeKind.isDirect() || (implementations.length == 1 && (isClosedTypeWorld || method.canBeStaticallyBound()))) {
                     SharedMethod targetMethod = method;
                     if (!invokeKind.isDirect()) {
                         /*
@@ -374,54 +398,112 @@ public abstract class NonSnippetLowerings {
                          * emit a direct call to the unique implementation.
                          */
                         targetMethod = implementations[0];
+                        assert targetMethod != null : "Expecting a unique callee for target method " + method;
                     }
 
+                    JavaKind wordKind = SubstrateTarget.getWordKind();
                     if (SubstrateUtil.HOSTED && targetMethod.forceIndirectCall()) {
                         /*
                          * Lower cross layer boundary direct calls to indirect calls. First load the
                          * address offset of the text section start and then add in the offset for
                          * this specific method.
                          */
-                        Pair<CGlobalDataInfo, Integer> methodLocation = DynamicImageLayerInfo.singleton().getPriorLayerMethodLocation(targetMethod);
-                        AddressNode methodPointerAddress = graph.addOrUniqueWithInputs(
-                                        new OffsetAddressNode(new CGlobalDataLoadAddressNode(methodLocation.getLeft()),
-                                                        ConstantNode.forIntegerKind(ConfigurationValues.getWordKind(), methodLocation.getRight())));
-                        loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind, methodPointerAddress);
+                        DynamicImageLayerInfo dynamicImageLayerInfo = DynamicImageLayerInfo.singleton();
+                        if (dynamicImageLayerInfo.isMethodCompilationDelayed(targetMethod)) {
+                            loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind,
+                                            graph.addOrUniqueWithInputs(new CGlobalDataLoadAddressNode(dynamicImageLayerInfo.getSymbolForDelayedMethod(targetMethod))));
+                        } else {
+                            var methodLocation = dynamicImageLayerInfo.getPriorLayerMethodLocation(targetMethod);
+                            AddressNode methodPointerAddress = graph.addOrUniqueWithInputs(
+                                            new OffsetAddressNode(new CGlobalDataLoadAddressNode(methodLocation.base()),
+                                                            ConstantNode.forIntegerKind(wordKind, methodLocation.offset())));
+                            loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind, methodPointerAddress);
+                        }
                     } else if (!SubstrateBackend.shouldEmitOnlyIndirectCalls()) {
                         loweredCallTarget = createDirectCall(graph, callTarget, parameters, signature, callType, invokeKind, targetMethod, node);
                     } else if (!targetMethod.hasImageCodeOffset()) {
-                        /*
-                         * The target method is not included in the image. This means that it was
-                         * also not needed for the deoptimization entry point. Thus, we are certain
-                         * that this branch will fold away. If not, we will fail later on.
-                         *
-                         * Also lower the MethodCallTarget below to avoid recursive lowering error
-                         * messages. The invoke and call target are actually dead and will be
-                         * removed by a subsequent dead code elimination pass.
-                         */
-                        loweredCallTarget = createUnreachableCallTarget(tool, node, parameters, callTarget.returnStamp(), signature, method, callType, invokeKind);
-                    } else {
-                        /*
-                         * In runtime-compiled code, we emit indirect calls via the respective heap
-                         * objects to avoid patching and creating trampolines.
-                         */
-                        JavaConstant codeInfo = SubstrateObjectConstant.forObject(targetMethod.getImageCodeInfo());
-                        ValueNode codeInfoConstant = ConstantNode.forConstant(codeInfo, tool.getMetaAccess(), graph);
-                        ValueNode codeStartFieldOffset = ConstantNode.forIntegerKind(ConfigurationValues.getWordKind(), knownOffsets.getImageCodeInfoCodeStartOffset(), graph);
-                        AddressNode codeStartField = graph.unique(new OffsetAddressNode(codeInfoConstant, codeStartFieldOffset));
-                        /*
-                         * Uses ANY_LOCATION because runtime-compiled code can be persisted and
-                         * loaded in a process where image code is located elsewhere.
-                         */
-                        ReadNode codeStart = graph.add(new ReadNode(codeStartField, LocationIdentity.ANY_LOCATION, FrameAccess.getWordStamp(), BarrierType.NONE, MemoryOrderMode.PLAIN));
-                        ValueNode offset = ConstantNode.forIntegerKind(ConfigurationValues.getWordKind(), targetMethod.getImageCodeOffset(), graph);
-                        AddressNode address = graph.unique(new OffsetAddressNode(codeStart, offset));
+                        ResolvedJavaMethod targetInterpreterMethod = targetMethod.getInterpreterMethod();
+                        if (targetInterpreterMethod == null) {
+                            /*
+                             * The target method is not included in the image. This means that it
+                             * was also not needed for the deoptimization entry point. Thus, we are
+                             * certain that this branch will fold away. If not, we will fail later
+                             * on.
+                             *
+                             * Also lower the MethodCallTarget below to avoid recursive lowering
+                             * error messages. The invoke and call target are actually dead and will
+                             * be removed by a subsequent dead code elimination pass.
+                             */
+                            loweredCallTarget = createUnreachableCallTarget(tool, node, parameters, callTarget.returnStamp(), signature, method, callType, invokeKind);
+                        } else if (!SubstrateUtil.HOSTED && SubstrateOptions.useRistretto()) {
+                            /*
+                             * The target method is not included in the image. However, a
+                             * runtime-loaded variant of it is.
+                             *
+                             * We call the "EnterDirectInterpreterStub" like a regular compiled
+                             * entry point. The stub understands the calling convention. Thus, it is
+                             * able to collect the arguments of the invocation and then either calls
+                             * into the interpreter or, if already available, the JIT compiled
+                             * variant of it.
+                             *
+                             * In order to dispatch to the correct target method, a hidden argument
+                             * is injected at the call-site.
+                             */
 
-                        loweredCallTarget = graph.add(new IndirectCallTargetNode(
-                                        address, parameters.toArray(new ValueNode[parameters.size()]), callTarget.returnStamp(), signature, targetMethod, callType, invokeKind));
-                        graph.addBeforeFixed(node, codeStart);
+                            JavaConstant targetInterpreterMethodConstant = SubstrateObjectConstant.forObject(targetInterpreterMethod);
+                            ValueNode targetInterpreterMethodNode = ConstantNode.forConstant(targetInterpreterMethodConstant, tool.getMetaAccess(), graph);
+
+                            /*
+                             * The "EnterDirectInterpreterStub" is included as AOT method, therefore
+                             * its address cannot change.
+                             */
+                            ConstantNode stubEntryPointNode = ConstantNode.forLong(CremaSupport.singleton().getEnterDirectInterpreterStubEntryPoint().rawValue(), graph);
+                            ValueNode base = graph.addWithoutUnique(new FloatingWordCastNode(tool.getStampProvider().createMethodStamp(), stubEntryPointNode));
+
+                            loweredCallTarget = graph.add(new SubstrateIndirectCallTargetNode(
+                                            base, parameters.toArray(new ValueNode[parameters.size()]), callTarget.returnStamp(), signature,
+                                            targetMethod, callType, invokeKind, null, targetInterpreterMethodNode));
+                        } else {
+                            throw VMError.shouldNotReachHereAtRuntime();
+                        }
+                    } else {
+                        CFunctionPointer rawAdrConstant = targetMethod.getAOTEntrypoint();
+                        assert !SubstrateUtil.HOSTED;
+                        if (rawAdrConstant == Word.nullPointer()) {
+                            /*
+                             * In runtime-compiled code, we emit indirect calls via the respective
+                             * heap objects to avoid patching and creating trampolines.
+                             */
+                            JavaConstant codeInfo = SubstrateObjectConstant.forObject(ImageCodeInfoProvider.getImageCodeInfo(targetMethod));
+                            ValueNode codeInfoConstant = ConstantNode.forConstant(codeInfo, tool.getMetaAccess(), graph);
+                            ValueNode codeStartFieldOffset = ConstantNode.forIntegerKind(wordKind, knownOffsets.getImageCodeInfoCodeStartOffset(), graph);
+                            AddressNode codeStartField = graph.unique(new OffsetAddressNode(codeInfoConstant, codeStartFieldOffset));
+                            /*
+                             * Uses ANY_LOCATION because runtime-compiled code can be persisted and
+                             * loaded in a process where image code is located elsewhere.
+                             */
+                            ReadNode codeStart = graph.add(new ReadNode(codeStartField, LocationIdentity.ANY_LOCATION, SubstrateTarget.getWordStamp(), BarrierType.NONE, MemoryOrderMode.PLAIN));
+                            ValueNode offset = ConstantNode.forIntegerKind(wordKind, targetMethod.getImageCodeOffset(), graph);
+                            AddressNode address = graph.unique(new OffsetAddressNode(codeStart, offset));
+
+                            loweredCallTarget = graph.add(new SubstrateIndirectCallTargetNode(
+                                            address, parameters.toArray(new ValueNode[parameters.size()]), callTarget.returnStamp(), signature, targetMethod, callType, invokeKind));
+                            graph.addBeforeFixed(node, codeStart);
+                        } else {
+                            /*
+                             * Directly lower to a call based on the raw address, no offset address
+                             * required.
+                             */
+                            assert SubstrateOptions.useRistretto();
+                            final long untrackedMethodAdr = rawAdrConstant.rawValue();
+                            GraalError.guarantee(untrackedMethodAdr != 0L, "runtime-loaded method has no valid entry point: %s", targetMethod);
+                            final ValueNode base = graph.addWithoutUnique(new FloatingWordCastNode(tool.getStampProvider().createMethodStamp(), ConstantNode.forLong(untrackedMethodAdr, graph)));
+                            loweredCallTarget = graph.add(new SubstrateIndirectCallTargetNode(
+                                            base, parameters.toArray(new ValueNode[parameters.size()]), callTarget.returnStamp(), signature,
+                                            targetMethod, callType, invokeKind));
+                        }
                     }
-                } else if (implementations.length == 0) {
+                } else if (implementations.length == 0 && isClosedTypeWorld) {
                     /*
                      * We are calling an abstract method with no implementation, i.e., the
                      * closed-world analysis showed that there is no concrete receiver ever
@@ -432,47 +514,27 @@ public abstract class NonSnippetLowerings {
                      * a subsequent dead code elimination pass.
                      */
                     loweredCallTarget = createUnreachableCallTarget(tool, node, parameters, callTarget.returnStamp(), signature, method, callType, invokeKind);
-
                 } else {
-                    LoadHubNode hub = graph.unique(new LoadHubNode(runtimeConfig.getProviders().getStampProvider(), graph.addOrUnique(PiNode.create(receiver, nullCheck))));
+                    StampProvider stampProvider = runtimeConfig.getProviders().getStampProvider();
+                    LoadHubNode hub = graph.unique(new LoadHubNode(stampProvider, graph.addOrUnique(PiNode.create(receiver, nullCheck))));
                     nodesToLower.add(hub);
 
-                    if (SubstrateOptions.closedTypeWorld()) {
-                        int vtableEntryOffset = knownOffsets.getVTableOffset(method.getVTableIndex(), true);
-
-                        AddressNode address = graph.unique(new OffsetAddressNode(hub, ConstantNode.forIntegerKind(ConfigurationValues.getWordKind(), vtableEntryOffset, graph)));
-                        ReadNode entry = graph.add(new ReadNode(address, SubstrateBackend.getVTableIdentity(), FrameAccess.getWordStamp(), BarrierType.NONE, MemoryOrderMode.PLAIN));
-
-                        loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind, entry);
-
-                        graph.addBeforeFixed(node, entry);
-                    } else {
-
-                        // Compute the dispatch table starting offset
-                        LoadOpenTypeWorldDispatchTableStartingOffset tableStartingOffset = graph.add(new LoadOpenTypeWorldDispatchTableStartingOffset(hub, method));
-                        nodesToLower.add(tableStartingOffset);
-
-                        // Add together table starting offset and index offset
-                        ValueNode methodAddressOffset = graph.unique(new AddNode(tableStartingOffset,
-                                        ConstantNode.forIntegerKind(ConfigurationValues.getWordKind(), knownOffsets.getVTableOffset(method.getVTableIndex(), false), graph)));
-
-                        // The load the method address for the dispatch table
-                        AddressNode dispatchTableAddress = graph.unique(new OffsetAddressNode(hub, methodAddressOffset));
-                        ReadNode entry = graph.add(new ReadNode(dispatchTableAddress, SubstrateBackend.getVTableIdentity(), FrameAccess.getWordStamp(), BarrierType.NONE, MemoryOrderMode.PLAIN));
-
-                        loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind, entry);
-
-                        // wire in the new nodes
-                        FixedWithNextNode predecessor = (FixedWithNextNode) node.predecessor();
-                        predecessor.setNext(tableStartingOffset);
-                        tableStartingOffset.setNext(entry);
-                        entry.setNext(node);
-
-                        /*
-                         * note here we don't delete the invoke because it remains in the graph,
-                         * albeit with a different call target
-                         */
+                    LoadOpenTypeWorldDispatchTableStartingOffset openWorldDispatchTableOffset = null;
+                    if (!haveClosedTypeWorldHubLayout) {
+                        openWorldDispatchTableOffset = graph.add(new LoadOpenTypeWorldDispatchTableStartingOffset(hub, method));
+                        graph.addBeforeFixed(node, openWorldDispatchTableOffset);
+                        nodesToLower.add(openWorldDispatchTableOffset);
                     }
+
+                    ConstantNode vtableIndex = ConstantNode.forInt(method.getVTableIndex(), graph);
+                    ValueNode callAddress = loadMethodTool.createVirtualMethodAddressLoad(node, hub, openWorldDispatchTableOffset, vtableIndex);
+
+                    loweredCallTarget = createIndirectCall(graph, callTarget, parameters, method, signature, callType, invokeKind, callAddress);
+
+                    /*
+                     * note here we don't delete the invoke because it remains in the graph, albeit
+                     * with a different call target
+                     */
                 }
 
                 callTarget.replaceAndDelete(loweredCallTarget);
@@ -491,7 +553,8 @@ public abstract class NonSnippetLowerings {
 
         protected IndirectCallTargetNode createIndirectCall(StructuredGraph graph, MethodCallTargetNode callTarget, NodeInputList<ValueNode> parameters, SharedMethod method, JavaType[] signature,
                         CallingConvention.Type callType, InvokeKind invokeKind, ValueNode entry) {
-            return graph.add(new IndirectCallTargetNode(entry, parameters.toArray(new ValueNode[parameters.size()]), callTarget.returnStamp(), signature, method, callType, invokeKind));
+            JavaMethodProfile methodProfile = callTarget instanceof SubstrateMethodCallTargetNode substrateCallTarget ? substrateCallTarget.getMethodProfile() : null;
+            return graph.add(new SubstrateIndirectCallTargetNode(entry, parameters.toArray(ValueNode.EMPTY_ARRAY), callTarget.returnStamp(), signature, method, callType, invokeKind, methodProfile));
         }
 
         private static CallTargetNode createUnreachableCallTarget(LoweringTool tool, FixedNode node, NodeInputList<ValueNode> parameters, StampPair returnStamp, JavaType[] signature,
@@ -509,6 +572,107 @@ public abstract class NonSnippetLowerings {
              * code elimination pass.
              */
             return graph.add(new DirectCallTargetNode(parameters.toArray(ValueNode.EMPTY_ARRAY), returnStamp, signature, method, callType, invokeKind));
+        }
+    }
+
+    static final class LoadMethodLowering implements NodeLoweringProvider<FixedWithNextNode> {
+        private final LoadMethodTool loadTool;
+        private final boolean haveClosedWorldHubLayout;
+
+        LoadMethodLowering(RuntimeConfiguration runtimeConfig, KnownOffsets knownOffsets) {
+            this.loadTool = new LoadMethodTool(runtimeConfig, knownOffsets);
+            this.haveClosedWorldHubLayout = SubstrateOptions.useClosedTypeWorldHubLayout();
+        }
+
+        @Override
+        public void lower(FixedWithNextNode node, LoweringTool tool) {
+            if (node instanceof LoadMethodNode ln) {
+                lowerLoadMethodNode(ln, tool);
+            } else if (node instanceof LoadMethodByIndexNode ln) {
+                lowerLoadMethodByIndexNode(ln, tool);
+            }
+        }
+
+        private void lowerLoadMethodNode(LoadMethodNode node, LoweringTool tool) {
+            StructuredGraph graph = node.graph();
+            SharedMethod method = (SharedMethod) node.getMethod();
+            int vtableIndex = method.getVTableIndex();
+            ConstantNode vtableIndexNode = ConstantNode.forIntegerKind(loadTool.runtimeConfig.getProviders().getWordTypes().getWordKind(), vtableIndex, graph);
+            LoadOpenTypeWorldDispatchTableStartingOffset tableStartOffset = null;
+            if (!haveClosedWorldHubLayout) {
+                tableStartOffset = graph.add(new LoadOpenTypeWorldDispatchTableStartingOffset(node.getHub(), method));
+            }
+            lowerLoadMethod(node, node.getHub(), tool, vtableIndexNode, tableStartOffset);
+        }
+
+        private void lowerLoadMethodByIndexNode(LoadMethodByIndexNode node, LoweringTool tool) {
+            LoadOpenTypeWorldDispatchTableStartingOffset tableStartOffset = null;
+            if (!haveClosedWorldHubLayout) {
+                tableStartOffset = node.graph().add(new LoadOpenTypeWorldDispatchTableStartingOffset(node.getHub(), node.getInterfaceID()));
+            }
+            lowerLoadMethod(node, node.getHub(), tool, node.getVTableIndex(), tableStartOffset);
+        }
+
+        private void lowerLoadMethod(FixedWithNextNode loadMethodNode, ValueNode hub, LoweringTool tool, ValueNode vtableIndex,
+                        LoadOpenTypeWorldDispatchTableStartingOffset openWorldDispatchTableOffset) {
+            StructuredGraph graph = loadMethodNode.graph();
+
+            if (openWorldDispatchTableOffset != null) {
+                graph.addBeforeFixed(loadMethodNode, openWorldDispatchTableOffset);
+            }
+
+            ValueNode virtualMethod = loadTool.createVirtualMethodAddressLoad(loadMethodNode, hub, openWorldDispatchTableOffset, vtableIndex);
+            graph.replaceFixed(loadMethodNode, virtualMethod);
+
+            if (openWorldDispatchTableOffset != null) {
+                openWorldDispatchTableOffset.lower(tool);
+            }
+        }
+    }
+
+    static final class LoadMethodTool {
+        private final RuntimeConfiguration runtimeConfig;
+        private final KnownOffsets knownOffsets;
+        private final boolean relativeCodePointers;
+
+        LoadMethodTool(RuntimeConfiguration runtimeConfig, KnownOffsets knownOffsets) {
+            this.runtimeConfig = runtimeConfig;
+            this.knownOffsets = knownOffsets;
+            this.relativeCodePointers = SubstrateOptions.useRelativeCodePointers();
+        }
+
+        ValueNode createVirtualMethodAddressLoad(FixedNode prependTo, ValueNode hub, LoadOpenTypeWorldDispatchTableStartingOffset openWorldDispatchTableOffset, ValueNode vtableIndex) {
+            StructuredGraph graph = prependTo.graph();
+            JavaKind wordKind = runtimeConfig.getProviders().getWordTypes().getWordKind();
+
+            int entrySizeValue = knownOffsets.getVTableEntrySize();
+            ConstantNode entrySize = ConstantNode.forIntegerKind(wordKind, entrySizeValue, graph);
+            ValueNode vtableIndexWord = graph.unique(new ZeroExtendNode(vtableIndex, wordKind.getBitCount()));
+            ValueNode vtableEntryOffset = graph.unique(new MulNode(vtableIndexWord, entrySize));
+
+            ValueNode baseOffset;
+            assert SubstrateOptions.useClosedTypeWorldHubLayout() == (openWorldDispatchTableOffset == null);
+            if (openWorldDispatchTableOffset != null) {
+                baseOffset = openWorldDispatchTableOffset;
+            } else {
+                int baseOffsetValue = knownOffsets.getVTableBaseOffset();
+                baseOffset = ConstantNode.forIntegerKind(wordKind, baseOffsetValue, graph);
+            }
+
+            ValueNode hubEntryOffset = graph.unique(new AddNode(baseOffset, vtableEntryOffset));
+            AddressNode entryAddress = graph.unique(new OffsetAddressNode(hub, hubEntryOffset));
+            Stamp vtableEntryStamp = relativeCodePointers ? SubstrateMethodRefStamp.offsetNonNull() : SubstrateMethodRefStamp.pointerNonNull();
+            ReadNode vtableEntry = graph.add(new ReadNode(entryAddress, SubstrateBackend.getVTableIdentity(), vtableEntryStamp, BarrierType.NONE, MemoryOrderMode.PLAIN));
+            graph.addBeforeFixed(prependTo, vtableEntry);
+
+            ValueNode address;
+            if (relativeCodePointers) {
+                address = graph.unique(new MethodOffsetToPointerNode(vtableEntry));
+            } else {
+                address = vtableEntry;
+            }
+
+            return address;
         }
     }
 

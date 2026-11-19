@@ -54,24 +54,25 @@ typedef unsigned long __graal_uword;
 #define NEW_PROTECTION_DOMAIN -1
 
 /* Parameters for the creation of a new isolate. */
-enum { __graal_create_isolate_params_version = 4 };
+enum { __graal_create_isolate_params_version = 5 };
 struct __graal_create_isolate_params_t {
-    int version;                                /* Version of this struct */
+    /* Version of this struct. Set to __graal_create_isolate_params_version after zeroing this struct. */
+    int version;
 
     /* Fields introduced in version 1 */
-    __graal_uword  reserved_address_space_size; /* Size of address space to reserve */
+    __graal_uword  reserved_address_space_size; /* Size of virtual address space to reserve for the heap. */
 
-    /* Fields introduced in version 2 */
+    /* Fields introduced in version 2. Internal usage, do not use. */
     const char    *auxiliary_image_path;                /* Path to an auxiliary image to load. */
     __graal_uword  auxiliary_image_reserved_space_size; /* Reserved bytes for loading an auxiliary image. */
 
     /* Fields introduced in version 3 */
-    int            _reserved_1;                 /* Internal usage, do not use. */
-    char         **_reserved_2;                 /* Internal usage, do not use. */
-    int            pkey;                        /* Isolate protection key or domain. */
+    int            argc;                        /* Number of char* argument strings in argv. */
+    char         **argv;                        /* Array of argument strings, parsed like command line arguments. */
+    int            pkey;                        /* Isolate protection key or domain. Internal usage, do not use. */
 
     /* Fields introduced in version 4 */
-    char           _reserved_3;                 /* Internal usage, do not use. */
+    char           ignore_unrecognized_args;    /* Ignore unrecognized arguments in argv when 1. */
     char           _reserved_4;                 /* Internal usage, do not use. */
 
     /* Fields introduced in version 5 */
@@ -127,8 +128,16 @@ typedef int (*graal_detach_thread_fn_t)(graal_isolatethread_t* thread);
  * waiting for any attached threads to detach from it, then discards its objects,
  * threads, and any other state or context that is associated with it.
  * Returns 0 on success, or a non-zero value on failure.
+ * 
+ * If this call blocks indefinitely, this means there are still Java threads running
+ * which do not terminate after receiving the Thread.interrupt() event.
+ * To prevent indefinite blocking, these threads should be cooperatively shut down
+ * within Java before invoking this call.
+ * To diagnose such issues, use the option '-R:TearDownWarningSeconds=<secs>' to detect
+ * the threads that are still running.
+ * This will print the stack traces of all threads that block tear-down.
  */
-typedef int (*graal_tear_down_isolate_fn_t)(graal_isolatethread_t* isolateThread);
+typedef int (*graal_tear_down_isolate_fn_t)(graal_isolatethread_t* thread);
 
 /*
  * In the isolate of the passed isolate thread, detach all those threads that were
@@ -141,8 +150,16 @@ typedef int (*graal_tear_down_isolate_fn_t)(graal_isolatethread_t* isolateThread
  * Java code at the time when this function is called or at any point in the future
  * or this will cause entirely undefined (and likely fatal) behavior.
  * Returns 0 on success, or a non-zero value on (non-fatal) failure.
+ * 
+ * If this call blocks indefinitely, this means there are still Java threads running
+ * which do not terminate after receiving the Thread.interrupt() event.
+ * To prevent indefinite blocking, these threads should be cooperatively shut down
+ * within Java before invoking this call.
+ * To diagnose such issues, use the option '-R:TearDownWarningSeconds=<secs>' to detect
+ * the threads that are still running.
+ * This will print the stack traces of all threads that block tear-down.
  */
-typedef int (*graal_detach_all_threads_and_tear_down_isolate_fn_t)(graal_isolatethread_t* isolateThread);
+typedef int (*graal_detach_all_threads_and_tear_down_isolate_fn_t)(graal_isolatethread_t* thread);
 
 #if defined(__cplusplus)
 }

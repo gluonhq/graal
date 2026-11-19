@@ -25,13 +25,26 @@
 package jdk.graal.compiler.hotspot.meta;
 
 import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
-
+import jdk.graal.compiler.hotspot.GraalHotSpotVMConfig;
+import jdk.vm.ci.hotspot.HotSpotObjectConstant;
+import jdk.vm.ci.hotspot.HotSpotResolvedJavaMethod;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public class HotSpotMetaAccessExtensionProvider implements MetaAccessExtensionProvider {
+    private final ConstantReflectionProvider constantReflection;
+    private final GraalHotSpotVMConfig config;
+
+    public HotSpotMetaAccessExtensionProvider(ConstantReflectionProvider constantReflection, GraalHotSpotVMConfig config) {
+        this.constantReflection = constantReflection;
+        this.config = config;
+    }
+
     @Override
     public JavaKind getStorageKind(JavaType type) {
         return type.getJavaKind();
@@ -53,7 +66,35 @@ public class HotSpotMetaAccessExtensionProvider implements MetaAccessExtensionPr
     }
 
     @Override
+    public boolean isLambdaFormCompiled(ResolvedJavaMethod method) {
+        return config.VMINTRINSIC_COMPILED_LAMBDA_FORM != -1 && method instanceof HotSpotResolvedJavaMethod hotSpotMethod &&
+                        hotSpotMethod.intrinsicId() == config.VMINTRINSIC_COMPILED_LAMBDA_FORM;
+    }
+
+    @Override
     public boolean canVirtualize(ResolvedJavaType instanceType) {
         return true;
+    }
+
+    @Override
+    public ResolvedJavaField getStaticFieldForAccess(JavaConstant base, long offset, JavaKind accessKind) {
+        if (accessKind.getSlotCount() <= 0) {
+            throw new IllegalArgumentException("Unexpected access kind: " + accessKind);
+        }
+        if (!(base instanceof HotSpotObjectConstant objectConstant)) {
+            return null;
+        }
+        ResolvedJavaType type = constantReflection.asJavaType(base);
+        // check that it's indeed a j.l.Class when we get a result since constant reflection will
+        // also return a type if the constant wraps a ResolvedJavaType
+        if (type == null || !objectConstant.getType().getName().equals("Ljava/lang/Class;")) {
+            return null;
+        }
+        for (ResolvedJavaField field : type.getStaticFields()) {
+            if (field.getOffset() == offset && accessKind == field.getJavaKind()) {
+                return field;
+            }
+        }
+        return null;
     }
 }

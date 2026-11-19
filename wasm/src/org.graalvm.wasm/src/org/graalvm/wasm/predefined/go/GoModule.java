@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -51,7 +51,7 @@ public class GoModule extends BuiltinModule {
 
     @Override
     protected WasmModule createModule(WasmLanguage language, WasmContext context, String name) {
-        WasmModule module = WasmModule.createBuiltin(name);
+        WasmModule module = WasmModule.createBuiltin(language, name);
         defineFunction(context, module, "debug", types(I32_TYPE), types(), new GoFunctionNode(language, module));
         defineFunction(context, module, "runtime.wasmExit", types(I32_TYPE), types(), new GoFunctionNode(language, module));
         defineFunction(context, module, "runtime.wasmWrite", types(I32_TYPE), types(), new GoFunctionNode(language, module));

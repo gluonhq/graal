@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 package jdk.graal.compiler.core.common;
 
 import jdk.vm.ci.code.CompilationRequest;
+import jdk.vm.ci.meta.JavaMethod;
 
 /**
  * A unique identifier for a compilation. Compiled code can be mapped to a single compilation id.
@@ -77,4 +78,39 @@ public interface CompilationIdentifier {
      * {@link Verbosity}.
      */
     String toString(Verbosity verbosity);
+
+    /**
+     * Get a JavaMethod representation of the current compilation.
+     */
+    default JavaMethod asJavaMethod() {
+        return null;
+    }
+
+    /**
+     * Returns the identifier from which this identifier was derived. This relationship allows
+     * consumers that group artifacts by root compilation to do so without changing the identity of
+     * derived identifiers. Parent links must form a finite, acyclic chain.
+     *
+     * @return the parent identifier, or {@code null} if this is a root identifier
+     */
+    default CompilationIdentifier getParentCompilationIdentifier() {
+        return null;
+    }
+
+    /**
+     * Walks {@linkplain #getParentCompilationIdentifier() parent identifiers} to the root. This is
+     * intended for consumers that group diagnostics belonging to one compilation while preserving
+     * the distinct identity of each derived identifier.
+     *
+     * @return the root identifier
+     */
+    default CompilationIdentifier getRootCompilationIdentifier() {
+        CompilationIdentifier root = this;
+        CompilationIdentifier parent;
+        while ((parent = root.getParentCompilationIdentifier()) != null) {
+            root = parent;
+        }
+        return root;
+    }
+
 }

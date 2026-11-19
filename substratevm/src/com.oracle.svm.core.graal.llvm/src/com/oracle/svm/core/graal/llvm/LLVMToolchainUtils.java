@@ -32,9 +32,6 @@ import java.util.List;
 import java.util.function.Function;
 import java.util.function.IntFunction;
 
-import jdk.graal.compiler.debug.DebugContext;
-import jdk.graal.compiler.debug.GraalError;
-
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.util.CompletionExecutor;
 import com.oracle.objectfile.ObjectFile;
@@ -44,27 +41,18 @@ import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
 import com.oracle.svm.core.graal.llvm.util.LLVMTargetSpecific;
 import com.oracle.svm.hosted.image.LLVMToolchain;
 
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.GraalError;
+
 public class LLVMToolchainUtils {
     public static void llvmOptimize(DebugContext debug, String outputPath, String inputPath, Path basePath, Function<String, String> outputPathFormat) {
         List<String> args = new ArrayList<>();
         List<String> passes = new ArrayList<>();
-        if (LLVMOptions.BitcodeOptimizations.getValue()) {
-            /*
-             * This runs LLVM's bitcode optimizations in addition to the Graal optimizations.
-             * Inlining has to be disabled in this case as the functions are already stored in the
-             * image heap and inlining them would produce bogus runtime information for garbage
-             * collection and exception handling. Starting with LLVM 16, the -disable-inlining flag
-             * doesn't work anymore. But inlining is implicitly disabled by adding no-inline to all
-             * bitcode functions.
-             */
-            passes.add("default<O2>");
-        } else {
-            /*
-             * Mem2reg has to be run before rewriting statepoints as it promotes allocas, which are
-             * not supported for statepoints.
-             */
-            passes.add("function(mem2reg)");
-        }
+        /*
+         * Mem2reg has to be run before rewriting statepoints as it promotes allocas, which are not
+         * supported for statepoints.
+         */
+        passes.add("function(mem2reg)");
         passes.add("rewrite-statepoints-for-gc");
         passes.add("always-inline");
 
@@ -78,7 +66,7 @@ public class LLVMToolchainUtils {
             LLVMToolchain.runLLVMCommand("opt", basePath, args);
         } catch (LLVMToolchain.RunFailureException e) {
             debug.log("%s", e.getOutput());
-            throw new GraalError("LLVM optimization failed for " + outputPathFormat.apply(inputPath) + ": " + e.getStatus() + "\nCommand: opt " + String.join(" ", args));
+            throw new GraalError("LLVM optimization failed for " + outputPathFormat.apply(inputPath) + ": " + e.getStatus() + System.lineSeparator() + "Command: opt " + String.join(" ", args));
         }
     }
 
@@ -104,7 +92,7 @@ public class LLVMToolchainUtils {
             LLVMToolchain.runLLVMCommand("llc", basePath, args);
         } catch (LLVMToolchain.RunFailureException e) {
             debug.log("%s", e.getOutput());
-            throw new GraalError("LLVM compilation failed for " + outputPathFormat.apply(inputPath) + ": " + e.getStatus() + "\nCommand: llc " + String.join(" ", args));
+            throw new GraalError("LLVM compilation failed for " + outputPathFormat.apply(inputPath) + ": " + e.getStatus() + System.lineSeparator() + "Command: llc " + String.join(" ", args));
         }
     }
 
@@ -162,7 +150,40 @@ public class LLVMToolchainUtils {
             LLVMToolchain.runLLVMCommand("llvm-objcopy", basePath, args);
         } catch (LLVMToolchain.RunFailureException e) {
             debug.log("%s", e.getOutput());
-            throw new GraalError("Removing stack maps failed for " + inputPath + ": " + e.getStatus() + "\nCommand: llvm-objcopy " + String.join(" ", args));
+            throw new GraalError("Removing stack maps failed for " + inputPath + ": " + e.getStatus() + System.lineSeparator() + "Command: llvm-objcopy " + String.join(" ", args));
+        }
+    }
+
+    public static void llvmCleanupRISCVAttributes(DebugContext debug, String inputPath, Path basePath) {
+        if (!LLVMTargetSpecific.get().getLLVMArchName().equals("riscv64")) {
+            return;
+        }
+
+        List<String> args = new ArrayList<>();
+        args.add("--remove-section=.riscv.attributes");
+        args.add(inputPath);
+
+        try {
+            LLVMToolchain.runLLVMCommand("llvm-objcopy", basePath, args);
+        } catch (LLVMToolchain.RunFailureException e) {
+            debug.log("%s", e.getOutput());
+            throw new GraalError("Removing RISC-V attributes failed for " + inputPath + ": " + e.getStatus() + System.lineSeparator() + "Command: llvm-objcopy " + String.join(" ", args));
+        }
+    }
+
+    public static void llvmAddTextSectionSymbols(DebugContext debug, String inputPath, String startSymbolName, String endSymbolName, long textSectionSize, Path basePath) {
+        String textSectionName = SectionName.TEXT.getFormatDependentName(ObjectFile.getNativeFormat());
+        String symbolPrefix = ObjectFile.getNativeFormat() == ObjectFile.Format.MACH_O ? "_" : "";
+        List<String> args = new ArrayList<>();
+        args.add("--add-symbol=" + symbolPrefix + startSymbolName + "=" + textSectionName + ":0,global");
+        args.add("--add-symbol=" + symbolPrefix + endSymbolName + "=" + textSectionName + ":" + textSectionSize + ",global");
+        args.add(inputPath);
+
+        try {
+            LLVMToolchain.runLLVMCommand("llvm-objcopy", basePath, args);
+        } catch (LLVMToolchain.RunFailureException e) {
+            debug.log("%s", e.getOutput());
+            throw new GraalError("Adding text section symbols failed for " + inputPath + ": " + e.getStatus() + System.lineSeparator() + "Command: llvm-objcopy " + String.join(" ", args));
         }
     }
 

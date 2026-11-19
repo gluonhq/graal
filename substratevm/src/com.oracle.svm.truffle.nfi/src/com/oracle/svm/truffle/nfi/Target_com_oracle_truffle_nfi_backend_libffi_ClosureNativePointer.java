@@ -25,18 +25,18 @@
 package com.oracle.svm.truffle.nfi;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.truffle.nfi.libffi.LibFFI;
+import org.graalvm.word.impl.Word;
 
 @TargetClass(className = "com.oracle.truffle.nfi.backend.libffi.ClosureNativePointer", onlyWith = TruffleNFIFeature.IsEnabled.class)
 final class Target_com_oracle_truffle_nfi_backend_libffi_ClosureNativePointer {
 
     @Substitute
     private static void freeClosure(long closure) {
-        com.oracle.svm.truffle.nfi.LibFFI.ClosureData data = WordFactory.pointer(closure);
+        com.oracle.svm.truffle.nfi.LibFFI.ClosureData data = Word.pointer(closure);
         ImageSingletons.lookup(TruffleNFISupport.class).destroyClosureHandle(data.nativeClosureHandle());
         LibFFI.ffi_closure_free(data);
     }

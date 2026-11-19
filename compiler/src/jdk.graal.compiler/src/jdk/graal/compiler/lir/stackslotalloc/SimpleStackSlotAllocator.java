@@ -90,12 +90,8 @@ public class SimpleStackSlotAllocator extends AllocationPhase {
         try (DebugContext.Scope scope = debug.scope("StackSlotMappingLIR")) {
             ValueProcedure updateProc = (value, mode, flags) -> {
                 if (isVirtualStackSlot(value)) {
-                    StackSlot stackSlot = mapping[asVirtualStackSlot(value).getId()];
-                    if (value instanceof SimpleVirtualStackSlotAlias) {
-                        GraalError.guarantee(mode == LIRInstruction.OperandMode.USE || mode == LIRInstruction.OperandMode.ALIVE, "Invalid application of SimpleVirtualStackSlotAlias");
-                        // return the same slot, but with the alias's kind.
-                        stackSlot = StackSlot.get(value.getValueKind(), stackSlot.getRawOffset(), stackSlot.getRawAddFrameSize());
-                    }
+                    VirtualStackSlot virtualSlot = asVirtualStackSlot(value);
+                    StackSlot stackSlot = StackSlotAllocatorUtil.toStackSlot(virtualSlot, mapping[virtualSlot.getId()], mode);
                     debug.log("map %s -> %s", value, stackSlot);
                     return stackSlot;
                 }
@@ -105,10 +101,9 @@ public class SimpleStackSlotAllocator extends AllocationPhase {
                 try (Indent indent0 = debug.logAndIndent("block: %s", block)) {
                     for (LIRInstruction inst : res.getLIR().getLIRforBlock(block)) {
                         try (Indent indent1 = debug.logAndIndent("Inst: %d: %s", inst.id(), inst)) {
-                            inst.forEachAlive(updateProc);
-                            inst.forEachInput(updateProc);
-                            inst.forEachOutput(updateProc);
-                            inst.forEachTemp(updateProc);
+                            // Simple stack-slot allocation updates operand buckets at the
+                            // instruction boundary, so it uses the canonical forward operand walk.
+                            inst.forEachValue(updateProc);
                             inst.forEachState(updateProc);
                         }
                     }

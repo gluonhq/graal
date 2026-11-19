@@ -50,11 +50,8 @@ import jdk.vm.ci.meta.Value;
 public final class AArch64ZeroMemoryOp extends AArch64LIRInstruction {
     public static final LIRInstructionClass<AArch64ZeroMemoryOp> TYPE = LIRInstructionClass.create(AArch64ZeroMemoryOp.class);
 
-    @Use({REG}) protected Value addressValue;
-    @Use({REG}) protected Value lengthValue;
-
-    @Temp({REG}) protected Value addressValueTemp;
-    @Temp({REG}) protected Value lengthValueTemp;
+    @UseKill({REG}) protected Value addressValue;
+    @UseKill({REG}) protected Value lengthValue;
 
     private final boolean isAligned;
     private final boolean useDcZva;
@@ -74,8 +71,6 @@ public final class AArch64ZeroMemoryOp extends AArch64LIRInstruction {
         super(TYPE);
         this.addressValue = address;
         this.lengthValue = length;
-        this.addressValueTemp = address;
-        this.lengthValueTemp = length;
         this.useDcZva = useDcZva;
         this.zvaLength = zvaLength;
         this.isAligned = isAligned;

@@ -43,7 +43,7 @@ import com.oracle.graal.pointsto.flow.context.AnalysisContext;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.util.LightImmutableCollection;
-import com.oracle.svm.common.meta.MultiMethod.MultiMethodKey;
+import com.oracle.svm.common.meta.MethodVariant;
 
 import jdk.vm.ci.code.BytecodePosition;
 
@@ -64,8 +64,8 @@ final class BytecodeSensitiveStaticInvokeTypeFlow extends AbstractStaticInvokeTy
     private AnalysisContext callerContext;
 
     BytecodeSensitiveStaticInvokeTypeFlow(BytecodePosition invokeLocation, AnalysisType receiverType, PointsToAnalysisMethod targetMethod,
-                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MultiMethodKey callerMultiMethodKey) {
-        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMultiMethodKey);
+                    TypeFlow<?>[] actualParameters, ActualReturnTypeFlow actualReturn, MethodVariant.MethodVariantKey callerMethodVariantKey) {
+        super(invokeLocation, receiverType, targetMethod, actualParameters, actualReturn, callerMethodVariantKey);
     }
 
     private BytecodeSensitiveStaticInvokeTypeFlow(PointsToAnalysis bb, MethodFlowsGraph methodFlows, BytecodeSensitiveStaticInvokeTypeFlow original) {
@@ -79,8 +79,22 @@ final class BytecodeSensitiveStaticInvokeTypeFlow extends AbstractStaticInvokeTy
     }
 
     @Override
+    public boolean needsInitialization() {
+        return true;
+    }
+
+    @Override
+    public void initFlow(PointsToAnalysis bb) {
+        /* Trigger the update for static invokes, there is no receiver to trigger it. */
+        if (isClone() && isFlowEnabled()) {
+            bb.postFlow(this);
+        }
+    }
+
+    @Override
     public void update(PointsToAnalysis bb) {
-        assert this.isClone() : this;
+        assert isFlowEnabled() : "The linking should only be triggered for enabled flows: " + this;
+        assert isClone() : "Only clones should be updated: " + this;
         /* The static invokes should be updated only once and the callee should be null. */
         guarantee(LightImmutableCollection.isEmpty(this, CALLEES_ACCESSOR), "static invoke updated multiple times!");
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,12 +31,14 @@ import java.lang.invoke.MethodHandle;
 
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.WithExceptionNode;
 import jdk.graal.compiler.nodes.spi.Simplifiable;
 import jdk.graal.compiler.nodes.spi.SimplifierTool;
-
+import jdk.graal.compiler.replacements.nodes.MethodHandleNode.GraphAdder;
+import jdk.graal.compiler.replacements.nodes.MethodHandleNode.InvokeFactory;
 import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.MethodHandleAccessProvider.IntrinsicMethod;
 
@@ -44,14 +46,18 @@ import jdk.vm.ci.meta.MethodHandleAccessProvider.IntrinsicMethod;
  * Node for invocation methods defined on the class {@link MethodHandle}.
  */
 @NodeInfo(cycles = CYCLES_UNKNOWN, cyclesRationale = "see MacroNode", size = SIZE_UNKNOWN, sizeRationale = "see MacroNode")
-public final class MethodHandleWithExceptionNode extends MacroWithExceptionNode implements Simplifiable {
+public class MethodHandleWithExceptionNode extends MacroWithExceptionNode implements Simplifiable {
     public static final NodeClass<MethodHandleWithExceptionNode> TYPE = NodeClass.create(MethodHandleWithExceptionNode.class);
 
     protected final IntrinsicMethod intrinsicMethod;
 
-    public MethodHandleWithExceptionNode(IntrinsicMethod intrinsicMethod, MacroNode.MacroParams p) {
-        super(TYPE, p);
+    protected MethodHandleWithExceptionNode(NodeClass<? extends MacroWithExceptionNode> c, IntrinsicMethod intrinsicMethod, MacroNode.MacroParams p) {
+        super(c, p);
         this.intrinsicMethod = intrinsicMethod;
+    }
+
+    public MethodHandleWithExceptionNode(IntrinsicMethod intrinsicMethod, MacroNode.MacroParams p) {
+        this(TYPE, intrinsicMethod, p);
     }
 
     @Override
@@ -69,7 +75,7 @@ public final class MethodHandleWithExceptionNode extends MacroWithExceptionNode 
             invoke.setStamp(stmp);
             return invoke;
         };
-        InvokeWithExceptionNode invoke = MethodHandleNode.tryResolveTargetInvoke(adder, invokeFactory, methodHandleAccess, intrinsicMethod, targetMethod, bci, returnStamp, argumentsArray);
+        InvokeWithExceptionNode invoke = tryResolveTargetInvoke(adder, invokeFactory, methodHandleAccess, argumentsArray);
         if (invoke == null) {
             return this;
         }
@@ -79,5 +85,10 @@ public final class MethodHandleWithExceptionNode extends MacroWithExceptionNode 
         invoke.setStateAfter(stateAfter());
         graph().replaceWithExceptionSplit(this, invoke);
         return invoke;
+    }
+
+    /** {@link MethodHandleNode#tryResolveTargetInvoke}. */
+    protected <T extends Invoke> T tryResolveTargetInvoke(GraphAdder adder, InvokeFactory<T> factory, MethodHandleAccessProvider methodHandleAccess, ValueNode... argumentsArray) {
+        return MethodHandleNode.tryResolveTargetInvoke(adder, factory, methodHandleAccess, intrinsicMethod, targetMethod, bci, returnStamp, argumentsArray);
     }
 }

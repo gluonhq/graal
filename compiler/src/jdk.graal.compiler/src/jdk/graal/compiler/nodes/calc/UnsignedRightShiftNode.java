@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ import jdk.graal.compiler.core.common.type.IntegerStamp;
 import jdk.graal.compiler.core.common.type.PrimitiveStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.Assertions;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.lir.gen.ArithmeticLIRGeneratorTool;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
@@ -39,7 +40,9 @@ import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
+import jdk.graal.compiler.vector.nodes.simd.SimdStamp;
 import jdk.vm.ci.code.CodeUtil;
+import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.JavaKind;
 
 @NodeInfo(shortName = ">>>")
@@ -53,7 +56,7 @@ public final class UnsignedRightShiftNode extends ShiftNode<UShr> {
 
     public static ValueNode create(ValueNode x, ValueNode y, NodeView view) {
         ArithmeticOpTable.ShiftOp<UShr> op = ArithmeticOpTable.forStamp(x.stamp(view)).getUShr();
-        Stamp stamp = op.foldStamp(x.stamp(view), (IntegerStamp) y.stamp(view));
+        Stamp stamp = op.foldStamp(x.stamp(view), y.stamp(view));
         ValueNode value = ShiftNode.canonical(op, stamp, x, y, view);
         if (value != null) {
             return value;
@@ -75,50 +78,70 @@ public final class UnsignedRightShiftNode extends ShiftNode<UShr> {
             return ret;
         }
 
-        return canonical(this, this.getArithmeticOp(), this.stamp(view), forX, forY, view);
+        ShiftOp<UShr> op = getOp(forX);
+        // A constant result inferred from the original operands may not hold for supplied operands.
+        Stamp resultStamp = forX == getX() && forY == getY() ? stamp(view) : op.foldStamp(forX.stamp(view), forY.stamp(view));
+        return canonical(this, op, resultStamp, forX, forY, view);
     }
 
     @SuppressWarnings("unused")
     private static ValueNode canonical(UnsignedRightShiftNode node, ArithmeticOpTable.ShiftOp<UShr> op, Stamp stamp, ValueNode forX, ValueNode forY, NodeView view) {
-        if (forY.isConstant()) {
+        if (forY.isConstant() && op.isNeutral(forY.asConstant())) {
+            return forX;
+        }
+
+        if (forY.isJavaConstant()) {
             int amount = forY.asJavaConstant().asInt();
-            int originalAmout = amount;
+            int originalAmount = amount;
             int mask = op.getShiftAmountMask(stamp);
             amount &= mask;
             if (amount == 0) {
                 return forX;
             }
 
+            Constant constant = stamp.asConstant();
+            if (constant != null) {
+                return ConstantNode.forPrimitive(stamp, constant);
+            }
+
             Stamp xStampGeneric = forX.stamp(view);
             if (xStampGeneric instanceof IntegerStamp) {
                 IntegerStamp xStamp = (IntegerStamp) xStampGeneric;
-                long xMask = CodeUtil.mask(xStamp.getBits());
-                long xLowerBound = xStamp.lowerBound() & xMask;
-                long xUpperBound = xStamp.upperBound() & xMask;
+                if (xStamp.getBits() >= Integer.SIZE) {
+                    long xMask = CodeUtil.mask(xStamp.getBits());
+                    long xLowerBound = xStamp.lowerBound() & xMask;
+                    long xUpperBound = xStamp.upperBound() & xMask;
 
-                if (xLowerBound >>> amount == xUpperBound >>> amount) {
-                    // The result of the shift is constant.
-                    return ConstantNode.forIntegerBits(PrimitiveStamp.getBits(stamp), xLowerBound >>> amount);
+                    if (xLowerBound >>> amount == xUpperBound >>> amount) {
+                        // The result of the shift is constant.
+                        return ConstantNode.forIntegerBits(PrimitiveStamp.getBits(stamp), xLowerBound >>> amount);
+                    }
                 }
 
-                if (amount == xStamp.getBits() - 1 && xStamp.lowerBound() == -1 && xStamp.upperBound() == 0) {
+                if (xStamp.getBits() >= Integer.SIZE && amount == xStamp.getBits() - 1 && xStamp.lowerBound() == -1 && xStamp.upperBound() == 0) {
                     // Shift is equivalent to a negation, i.e., turns -1 into 1 and keeps 0 at 0.
                     return NegateNode.create(forX, view);
                 }
             }
 
-            if (forX instanceof ShiftNode) {
+            int bits = stamp instanceof SimdStamp simdStamp ? PrimitiveStamp.getBits(simdStamp.getComponent(0)) : PrimitiveStamp.getBits(stamp);
+            if (bits >= Integer.SIZE && forX instanceof ShiftNode) {
                 ShiftNode<?> other = (ShiftNode<?>) forX;
                 if (other.getY().isConstant()) {
-                    int otherAmount = other.getY().asJavaConstant().asInt() & mask;
+                    int otherAmount = other.getConstantShiftAmount();
                     if (other instanceof UnsignedRightShiftNode) {
                         int total = amount + otherAmount;
                         if (total != (total & mask)) {
-                            return ConstantNode.forIntegerBits(PrimitiveStamp.getBits(stamp), 0);
+                            return BinaryArithmeticNode.createIntegerConstant(stamp, 0);
                         }
                         return new UnsignedRightShiftNode(other.getX(), ConstantNode.forInt(total));
                     } else if (other instanceof LeftShiftNode && otherAmount == amount) {
-                        if (stamp.getStackKind() == JavaKind.Long) {
+                        if (stamp instanceof SimdStamp simdStamp) {
+                            JavaKind componentKind = simdStamp.getComponent(0).getStackKind();
+                            GraalError.guarantee(componentKind == JavaKind.Int || componentKind == JavaKind.Long, "unexpected SIMD component kind: %s", componentKind);
+                            long constantMask = componentKind == JavaKind.Long ? -1L >>> amount : -1 >>> amount;
+                            return new AndNode(other.getX(), BinaryArithmeticNode.createIntegerConstant(stamp, constantMask));
+                        } else if (stamp.getStackKind() == JavaKind.Long) {
                             return new AndNode(other.getX(), ConstantNode.forLong(-1L >>> amount));
                         } else {
                             assert stamp.getStackKind() == JavaKind.Int : Assertions.errorMessage(node, op, stamp, forX, forY);
@@ -127,7 +150,7 @@ public final class UnsignedRightShiftNode extends ShiftNode<UShr> {
                     }
                 }
             }
-            if (originalAmout != amount) {
+            if (originalAmount != amount) {
                 return new UnsignedRightShiftNode(forX, ConstantNode.forInt(amount));
             }
         }

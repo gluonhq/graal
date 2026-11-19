@@ -131,12 +131,10 @@ public class FrameMapBuilderImpl extends FrameMapBuilderTool {
         };
         for (BasicBlock<?> block : lir.getControlFlowGraph().getBlocks()) {
             lir.getLIRforBlock(block).forEach(op -> {
-                op.visitEachInput(verifySlots);
-                op.visitEachAlive(verifySlots);
+                // Stack-slot verification is a single boundary check over operand buckets, so it
+                // uses the canonical forward operand walk.
+                op.visitEachValueForward(verifySlots);
                 op.visitEachState(verifySlots);
-
-                op.visitEachTemp(verifySlots);
-                op.visitEachOutput(verifySlots);
             });
         }
     }

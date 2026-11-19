@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,6 +42,8 @@ package com.oracle.truffle.polyglot;
 
 import static com.oracle.truffle.polyglot.EngineAccessor.LANGUAGE;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,6 +52,8 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Function;
 
 import org.graalvm.collections.Pair;
+import org.graalvm.options.OptionDescriptor;
+import org.graalvm.polyglot.SandboxPolicy;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 
 import com.oracle.truffle.api.CallTarget;
@@ -57,10 +61,12 @@ import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.polyglot.PolyglotImpl.VMObject;
 import com.oracle.truffle.polyglot.PolyglotLocals.LanguageContextLocal;
 import com.oracle.truffle.polyglot.PolyglotLocals.LanguageContextThreadLocal;
 import com.oracle.truffle.polyglot.PolyglotLocals.LocalLocation;
+import com.oracle.truffle.polyglot.PolyglotSourceCache.ParseOrigin;
 
 /** The data corresponding to a specific {@link TruffleLanguage} instance. */
 final class PolyglotLanguageInstance implements VMObject {
@@ -104,7 +110,6 @@ final class PolyglotLanguageInstance implements VMObject {
         } catch (Exception e) {
             throw new IllegalStateException(String.format("Error initializing language '%s' using class '%s'.", language.cache.getId(), language.cache.getClassName()), e);
         }
-        PolyglotValueDispatch.createDefaultValues(getImpl(), this, this.valueCache);
     }
 
     CallTarget lookupCallTarget(Class<? extends RootNode> rootNodeClass) {
@@ -113,6 +118,47 @@ final class PolyglotLanguageInstance implements VMObject {
 
     CallTarget installCallTarget(RootNode rootNode) {
         return callTargetCache.computeIfAbsent(rootNode.getClass(), (r) -> rootNode.getCallTarget());
+    }
+
+    OptionValuesImpl parseSourceOptions(ParseOrigin origin, Source source, String componentOnly) {
+        Map<String, String> rawOptions = EngineAccessor.SOURCE.getSourceOptions(source);
+        if (rawOptions.isEmpty()) {
+            // fast-path: no options
+            return language.getEmptySourceOptionsInternal();
+        }
+        PolyglotEngineImpl engine = this.sharing.engine;
+
+        // if same language
+        boolean allowExperimental = true;
+        SandboxPolicy sandboxPolicy = SandboxPolicy.TRUSTED;
+        if (origin == ParseOrigin.EMBEDDING) {
+            allowExperimental = engine.allowExperimentalOptions;
+            sandboxPolicy = engine.sandboxPolicy;
+        }
+        Map<String, OptionValuesImpl> options = PolyglotSourceCache.parseSourceOptions(getEngine(),
+                        rawOptions, componentOnly,
+                        sandboxPolicy,
+                        allowExperimental);
+        OptionValuesImpl languageOptions = options.get(componentOnly != null ? componentOnly : source.getLanguage());
+        if (languageOptions == null) {
+            return language.getEmptySourceOptionsInternal();
+        }
+        List<OptionDescriptor> deprecated = null;
+        for (OptionValuesImpl resolvedOptions : options.values()) {
+            Collection<OptionDescriptor> descriptors = resolvedOptions.getUsedDeprecatedDescriptors();
+            if (!descriptors.isEmpty()) {
+                if (deprecated == null) {
+                    deprecated = new ArrayList<>();
+                }
+                deprecated.addAll(descriptors);
+            }
+        }
+
+        if (deprecated != null) {
+            engine.printDeprecatedOptionsWarning(deprecated);
+        }
+
+        return languageOptions;
     }
 
     @Override
@@ -147,6 +193,9 @@ final class PolyglotLanguageInstance implements VMObject {
     private synchronized PolyglotValueDispatch lookupValueCacheImpl(Object guestValue) {
         PolyglotValueDispatch cache = valueCache.computeIfAbsent(guestValue.getClass(), new Function<Class<?>, PolyglotValueDispatch>() {
             public PolyglotValueDispatch apply(Class<?> t) {
+                if (PolyglotImpl.isGuestPrimitive(guestValue)) {
+                    return new PolyglotValueDispatch.PrimitiveValue(getImpl(), PolyglotLanguageInstance.this);
+                }
                 return PolyglotValueDispatch.createInteropValue(PolyglotLanguageInstance.this, (TruffleObject) guestValue, guestValue.getClass());
             }
         });

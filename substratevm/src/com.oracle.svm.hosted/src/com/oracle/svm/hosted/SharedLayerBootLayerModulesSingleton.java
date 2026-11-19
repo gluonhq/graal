@@ -1,0 +1,119 @@
+/*
+ * Copyright (c) 2025, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.hosted;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.stream.Stream;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.core.imagelayer.BuildingInitialLayerPredicate;
+import com.oracle.svm.hosted.imagelayer.SnapshotWriters;
+import com.oracle.svm.hosted.imagelayer.SVMImageSingletonWriter;
+import com.oracle.svm.hosted.imagelayer.SVMImageLayerSingletonLoader;
+import com.oracle.svm.hosted.snapshot.util.SnapshotAdapters;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.ImageSingletonLoader;
+import com.oracle.svm.shared.singletons.ImageSingletonWriter;
+import com.oracle.svm.shared.singletons.LayeredPersistFlags;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.LayeredCallbacksSingletonTrait;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacksSupplier;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+/**
+ * This singleton persists all the modules from the {@code bootLayer} of the shared layers and
+ * allows to loads them in the extension layers. This is needed for the {@code RuntimeModuleSupport}
+ * that contains the runtime bootLayer and is only installed in the application layer.
+ */
+@Platforms(Platform.HOSTED_ONLY.class)
+@AutomaticallyRegisteredImageSingleton(onlyWith = BuildingInitialLayerPredicate.class)
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = SharedLayerBootLayerModulesSingleton.LayeredCallbacks.class)
+public class SharedLayerBootLayerModulesSingleton {
+    private final Collection<String> sharedBootLayerModules;
+    private ModuleLayer bootLayer;
+
+    public SharedLayerBootLayerModulesSingleton() {
+        this.sharedBootLayerModules = null;
+    }
+
+    private SharedLayerBootLayerModulesSingleton(Collection<String> baseBootLayerModules) {
+        this.sharedBootLayerModules = baseBootLayerModules;
+    }
+
+    public static SharedLayerBootLayerModulesSingleton singleton() {
+        return ImageSingletons.lookup(SharedLayerBootLayerModulesSingleton.class);
+    }
+
+    public void setBootLayer(ModuleLayer bootLayer) {
+        this.bootLayer = bootLayer;
+    }
+
+    public Collection<String> getSharedBootLayerModules() {
+        return sharedBootLayerModules;
+    }
+
+    static class LayeredCallbacks extends SingletonLayeredCallbacksSupplier {
+
+        @Override
+        public LayeredCallbacksSingletonTrait getLayeredCallbacksTrait() {
+            return new LayeredCallbacksSingletonTrait(new SingletonLayeredCallbacks<SharedLayerBootLayerModulesSingleton>() {
+
+                @Override
+                public LayeredPersistFlags doPersist(ImageSingletonWriter writer, SharedLayerBootLayerModulesSingleton singleton) {
+                    SVMImageSingletonWriter writerImpl = (SVMImageSingletonWriter) writer;
+                    Stream<String> moduleNames = singleton.bootLayer.modules().stream().map(Module::getName);
+
+                    if (singleton.sharedBootLayerModules != null) {
+                        moduleNames = Stream.concat(moduleNames, singleton.sharedBootLayerModules.stream());
+                    }
+
+                    SnapshotWriters.initStringList(writerImpl.getSnapshotWriter()::initSharedLayerBootLayerModules, moduleNames);
+
+                    return LayeredPersistFlags.CREATE;
+                }
+
+                @Override
+                public Class<? extends LayeredSingletonInstantiator<?>> getSingletonInstantiator() {
+                    return SingletonInstantiator.class;
+                }
+            });
+        }
+    }
+
+    static class SingletonInstantiator implements SingletonLayeredCallbacks.LayeredSingletonInstantiator<SharedLayerBootLayerModulesSingleton> {
+        @Override
+        public SharedLayerBootLayerModulesSingleton createFromLoader(ImageSingletonLoader loader) {
+            SVMImageLayerSingletonLoader.ImageSingletonLoaderImpl loaderImpl = (SVMImageLayerSingletonLoader.ImageSingletonLoaderImpl) loader;
+            List<String> moduleNames = SnapshotAdapters.toCollection(loaderImpl.getSnapshotLoader().getSharedLayerBootLayerModules(), ArrayList::new);
+            return new SharedLayerBootLayerModulesSingleton(moduleNames);
+        }
+    }
+}

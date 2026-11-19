@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,6 +38,7 @@ import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
@@ -76,6 +77,8 @@ public final class ConstantReflectionUtil {
      * as the array element's bit width, e.g. reading a {@code char} value from a {@code byte}
      * array.
      *
+     * @param typePunnedOffset array offset in relation to the type punned element size, e.g.
+     *            "number of char elements in this byte array".
      * @param typePunnedLength array length in relation to the type punned element size, e.g.
      *            "number of char elements in this byte array".
      * @param typePunnedStride type punned array element size.
@@ -84,12 +87,16 @@ public final class ConstantReflectionUtil {
      * @param arrayKind actual array kind, e.g. {@link JavaKind#Byte} for a {@code byte} array we
      *            want to read a {@code char} from.
      */
-    public static void boundsCheckTypePunned(int typePunnedLength, Stride typePunnedStride, int arrayLength, JavaKind arrayKind) {
-        GraalError.guarantee(typePunnedLength * typePunnedStride.value <= arrayLength * arrayKind.getByteCount(), Assertions.errorMessageContext(
-                        "typePunnedLength", typePunnedLength,
-                        "typePunnedStride", typePunnedStride.value,
-                        "arrayLength", arrayLength,
-                        "arrayKind", arrayKind));
+    public static boolean boundsCheckTypePunned(long typePunnedOffset, int typePunnedLength, Stride typePunnedStride, int arrayLength, JavaKind arrayKind) {
+        /*
+         * Note: A simple (offset + length |<=| array.length) check does not protect against illegal
+         * negative offset or length values for which (offset + length) might appear to be in bounds
+         * while the start of the range is out of bounds or greater than the end.
+         */
+        long arrayByteLength = (long) arrayLength * arrayKind.getByteCount();
+        long byteOffset = typePunnedOffset * typePunnedStride.value;
+        long byteLength = (long) typePunnedLength * typePunnedStride.value;
+        return Long.compareUnsigned(byteOffset + byteLength, arrayByteLength) <= 0 && byteOffset >= 0 && byteLength >= 0;
     }
 
     /**
@@ -185,5 +192,46 @@ public final class ConstantReflectionUtil {
             return null;
         }
         return (int) (elementOffset / stride.value);
+    }
+
+    /**
+     * Reads a string's contents through constant reflection, including when the string belongs to
+     * a different runtime, as with libgraal. The JDK stores the contents in {@code String.value}
+     * as Latin-1 bytes or UTF-16 code units in native byte order, selected by {@code String.coder}.
+     * Returns {@code null} for null or non-string constants, or if the fields or array length
+     * cannot be read.
+     */
+    public static String readString(MetaAccessProvider metaAccess, ConstantReflectionProvider constantReflection, JavaConstant string) {
+        if (string == null || string.getJavaKind() != JavaKind.Object || string.isNull()) {
+            return null;
+        }
+        ResolvedJavaType stringType = metaAccess.lookupJavaType(String.class);
+        if (!stringType.equals(metaAccess.lookupJavaType(string))) {
+            return null;
+        }
+        JavaConstant value = null;
+        JavaConstant coder = null;
+        for (ResolvedJavaField field : stringType.getInstanceFields(false)) {
+            switch (field.getName()) {
+                case "value" -> value = constantReflection.readFieldValue(field, string);
+                case "coder" -> coder = constantReflection.readFieldValue(field, string);
+            }
+        }
+        if (value == null || value.isNull() || coder == null) {
+            return null;
+        }
+        Integer byteLength = constantReflection.readArrayLength(value);
+        if (byteLength == null) {
+            return null;
+        }
+        int encoding = coder.asInt();
+        GraalError.guarantee(encoding == 0 || encoding == 1, "unexpected String coder: %s", encoding);
+        GraalError.guarantee((byteLength & encoding) == 0, "invalid String byte length: %s", byteLength);
+        Stride stride = encoding == 0 ? Stride.S1 : Stride.S2;
+        char[] chars = new char[byteLength >> encoding];
+        for (int i = 0; i < chars.length; i++) {
+            chars[i] = (char) readTypePunned(constantReflection, value, JavaKind.Byte, stride, i);
+        }
+        return new String(chars);
     }
 }

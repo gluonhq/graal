@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.hosted.c.info;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import org.graalvm.word.LocationIdentity;
 
@@ -39,7 +39,7 @@ public class StructFieldInfo extends SizableInfo {
     @SuppressWarnings("this-escape")
     public StructFieldInfo(String name, ElementKind kind) {
         super(name, kind);
-        this.offset = adoptChild(new PropertyInfo<Integer>("offset"));
+        this.offset = adoptChild(new PropertyInfo<>("offset"));
     }
 
     public PropertyInfo<Integer> getOffsetInfo() {

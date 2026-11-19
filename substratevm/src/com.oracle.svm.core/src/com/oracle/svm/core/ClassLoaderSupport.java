@@ -30,11 +30,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.ResourceBundle;
-import java.util.Set;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 
 @Platforms(Platform.HOSTED_ONLY.class)
 public abstract class ClassLoaderSupport {
@@ -52,12 +52,22 @@ public abstract class ClassLoaderSupport {
 
     protected abstract boolean isNativeImageClassLoaderImpl(ClassLoader classLoader);
 
+    public record ConditionWithOrigin(AccessCondition condition, Object origin, boolean preserved) {
+        public ConditionWithOrigin(AccessCondition condition, Object origin) {
+            this(condition, origin, false);
+        }
+    }
+
     public interface ResourceCollector {
-        List<ConfigurationCondition> isIncluded(Module module, String resourceName, URI resourceURI);
+        List<ConditionWithOrigin> isIncluded(Module module, String resourceName, URI resourceURI);
 
-        void addResourceEntry(Module module, String resourceName);
+        void addResourceEntry(Module module, String resourceName, Object origin);
 
-        void addResourceConditionally(Module module, String resourceName, ConfigurationCondition condition);
+        default void addResourceConditionally(Module module, String resourceName, AccessCondition condition, Object origin) {
+            addResourceConditionally(module, resourceName, condition, origin, false);
+        }
+
+        void addResourceConditionally(Module module, String resourceName, AccessCondition condition, Object origin, boolean preserved);
 
         void registerNegativeQuery(Module module, String resourceName);
 
@@ -68,5 +78,5 @@ public abstract class ClassLoaderSupport {
 
     public abstract List<ResourceBundle> getResourceBundle(String bundleName, Locale locale);
 
-    public abstract Map<String, Set<Module>> getPackageToModules();
+    public abstract Map<String, EconomicSet<Module>> getPackageToModules();
 }

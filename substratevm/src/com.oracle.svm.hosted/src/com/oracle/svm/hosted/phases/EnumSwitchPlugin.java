@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,33 +24,28 @@
  */
 package com.oracle.svm.hosted.phases;
 
-import java.lang.reflect.Method;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-
 import org.graalvm.nativeimage.ImageSingletons;
 
-import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.svm.core.ParsingReason;
-import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
-import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
-import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.nodes.ConstantNode;
-import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
 import jdk.graal.compiler.nodes.graphbuilderconf.NodePlugin;
 import jdk.graal.compiler.phases.util.Providers;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * The Eclipse Java compiler generates methods that lazily initializes tables for Enum switches,
@@ -94,25 +89,23 @@ final class EnumSwitchPlugin implements NodePlugin {
          * check for transitive callees, because we trust that the Eclipse compiler only emits calls
          * that end up in the same class or in the JDK.
          */
-        EnumSwitchFeature feature = ImageSingletons.lookup(EnumSwitchFeature.class);
-        method.ensureGraphParsed(feature.bb);
-        Boolean methodSafeForExecution = feature.methodsSafeForExecution.get(method);
+        EnumSwitchSupport support = EnumSwitchSupport.singleton();
+        AnalysisMetaAccess metaAccess = (AnalysisMetaAccess) b.getMetaAccess();
+        method.ensureGraphParsed(metaAccess.getUniverse().getBigbang());
+        Boolean methodSafeForExecution = support.isMethodsSafeForExecution(method);
         assert methodSafeForExecution != null : "after-parsing hook not executed for method " + method.format("%H.%n(%p)");
         if (!methodSafeForExecution.booleanValue()) {
             return false;
         }
 
-        Object switchTable;
-        try {
-            Method switchTableMethod = ReflectionUtil.lookupMethod(method.getDeclaringClass().getJavaClass(), method.getName());
-            switchTable = switchTableMethod.invoke(null);
-        } catch (ReflectiveOperationException ex) {
-            throw GraalError.shouldNotReachHere(ex); // ExcludeFromJacocoGeneratedReport
-        }
-
-        if (switchTable instanceof int[]) {
-            b.addPush(JavaKind.Object, ConstantNode.forConstant(b.getSnippetReflection().forObject(switchTable), 1, true, b.getMetaAccess()));
-            return true;
+        JavaConstant switchTable = GuestAccess.get().invoke(OriginalMethodProvider.getOriginalMethod(method), null);
+        if (switchTable != null && !switchTable.isNull()) {
+            ResolvedJavaType switchTableType = GuestAccess.get().getProviders().getMetaAccess().lookupJavaType(switchTable);
+            if (switchTableType != null && switchTableType.isArray() && switchTableType.getComponentType().getJavaKind() == JavaKind.Int) {
+                switchTable = metaAccess.getUniverse().lookup(switchTable);
+                b.addPush(JavaKind.Object, ConstantNode.forConstant(switchTable, 1, true, b.getMetaAccess()));
+                return true;
+            }
         }
         return false;
     }
@@ -120,28 +113,17 @@ final class EnumSwitchPlugin implements NodePlugin {
 
 @AutomaticallyRegisteredFeature
 final class EnumSwitchFeature implements InternalFeature {
-
-    BigBang bb;
-
-    final ConcurrentMap<AnalysisMethod, Boolean> methodsSafeForExecution = new ConcurrentHashMap<>();
-
     @Override
     public void duringSetup(DuringSetupAccess a) {
         DuringSetupAccessImpl access = (DuringSetupAccessImpl) a;
-        bb = access.getBigBang();
-        access.getHostVM().addMethodAfterParsingListener(this::onMethodParsed);
-    }
-
-    private void onMethodParsed(AnalysisMethod method, StructuredGraph graph) {
-        boolean methodSafeForExecution = graph.getNodes().filter(node -> node instanceof EnsureClassInitializedNode).isEmpty();
-
-        Boolean existingValue = methodsSafeForExecution.put(method, methodSafeForExecution);
-        assert existingValue == null || SubstrateCompilationDirectives.isDeoptTarget(method) : "Method parsed twice: " + method.format("%H.%n(%p)");
+        EnumSwitchSupport support = new EnumSwitchSupport();
+        ImageSingletons.add(EnumSwitchSupport.class, support);
+        access.getHostVM().addMethodAfterParsingListener(support::onMethodParsed);
     }
 
     @Override
     public void afterAnalysis(AfterAnalysisAccess access) {
-        bb = null;
+        EnumSwitchSupport.singleton().afterAnalysis();
     }
 
     @Override

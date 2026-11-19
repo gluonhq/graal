@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -95,23 +95,30 @@ public class EATestBase extends GraalCompilerTest {
 
         static {
             try {
-                long localFieldOffset1 = getObjectFieldOffset(EATestBase.TestClassInt.class.getField("x"));
+                long localFieldOffset1 = UNSAFE.objectFieldOffset(TestClassInt.class.getField("x"));
                 // Make the fields 8 byte aligned (Required for testing setLong on Architectures
                 // which does not support unaligned memory access. The code has to be extra careful
                 // because some JDKs do a better job of packing fields.
                 if (localFieldOffset1 % 8 == 0) {
                     fieldOffset1 = localFieldOffset1;
-                    fieldOffset2 = getObjectFieldOffset(EATestBase.TestClassInt.class.getField("y"));
+                    fieldOffset2 = UNSAFE.objectFieldOffset(TestClassInt.class.getField("y"));
                     firstFieldIsX = true;
                 } else {
-                    fieldOffset1 = getObjectFieldOffset(EATestBase.TestClassInt.class.getField("y"));
-                    fieldOffset2 = getObjectFieldOffset(EATestBase.TestClassInt.class.getField("z"));
+                    fieldOffset1 = UNSAFE.objectFieldOffset(TestClassInt.class.getField("y"));
+                    fieldOffset2 = UNSAFE.objectFieldOffset(TestClassInt.class.getField("z"));
                     firstFieldIsX = false;
                 }
                 assert fieldOffset2 == fieldOffset1 + 4;
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
+        }
+
+        public int getFirstField() {
+            if (firstFieldIsX) {
+                return x;
+            }
+            return y;
         }
 
         public void setFirstField(int v) {
@@ -207,11 +214,10 @@ public class EATestBase extends GraalCompilerTest {
         return graph.getNodes().filter(isA(NewInstanceNode.class).or(NewArrayNode.class).or(AllocatedObjectNode.class)).count();
     }
 
-    @SuppressWarnings("try")
     protected void prepareGraph(String snippet, boolean removeIdentity) {
         ResolvedJavaMethod method = getResolvedJavaMethod(snippet);
         DebugContext debug = getDebugContext();
-        try (DebugContext.Scope s = debug.scope(getClass(), method, getCodeCache())) {
+        try (DebugContext.Scope _ = debug.scope(getClass(), method, getCodeCache())) {
             graph = parseEager(method, AllowAssumptions.YES, debug);
             context = getDefaultHighTierContext();
             createInliningPhase().apply(graph, context);

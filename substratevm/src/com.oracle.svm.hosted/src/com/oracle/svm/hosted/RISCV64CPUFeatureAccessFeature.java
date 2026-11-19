@@ -26,15 +26,14 @@ package com.oracle.svm.hosted;
 
 import java.util.EnumSet;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.SubstrateTargetDescription;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.riscv64.RISCV64CPUFeatureAccess;
 import com.oracle.svm.core.riscv64.RISCV64LibCHelper;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 
 import jdk.vm.ci.riscv64.RISCV64;
 
@@ -44,8 +43,7 @@ class RISCV64CPUFeatureAccessFeature extends CPUFeatureAccessFeatureBase impleme
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess arg) {
-        var targetDescription = ImageSingletons.lookup(SubstrateTargetDescription.class);
-        var arch = (RISCV64) targetDescription.arch;
+        var arch = (RISCV64) SubstrateTarget.getArchitecture();
         var buildtimeCPUFeatures = arch.getFeatures();
         initializeCPUFeatureAccessData(RISCV64.CPUFeature.values(), buildtimeCPUFeatures, RISCV64LibCHelper.CPUFeatures.class, (FeatureImpl.BeforeAnalysisAccessImpl) arg);
     }

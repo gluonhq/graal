@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,30 +25,30 @@
 package jdk.graal.compiler.nodes.spi;
 
 import java.util.BitSet;
+import java.util.Map;
 
 import jdk.graal.compiler.api.replacements.SnippetTemplateCache;
 import jdk.graal.compiler.bytecode.BytecodeProvider;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.graph.NodeSourcePosition;
-import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
-import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderPlugin;
-import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
 import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.StructuredGraph.AllowAssumptions;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderPlugin;
 import jdk.graal.compiler.options.OptionValues;
-
+import jdk.graal.compiler.replacements.SnippetTemplate;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
  * A convenience class for overriding just a portion of the Replacements API.
  */
-public class DelegatingReplacements implements Replacements {
-    protected final Replacements delegate;
+public class DelegatingReplacements<T extends Replacements> implements Replacements {
+    protected final T delegate;
 
-    public DelegatingReplacements(Replacements delegate) {
+    public DelegatingReplacements(T delegate) {
         this.delegate = delegate;
     }
 
@@ -58,13 +58,13 @@ public class DelegatingReplacements implements Replacements {
     }
 
     @Override
-    public <T> T getInjectedArgument(Class<T> type) {
+    public <S> S getInjectedArgument(Class<S> type) {
         return delegate.getInjectedArgument(type);
     }
 
     @Override
-    public Stamp getInjectedStamp(Class<?> type, boolean nonNull) {
-        return delegate.getInjectedStamp(type, nonNull);
+    public Stamp getInjectedStamp(Class<?> type) {
+        return delegate.getInjectedStamp(type);
     }
 
     @Override
@@ -104,15 +104,9 @@ public class DelegatingReplacements implements Replacements {
     }
 
     @Override
-    public void registerConditionalPlugin(InvocationPlugin plugin) {
-        delegate.registerConditionalPlugin(plugin);
-    }
-
-    @Override
-    public StructuredGraph getInlineSubstitution(ResolvedJavaMethod method, int invokeBci, Invoke.InlineControl inlineControl, boolean trackNodeSourcePosition, NodeSourcePosition replaceePosition,
-                    AllowAssumptions allowAssumptions,
-                    OptionValues options) {
-        return delegate.getInlineSubstitution(method, invokeBci, inlineControl, trackNodeSourcePosition, replaceePosition, allowAssumptions, options);
+    public StructuredGraph getInlineSubstitution(ResolvedJavaMethod method, int invokeBci, boolean isInOOMETry, Invoke.InlineControl inlineControl, boolean trackNodeSourcePosition,
+                    NodeSourcePosition replaceePosition, AllowAssumptions allowAssumptions, OptionValues options) {
+        return delegate.getInlineSubstitution(method, invokeBci, isInOOMETry, inlineControl, trackNodeSourcePosition, replaceePosition, allowAssumptions, options);
     }
 
     @Override
@@ -131,12 +125,17 @@ public class DelegatingReplacements implements Replacements {
     }
 
     @Override
-    public <T extends SnippetTemplateCache> T getSnippetTemplateCache(Class<T> templatesClass) {
+    public <S extends SnippetTemplateCache> S getSnippetTemplateCache(Class<S> templatesClass) {
         return delegate.getSnippetTemplateCache(templatesClass);
     }
 
     @Override
     public JavaKind getWordKind() {
         return delegate.getWordKind();
+    }
+
+    @Override
+    public Map<SnippetTemplate.CacheKey, SnippetTemplate> getTemplatesCache() {
+        return delegate.getTemplatesCache();
     }
 }

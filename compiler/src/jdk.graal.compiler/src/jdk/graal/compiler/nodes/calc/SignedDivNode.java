@@ -124,7 +124,8 @@ public class SignedDivNode extends IntegerDivRemNode implements LIRLowerable {
             }
         }
 
-        if (self != null && self.next() instanceof SignedDivNode) {
+        // Equality with the original node only proves reuse for unchanged supplied operands.
+        if (self != null && self.x == forX && self.y == forY && self.next() instanceof SignedDivNode) {
             NodeClass<?> nodeClass = self.getNodeClass();
             if (self.next().getClass() == self.getClass() && nodeClass.equalInputs(self, self.next()) && self.valueEquals(self.next())) {
                 return self.next();
@@ -175,7 +176,10 @@ public class SignedDivNode extends IntegerDivRemNode implements LIRLowerable {
         if (c == -1) {
             return NegateNode.create(forX, view);
         }
-        long abs = Math.abs(c);
+        if (NumUtil.absOverflows(c, IntegerStamp.getBits(forX.stamp(view)))) {
+            return null;
+        }
+        long abs = NumUtil.safeAbs(c, forX);
         if (CodeUtil.isPowerOf2(abs) && forX.stamp(view) instanceof IntegerStamp) {
             IntegerStamp stampX = (IntegerStamp) forX.stamp(view);
             ValueNode dividend = forX;

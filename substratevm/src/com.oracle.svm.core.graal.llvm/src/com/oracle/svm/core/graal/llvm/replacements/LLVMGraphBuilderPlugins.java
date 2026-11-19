@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,45 +29,50 @@ import java.util.Arrays;
 
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.calc.FusedMultiplyAddNode;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
 import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins.Registration;
-import jdk.graal.compiler.nodes.spi.Replacements;
 import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.replacements.StandardGraphBuilderPlugins;
 import jdk.graal.compiler.replacements.TargetGraphBuilderPlugins;
-import jdk.graal.compiler.replacements.nodes.BinaryMathIntrinsicNode;
 import jdk.graal.compiler.replacements.nodes.BinaryMathIntrinsicNode.BinaryOperation;
+import jdk.graal.compiler.replacements.nodes.BinaryMathIntrinsicGenerationNode;
 import jdk.graal.compiler.replacements.nodes.BitCountNode;
-import jdk.graal.compiler.replacements.nodes.FusedMultiplyAddNode;
-import jdk.graal.compiler.replacements.nodes.UnaryMathIntrinsicNode;
+import jdk.graal.compiler.replacements.nodes.UnaryMathIntrinsicGenerationNode;
 import jdk.graal.compiler.replacements.nodes.UnaryMathIntrinsicNode.UnaryOperation;
 
 import com.oracle.svm.core.graal.llvm.replacements.LLVMIntrinsicNode.LLVMIntrinsicOperation;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 public class LLVMGraphBuilderPlugins implements TargetGraphBuilderPlugins {
 
     @Override
-    public void register(Plugins plugins, Replacements replacements, Architecture arch, boolean registerMathPlugins, OptionValues options) {
+    public void registerPlugins(Plugins plugins, OptionValues options) {
         InvocationPlugins invocationPlugins = plugins.getInvocationPlugins();
         invocationPlugins.defer(new Runnable() {
             @Override
             public void run() {
-                registerIntegerLongPlugins(invocationPlugins, JavaKind.Int, replacements);
-                registerIntegerLongPlugins(invocationPlugins, JavaKind.Long, replacements);
-                registerMathPlugins(invocationPlugins, replacements);
+                registerIntegerLongPlugins(invocationPlugins, JavaKind.Int);
+                registerIntegerLongPlugins(invocationPlugins, JavaKind.Long);
+                registerMathPlugins(invocationPlugins);
+                registerArraysEqualsPlugins(invocationPlugins);
             }
         });
     }
 
-    private static void registerIntegerLongPlugins(InvocationPlugins plugins, JavaKind kind, Replacements replacements) {
+    private static void registerIntegerLongPlugins(InvocationPlugins plugins, JavaKind kind) {
         Class<?> declaringClass = kind.toBoxedJavaClass();
-        Registration r = new Registration(plugins, declaringClass, replacements);
+        Registration r = new Registration(plugins, declaringClass).setAllowOverwrite(true);
         registerUnaryLLVMIntrinsic(r, "numberOfLeadingZeros", LLVMIntrinsicOperation.CTLZ, JavaKind.Int, kind.toJavaClass());
         registerUnaryLLVMIntrinsic(r, "numberOfTrailingZeros", LLVMIntrinsicOperation.CTTZ, JavaKind.Int, kind.toJavaClass());
         r.register(new InvocationPlugin("bitCount", kind.toJavaClass()) {
@@ -79,8 +84,8 @@ public class LLVMGraphBuilderPlugins implements TargetGraphBuilderPlugins {
         });
     }
 
-    private static void registerMathPlugins(InvocationPlugins plugins, Replacements replacements) {
-        Registration r = new Registration(plugins, Math.class, replacements);
+    private static void registerMathPlugins(InvocationPlugins plugins) {
+        Registration r = new Registration(plugins, Math.class).setAllowOverwrite(true);
         registerUnaryMath(r, "log", UnaryOperation.LOG);
         registerUnaryMath(r, "log10", UnaryOperation.LOG10);
         registerUnaryMath(r, "exp", UnaryOperation.EXP);
@@ -99,12 +104,21 @@ public class LLVMGraphBuilderPlugins implements TargetGraphBuilderPlugins {
         registerFMA(r);
     }
 
+    private static void registerArraysEqualsPlugins(InvocationPlugins plugins) {
+        Registration r = new Registration(plugins, Arrays.class);
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Boolean, boolean[].class, boolean[].class));
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Byte, byte[].class, byte[].class));
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Short, short[].class, short[].class));
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Char, char[].class, char[].class));
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Int, int[].class, int[].class));
+        r.register(new StandardGraphBuilderPlugins.ArrayEqualsInvocationPlugin(JavaKind.Long, long[].class, long[].class));
+    }
+
     private static void registerUnaryMath(Registration r, String name, UnaryOperation operation) {
         r.register(new InvocationPlugin(name, double.class) {
             @Override
             public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode value) {
-                b.push(JavaKind.Double, b.append(UnaryMathIntrinsicNode.create(value, operation)));
-                return true;
+                return UnaryMathIntrinsicGenerationNode.intrinsify(b, value, operation);
             }
         });
     }
@@ -113,8 +127,7 @@ public class LLVMGraphBuilderPlugins implements TargetGraphBuilderPlugins {
         r.register(new InvocationPlugin(name, double.class, double.class) {
             @Override
             public boolean apply(GraphBuilderContext b, ResolvedJavaMethod targetMethod, Receiver receiver, ValueNode x, ValueNode y) {
-                b.push(JavaKind.Double, b.append(BinaryMathIntrinsicNode.create(x, y, operation)));
-                return true;
+                return BinaryMathIntrinsicGenerationNode.intrinsify(b, x, y, operation);
             }
         });
     }

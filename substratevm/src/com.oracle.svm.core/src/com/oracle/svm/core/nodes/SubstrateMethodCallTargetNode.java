@@ -24,19 +24,46 @@
  */
 package com.oracle.svm.core.nodes;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.word.WordBase;
+
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalClassProvider;
+
+import jdk.graal.compiler.core.common.NativeImageSupport;
 import jdk.graal.compiler.core.common.type.StampPair;
 import jdk.graal.compiler.graph.NodeClass;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
+import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaMethodProfile;
+import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.JavaTypeProfile;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
+/**
+ * Extension of {@link MethodCallTargetNode} that adds a {@link JavaMethodProfile} when available.
+ * Note that the replacement from {@link MethodCallTargetNode} to
+ * {@link SubstrateMethodCallTargetNode} is not mandatory. SVM code can introduce new
+ * {@link MethodCallTargetNode}s.
+ */
 @NodeInfo
 public final class SubstrateMethodCallTargetNode extends MethodCallTargetNode {
     public static final NodeClass<SubstrateMethodCallTargetNode> TYPE = NodeClass.create(SubstrateMethodCallTargetNode.class);
 
+    /**
+     * Method profile inferred from a static type profile.
+     */
+    private JavaMethodProfile staticMethodProfile;
+    /**
+     * Either the static method profile, or a dynamic method profile inferred from, for example,
+     * sampling data.
+     */
     private JavaMethodProfile methodProfile;
 
     /*
@@ -46,30 +73,95 @@ public final class SubstrateMethodCallTargetNode extends MethodCallTargetNode {
     private JavaTypeProfile staticTypeProfile;
 
     public SubstrateMethodCallTargetNode(InvokeKind invokeKind, ResolvedJavaMethod targetMethod, ValueNode[] arguments, StampPair returnStamp) {
-        super(TYPE, invokeKind, targetMethod, arguments, returnStamp, null);
+        this(invokeKind, targetMethod, arguments, returnStamp, null);
     }
 
-    public void setProfiles(JavaTypeProfile typeProfile, JavaMethodProfile methodProfile) {
-        this.typeProfile = typeProfile;
-        this.methodProfile = methodProfile;
-        this.staticTypeProfile = typeProfile;
+    public SubstrateMethodCallTargetNode(InvokeKind invokeKind, ResolvedJavaMethod targetMethod, ValueNode[] arguments, StampPair returnStamp, JavaTypeProfile typeProfile) {
+        super(TYPE, invokeKind, targetMethod, arguments, returnStamp, typeProfile);
     }
 
-    public void setProfiles(JavaTypeProfile typeProfile, JavaMethodProfile methodProfile, JavaTypeProfile staticTypeProfile) {
-        this.typeProfile = typeProfile;
-        this.methodProfile = methodProfile;
+    @Override
+    protected JavaKind expectedStackKind(JavaType expectedType) {
+        if (expectedType instanceof SharedType sharedType && sharedType.isWordType()) {
+            return sharedType.getStorageKind().getStackKind();
+        }
+        if (!NativeImageSupport.inRuntimeCode() && isHostedWordType(expectedType)) {
+            return SubstrateTarget.getWordKind().getStackKind();
+        }
+        return super.expectedStackKind(expectedType);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private static boolean isHostedWordType(JavaType expectedType) {
+        if (expectedType instanceof OriginalClassProvider) {
+            ResolvedJavaType wordBaseType = GuestAccess.get().lookupType(WordBase.class);
+            return wordBaseType.isAssignableFrom(OriginalClassProvider.getOriginalType(expectedType));
+        }
+        return false;
+    }
+
+    public void setProfiles(JavaTypeProfile dynamicTypeProfile, JavaTypeProfile staticTypeProfile, JavaMethodProfile dynamicMethodProfile, JavaMethodProfile staticMethodProfile) {
+        this.typeProfile = dynamicTypeProfile;
+        this.methodProfile = dynamicMethodProfile;
         this.staticTypeProfile = staticTypeProfile;
+        this.staticMethodProfile = staticMethodProfile;
     }
 
+    public void setDynamicProfiles(JavaTypeProfile typeProfile, JavaMethodProfile methodProfile) {
+        this.typeProfile = typeProfile;
+        this.methodProfile = methodProfile;
+    }
+
+    /**
+     * Returns a dynamic method profile if one exists. Otherwise, returns a static method profile if
+     * one exists. If neither exist, returns null.
+     */
     public JavaMethodProfile getMethodProfile() {
         return methodProfile;
     }
 
+    /**
+     * Returns a static type profile if one exists. Otherwise, returns null.
+     */
     public JavaTypeProfile getStaticTypeProfile() {
         return staticTypeProfile;
     }
 
+    /**
+     * Returns a static method profile if one exists. Otherwise, returns null.
+     */
+    public JavaMethodProfile getStaticMethodProfile() {
+        return staticMethodProfile;
+    }
+
+    /**
+     * Set a dynamic method profile.
+     */
     public void setJavaMethodProfile(JavaMethodProfile profile) {
         methodProfile = profile;
+    }
+
+    /**
+     * Returns true iff {@code this} has a dynamic type profile. A dynamic type profile can be
+     * gathered by, for example, instrumentation. A static type profile (as produced by the static
+     * analysis) does not count as a dynamic profile.
+     */
+    public boolean hasDynamicTypeProfile() {
+        if (typeProfile == null) {
+            return false;
+        }
+        return !typeProfile.equals(staticTypeProfile);
+    }
+
+    /**
+     * Returns true iff {@code this} has a dynamic method profile. A dynamic method profile can be
+     * gathered by, for example, instrumentation or perf samples. A static method profile (as
+     * produced by the static analysis) does not count as a dynamic profile.
+     */
+    public boolean hasDynamicMethodProfile() {
+        if (methodProfile == null) {
+            return false;
+        }
+        return !methodProfile.equals(staticMethodProfile);
     }
 }

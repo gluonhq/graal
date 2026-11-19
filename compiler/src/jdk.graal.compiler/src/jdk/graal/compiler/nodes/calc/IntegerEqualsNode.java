@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -42,6 +42,7 @@ import jdk.graal.compiler.nodes.spi.Canonicalizable;
 import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.options.OptionValues;
+import jdk.vm.ci.code.CodeUtil;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaKind;
@@ -86,6 +87,20 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
         ValueNode value = OP.canonical(tool.getConstantReflection(), tool.getMetaAccess(), tool.getOptions(), tool.smallestCompareWidth(), CanonicalCondition.EQ, false, forX, forY, view);
         if (value != null) {
             return value;
+        }
+        if (forX instanceof MinMaxNode<?> minMax && (minMax.getX() == forY || minMax.getY() == forY)) {
+            // patterns like min(x, y) == y --> x >= y, see doc for conditionForEqualsUsage
+            LogicNode equivalentCondition = minMax.conditionForEqualsUsage(forY, tool);
+            if (equivalentCondition != null) {
+                return equivalentCondition;
+            }
+        }
+        if (forY instanceof MinMaxNode<?> minMax && (minMax.getX() == forX || minMax.getY() == forX)) {
+            // patterns like x == min(x, y) --> x <= y, see doc for conditionForEqualsUsage
+            LogicNode equivalentCondition = minMax.conditionForEqualsUsage(forX, tool);
+            if (equivalentCondition != null) {
+                return equivalentCondition;
+            }
         }
         return super.canonical(tool, forX, forY);
     }
@@ -219,6 +234,22 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
                 return LogicConstantNode.contradiction();
             }
 
+            if (forX instanceof MinMaxNode<?> minMax && minMax.getY().isJavaConstant() && forY.isJavaConstant() && !minMax.getY().asJavaConstant().equals(forY.asJavaConstant())) {
+                Constant comparedConstants = minMax.getArithmeticOp().foldConstant(minMax.getY().asJavaConstant(), forY.asJavaConstant());
+                if (comparedConstants.equals(forY.asJavaConstant())) {
+                    /*
+                     * We have a case like min(x, C1) == C2 where min(C1, C2) == C2; for example,
+                     * min(x, 8) == 7. Or max(x, C1) == C2 where max(C1, C2) == C2; for example,
+                     * max(x, 7) == 8. The constants are not equal.
+                     *
+                     * If the min/max returns a value != x, it will return C1; since C1 != C2, the
+                     * comparison will be false. So the comparison can only be true if the min/max
+                     * returns x, and the returned value equals C2. So simplify to x == C2 directly.
+                     */
+                    return IntegerEqualsNode.create(minMax.getX(), forY, view);
+                }
+            }
+
             return super.canonical(constantReflection, metaAccess, options, smallestCompareWidth, condition, unorderedIsTrue, forX, forY, view);
         }
 
@@ -248,8 +279,7 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
                         if (nonConstant instanceof LeftShiftNode) {
                             LeftShiftNode shift = (LeftShiftNode) nonConstant;
                             if (shift.getY().isConstant()) {
-                                int mask = shift.getShiftAmountMask();
-                                int amount = shift.getY().asJavaConstant().asInt() & mask;
+                                int amount = shift.getConstantShiftAmount();
                                 if (shift.getX().getStackKind() == JavaKind.Int) {
                                     return new IntegerTestNode(shift.getX(), ConstantNode.forInt(-1 >>> amount));
                                 } else {
@@ -260,8 +290,7 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
                         } else if (nonConstant instanceof RightShiftNode) {
                             RightShiftNode shift = (RightShiftNode) nonConstant;
                             if (shift.getY().isConstant() && ((IntegerStamp) shift.getX().stamp(view)).isPositive()) {
-                                int mask = shift.getShiftAmountMask();
-                                int amount = shift.getY().asJavaConstant().asInt() & mask;
+                                int amount = shift.getConstantShiftAmount();
                                 if (shift.getX().getStackKind() == JavaKind.Int) {
                                     return new IntegerTestNode(shift.getX(), ConstantNode.forInt(-1 << amount));
                                 } else {
@@ -272,8 +301,7 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
                         } else if (nonConstant instanceof UnsignedRightShiftNode) {
                             UnsignedRightShiftNode shift = (UnsignedRightShiftNode) nonConstant;
                             if (shift.getY().isConstant()) {
-                                int mask = shift.getShiftAmountMask();
-                                int amount = shift.getY().asJavaConstant().asInt() & mask;
+                                int amount = shift.getConstantShiftAmount();
                                 if (shift.getX().getStackKind() == JavaKind.Int) {
                                     return new IntegerTestNode(shift.getX(), ConstantNode.forInt(-1 << amount));
                                 } else {
@@ -318,13 +346,38 @@ public final class IntegerEqualsNode extends CompareNode implements Canonicaliza
         if (!negated) {
             return xStamp.join(yStamp);
         }
-        return null;
+        return getSucceedingStampForNegatedEquality(xStamp, yStamp);
     }
 
     @Override
     public Stamp getSucceedingStampForY(boolean negated, Stamp xStamp, Stamp yStamp) {
         if (!negated) {
             return xStamp.join(yStamp);
+        }
+        return getSucceedingStampForNegatedEquality(yStamp, xStamp);
+    }
+
+    /**
+     * Refines {@code [c..hi] != c} to {@code [c + 1..hi]}, {@code [lo..c] != c} to
+     * {@code [lo..c - 1]}, and {@code x != 0} to a non-zero {@link IntegerStamp}.
+     */
+    private static Stamp getSucceedingStampForNegatedEquality(Stamp valueStamp, Stamp excludedStamp) {
+        if (valueStamp instanceof IntegerStamp value && excludedStamp instanceof IntegerStamp excluded && excluded.lowerBound() == excluded.upperBound()) {
+            long excludedValue = excluded.lowerBound();
+            int bits = value.getBits();
+            if (value.lowerBound() == excludedValue) {
+                if (excludedValue == CodeUtil.maxValue(bits)) {
+                    return value.empty();
+                }
+                return value.join(IntegerStamp.create(bits, excludedValue + 1, value.upperBound()));
+            } else if (value.upperBound() == excludedValue) {
+                if (excludedValue == CodeUtil.minValue(bits)) {
+                    return value.empty();
+                }
+                return value.join(IntegerStamp.create(bits, value.lowerBound(), excludedValue - 1));
+            } else if (excludedValue == 0 && value.contains(0)) {
+                return IntegerStamp.create(bits, value.lowerBound(), value.upperBound(), value.mustBeSet(), value.mayBeSet(), false);
+            }
         }
         return null;
     }

@@ -25,7 +25,7 @@
 package jdk.graal.compiler.nodes.calc;
 
 import static jdk.graal.compiler.nodeinfo.InputType.Guard;
-import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_32;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_16;
 import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_1;
 
 import jdk.graal.compiler.core.common.type.IntegerStamp;
@@ -38,11 +38,15 @@ import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.extended.GuardingNode;
+import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.graal.compiler.nodes.spi.Lowerable;
 
 import jdk.vm.ci.meta.JavaConstant;
 
-@NodeInfo(allowedUsageTypes = Guard, cycles = CYCLES_32, size = SIZE_1)
+/**
+ * Integer division remainder node.
+ */
+@NodeInfo(allowedUsageTypes = Guard, cycles = CYCLES_16, size = SIZE_1, cyclesRationale = "The node cycle estimate is taken from Agner Fog's instruction tables (https://www.agner.org/optimize/instruction_tables.pdf).")
 public abstract class IntegerDivRemNode extends FixedBinaryNode implements Lowerable, IterableNodeType, GuardingNode {
 
     public static final NodeClass<IntegerDivRemNode> TYPE = NodeClass.create(IntegerDivRemNode.class);
@@ -98,6 +102,22 @@ public abstract class IntegerDivRemNode extends FixedBinaryNode implements Lower
 
     public boolean canFloat() {
         return false;
+    }
+
+    /**
+     * Returns true when canonicalization may remove this fixed unsigned div/rem node because its
+     * value is unused and it cannot throw {@link ArithmeticException}.
+     *
+     * For unsigned div/rem, a maybe-zero divisor and no explicit zero guard is the only observable
+     * side effect of an otherwise unused node. Unlike signed div/rem, a divisor of {@code -1} is not
+     * special. A node that was explicitly marked non-deoptimizing is also removable: in that case
+     * the zero-divisor exception is known to be represented elsewhere.
+     */
+    protected final boolean canCanonicalizeUnsignedToNull(CanonicalizerTool tool, ValueNode forY) {
+        assert getType() == Type.UNSIGNED : "expected unsigned div/rem: " + this;
+        IntegerStamp yStamp = (IntegerStamp) forY.stamp(NodeView.from(tool));
+        boolean canDivideByZero = yStamp.contains(0) && zeroGuard == null;
+        return tool.allUsagesAvailable() && hasNoUsages() && (!canDivideByZero || !canDeoptimize());
     }
 
     public void setCanDeopt(boolean canDeopt) {

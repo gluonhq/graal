@@ -27,6 +27,7 @@ package jdk.graal.compiler.lir;
 import java.util.ArrayList;
 import java.util.List;
 
+import jdk.graal.compiler.asm.CodeSnippetRecord;
 import jdk.graal.compiler.asm.Label;
 import jdk.graal.compiler.core.common.cfg.AbstractControlFlowGraph;
 import jdk.graal.compiler.core.common.cfg.BasicBlock;
@@ -206,6 +207,10 @@ public final class LIR extends LIRGenerator.VariableProvider implements EventCou
 
     /**
      * Add a chunk of assembly that will be emitted out of line after all LIR has been emitted.
+     *
+     * If called during assembler code snippet recording, the slow path will not be duplicated.
+     * Instead, it will be shared among replayed code snippets. See {@link CodeSnippetRecord} for
+     * more details.
      */
     public void addSlowPath(LIRInstruction op, Runnable slowPath) {
         if (slowPaths == null) {
@@ -286,6 +291,20 @@ public final class LIR extends LIRGenerator.VariableProvider implements EventCou
      */
     public static final int MAX_EXCEPTION_EDGE_OP_DISTANCE_FROM_END = 3;
 
+    /**
+     * Custom calling conventions may materialize additional return values with moves after the
+     * call. Those moves are still part of the operation's normal successor value setup, so the
+     * verifier allows them to extend the usual exception-edge distance.
+     */
+    private static boolean hasOnlyTrailingMoves(ArrayList<LIRInstruction> ops, int exceptionEdgeIndex, int lastIndex) {
+        for (int i = exceptionEdgeIndex + 1; i < lastIndex; i++) {
+            if (!ops.get(i).isMoveOp()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public static boolean verifyBlock(LIR lir, BasicBlock<?> block) {
         ArrayList<LIRInstruction> ops = lir.getLIRforBlock(block);
         if (ops.size() == 0) {
@@ -302,7 +321,7 @@ public final class LIR extends LIRGenerator.VariableProvider implements EventCou
                 assert opWithExceptionEdge == null : "multiple ops with an exception edge not allowed";
                 opWithExceptionEdge = op;
                 int distanceFromEnd = lastIndex - index;
-                assert distanceFromEnd <= MAX_EXCEPTION_EDGE_OP_DISTANCE_FROM_END : distanceFromEnd;
+                assert distanceFromEnd <= MAX_EXCEPTION_EDGE_OP_DISTANCE_FROM_END || hasOnlyTrailingMoves(ops, index, lastIndex) : distanceFromEnd;
             }
             index++;
         }

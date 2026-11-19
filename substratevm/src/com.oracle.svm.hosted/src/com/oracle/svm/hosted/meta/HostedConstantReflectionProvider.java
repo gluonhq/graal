@@ -24,7 +24,9 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHereAtRuntime;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereAtRuntime;
+
+import java.util.Objects;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
@@ -51,7 +53,7 @@ public class HostedConstantReflectionProvider extends AnalysisConstantReflection
         super(hUniverse.getBigBang().getUniverse(), hUniverse.getBigBang().getMetaAccess(), classInitializationSupport);
         this.hUniverse = hUniverse;
         this.hMetaAccess = hMetaAccess;
-        this.hMemoryAccess = new HostedMemoryAccessProvider(hMetaAccess, this);
+        this.hMemoryAccess = new HostedMemoryAccessProvider(hUniverse, hMetaAccess, this);
     }
 
     @Override
@@ -71,9 +73,18 @@ public class HostedConstantReflectionProvider extends AnalysisConstantReflection
 
     @Override
     public JavaConstant readFieldValue(ResolvedJavaField field, JavaConstant receiver) {
+        return readFieldValueHelper(field, receiver, false);
+    }
+
+    /** Same as {@link #readFieldValue}, except that the field value must be available. */
+    public JavaConstant readConstantField(ResolvedJavaField field, JavaConstant receiver) {
+        return Objects.requireNonNull(readFieldValueHelper(field, receiver, true));
+    }
+
+    private JavaConstant readFieldValueHelper(ResolvedJavaField field, JavaConstant receiver, boolean readRelocatableValues) {
         var hField = (HostedField) field;
         assert checkHub(receiver) : "Receiver " + receiver + " of field " + hField + " read should not be java.lang.Class. Expecting to see DynamicHub here.";
-        return super.readValue(hField.getWrapped(), receiver, true);
+        return super.readValue(hField.getWrapped(), receiver, true, readRelocatableValues);
     }
 
     private boolean checkHub(JavaConstant constant) {

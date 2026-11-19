@@ -39,9 +39,87 @@ import jdk.vm.ci.meta.Signature;
 /**
  * This class implements a method filter that can filter based on class name, method name and
  * parameters. This filter is a collection of "base filters", each of which may be negated. The
- * syntax for a filter is explained <a href="file:doc-files/MethodFilterHelp.txt">here</a>.
+ * syntax for a filter is explained by {@link #HELP}.
  */
 public final class MethodFilter {
+
+    public static final String HELP = """
+                    Pattern for matching methods.
+                    The syntax for a pattern is:
+
+                      SourcePatterns = SourcePattern ["," SourcePatterns] .
+                      SourcePattern = [ "~" ] [ Class "." ] method [ "(" ParameterList ")" ] .
+                      ParameterList = [ Parameter | ( ParameterSlot ";" ParameterSlot { ";" ParameterSlot } ) ] .
+                      ParameterSlot = [ Parameter ] .
+                      Parameter = Class | "int" | "long" | "float" | "double" | "short" | "char" | "boolean" .
+                      Class = { package "." } class .
+
+                    Glob pattern matching (*, ?) is allowed in all parts of the source pattern.
+                    An empty parameter slot is equivalent to "*".
+                    The "~" prefix negates the pattern.
+                    Omitting the parentheses matches any parameter list. An empty parameter list
+                    matches a method with no parameters.
+
+                    Positive patterns are joined by an "or" operator: "A,B" matches anything
+                    matched by "A" or "B". Negative patterns are joined by "and not": "~A,~B"
+                    matches anything not matched by "A" and not matched by "B". "A,~B,~C,D"
+                    matches anything matched by "A" or "D" and not matched by "B" and not
+                    matched by "C".
+
+                    A set of patterns containing negative patterns but no positive ones contains
+                    an implicit positive "*" pattern: "~A,~B" is equivalent to "*,~A,~B".
+
+                    Examples of method filters:
+                    ---------
+                      *
+
+                      Matches all methods in all classes.
+                    ---------
+                      canonical(CanonicalizerTool;LogicNode;LogicNode)
+
+                      Matches all methods named "canonical", with the first parameter of type
+                      "CanonicalizerTool", and the second and third parameters of type
+                      "LogicNode".
+                      The packages of the parameter types are irrelevant.
+                    ---------
+                      arraycopy(Object;;;;)
+
+                      Matches all methods named "arraycopy", with the first parameter
+                      of type "Object", and four more parameters of any type. The
+                      packages of the parameter types are irrelevant.
+                    ---------
+                      List.set
+
+                      Matches all methods named "set" in a class whose simple name is "List".
+                    ---------
+                      *List.set
+
+                      Matches all methods named "set" in a class whose simple name ends with "List".
+                    ---------
+                      jdk.graal.compiler.nodes.PhiNode.*
+
+                      Matches all methods in the class "jdk.graal.compiler.nodes.PhiNode".
+                    ---------
+                      jdk.graal.compiler.nodes.*.canonical
+
+                      Matches all methods named "canonical" in classes in the package
+                      "jdk.graal.compiler.nodes".
+                    ---------
+                      arraycopy,toString
+
+                      Matches all methods named "arraycopy" or "toString", meaning that ',' acts
+                      as an "or" operator.
+                    ---------
+                      java.util.*.*.,~java.util.*Array*.*
+                      java.util.*.*.,~*Array*.*
+
+                      These patterns are equivalent and match all methods in the package
+                      "java.util" except for classes that have "Array" in their name.
+                    ---------
+                      ~java.util.*.*
+
+                      Matches all methods in all classes in all packages except for anything in
+                      the "java.util" package.""";
 
     private final ArrayList<BaseFilter> positiveFilters;
     private final ArrayList<BaseFilter> negativeFilters;
@@ -208,7 +286,8 @@ public final class MethodFilter {
                 if (pattern.charAt(pattern.length() - 1) != ')') {
                     throw new IllegalArgumentException("missing ')' at end of method filter pattern: " + pattern);
                 }
-                String[] signatureClasses = pattern.substring(pos + 1, pattern.length() - 1).split(";", -1);
+                String signatureString = pattern.substring(pos + 1, pattern.length() - 1).trim();
+                String[] signatureClasses = signatureString.isEmpty() ? new String[0] : signatureString.split(";", -1);
                 signature = new Pattern[signatureClasses.length];
                 for (int i = 0; i < signatureClasses.length; i++) {
                     signature[i] = createClassGlobPattern(signatureClasses[i].trim());

@@ -34,7 +34,7 @@ import org.graalvm.collections.UnmodifiableMapCursor;
 import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.util.TypedDataInputStream;
 import jdk.graal.compiler.util.TypedDataOutputStream;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 final class OptionValuesEncoder {
 
@@ -65,7 +65,7 @@ final class OptionValuesEncoder {
         try (TypedDataInputStream in = new TypedDataInputStream(new ByteArrayInputStream(input))) {
             final int size = in.readInt();
             for (int i = 0; i < size; i++) {
-                ImageHeapRef<OptionKey<?>> keyRef = WordFactory.signed(in.readLong());
+                ImageHeapRef<OptionKey<?>> keyRef = Word.signed(in.readLong());
                 final OptionKey<?> key = ImageHeapObjects.deref(keyRef);
                 final Object value = in.readTypedValue();
                 options.put(key, value);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,18 +42,28 @@ package org.graalvm.wasm;
 
 import static com.oracle.truffle.api.nodes.ExplodeLoop.LoopExplosionKind.FULL_EXPLODE_UNTIL_RETURN;
 
-import org.graalvm.wasm.constants.GlobalModifier;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+
+import org.graalvm.wasm.constants.Mutability;
 import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
 
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.memory.ByteArraySupport;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 
-import java.util.Arrays;
-
 public abstract class BinaryStreamParser {
-    protected static final int SINGLE_RESULT_VALUE = 0;
-    protected static final int MULTI_RESULT_VALUE = 1;
+    protected static final int BLOCK_TYPE_VOID = 0;
+    protected static final int BLOCK_TYPE_VALTYPE = 1;
+    protected static final int BLOCK_TYPE_TYPE_INDEX = 2;
+
+    private static final VarHandle I16LE = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I32LE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I64LE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
 
     @CompilationFinal(dimensions = 1) protected byte[] data;
     protected int offset;
@@ -190,12 +200,30 @@ public abstract class BinaryStreamParser {
 
     protected byte peekMutability() {
         final byte mut = peek1();
-        if (mut == GlobalModifier.CONSTANT) {
+        if (mut == Mutability.CONSTANT) {
             return mut;
-        } else if (mut == GlobalModifier.MUTABLE) {
+        } else if (mut == Mutability.MUTABLE) {
             return mut;
         } else {
-            throw Assert.fail(Failure.MALFORMED_MUTABILITY, "Invalid mutability flag: " + mut);
+            throw Assert.fail(Failure.MALFORMED_MUTABILITY, "Invalid mutability flag: 0x%02x", mut);
+        }
+    }
+
+    /**
+     * Reads the attribute of a tag (uint8).
+     */
+    protected byte readTagAttribute() {
+        final byte attribute = peekTagAttribute();
+        offset++;
+        return attribute;
+    }
+
+    protected byte peekTagAttribute() {
+        final byte attribute = peek1();
+        if (attribute == WasmTag.Attribute.EXCEPTION) {
+            return attribute;
+        } else {
+            throw Assert.fail(Failure.MALFORMED_TAG_ATTRIBUTE, "Invalid tag attribute: 0x%02x", attribute);
         }
     }
 
@@ -267,75 +295,6 @@ public abstract class BinaryStreamParser {
         return offset;
     }
 
-    /**
-     * Reads the block type at the current location. The result is provided as two values. The first
-     * is the actual value of the block type. The second is an indicator if it is a single result
-     * type or a multi-value result.
-     *
-     * @param result The array used for returning the result.
-     *
-     */
-    protected void readBlockType(int[] result, boolean allowRefTypes, boolean allowVecType) {
-        byte type = peek1(data, offset);
-        switch (type) {
-            case WasmType.VOID_TYPE:
-            case WasmType.I32_TYPE:
-            case WasmType.I64_TYPE:
-            case WasmType.F32_TYPE:
-            case WasmType.F64_TYPE:
-                offset++;
-                result[0] = type;
-                result[1] = SINGLE_RESULT_VALUE;
-                break;
-            case WasmType.V128_TYPE:
-                Assert.assertTrue(allowVecType, Failure.MALFORMED_VALUE_TYPE);
-                offset++;
-                result[0] = type;
-                result[1] = SINGLE_RESULT_VALUE;
-                break;
-            case WasmType.FUNCREF_TYPE:
-            case WasmType.EXTERNREF_TYPE:
-                Assert.assertTrue(allowRefTypes, Failure.MALFORMED_VALUE_TYPE);
-                offset++;
-                result[0] = type;
-                result[1] = SINGLE_RESULT_VALUE;
-                break;
-            default:
-                long valueAndLength = peekSignedInt32AndLength(data, offset);
-                result[0] = value(valueAndLength);
-                Assert.assertIntGreaterOrEqual(result[0], 0, Failure.UNSPECIFIED_MALFORMED);
-                result[1] = MULTI_RESULT_VALUE;
-                offset += length(valueAndLength);
-        }
-    }
-
-    protected static byte peekValueType(byte[] data, int offset, boolean allowRefTypes, boolean allowVecType) {
-        byte b = peek1(data, offset);
-        switch (b) {
-            case WasmType.I32_TYPE:
-            case WasmType.I64_TYPE:
-            case WasmType.F32_TYPE:
-            case WasmType.F64_TYPE:
-                break;
-            case WasmType.V128_TYPE:
-                Assert.assertTrue(allowVecType, Failure.MALFORMED_VALUE_TYPE);
-                break;
-            case WasmType.FUNCREF_TYPE:
-            case WasmType.EXTERNREF_TYPE:
-                Assert.assertTrue(allowRefTypes, Failure.MALFORMED_VALUE_TYPE);
-                break;
-            default:
-                Assert.fail(Failure.MALFORMED_VALUE_TYPE, String.format("Invalid value type: 0x%02X", b));
-        }
-        return b;
-    }
-
-    protected byte readValueType(boolean allowRefTypes, boolean allowVecType) {
-        byte b = peekValueType(data, offset, allowRefTypes, allowVecType);
-        offset++;
-        return b;
-    }
-
     @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
     public static byte peekLeb128Length(byte[] data, int initialOffset) {
         int currentOffset = initialOffset;
@@ -353,7 +312,7 @@ public abstract class BinaryStreamParser {
 
     /**
      * Reads the unsigned byte value at the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode
      * @return the unsigned byte value at the given bytecode offset.
@@ -364,7 +323,7 @@ public abstract class BinaryStreamParser {
 
     /**
      * Reads the signed byte value at the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode
      * @return The signed byte value at the given bytecode offset.
@@ -375,27 +334,38 @@ public abstract class BinaryStreamParser {
 
     /**
      * Reads the unsigned short value at the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode
      * @return The unsigned short value at the given bytecode offset.
      */
     public static int rawPeekU16(byte[] bytecode, int offset) {
-        return ((bytecode[offset] & 0xFF) | ((bytecode[offset + 1] & 0xFF) << 8));
+        return Short.toUnsignedInt(rawPeekI16(bytecode, offset));
+    }
+
+    /**
+     * Reads the signed short value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return The signed short value at the given bytecode offset.
+     */
+    public static short rawPeekI16(byte[] bytecode, int offset) {
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getShortUnaligned(bytecode, offset);
+        }
+        return (short) I16LE.get(bytecode, offset);
     }
 
     /**
      * Writes the unsigned short value to the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode
      * @param value The value that should be written
      */
     public static void writeU16(byte[] bytecode, int offset, int value) {
-        final byte low = (byte) (value & 0xFF);
-        final byte high = (byte) ((value >> 8) & 0xFF);
-        bytecode[offset] = low;
-        bytecode[offset + 1] = high;
+        I16LE.set(bytecode, offset, (short) value);
     }
 
     /**
@@ -406,60 +376,46 @@ public abstract class BinaryStreamParser {
      * @return The unsigned integer value at the given bytecode offset.
      */
     public static long rawPeekU32(byte[] bytecode, int offset) {
-        return (bytecode[offset] & 0xFFL) |
-                        ((bytecode[offset + 1] & 0xFFL) << 8) |
-                        ((bytecode[offset + 2] & 0xFFL) << 16) |
-                        ((bytecode[offset + 3] & 0xFFL) << 24);
+        return Integer.toUnsignedLong(rawPeekI32(bytecode, offset));
     }
 
     /**
      * Reads the signed integer value at the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode.
      * @return The signed integer value at the given bytecode offset.
      */
     public static int rawPeekI32(byte[] bytecode, int offset) {
-        return (bytecode[offset] & 0xFF) |
-                        ((bytecode[offset + 1] & 0xFF) << 8) |
-                        ((bytecode[offset + 2] & 0xFF) << 16) |
-                        ((bytecode[offset + 3] & 0xFF) << 24);
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getIntUnaligned(bytecode, offset);
+        }
+        return (int) I32LE.get(bytecode, offset);
     }
 
     /**
      * Reads the signed long value at the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode.
      * @return The signed long value at the given bytecode offset.
      */
     public static long rawPeekI64(byte[] bytecode, int offset) {
-        return (bytecode[offset] & 0xFFL) |
-                        ((bytecode[offset + 1] & 0xFFL) << 8) |
-                        ((bytecode[offset + 2] & 0xFFL) << 16) |
-                        ((bytecode[offset + 3] & 0xFFL) << 24) |
-                        ((bytecode[offset + 4] & 0xFFL) << 32) |
-                        ((bytecode[offset + 5] & 0xFFL) << 40) |
-                        ((bytecode[offset + 6] & 0xFFL) << 48) |
-                        ((bytecode[offset + 7] & 0xFFL) << 56);
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getLongUnaligned(bytecode, offset);
+        }
+        return (long) I64LE.get(bytecode, offset);
     }
 
     /**
      * Writes the signed long value to the given bytecode offset.
-     * 
+     *
      * @param bytecode The bytecode
      * @param offset The offset in the bytecode
      * @param value The value that should be written
      */
     public static void writeI64(byte[] bytecode, int offset, long value) {
-        bytecode[offset] = (byte) (value & 0xFF);
-        bytecode[offset + 1] = (byte) ((value >> 8) & 0xFF);
-        bytecode[offset + 2] = (byte) ((value >> 16) & 0xFF);
-        bytecode[offset + 3] = (byte) ((value >> 24) & 0xFF);
-        bytecode[offset + 4] = (byte) ((value >> 32) & 0xFF);
-        bytecode[offset + 5] = (byte) ((value >> 40) & 0xFF);
-        bytecode[offset + 6] = (byte) ((value >> 48) & 0xFF);
-        bytecode[offset + 7] = (byte) ((value >> 56) & 0xFF);
+        I64LE.set(bytecode, offset, value);
     }
 
     /**

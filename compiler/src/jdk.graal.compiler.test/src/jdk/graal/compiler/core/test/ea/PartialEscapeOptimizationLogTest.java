@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,14 +24,12 @@
  */
 package jdk.graal.compiler.core.test.ea;
 
-import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.EconomicSet;
 import jdk.graal.compiler.core.test.TypeSystemTest;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.DebugDumpHandler;
 import jdk.graal.compiler.debug.DebugOptions;
 import jdk.graal.compiler.nodes.OptimizationLogImpl;
-import jdk.graal.compiler.options.OptionKey;
 import jdk.graal.compiler.options.OptionValues;
 import org.junit.Assert;
 import org.junit.Test;
@@ -153,11 +151,9 @@ public class PartialEscapeOptimizationLogTest extends EATestBase {
      */
     @Override
     protected DebugContext getDebugContext() {
-        EconomicMap<OptionKey<?>, Object> extraOptions = EconomicMap.create();
         EconomicSet<DebugOptions.OptimizationLogTarget> optimizationLogTargets = EconomicSet.create();
         optimizationLogTargets.add(DebugOptions.OptimizationLogTarget.Stdout);
-        extraOptions.put(DebugOptions.OptimizationLog, optimizationLogTargets);
-        OptionValues options = new OptionValues(getInitialOptions(), extraOptions);
+        OptionValues options = getInitialOptions().derive(DebugOptions.OptimizationLog, optimizationLogTargets);
         return getDebugContext(options, null, null);
     }
 }

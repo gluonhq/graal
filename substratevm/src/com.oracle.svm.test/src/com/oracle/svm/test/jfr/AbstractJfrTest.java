@@ -30,6 +30,7 @@ import static org.junit.Assume.assumeTrue;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -48,7 +49,7 @@ import org.junit.BeforeClass;
 
 import com.oracle.svm.core.jfr.HasJfrSupport;
 import com.oracle.svm.core.jfr.SubstrateJVM;
-import com.oracle.svm.core.util.TimeUtils;
+import com.oracle.svm.shared.util.TimeUtils;
 import com.oracle.svm.test.jfr.utils.JfrFileParser;
 
 import jdk.jfr.Configuration;
@@ -121,7 +122,7 @@ public abstract class AbstractJfrTest {
     }
 
     private static void checkEvents(List<RecordedEvent> events, String[] testedEventTypes) {
-        HashSet<String> seenEventTypes = new HashSet<>();
+        HashSet<String> seenEventTypes = new HashSet<>(); // noEconomicSet(test)
         for (RecordedEvent event : events) {
             String eventName = event.getEventType().getName();
             seenEventTypes.add(eventName);
@@ -135,9 +136,7 @@ public abstract class AbstractJfrTest {
     }
 
     protected static void flushAllThreads() {
-        if (HasJfrSupport.get()) {
-            SubstrateJVM.get().flush();
-        }
+        SubstrateJVM.get().flush();
     }
 
     protected static void waitUntilTrue(BooleanSupplier supplier) throws InterruptedException {
@@ -152,12 +151,32 @@ public abstract class AbstractJfrTest {
         }
     }
 
+    protected static byte[] toUTF8Bytes(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    protected static boolean containsByteSequence(byte[] fileBytes, byte[] sequence) {
+        if (sequence.length == 0) {
+            return true;
+        }
+
+        outer: for (int i = 0; i <= fileBytes.length - sequence.length; i++) {
+            for (int j = 0; j < sequence.length; j++) {
+                if (fileBytes[i + j] != sequence[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
     private static boolean isDebuggingEnabled() {
         String debugRecording = System.getenv("DEBUG_RECORDING");
         return debugRecording != null && !"false".equals(debugRecording);
     }
 
-    private static class ChronologicalComparator implements Comparator<RecordedEvent> {
+    private static final class ChronologicalComparator implements Comparator<RecordedEvent> {
         @Override
         public int compare(RecordedEvent e1, RecordedEvent e2) {
             return e1.getEndTime().compareTo(e2.getEndTime());

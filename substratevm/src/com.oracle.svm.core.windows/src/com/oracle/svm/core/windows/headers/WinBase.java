@@ -58,6 +58,8 @@ public class WinBase {
     @CPointerTo(nameOfCType = "HANDLE")
     public interface LPHANDLE extends PointerBase {
         HANDLE read();
+
+        void write(HANDLE value);
     }
 
     /**
@@ -68,9 +70,9 @@ public class WinBase {
 
     @CPointerTo(nameOfCType = "HMODULE")
     public interface HMODULEPointer extends PointerBase {
-        public HMODULE read();
+        HMODULE read();
 
-        public void write(HMODULE value);
+        void write(HMODULE value);
     }
 
     /**
@@ -101,15 +103,14 @@ public class WinBase {
     /**
      * QueryPerformance Counter - used for elapsed time
      */
-
     @CFunction(transition = Transition.NO_TRANSITION)
-    public static native void QueryPerformanceCounter(CLongPointer counter);
+    public static native int QueryPerformanceCounter(CLongPointer counter);
 
     /**
      * QueryPerformance Frequency - used for elapsed time
      */
     @CFunction(transition = Transition.NO_TRANSITION)
-    public static native void QueryPerformanceFrequency(CLongPointer counter);
+    public static native int QueryPerformanceFrequency(CLongPointer counter);
 
     /**
      * CloseHandle

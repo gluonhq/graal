@@ -1,0 +1,1070 @@
+/*
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.genscavenge;
+
+import static com.oracle.svm.core.util.PointerUtils.roundDown;
+import static com.oracle.svm.core.util.PointerUtils.roundUp;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.util.VMError.guarantee;
+import static org.graalvm.word.impl.Word.nullPointer;
+import static org.graalvm.word.impl.Word.unsigned;
+
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.c.struct.RawField;
+import org.graalvm.nativeimage.c.struct.RawStructure;
+import org.graalvm.nativeimage.c.struct.SizeOf;
+import org.graalvm.nativeimage.c.type.WordPointer;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.guest.staging.IsolateArgumentAccess;
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.guest.staging.IsolateArguments;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.core.VMInspectionOptions;
+import com.oracle.svm.core.graal.snippets.CEntryPointSnippets;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.core.locks.VMMutex;
+import com.oracle.svm.core.memory.NullableNativeMemory;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
+import com.oracle.svm.core.nmt.NativeMemoryTracking;
+import com.oracle.svm.core.nmt.NmtCategory;
+import com.oracle.svm.core.os.AuxiliaryImageProvider;
+import com.oracle.svm.core.os.CommittedMemoryProvider;
+import com.oracle.svm.core.os.ImageHeapProvider;
+import com.oracle.svm.core.os.VirtualMemoryProvider;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.core.util.PointerUtils;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.replacements.Fold;
+
+/**
+ * Reserves a fixed-size address range and provides memory from it by committing and uncommitting
+ * virtual memory within that range. The address space is shared by the null regions, the
+ * {@link Metaspace}, optional pre-heap data, the image heap, and the collected Java heap.
+ * <p>
+ * The main objective of this code is to keep external fragmentation low so that an
+ * {@linkplain Isolate} is unlikely to run out of memory because its address space is exhausted. To
+ * accomplish that, allocation requests are satisfied with a best-fit strategy that traverses the
+ * {@linkplain #allocListHead entire list of allocatable blocks} and chooses the smallest block that
+ * satisfies the request.
+ * <p>
+ * Allocating memory usually involves splitting a block. When a new block is smaller than the
+ * minimum size that can be allocated, it is kept only in a {@linkplain #unusedListHead separate
+ * list that contains all unused blocks}. This list is needed when adjacent memory areas are freed
+ * so that they can be coalesced into a larger memory area. Observations have shown that the list of
+ * allocatable blocks is around half of the size of the list of all unused blocks. Overall, list
+ * traversals should be negligible in contrast to the cost of the performed commit and uncommit
+ * operations that require system calls.
+ * <p>
+ * However, traversing the list of allocatable blocks might become expensive in long-running
+ * programs due to increasing fragmentation. In that case, the list could be replaced by a
+ * self-balancing search tree with block sizes as keys, which guarantees logarithmic time complexity
+ * for allocation. Several blocks of the same size could be grouped in one tree node to reduce tree
+ * operations (particularly balancing).
+ * <p>
+ * Memory is uncommitted lazily. Usually, a lot of adjacent blocks are freed within a short time
+ * (such as, during garbage collection), so we coalesce the freed memory first and then uncommit a
+ * larger block of memory. Observations show that this tends to cut the number of required uncommit
+ * operations in half.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public class AddressRangeCommittedMemoryProvider extends ChunkBasedCommittedMemoryProvider {
+    private static final long MIN_RESERVED_ADDRESS_SPACE_SIZE = 32L * 1024 * 1024 * 1024;
+
+    protected static final int NO_ERROR = 0;
+    protected static final int OUT_OF_ADDRESS_SPACE = 1;
+    protected static final int COMMIT_FAILED = 2;
+
+    protected static final String UNCOMMIT_FAILED_ERROR_MSG = "Failed while uncommitting memory. " +
+                    "This error may occur if the operating system's memory mapping limit is too low (see vm.max_map_count on Linux). Please increase this limit and try again.";
+    private static final OutOfMemoryError NODE_ALLOCATION_FAILED = PreallocatedExceptions.createOutOfMemoryError("Could not allocate node for free list, OS may be out of memory.");
+    private static final HeapChunkAllocationException ALIGNED_OUT_OF_ADDRESS_SPACE = PreallocatedExceptions.prepare(new HeapChunkAllocationException(
+                    "Could not allocate an aligned heap chunk because the heap address space is exhausted. " +
+                                    "Consider increasing the address space size (see option -XX:ReservedAddressSpaceSize). If compressed references limit the maximum address space size, typically to 32 GB, consider " +
+                                    "re-building the image with compressed references disabled ('-H:-UseCompressedReferences')."));
+    private static final HeapChunkAllocationException UNALIGNED_OUT_OF_ADDRESS_SPACE = PreallocatedExceptions.prepare(new HeapChunkAllocationException(
+                    "Could not allocate an unaligned heap chunk because the heap address space is exhausted. " +
+                                    "Consider increasing the address space size (see option -XX:ReservedAddressSpaceSize). If compressed references limit the maximum address space size, typically to 32 GB, consider " +
+                                    "re-building the image with compressed references disabled ('-H:-UseCompressedReferences')."));
+
+    /**
+     * This mutex is used by the GC and the application. The application may hold this mutex only in
+     * uninterruptible code to prevent the case that a safepoint can be initiated while the
+     * application holds the mutex. Otherwise, we would risk deadlocks between the application and
+     * the GC.
+     */
+    private final VMMutex lock = new VMMutex("freeList");
+
+    protected Pointer reservedAddressSpaceBegin;
+    protected UnsignedWord reservedAddressSpaceSize;
+    private Pointer metaspaceBegin;
+    private Pointer metaspaceTop;
+    private Pointer metaspaceEnd;
+    protected Pointer collectedHeapBegin;
+    protected UnsignedWord collectedHeapSize;
+
+    /**
+     * Contains free blocks for the collected Java heap that are large enough to fit allocations.
+     */
+    protected FreeListNode allocListHead;
+    protected long allocListCount;
+
+    /**
+     * Contains all free blocks for the collected Java heap, including small blocks that are needed
+     * for coalescing.
+     */
+    protected FreeListNode unusedListHead;
+    protected long unusedListCount;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public AddressRangeCommittedMemoryProvider() {
+    }
+
+    @Fold
+    public static AddressRangeCommittedMemoryProvider singleton() {
+        return (AddressRangeCommittedMemoryProvider) ImageSingletons.lookup(CommittedMemoryProvider.class);
+    }
+
+    @Override
+    @Uninterruptible(reason = "Still being initialized.")
+    public int initialize(WordPointer heapBaseOut, IsolateArguments arguments) {
+        int reservedAddressSpaceSizeOptionIndex = IsolateArgumentParser.getOptionIndex(SubstrateGCOptions.ReservedAddressSpaceSize);
+        UnsignedWord reservedSize = Word.unsigned(IsolateArgumentAccess.readLong(arguments, reservedAddressSpaceSizeOptionIndex));
+        if (reservedSize.equal(0)) {
+            /*
+             * Reserve a 32 GB address space, except if a larger heap size was specified, or if the
+             * maximum address space size is less than that.
+             */
+            int maxHeapSizeOptionIndex = IsolateArgumentParser.getOptionIndex(SubstrateGCOptions.MaxHeapSize);
+            UnsignedWord maxHeapSize = Word.unsigned(IsolateArgumentAccess.readLong(arguments, maxHeapSizeOptionIndex));
+            reservedSize = UnsignedUtils.max(maxHeapSize, Word.unsigned(MIN_RESERVED_ADDRESS_SPACE_SIZE));
+        }
+        reservedSize = UnsignedUtils.min(reservedSize, ReferenceAccess.singleton().getMaxAddressSpaceSize());
+
+        UnsignedWord alignment = unsigned(Heap.getHeap().getHeapBaseAlignment());
+        WordPointer reservedBeginPtr = StackValue.get(WordPointer.class);
+        int errorCode = reserveHeapMemory(reservedSize, alignment, arguments, reservedBeginPtr);
+        if (errorCode != CEntryPointErrors.NO_ERROR) {
+            return errorCode;
+        }
+
+        Pointer reservedBegin = reservedBeginPtr.read();
+        WordPointer imageHeapEndOut = StackValue.get(WordPointer.class);
+        errorCode = ImageHeapProvider.get().initialize(reservedBegin, reservedSize, heapBaseOut, imageHeapEndOut);
+        if (errorCode != CEntryPointErrors.NO_ERROR) {
+            freeOnInitializeError(reservedBegin, reservedSize);
+            return errorCode;
+        }
+
+        CEntryPointSnippets.initBaseRegisters(heapBaseOut.read());
+        WordPointer runtimeHeapBeginOut = StackValue.get(WordPointer.class);
+        errorCode = initializeForAuxiliaryImages(arguments, reservedBegin, reservedSize, imageHeapEndOut.read(), runtimeHeapBeginOut);
+        if (errorCode != CEntryPointErrors.NO_ERROR) {
+            freeOnInitializeError(reservedBegin, reservedSize);
+            return errorCode;
+        }
+
+        /*
+         * We can access the image heap from here on, but our `this` argument is not safe to use
+         * because the image heap was not initialized when we were called, so we invoke a static
+         * method that loads a new reference to our instance.
+         */
+        errorCode = initialize(reservedBegin, reservedSize, runtimeHeapBeginOut.read());
+        if (errorCode != CEntryPointErrors.NO_ERROR) {
+            freeOnInitializeError(reservedBegin, reservedSize);
+        }
+        return errorCode;
+    }
+
+    @Uninterruptible(reason = "Still being initialized.")
+    @NeverInline("Base registers are set in caller, prevent reads from floating before that.")
+    protected int initializeForAuxiliaryImages(IsolateArguments arguments, Pointer reservedBegin, UnsignedWord reservedSize, Pointer imageHeapEnd, WordPointer collectedHeapBeginOut) {
+        return AuxiliaryImageProvider.get().initializeHeapAddressRange(arguments, reservedBegin, reservedSize, imageHeapEnd, collectedHeapBeginOut);
+    }
+
+    @NeverInline("Ensure a newly looked up value is used as 'this', now that the image heap is initialized")
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE)
+    private static int initialize(Pointer reservedBegin, UnsignedWord reservedSize, Pointer collectedHeapBegin) {
+        AddressRangeCommittedMemoryProvider provider = (AddressRangeCommittedMemoryProvider) ChunkBasedCommittedMemoryProvider.get();
+        return provider.initializeFields(reservedBegin, reservedSize, collectedHeapBegin);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @SuppressWarnings("hiding")
+    protected int initializeFields(Pointer reservedBegin, UnsignedWord reservedSize, Pointer collectedHeapBegin) {
+        this.reservedAddressSpaceBegin = reservedBegin;
+        this.reservedAddressSpaceSize = reservedSize;
+
+        initializeMetaspaceFields();
+        return initializeCollectedHeapFields(reservedBegin, reservedSize, collectedHeapBegin);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected void initializeMetaspaceFields() {
+        int metaspaceSize = HeapImpl.getReservedMetaspaceSize();
+        this.metaspaceBegin = KnownIntrinsics.heapBase().add(HeapImpl.getMetaspaceOffsetInAddressSpace());
+        this.metaspaceTop = metaspaceBegin;
+        this.metaspaceEnd = metaspaceTop.add(metaspaceSize);
+
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport() && metaspaceSize > 0) {
+            NativeMemoryTracking.singleton().trackReserve(metaspaceSize, NmtCategory.Metaspace);
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @SuppressWarnings("hiding")
+    private int initializeCollectedHeapFields(Pointer reservedBegin, UnsignedWord reservedSize, Pointer collectedHeapBegin) {
+        this.collectedHeapBegin = collectedHeapBegin;
+        this.collectedHeapSize = reservedSize.subtract(collectedHeapBegin.subtract(reservedBegin));
+
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackReserve(collectedHeapSize, NmtCategory.JavaHeap);
+        }
+
+        FreeListNode node = allocNodeOrNull(collectedHeapBegin, collectedHeapSize);
+        if (node.isNull()) {
+            return CEntryPointErrors.ALLOCATION_FAILED;
+        }
+
+        this.unusedListHead = node;
+        this.unusedListCount = 1;
+        this.allocListHead = node;
+        this.allocListCount = 1;
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    @Override
+    public UnsignedWord getCollectedHeapAddressSpaceSize() {
+        return collectedHeapSize;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean isInMetaspace(Pointer ptr) {
+        return ptr.aboveOrEqual(metaspaceBegin) && ptr.belowThan(metaspaceEnd);
+    }
+
+    @Uninterruptible(reason = "Still being initialized.")
+    protected int reserveHeapMemory(UnsignedWord reserved, UnsignedWord alignment, IsolateArguments arguments, WordPointer beginOut) {
+        Pointer begin = reserveHeapMemory0(reserved, alignment, arguments);
+        if (begin.isNull()) {
+            return CEntryPointErrors.RESERVE_ADDRESS_SPACE_FAILED;
+        }
+        beginOut.write(begin);
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    @Uninterruptible(reason = "Still being initialized.")
+    protected Pointer reserveHeapMemory0(UnsignedWord reserved, UnsignedWord alignment, @SuppressWarnings("unused") IsolateArguments arguments) {
+        return VirtualMemoryProvider.get().reserve(reserved, alignment, false);
+    }
+
+    @Uninterruptible(reason = "Still being initialized.")
+    protected void freeOnInitializeError(Pointer begin, UnsignedWord reserved) {
+        VirtualMemoryProvider.get().free(begin, reserved);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private FreeListNode allocNode(Pointer start, UnsignedWord size) {
+        FreeListNode node = allocNodeOrNull(start, size);
+        if (node.isNull()) {
+            throw NODE_ALLOCATION_FAILED;
+        }
+        return node;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private FreeListNode allocNodeOrNull(Pointer start, UnsignedWord size) {
+        FreeListNode node = NullableNativeMemory.calloc(sizeOfFreeListNode(), NmtCategory.GC);
+        if (node.isNonNull()) {
+            setBounds(node, start, size);
+        }
+        return node;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected UnsignedWord sizeOfFreeListNode() {
+        return SizeOf.unsigned(FreeListNode.class);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static void freeNode(FreeListNode node) {
+        NullableNativeMemory.free(node);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static boolean isAllocatable(UnsignedWord size) {
+        return size.aboveOrEqual(minAllocationSize());
+    }
+
+    @Fold
+    static UnsignedWord minAllocationSize() {
+        return UnsignedUtils.min(HeapParameters.getAlignedHeapChunkSize(), HeapParameters.getMinUnalignedChunkSize());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void setBounds(FreeListNode node, Pointer start, UnsignedWord size) {
+        assert UnsignedUtils.isAMultiple(start, getGranularity());
+        assert UnsignedUtils.isAMultiple(size, getGranularity());
+        assert start.aboveOrEqual(collectedHeapBegin);
+        assert size.belowOrEqual(collectedHeapSize);
+        assert start.add(size).belowOrEqual(collectedHeapBegin.add(collectedHeapSize));
+
+        node.setStart(start);
+        node.setSize(size);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected static Pointer getNodeEnd(FreeListNode node) {
+        return node.getStart().add(node.getSize());
+    }
+
+    @Override
+    @Uninterruptible(reason = "Tear-down in progress.")
+    public int tearDown() {
+        FreeListNode node = unusedListHead;
+        while (node.isNonNull()) {
+            FreeListNode next = node.getUnusedNext();
+            freeNode(node);
+            node = next;
+        }
+        // This provider owns the complete address-space reservation, including the image heap. Release the
+        // reservation here instead of calling ImageHeapProvider.freeImageHeap.
+        return unmapAddressSpace();
+    }
+
+    @Uninterruptible(reason = "Tear-down in progress.")
+    protected int unmapAddressSpace() {
+        if (VirtualMemoryProvider.get().free(reservedAddressSpaceBegin, reservedAddressSpaceSize) != 0) {
+            return CEntryPointErrors.FREE_ADDRESS_SPACE_FAILED;
+        }
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Locking without transition requires that the whole critical section is uninterruptible.")
+    public Pointer allocateMetaspaceChunk(UnsignedWord nbytes, UnsignedWord alignment) {
+        lock.lockNoTransition();
+        try {
+            return allocateMetaspaceChunk0(nbytes, alignment);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Returns {@link Word#nullPointer()} if the allocation fails. */
+    @Uninterruptible(reason = "Locking without transition requires that the whole critical section is uninterruptible.")
+    private Pointer allocateMetaspaceChunk0(UnsignedWord nbytes, UnsignedWord alignment) {
+        assert lock.isOwner();
+
+        Pointer result = metaspaceTop;
+        Pointer newTop = metaspaceTop.add(nbytes);
+        assert result.isNonNull();
+        assert PointerUtils.isAMultiple(result, alignment);
+        assert UnsignedUtils.isAMultiple(newTop, alignment);
+
+        /* Check if the allocation fits into the reserved address space. */
+        if (newTop.aboveThan(metaspaceEnd)) {
+            return Word.nullPointer();
+        }
+
+        /* Try to commit the memory. */
+        int access = VirtualMemoryProvider.Access.READ | VirtualMemoryProvider.Access.WRITE;
+        Pointer actualBegin = VirtualMemoryProvider.get().commit(result, nbytes, access);
+        if (actualBegin.isNull()) {
+            throw METASPACE_CHUNK_COMMIT_FAILED;
+        }
+
+        /* Update top and NMT statistics. */
+        metaspaceTop = newTop;
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackCommit(nbytes, NmtCategory.Metaspace);
+        }
+        return actualBegin;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Allocation internals must never end up in interruptible code.")
+    public Pointer allocateAlignedChunk(UnsignedWord nbytes, UnsignedWord alignment) {
+        WordPointer allocOut = UnsafeStackValue.get(WordPointer.class);
+        int error = allocateInHeapAddressSpace(nbytes, alignment, allocOut);
+        if (error == NO_ERROR) {
+            if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+                NativeMemoryTracking.singleton().trackCommit(nbytes, NmtCategory.JavaHeap);
+            }
+            return allocOut.read();
+        }
+        throw alignedChunkAllocationFailed(error);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static HeapChunkAllocationException alignedChunkAllocationFailed(int error) {
+        if (error == OUT_OF_ADDRESS_SPACE) {
+            throw ALIGNED_OUT_OF_ADDRESS_SPACE;
+        } else if (error == COMMIT_FAILED) {
+            throw ALIGNED_CHUNK_COMMIT_FAILED;
+        } else {
+            throw VMError.shouldNotReachHereAtRuntime();
+        }
+    }
+
+    @Override
+    @Uninterruptible(reason = "Allocation internals must never end up in interruptible code.")
+    public Pointer allocateUnalignedChunk(UnsignedWord nbytes) {
+        WordPointer allocOut = UnsafeStackValue.get(WordPointer.class);
+        int error = allocateInHeapAddressSpace(nbytes, getAlignmentForUnalignedChunks(), allocOut);
+        if (error == NO_ERROR) {
+            if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+                NativeMemoryTracking.singleton().trackCommit(nbytes, NmtCategory.JavaHeap);
+            }
+            return allocOut.read();
+        }
+        throw unalignedChunkAllocationFailed(error);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static HeapChunkAllocationException unalignedChunkAllocationFailed(int error) {
+        if (error == OUT_OF_ADDRESS_SPACE) {
+            throw UNALIGNED_OUT_OF_ADDRESS_SPACE;
+        } else if (error == COMMIT_FAILED) {
+            throw UNALIGNED_CHUNK_COMMIT_FAILED;
+        } else {
+            throw VMError.shouldNotReachHereAtRuntime();
+        }
+    }
+
+    /**
+     * When allocating an unaligned chunk, we only use freshly {@link VirtualMemoryProvider#commit
+     * committed} pages. This guarantees that a. unaligned chunks are pre-zeroed and b. only pages
+     * that are accessed by the application are committed into memory.
+     *
+     * To guarantee that only freshly committed pages are used, we need the following invariants:
+     * <ul>
+     * <li>The address space is only used for aligned and unaligned heap chunks.</li>
+     * <li>The GC does not cache or reuse unaligned chunks.</li>
+     * <li>At the end of a GC, the memory of all freed heap chunks is uncommitted.</li>
+     * <li>The GC does not allocate unaligned chunks.</li>
+     * </ul>
+     *
+     * On Windows, it is crucial that we only use pages that are in uncommitted state (VirtualAlloc
+     * only zeroes pages if they are not already in committed state). Note that this wouldn't be
+     * absolutely required on Linux/Darwin because mmap guarantees that pages are always zeroed.
+     */
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean areUnalignedChunksZeroed() {
+        return true;
+    }
+
+    /**
+     * Allocates memory from the address space. If the allocation succeeded, {@link #NO_ERROR} is
+     * returned. The allocated memory is always committed.
+     */
+    @Uninterruptible(reason = "Entering a safepoint in this code can deadlock garbage collection.")
+    protected int allocateInHeapAddressSpace(UnsignedWord size, UnsignedWord alignment, WordPointer allocOut) {
+        assert size.aboveThan(0);
+        assert alignment.aboveThan(0);
+
+        // this code is also executed in JNI_CreateJavaVM, so we don't always know the owning thread
+        lock.lockNoTransitionUnspecifiedOwner();
+        try {
+            // Find best fit for requested size and alignment
+            FreeListNode fit = nullPointer();
+            FreeListNode fitAllocPrevious = nullPointer();
+            UnsignedWord fitSize = UnsignedUtils.MAX_VALUE;
+            for (FreeListNode previous = nullPointer(), node = allocListHead; node.isNonNull(); previous = node, node = node.getAllocNext()) {
+                UnsignedWord nodeSize = node.getSize();
+                if (nodeSize.aboveOrEqual(size) && nodeSize.belowThan(fitSize)) {
+                    Pointer offset = roundUp(node.getStart(), alignment).subtract(node.getStart());
+                    if (nodeSize.subtract(size).aboveOrEqual(offset)) {
+                        fitAllocPrevious = previous;
+                        fit = node;
+                        fitSize = nodeSize;
+                        if (nodeSize.equal(size)) {
+                            break; // perfect fit
+                        }
+                    }
+                }
+            }
+
+            if (fit.isNull()) {
+                allocOut.write(nullPointer());
+                return OUT_OF_ADDRESS_SPACE;
+            }
+
+            UnsignedWord pageSize = getGranularity();
+
+            // Determine an area that satisfies both requested alignment and page size alignment
+            Pointer fitStart = fit.getStart();
+            assert PointerUtils.isAMultiple(fitStart, pageSize);
+            assert UnsignedUtils.isAMultiple(fitSize, pageSize);
+
+            Pointer allocated = roundUp(fitStart, alignment);
+            Pointer mapBegin = roundDown(allocated, pageSize);
+            Pointer mapEnd = roundUp(allocated.add(size), pageSize);
+            UnsignedWord alignedSize = mapEnd.subtract(mapBegin);
+            assert mapBegin.aboveOrEqual(fitStart) && mapEnd.belowOrEqual(fitStart.add(fitSize));
+
+            final int access = VirtualMemoryProvider.Access.READ | VirtualMemoryProvider.Access.WRITE;
+            Pointer actualMapBegin = VirtualMemoryProvider.get().commit(mapBegin, alignedSize, access);
+            if (actualMapBegin.isNull()) {
+                allocOut.write(nullPointer());
+                return COMMIT_FAILED;
+            }
+            VMError.guarantee(actualMapBegin.equal(mapBegin), "Must not be mapped anywhere else.");
+
+            /*
+             * Update lists with leftover memory, reusing the existing node whenever possible. If
+             * possible, we reuse the existing node in a way that we don't need to touch allocList.
+             */
+            UnsignedWord leadingSize = mapBegin.subtract(fitStart);
+            UnsignedWord trailingSize = fitStart.add(fitSize).subtract(mapEnd);
+
+            boolean perfectFit = false;
+            if (leadingSize.aboveThan(0) && trailingSize.aboveThan(0)) {
+                if (isAllocatable(leadingSize)) {
+                    /* Reuse the existing node for the leading memory. */
+                    createNodeForTrailingMemory(fit, mapEnd, trailingSize);
+                    trimBounds(fit, fit.getStart(), leadingSize);
+                } else {
+                    /* Reuse the existing node for the trailing memory. */
+                    createNodeForLeadingMemory(fit, leadingSize);
+                    trimBounds(fit, mapEnd, trailingSize);
+                }
+            } else if (trailingSize.aboveThan(0)) {
+                /* Reuse the existing node for the trailing memory. */
+                trimBounds(fit, mapEnd, trailingSize);
+            } else if (leadingSize.aboveThan(0)) {
+                /* Reuse the existing node for the leading memory. */
+                trimBounds(fit, fit.getStart(), leadingSize);
+            } else {
+                perfectFit = true;
+            }
+
+            if (perfectFit || !isAllocatable(fit.getSize())) {
+                removeFromAllocList(fit, fitAllocPrevious);
+            }
+
+            if (perfectFit) {
+                /* Perfect fit, remove node entirely. */
+                removeFromUnusedList(fit);
+                freeNode(fit);
+                fit = nullPointer();
+            }
+
+            allocOut.write(allocated);
+            return NO_ERROR;
+        } finally {
+            lock.unlockNoTransitionUnspecifiedOwner();
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void createNodeForLeadingMemory(FreeListNode fit, UnsignedWord leadingSize) {
+        FreeListNode leadingNode = createNodeWhenSplitting(fit, fit.getStart(), leadingSize);
+        addToUnusedList(leadingNode, fit.getUnusedPrevious());
+
+        /* No need to add the new node to allocList if leadingSize is too small. */
+        assert !isAllocatable(leadingSize);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void createNodeForTrailingMemory(FreeListNode fit, Pointer trailingStart, UnsignedWord trailingSize) {
+        FreeListNode trailingNode = createNodeWhenSplitting(fit, trailingStart, trailingSize);
+        addToUnusedList(trailingNode, fit);
+
+        if (isAllocatable(trailingSize)) {
+            addToAllocList(trailingNode, fit);
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected FreeListNode createNodeWhenSplitting(FreeListNode fit, Pointer start, UnsignedWord size) {
+        FreeListNode result = allocNode(start, size);
+        addCommitted(result, fit.getCommittedStart(), fit.getCommittedEnd());
+        return result;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void addToUnusedList(FreeListNode newNode, FreeListNode prev) {
+        assert newNode.isNonNull();
+        assert newNode.getUnusedNext().isNull();
+        assert newNode.getUnusedPrevious().isNull();
+
+        FreeListNode next;
+        if (prev.isNull()) {
+            next = unusedListHead;
+            unusedListHead = newNode;
+        } else {
+            next = prev.getUnusedNext();
+            prev.setUnusedNext(newNode);
+            newNode.setUnusedPrevious(prev);
+        }
+
+        if (next.isNonNull()) {
+            next.setUnusedPrevious(newNode);
+            newNode.setUnusedNext(next);
+        }
+        unusedListCount++;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void removeFromUnusedList(FreeListNode node) {
+        assert node.isNonNull();
+
+        FreeListNode next = node.getUnusedNext();
+        FreeListNode prev = node.getUnusedPrevious();
+        if (next.isNonNull()) {
+            next.setUnusedPrevious(prev);
+        }
+        if (node == unusedListHead) {
+            unusedListHead = next;
+        } else {
+            prev.setUnusedNext(next);
+        }
+        unusedListCount--;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void addToAllocList(FreeListNode newNode, FreeListNode prev) {
+        assert newNode.isNonNull();
+        assert newNode.getAllocNext().isNull();
+        assert isAllocatable(newNode.getSize());
+
+        if (prev.isNull()) {
+            newNode.setAllocNext(allocListHead);
+            allocListHead = newNode;
+        } else {
+            newNode.setAllocNext(prev.getAllocNext());
+            prev.setAllocNext(newNode);
+        }
+        allocListCount++;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void removeFromAllocList(FreeListNode node, FreeListNode prevNode) {
+        assert node.isNonNull();
+
+        if (node == allocListHead) {
+            assert prevNode.isNull();
+            allocListHead = node.getAllocNext();
+        } else {
+            prevNode.setAllocNext(node.getAllocNext());
+        }
+        node.setAllocNext(nullPointer());
+        allocListCount--;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Allocation internals must never end up in interruptible code.")
+    public void freeAlignedChunk(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment, UnsignedWord nbytesCommitted) {
+        assert nbytesCommitted.belowOrEqual(nbytes);
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackUncommit(nbytesCommitted, NmtCategory.JavaHeap);
+        }
+        freeInHeapAddressSpace((Pointer) start, nbytes);
+    }
+
+    @Override
+    @Uninterruptible(reason = "Allocation internals must never end up in interruptible code.")
+    public void freeUnalignedChunk(PointerBase start, UnsignedWord nbytes) {
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackUncommit(nbytes, NmtCategory.JavaHeap);
+        }
+        freeInHeapAddressSpace((Pointer) start, nbytes);
+    }
+
+    @Uninterruptible(reason = "Entering a safepoint in this code can deadlock garbage collection.")
+    protected void freeInHeapAddressSpace(Pointer start, UnsignedWord nbytes) {
+        assert start.isNonNull();
+        assert nbytes.aboveThan(0);
+
+        lock.lockNoTransition();
+        try {
+            UnsignedWord pageSize = getGranularity();
+            Pointer mapBegin = roundDown(start, pageSize);
+
+            /* Find adjacent allocatable free blocks. */
+            FreeListNode allocPrevious = nullPointer();
+            FreeListNode allocNext = allocListHead;
+            while (allocNext.isNonNull() && allocNext.getStart().belowThan(mapBegin)) {
+                allocPrevious = allocNext;
+                allocNext = allocNext.getAllocNext();
+            }
+
+            /* Find adjacent unused blocks. */
+            FreeListNode unusedPrevious = allocPrevious;
+            FreeListNode unusedNext = unusedPrevious.isNull() ? unusedListHead : unusedPrevious.getUnusedNext();
+            while (unusedNext.isNonNull() && unusedNext.getStart().belowThan(mapBegin)) {
+                unusedPrevious = unusedNext;
+                unusedNext = unusedNext.getUnusedNext();
+            }
+
+            Pointer mapEnd = roundUp(start.add(nbytes), pageSize);
+            UnsignedWord alignedSize = mapEnd.subtract(mapBegin);
+            assert alignedSize.aboveOrEqual(nbytes);
+            assert unusedPrevious.isNull() || mapBegin.aboveOrEqual(getNodeEnd(unusedPrevious));
+            assert unusedNext.isNull() || mapEnd.belowOrEqual(unusedNext.getStart());
+
+            /*
+             * Always try to add the freed memory to adjacent unused memory (i.e., by increasing the
+             * bounds of an existing node). If there is no adjacent unused memory, we need to create
+             * a new node.
+             */
+            FreeListNode container;
+            boolean adjacentPredecessor = unusedPrevious.isNonNull() && getNodeEnd(unusedPrevious).equal(mapBegin);
+            boolean adjacentSuccessor = unusedNext.isNonNull() && mapEnd.equal(unusedNext.getStart());
+
+            if (adjacentPredecessor) {
+                /* Add the freed memory to the predecessor. */
+                increaseBounds(unusedPrevious, mapBegin, alignedSize);
+                container = unusedPrevious;
+
+                if (adjacentSuccessor) {
+                    /* Merge the successor with the predecessor and remove the successor. */
+                    mergeNodes(container, unusedNext);
+
+                    if (allocNext == unusedNext) {
+                        allocNext = allocNext.getAllocNext();
+                        removeFromAllocList(unusedNext, allocPrevious);
+                    }
+
+                    removeFromUnusedList(unusedNext);
+                    freeNode(unusedNext);
+                    unusedNext = Word.nullPointer();
+                }
+            } else if (adjacentSuccessor) {
+                /* Add the freed memory to the successor node. */
+                increaseBounds(unusedNext, mapBegin, alignedSize);
+                container = unusedNext;
+            } else {
+                /* Create a new node for the freed memory because the adjacent memory is used. */
+                FreeListNode node = allocNode(mapBegin, alignedSize);
+                addToUnusedList(node, unusedPrevious);
+                container = node;
+            }
+
+            uncommitLazily(container, mapBegin, alignedSize);
+
+            /* Insert merged or created node into allocatables list if necessary. */
+            if (isAllocatable(container.getSize()) && container != allocPrevious && container != allocNext) {
+                addToAllocList(container, allocPrevious);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected void uncommitLazily(FreeListNode node, Pointer mapBegin, UnsignedWord alignedSize) {
+        /*
+         * Memory is uncommitted lazily. For most benchmarks, there is no difference between lazy
+         * and eager uncommit. However, on a few SPECjvm2008 benchmarks lazy uncommits have a
+         * relevant impact: GCs are a bit faster, so more GCs can be performed, which decreases
+         * memory usage on those benchmarks quite a bit.
+         */
+        addCommitted(node, mapBegin, mapBegin.add(alignedSize));
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected void mergeNodes(FreeListNode target, FreeListNode obsolete) {
+        increaseBounds(target, obsolete.getStart(), obsolete.getSize());
+        addCommitted(target, obsolete.getCommittedStart(), obsolete.getCommittedEnd());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void increaseBounds(FreeListNode node, Pointer otherStart, UnsignedWord otherSize) {
+        assert getNodeEnd(node).equal(otherStart) || otherStart.add(otherSize).equal(node.getStart()) : "must be adjacent";
+        assert UnsignedUtils.isAMultiple(otherSize, getGranularity());
+        assert otherSize.belowOrEqual(reservedAddressSpaceSize);
+
+        Pointer newStart = PointerUtils.min(node.getStart(), otherStart);
+        UnsignedWord newSize = node.getSize().add(otherSize);
+        setBounds(node, newStart, newSize);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected void trimBounds(FreeListNode fit, Pointer newStart, UnsignedWord newSize) {
+        assert newSize.belowOrEqual(reservedAddressSpaceSize);
+        assert fit.getStart().equal(newStart) && newSize.belowThan(fit.getSize()) ||
+                        fit.getStart().belowThan(newStart) && getNodeEnd(fit).equal(newStart.add(newSize));
+
+        setBounds(fit, newStart, newSize);
+        trimCommitted(fit);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void addCommitted(FreeListNode node, Pointer committedStart, Pointer committedEnd) {
+        assert node.getCommittedStart().isNull() == node.getCommittedEnd().isNull();
+        assert committedStart.isNull() == committedEnd.isNull();
+
+        if (committedStart.isNull()) {
+            /* No memory needs to be added. */
+            return;
+        }
+
+        assert committedStart.aboveOrEqual(collectedHeapBegin);
+        assert committedStart.belowThan(committedEnd);
+        assert PointerUtils.isAMultiple(committedStart, getGranularity());
+        assert PointerUtils.isAMultiple(committedEnd, getGranularity());
+        assert committedEnd.subtract(committedStart).belowOrEqual(collectedHeapSize);
+
+        Pointer nodeEnd = getNodeEnd(node);
+        if (committedStart.aboveOrEqual(nodeEnd) || committedEnd.belowOrEqual(node.getStart())) {
+            /* Committed memory is outside the node's address range. */
+            return;
+        }
+
+        Pointer enclosedBegin = PointerUtils.max(committedStart, node.getStart());
+        Pointer enclosedEnd = PointerUtils.min(committedEnd, nodeEnd);
+
+        if (node.getCommittedStart().isNull() || enclosedBegin.belowThan(node.getCommittedStart())) {
+            node.setCommittedStart(enclosedBegin);
+        }
+        if (node.getCommittedEnd().isNull() || enclosedEnd.aboveThan(node.getCommittedEnd())) {
+            node.setCommittedEnd(enclosedEnd);
+        }
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private void trimCommitted(FreeListNode node) {
+        Pointer begin = node.getCommittedStart();
+        Pointer end = node.getCommittedEnd();
+        if (begin.isNonNull()) {
+            node.setCommittedStart(nullPointer());
+            node.setCommittedEnd(nullPointer());
+            addCommitted(node, begin, end);
+        }
+    }
+
+    @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Called by the GC.")
+    public void beforeGarbageCollection() {
+        assert VMOperation.isGCInProgress() : "may only be called by the GC";
+        assert !lock.hasOwner() : "Must not be locked -- is mutator code holding the lock?";
+        if (SubstrateGCOptions.VerifyHeap.getValue()) {
+            verifyFreeList();
+        }
+    }
+
+    @Override
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Called by the GC.")
+    public void uncommitUnusedMemory() {
+        assert VMOperation.isInProgressAtSafepoint() : "may only be called at safepoint";
+        assert !lock.hasOwner() : "Must not be locked";
+        uncommitUnusedMemory0();
+    }
+
+    protected void uncommitUnusedMemory0() {
+        for (FreeListNode n = unusedListHead; n.isNonNull(); n = n.getUnusedNext()) {
+            FreeListNode node = n;
+            Pointer mapping = node.getCommittedStart();
+            if (mapping.isNonNull()) {
+                assert mapping.aboveOrEqual(node.getStart()) && node.getCommittedEnd().belowOrEqual(getNodeEnd(node));
+                Pointer mappingSize = node.getCommittedEnd().subtract(mapping);
+                if (VirtualMemoryProvider.get().uncommit(mapping, mappingSize) != 0) {
+                    Log.log().string("Uncommitting ").unsigned(mappingSize).string(" bytes of unused memory at ").zhex(mapping).string(" failed. nodeStart=").zhex(node.getStart()).string(", nodeEnd=")
+                                    .zhex(getNodeEnd(node)).newline();
+                    throw VMError.shouldNotReachHere(UNCOMMIT_FAILED_ERROR_MSG);
+                }
+                node.setCommittedStart(nullPointer());
+                node.setCommittedEnd(nullPointer());
+            }
+        }
+
+        if (SubstrateGCOptions.VerifyHeap.getValue()) {
+            verifyFreeList();
+        }
+    }
+
+    protected void verifyFreeList() {
+        int unusedCount = 0;
+        FreeListNode unusedPrevious = nullPointer();
+        for (FreeListNode unused = unusedListHead; unused.isNonNull(); unused = unused.getUnusedNext()) {
+            guarantee(unused.getUnusedPrevious().equal(unusedPrevious), "Unused list previous-next node linkage must be consistent");
+            guarantee(unusedPrevious.isNull() || unused.getStart().aboveThan(getNodeEnd(unusedPrevious)), "Unused blocks must not be adjacent or overlapping");
+            guarantee(isInAllocList(unused) == isAllocatable(unused.getSize()), "Allocatable blocks must be in the alloc list");
+            unusedCount++;
+            unusedPrevious = unused;
+        }
+        guarantee(unusedCount == unusedListCount, "Number of unused list nodes must match recorded count");
+
+        int unusedReverseCounted = 0;
+        if (unusedPrevious.isNonNull()) { // iterate in reverse
+            FreeListNode unusedNext = unusedPrevious;
+            unusedReverseCounted++;
+            for (FreeListNode unused = unusedNext.getUnusedPrevious(); unused.isNonNull(); unused = unused.getUnusedPrevious()) {
+                guarantee(unused.getUnusedNext().equal(unusedNext), "Unused list previous-next node linkage must be consistent");
+                guarantee(unusedNext.getStart().aboveThan(getNodeEnd(unused)), "Unused blocks must not be adjacent or overlapping");
+                unusedReverseCounted++;
+                unusedNext = unused;
+            }
+            guarantee(unusedNext == unusedListHead, "Unused list reverse iteration must terminate at list head");
+        }
+        guarantee(unusedCount == unusedReverseCounted, "Number of unused list nodes must be the same for forward and reverse iteration");
+
+        int allocCount = 0;
+        for (FreeListNode previous = nullPointer(), alloc = allocListHead; alloc.isNonNull(); previous = alloc, alloc = alloc.getAllocNext()) {
+            guarantee(previous.isNull() || alloc.getStart().aboveThan(getNodeEnd(previous)), "Allocatable blocks must not be adjacent or overlapping");
+            guarantee(isAllocatable(alloc.getSize()), "Allocatable blocks must satisfy minimum allocatable size");
+            allocCount++;
+        }
+
+        guarantee(allocListHead.isNull() || unusedListHead.equal(allocListHead) || getNodeEnd(unusedListHead).belowOrEqual(allocListHead.getStart()),
+                        "First unused block must start before first allocatable block, or be allocatable itself");
+        guarantee(allocCount <= unusedCount, "Allocation list must not be longer than unused list");
+        guarantee(allocCount == allocListCount, "Number of allocation list nodes must match recorded count");
+    }
+
+    private boolean isInAllocList(FreeListNode node) {
+        FreeListNode alloc = allocListHead;
+        while (alloc.isNonNull() && alloc.getStart().belowOrEqual(node.getStart())) {
+            if (alloc.equal(node)) {
+                return true;
+            }
+            alloc = alloc.getAllocNext();
+        }
+        return false;
+    }
+
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public UnsignedWord getReservedAddressSpaceSize() {
+        return reservedAddressSpaceSize;
+    }
+
+    /** Keeps track of unused memory. */
+    @RawStructure
+    protected interface FreeListNode extends PointerBase {
+        @RawField
+        Pointer getStart();
+
+        @RawField
+        void setStart(Pointer start);
+
+        @RawField
+        UnsignedWord getSize();
+
+        @RawField
+        void setSize(UnsignedWord size);
+
+        /**
+         * The start of unused but potentially committed memory. If both {@link #getCommittedStart}
+         * and {@link #getCommittedEnd} return {@code null}, this block does not contain any
+         * committed memory.
+         *
+         * Note that the memory range that is covered by {@link #getCommittedStart} and
+         * {@link #getCommittedEnd} may contain memory that is not committed.
+         */
+        @RawField
+        Pointer getCommittedStart();
+
+        @RawField
+        void setCommittedStart(Pointer committedStart);
+
+        @RawField
+        Pointer getCommittedEnd();
+
+        @RawField
+        void setCommittedEnd(Pointer committedEnd);
+
+        @RawField
+        FreeListNode getAllocNext();
+
+        @RawField
+        void setAllocNext(FreeListNode next);
+
+        @RawField
+        FreeListNode getUnusedPrevious();
+
+        @RawField
+        void setUnusedPrevious(FreeListNode unusedPrevious);
+
+        @RawField
+        FreeListNode getUnusedNext();
+
+        @RawField
+        void setUnusedNext(FreeListNode unusedNext);
+    }
+
+    public static final class TestingBackdoor {
+        public static void initialize(AddressRangeCommittedMemoryProvider provider, Pointer spaceBegin, UnsignedWord spaceSize, Pointer runtimeHeapBegin) {
+            provider.initializeFields(spaceBegin, spaceSize, runtimeHeapBegin);
+        }
+
+        public static void guaranteeEmpty(AddressRangeCommittedMemoryProvider provider) {
+            VMError.guarantee(provider.unusedListCount == 1, "more than one unused node");
+            VMError.guarantee(provider.allocListCount == 1, "more than one alloc node");
+            VMError.guarantee(provider.allocListHead == provider.unusedListHead, "different nodes");
+            VMError.guarantee(provider.unusedListHead.getStart().equal(provider.collectedHeapBegin), "begin is incorrect");
+            VMError.guarantee(provider.unusedListHead.getSize().equal(provider.collectedHeapSize), "size is incorrect");
+            VMError.guarantee(provider.unusedListHead.getCommittedStart().isNull(), "committed start is incorrect");
+            VMError.guarantee(provider.unusedListHead.getCommittedEnd().isNull(), "committed end is incorrect");
+        }
+
+        public static void guaranteeFull(AddressRangeCommittedMemoryProvider provider) {
+            VMError.guarantee(provider.unusedListCount == 0, "there must not be any nodes left");
+            VMError.guarantee(provider.allocListCount == 0, "there must not be any nodes left");
+            VMError.guarantee(provider.allocListHead.isNull(), "must be null");
+            VMError.guarantee(provider.unusedListHead.isNull(), "must be null");
+        }
+
+        public static Pointer allocateInHeapAddressSpace(AddressRangeCommittedMemoryProvider provider, UnsignedWord size, UnsignedWord alignment) {
+            WordPointer allocOut = UnsafeStackValue.get(WordPointer.class);
+            provider.allocateInHeapAddressSpace(size, alignment, allocOut);
+            return allocOut.read();
+        }
+
+        public static void freeInHeapAddressSpace(AddressRangeCommittedMemoryProvider provider, Pointer start, UnsignedWord nbytes) {
+            provider.freeInHeapAddressSpace(start, nbytes);
+        }
+
+        public static void uncommitUnusedMemory0(AddressRangeCommittedMemoryProvider provider) {
+            provider.uncommitUnusedMemory0();
+        }
+    }
+}

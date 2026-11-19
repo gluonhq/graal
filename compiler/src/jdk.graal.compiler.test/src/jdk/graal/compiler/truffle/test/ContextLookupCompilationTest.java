@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,9 +35,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-import jdk.graal.compiler.nodes.FieldLocationIdentity;
-import jdk.graal.compiler.nodes.StructuredGraph;
-import jdk.graal.compiler.nodes.memory.ReadNode;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 import org.graalvm.word.LocationIdentity;
@@ -60,12 +57,12 @@ import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.runtime.OptimizedCallTarget;
 
+import jdk.graal.compiler.nodes.FieldLocationIdentity;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.memory.ReadNode;
 import jdk.vm.ci.code.BailoutException;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
-// we suppress deprecation until the old APIs are gone
-// we should not break compilation of old APIs in the meantime
-@SuppressWarnings("deprecation")
 public class ContextLookupCompilationTest extends PartialEvaluationTest {
 
     static final String EXCLUSIVE = "ContextLookupCompilationTestExclusive";
@@ -268,7 +265,7 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
         assertCompiling(createAssertConstantFromRef());
         assertLookupsNoSharing();
 
-        TruffleContext innerContext = Shared1.getCurrentContext().env.newContextBuilder().build();
+        TruffleContext innerContext = Shared1.getCurrentContext().env.newInnerContextBuilder().initializeCreatorContext(true).inheritAllAccess(true).build();
         Object prev = innerContext.enter(null);
         try {
             Context.getCurrent().initialize(EXCLUSIVE);
@@ -293,7 +290,7 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
         assertBailout(createAssertConstantFromRef());
         assertLookupsSharedLayer();
 
-        TruffleContext innerContext = Shared1.getCurrentContext().env.newContextBuilder().build();
+        TruffleContext innerContext = Shared1.getCurrentContext().env.newInnerContextBuilder().initializeCreatorContext(true).inheritAllAccess(true).build();
         Object prev = innerContext.enter(null);
         try {
             Context.getCurrent().initialize(SHARED1);
@@ -609,6 +606,9 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
     @Registration(id = EXCLUSIVE, name = EXCLUSIVE, contextPolicy = ContextPolicy.EXCLUSIVE)
     public static class Exclusive extends TruffleLanguage<LanguageContext> {
 
+        private static final ContextReference<LanguageContext> CONTEXT_REFERENCE = ContextReference.create(Exclusive.class);
+        private static final LanguageReference<Exclusive> LANGUAGE_REFERENCE = LanguageReference.create(Exclusive.class);
+
         @Override
         protected LanguageContext createContext(Env env) {
             return new LanguageContext(env, 42);
@@ -620,11 +620,11 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
         }
 
         public static LanguageContext getCurrentContext() {
-            return getCurrentContext(Exclusive.class);
+            return CONTEXT_REFERENCE.get(null);
         }
 
         public static TruffleLanguage<LanguageContext> get() {
-            return getCurrentLanguage(Exclusive.class);
+            return LANGUAGE_REFERENCE.get(null);
         }
 
     }
@@ -650,8 +650,11 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
     @Registration(id = SHARED1, name = SHARED1, contextPolicy = ContextPolicy.SHARED)
     public static class Shared1 extends TruffleLanguage<LanguageContext> {
 
-        final ContextLocal<ContextLocalValue> local = locals.createContextLocal((e) -> new ContextLocalValue());
-        final ContextThreadLocal<ContextLocalValue> threadLocal = locals.createContextThreadLocal((e, t) -> new ContextLocalValue());
+        private static final ContextReference<LanguageContext> CONTEXT_REFERENCE = ContextReference.create(Shared1.class);
+        private static final LanguageReference<Shared1> LANGUAGE_REFERENCE = LanguageReference.create(Shared1.class);
+
+        final ContextLocal<ContextLocalValue> local = locals.createContextLocal((_) -> new ContextLocalValue());
+        final ContextThreadLocal<ContextLocalValue> threadLocal = locals.createContextThreadLocal((_, _) -> new ContextLocalValue());
 
         @Override
         protected LanguageContext createContext(Env env) {
@@ -664,11 +667,11 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
         }
 
         public static LanguageContext getCurrentContext() {
-            return getCurrentContext(Shared1.class);
+            return CONTEXT_REFERENCE.get(null);
         }
 
         public static Shared1 get() {
-            return getCurrentLanguage(Shared1.class);
+            return LANGUAGE_REFERENCE.get(null);
         }
 
     }
@@ -676,8 +679,11 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
     @Registration(id = SHARED2, name = SHARED2, contextPolicy = ContextPolicy.SHARED)
     public static class Shared2 extends TruffleLanguage<LanguageContext> {
 
-        final ContextLocal<ContextLocalValue> local = locals.createContextLocal((e) -> new ContextLocalValue());
-        final ContextThreadLocal<ContextLocalValue> threadLocal = locals.createContextThreadLocal((e, t) -> new ContextLocalValue());
+        private static final ContextReference<LanguageContext> CONTEXT_REFERENCE = ContextReference.create(Shared2.class);
+        private static final LanguageReference<Shared2> LANGUAGE_REFERENCE = LanguageReference.create(Shared2.class);
+
+        final ContextLocal<ContextLocalValue> local = locals.createContextLocal((_) -> new ContextLocalValue());
+        final ContextThreadLocal<ContextLocalValue> threadLocal = locals.createContextThreadLocal((_, _) -> new ContextLocalValue());
 
         @Override
         protected LanguageContext createContext(Env env) {
@@ -690,11 +696,11 @@ public class ContextLookupCompilationTest extends PartialEvaluationTest {
         }
 
         public static LanguageContext getCurrentContext() {
-            return getCurrentContext(Shared2.class);
+            return CONTEXT_REFERENCE.get(null);
         }
 
         public static Shared2 get() {
-            return getCurrentLanguage(Shared2.class);
+            return LANGUAGE_REFERENCE.get(null);
         }
 
     }

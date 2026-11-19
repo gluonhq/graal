@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,12 +31,12 @@ import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEn
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.CR_BROKEN_MULTIBYTE;
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.CR_VALID;
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.CR_VALID_MULTIBYTE;
-import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.UTF_16;
+import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.UTF_16_FOREIGN_ENDIAN;
+import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.UTF_32_FOREIGN_ENDIAN;
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.UTF_8;
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.UTF_8_STATE_MACHINE_ACCEPTING_STATE;
 import static jdk.graal.compiler.lir.gen.LIRGeneratorTool.CalcStringAttributesEncoding.utf8GetNextState;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.POPCNT;
-import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSE;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSE2;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSE3;
 import static jdk.vm.ci.amd64.AMD64.CPUFeature.SSE4_1;
@@ -47,6 +47,7 @@ import java.util.EnumSet;
 
 import org.graalvm.word.LocationIdentity;
 
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.graal.compiler.core.common.Stride;
 import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
 import jdk.graal.compiler.core.common.type.StampFactory;
@@ -66,6 +67,7 @@ import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import jdk.graal.compiler.nodes.util.ConstantReflectionUtil;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.Architecture;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -81,14 +83,6 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
 
     public static final NodeClass<CalcStringAttributesNode> TYPE = NodeClass.create(CalcStringAttributesNode.class);
 
-    private static final EnumSet<AMD64.CPUFeature> MINIMUM_FEATURES_AMD64 = EnumSet.of(
-                    SSE,
-                    SSE2,
-                    SSE3,
-                    SSSE3,
-                    SSE4_1,
-                    SSE4_2,
-                    POPCNT);
     public static final int MAX_ASCII_VALUE = 0x7f;
     public static final int MAX_LATIN_1_VALUE = 0xff;
 
@@ -140,7 +134,7 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
     }
 
     private static JavaKind getReturnValueKind(CalcStringAttributesEncoding encoding) {
-        return encoding == UTF_8 || encoding == UTF_16 ? JavaKind.Long : JavaKind.Int;
+        return encoding == UTF_8 || encoding.isUTF16() ? JavaKind.Long : JavaKind.Int;
     }
 
     public CalcStringAttributesEncoding getOp() {
@@ -179,10 +173,35 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
             // arrayOffset is given in bytes, scale it to the stride.
             long arrayBaseOffsetBytesConstant = offset.asJavaConstant().asLong();
             arrayBaseOffsetBytesConstant -= tool.getMetaAccess().getArrayBaseOffset(constantArrayKind);
-            final int offsetConstant = (int) (arrayBaseOffsetBytesConstant / stride.value);
+            final long offsetConstantScaled = arrayBaseOffsetBytesConstant >> stride.log2;
 
             final int lengthConstant = length.asJavaConstant().asInt();
-            ConstantReflectionUtil.boundsCheckTypePunned(lengthConstant, stride, actualArrayLength, constantArrayKind);
+            if (!ConstantReflectionUtil.boundsCheckTypePunned(offsetConstantScaled, lengthConstant, stride, actualArrayLength, constantArrayKind)) {
+                /*
+                 * This may happen when this node is in a branch that won't be taken for the given
+                 * array, but is still visible in the current compilation unit, e.g. for compact
+                 * UTF-16 strings:
+                 *
+                 * // @formatter:off
+                 *
+                 * byte[] array = {'a', 'b', 'c'};
+                 * int stringLength = 3;
+                 * boolean isCompactString = true;
+                 *
+                 * if (isCompactString) {
+                 *     // byte length in latin1 is 3
+                 *     calcStringAttributesLatin1(array, stringLength);
+                 * } else {
+                 *     // byte length in utf16 is 6 -> out of bounds. this branch won't be taken,
+                 *     // but Graal may still try to constant-fold it
+                 *     calcStringAttributesUTF16(array, stringLength);
+                 * }
+                 *
+                 * // @formatter:on
+                 */
+                return this;
+            }
+            final int offsetConstant = NumUtil.safeToInt(offsetConstantScaled);
 
             if (ConstantReflectionUtil.shouldConstantFoldArrayOperation(tool, lengthConstant)) {
                 switch (encoding) {
@@ -228,12 +247,16 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
                         }
                         return ConstantNode.forLong(nCodePoints << 32 | ret);
                     }
-                    case UTF_16 -> {
+                    case UTF_16, UTF_16_FOREIGN_ENDIAN -> {
                         long nCodePoints = lengthConstant;
                         int last = 0;
                         int ret = CR_7BIT;
                         for (int i = 0; i < lengthConstant; i++) {
-                            final int value = ConstantReflectionUtil.readTypePunned(provider, arrayConstant, constantArrayKind, stride, offsetConstant + i);
+                            int value = ConstantReflectionUtil.readTypePunned(provider, arrayConstant, constantArrayKind, stride, offsetConstant + i);
+                            if (encoding == UTF_16_FOREIGN_ENDIAN) {
+                                assert stride == Stride.S2 : stride;
+                                value = Character.reverseBytes((char) value);
+                            }
                             if (assumeValid) {
                                 if (Character.isHighSurrogate((char) value)) {
                                     nCodePoints--;
@@ -266,10 +289,14 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
                         }
                         return ConstantNode.forLong(nCodePoints << 32 | ret);
                     }
-                    case UTF_32 -> {
+                    case UTF_32, UTF_32_FOREIGN_ENDIAN -> {
                         int ret = CR_7BIT;
                         for (int i = 0; i < lengthConstant; i++) {
-                            final int value = ConstantReflectionUtil.readTypePunned(provider, arrayConstant, constantArrayKind, stride, offsetConstant + i);
+                            int value = ConstantReflectionUtil.readTypePunned(provider, arrayConstant, constantArrayKind, stride, offsetConstant + i);
+                            if (encoding == UTF_32_FOREIGN_ENDIAN) {
+                                assert stride == Stride.S4 : stride;
+                                value = Integer.reverseBytes(value);
+                            }
                             if ((Integer.compareUnsigned(value, Character.MAX_CODE_POINT) > 0) || ((value <= Character.MAX_VALUE) && Character.isSurrogate((char) value))) {
                                 ret = CR_BROKEN;
                                 break;
@@ -297,11 +324,15 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
     }
 
     public static EnumSet<AMD64.CPUFeature> minFeaturesAMD64() {
-        return MINIMUM_FEATURES_AMD64;
+        return EnumSet.of(SSE2, SSE3, SSSE3, SSE4_1, SSE4_2, POPCNT);
     }
 
-    public static EnumSet<AArch64.CPUFeature> minFeaturesAARCH64() {
-        return EnumSet.noneOf(AArch64.CPUFeature.class);
+    public static boolean isSupported(Architecture arch) {
+        return switch (arch) {
+            case AMD64 amd64 -> amd64.getFeatures().containsAll(minFeaturesAMD64());
+            case AArch64 aarch64 -> true;
+            default -> false;
+        };
     }
 
     @Override
@@ -315,6 +346,11 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
     }
 
     @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return false;
+    }
+
+    @Override
     public void emitIntrinsic(NodeLIRBuilderTool gen) {
         gen.setResult(this, gen.getLIRGeneratorTool().emitCalcStringAttributes(encoding, getRuntimeCheckedCPUFeatures(), gen.operand(array), gen.operand(offset), gen.operand(length), assumeValid));
     }
@@ -322,9 +358,11 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
     /* NodeIntrinsic plugins for snippet stubs. */
 
     @NodeIntrinsic
-    @GenerateStub(name = "calcStringAttributesLatin1", parameters = {"LATIN1", "false"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
-    @GenerateStub(name = "calcStringAttributesBMP", parameters = {"BMP", "false"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
-    @GenerateStub(name = "calcStringAttributesUTF32", parameters = {"UTF_32", "false"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+    @GenerateStub.Default(minimumCPUFeaturesAMD64 = "minFeaturesAMD64", runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
+    @GenerateStub(name = "calcStringAttributesLatin1", parameters = {"LATIN1", "false"})
+    @GenerateStub(name = "calcStringAttributesBMP", parameters = {"BMP", "false"})
+    @GenerateStub(name = "calcStringAttributesUTF32", parameters = {"UTF_32", "false"})
+    @GenerateStub(name = "calcStringAttributesUTF32FE", parameters = {"UTF_32_FOREIGN_ENDIAN", "false"})
     public static native int intReturnValue(Object array, long offset, int length,
                     @ConstantNodeParameter CalcStringAttributesEncoding encoding,
                     @ConstantNodeParameter boolean assumeValid);
@@ -336,10 +374,13 @@ public final class CalcStringAttributesNode extends PureFunctionStubIntrinsicNod
                     @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
 
     @NodeIntrinsic
-    @GenerateStub(name = "calcStringAttributesUTF8Valid", parameters = {"UTF_8", "true"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
-    @GenerateStub(name = "calcStringAttributesUTF8Unknown", parameters = {"UTF_8", "false"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
-    @GenerateStub(name = "calcStringAttributesUTF16Valid", parameters = {"UTF_16", "true"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
-    @GenerateStub(name = "calcStringAttributesUTF16Unknown", parameters = {"UTF_16", "false"}, minimumCPUFeaturesAMD64 = "minFeaturesAMD64", minimumCPUFeaturesAARCH64 = "minFeaturesAARCH64")
+    @GenerateStub.Default(minimumCPUFeaturesAMD64 = "minFeaturesAMD64", runtimeCPUFeaturesAMD64 = "amd64FeaturesAVX2")
+    @GenerateStub(name = "calcStringAttributesUTF8Valid", parameters = {"UTF_8", "true"})
+    @GenerateStub(name = "calcStringAttributesUTF8Unknown", parameters = {"UTF_8", "false"})
+    @GenerateStub(name = "calcStringAttributesUTF16Valid", parameters = {"UTF_16", "true"})
+    @GenerateStub(name = "calcStringAttributesUTF16Unknown", parameters = {"UTF_16", "false"})
+    @GenerateStub(name = "calcStringAttributesUTF16FEValid", parameters = {"UTF_16_FOREIGN_ENDIAN", "true"})
+    @GenerateStub(name = "calcStringAttributesUTF16FEUnknown", parameters = {"UTF_16_FOREIGN_ENDIAN", "false"})
     public static native long longReturnValue(Object array, long offset, int length,
                     @ConstantNodeParameter CalcStringAttributesEncoding encoding,
                     @ConstantNodeParameter boolean assumeValid);

@@ -30,9 +30,11 @@ import org.graalvm.nativeimage.Platforms;
 import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisField;
-import com.oracle.svm.core.meta.MethodPointer;
+import com.oracle.svm.core.graal.code.CGlobalDataBasePointer;
+import com.oracle.svm.guest.staging.meta.MethodRef;
 import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.graal.compiler.core.common.spi.JavaConstantFieldProvider;
 import jdk.vm.ci.meta.JavaConstant;
@@ -68,7 +70,7 @@ public abstract class SharedConstantFieldProvider extends JavaConstantFieldProvi
          * the class loader of the using class into account. So we look at the annotation directly
          * for now.
          */
-        if (field.isAnnotationPresent(jdk.internal.vm.annotation.Stable.class)) {
+        if (GuestAnnotationAccess.isAnnotationPresent(field, jdk.internal.vm.annotation.Stable.class)) {
             stable = true;
         } else {
             stable = super.isStableField(field, tool);
@@ -78,6 +80,10 @@ public abstract class SharedConstantFieldProvider extends JavaConstantFieldProvi
 
     private boolean allowConstantFolding(ResolvedJavaField field, ConstantFieldTool<?> tool) {
         var aField = asAnalysisField(field);
+
+        if (aField.preventConstantFolding()) {
+            return false;
+        }
 
         /*
          * During compiler optimizations, it is possible to see field loads with a constant receiver
@@ -96,7 +102,7 @@ public abstract class SharedConstantFieldProvider extends JavaConstantFieldProvi
          * for initialization at build time) before any constant folding of static fields is
          * attempted.
          */
-        if (!fieldValueInterceptionSupport.isValueAvailable(aField)) {
+        if (!fieldValueInterceptionSupport.isValueAvailable(aField, tool == null ? null : tool.getReceiver())) {
             return false;
         }
 
@@ -117,10 +123,10 @@ public abstract class SharedConstantFieldProvider extends JavaConstantFieldProvi
 
     @Override
     protected boolean isFinalFieldValueConstant(ResolvedJavaField field, JavaConstant value, ConstantFieldTool<?> tool) {
-        if (value.getJavaKind() == JavaKind.Object && metaAccess.isInstanceOf(value, MethodPointer.class)) {
+        if (value.getJavaKind() == JavaKind.Object && (metaAccess.isInstanceOf(value, MethodRef.class) || metaAccess.isInstanceOf(value, CGlobalDataBasePointer.class))) {
             /*
-             * Prevent the constant folding of MethodPointer objects. MethodPointer is a "hosted"
-             * type, so it cannot be present in compiler graphs.
+             * Prevent constant folding of placeholder objects for patched words (such as relocated
+             * pointers). These are "hosted" types and so cannot be present in compiler graphs.
              */
             return false;
         }

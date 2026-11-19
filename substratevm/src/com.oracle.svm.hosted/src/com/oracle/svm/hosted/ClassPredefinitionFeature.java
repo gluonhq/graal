@@ -25,45 +25,58 @@
  */
 package com.oracle.svm.hosted;
 
-import static jdk.internal.org.objectweb.asm.Opcodes.ACC_FINAL;
-import static jdk.internal.org.objectweb.asm.Opcodes.ACC_PUBLIC;
-import static jdk.internal.org.objectweb.asm.Opcodes.ACC_STATIC;
+import static java.lang.classfile.ClassFile.ACC_FINAL;
+import static java.lang.classfile.ClassFile.ACC_PUBLIC;
+import static java.lang.classfile.ClassFile.ACC_STATIC;
+import static java.lang.classfile.ClassFile.ConstantPoolSharingOption.NEW_POOL;
+import static java.lang.classfile.ClassFile.DebugElementsOption.DROP_DEBUG;
+import static java.lang.classfile.ClassFile.LineNumbersOption.DROP_LINE_NUMBERS;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
+import java.lang.classfile.ClassTransform;
+import java.lang.classfile.CodeTransform;
+import java.lang.classfile.FieldModel;
+import java.lang.classfile.MethodModel;
+import java.lang.classfile.MethodTransform;
+import java.lang.classfile.attribute.MethodParametersAttribute;
+import java.lang.classfile.attribute.SourceDebugExtensionAttribute;
+import java.lang.classfile.attribute.SourceFileAttribute;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
-import com.oracle.svm.core.configure.ConfigurationFile;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.configure.ConfigurationFile;
+import com.oracle.svm.configure.PredefinedClassesConfigurationParser;
+import com.oracle.svm.configure.PredefinedClassesRegistry;
 import com.oracle.svm.core.configure.ConfigurationFiles;
-import com.oracle.svm.core.configure.PredefinedClassesConfigurationParser;
-import com.oracle.svm.core.configure.PredefinedClassesRegistry;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.hub.PredefinedClassesSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl.AfterRegistrationAccessImpl;
 import com.oracle.svm.hosted.config.ConfigurationParserUtils;
 import com.oracle.svm.hosted.reflect.ReflectionFeature;
-import com.oracle.svm.util.ModuleSupport;
 
 import jdk.graal.compiler.java.LambdaUtils;
 import jdk.graal.compiler.util.Digest;
-import jdk.internal.org.objectweb.asm.ClassReader;
-import jdk.internal.org.objectweb.asm.ClassVisitor;
-import jdk.internal.org.objectweb.asm.ClassWriter;
-import jdk.internal.org.objectweb.asm.FieldVisitor;
-import jdk.internal.org.objectweb.asm.MethodVisitor;
-import jdk.internal.org.objectweb.asm.Opcodes;
 
 @AutomaticallyRegisteredFeature
 public class ClassPredefinitionFeature implements InternalFeature {
@@ -91,15 +104,22 @@ public class ClassPredefinitionFeature implements InternalFeature {
         AfterRegistrationAccessImpl access = (AfterRegistrationAccessImpl) arg;
         PredefinedClassesRegistry registry = new PredefinedClassesRegistryImpl();
         ImageSingletons.add(PredefinedClassesRegistry.class, registry);
-        PredefinedClassesConfigurationParser parser = new PredefinedClassesConfigurationParser(registry, ConfigurationFiles.Options.StrictConfiguration.getValue());
+        PredefinedClassesConfigurationParser parser = new PredefinedClassesConfigurationParser(registry, ConfigurationFiles.Options.getConfigurationParserOptions());
         ConfigurationParserUtils.parseAndRegisterConfigurations(parser, access.getImageClassLoader(), "class predefinition",
                         ConfigurationFiles.Options.PredefinedClassesConfigurationFiles, ConfigurationFiles.Options.PredefinedClassesConfigurationResources,
                         ConfigurationFile.PREDEFINED_CLASSES_NAME.getFileName());
-        ModuleSupport.accessPackagesToClass(ModuleSupport.Access.EXPORT, PredefinedClassesSupport.class, false, "java.base", "jdk.internal.org.objectweb.asm");
     }
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
+        FeatureImpl.BeforeAnalysisAccessImpl impl = (FeatureImpl.BeforeAnalysisAccessImpl) access;
+        PredefinedClassesSupport support = ImageSingletons.lookup(PredefinedClassesSupport.class);
+        support.setRegistrationValidator(clazz -> {
+            Optional<AnalysisType> analysisType = impl.getMetaAccess().optionalLookupJavaType(clazz);
+            analysisType.map(impl.getHostVM()::dynamicHub).ifPresent(
+                            hub -> VMError.guarantee(hub.isLoaded(), "Classes that should be predefined must not have a class loader."));
+        });
+
         sealed = true;
 
         List<String> skipped = new ArrayList<>();
@@ -114,7 +134,7 @@ public class ClassPredefinitionFeature implements InternalFeature {
                  * which are initialized during the image build if they are used in an annotation.
                  */
                 if (!record.definedClass.isAnnotation() && !record.definedClass.isEnum()) {
-                    RuntimeClassInitialization.initializeAtRunTime(record.definedClass);
+                    JVMCIRuntimeClassInitializationSupport.singleton().initializeAtRunTime(GuestAccess.get().lookupType(record.definedClass));
                 }
             } else if (record.pendingSubtypes != null) {
                 StringBuilder msg = new StringBuilder();
@@ -142,7 +162,8 @@ public class ClassPredefinitionFeature implements InternalFeature {
         }
     }
 
-    private class PredefinedClassesRegistryImpl implements PredefinedClassesRegistry {
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
+    private final class PredefinedClassesRegistryImpl implements PredefinedClassesRegistry {
         @Override
         public void add(String nameInfo, String providedHash, URI baseUri) {
             if (!PredefinedClassesSupport.supportsBytecodes()) {
@@ -176,13 +197,11 @@ public class ClassPredefinitionFeature implements InternalFeature {
                  * Compute a "canonical hash" that does not incorporate debug information such as
                  * source file names, line numbers, local variable names, etc.
                  */
-                ClassReader reader = new ClassReader(data);
-                ClassWriter writer = new ClassWriter(0);
-                reader.accept(writer, ClassReader.SKIP_DEBUG);
-                byte[] canonicalData = writer.toByteArray();
+                byte[] canonicalData = dropDebuggingAttributes(data);
                 String canonicalHash = Digest.digest(canonicalData);
 
-                String className = transformClassName(reader.getClassName());
+                ClassModel cm = ClassFile.of().parse(data);
+                String className = transformClassName(cm.thisClass().asInternalName());
                 PredefinedClass record = nameToRecord.computeIfAbsent(className, PredefinedClass::new);
                 if (record.canonicalHash != null) {
                     if (!canonicalHash.equals(record.canonicalHash)) {
@@ -201,13 +220,13 @@ public class ClassPredefinitionFeature implements InternalFeature {
 
                 // A class cannot be defined unless its superclass and all interfaces are loaded
                 boolean pendingSupertypes = false;
-                String superclassName = transformClassName(reader.getSuperName());
+                String superclassName = transformClassName(cm.superclass().get().asInternalName());
                 if (NativeImageSystemClassLoader.singleton().forNameOrNull(superclassName, false) == null) {
                     addPendingSupertype(record, superclassName);
                     pendingSupertypes = true;
                 }
-                for (String intf : reader.getInterfaces()) {
-                    String interfaceName = transformClassName(intf);
+                for (var intf : cm.interfaces()) {
+                    String interfaceName = transformClassName(intf.asInternalName());
                     if (NativeImageSystemClassLoader.singleton().forNameOrNull(interfaceName, false) == null) {
                         addPendingSupertype(record, interfaceName);
                         pendingSupertypes = true;
@@ -323,27 +342,31 @@ public class ClassPredefinitionFeature implements InternalFeature {
      * can access them.
      */
     private static byte[] makeLambdaInstanceFieldAndConstructorPublic(byte[] classBytes) {
-        ClassReader cr = new ClassReader(classBytes);
-        ClassWriter cw = new ClassWriter(cr, 0);
-
-        cr.accept(new ClassVisitor(Opcodes.ASM5, cw) {
-            @Override
-            public FieldVisitor visitField(int access, String name, String descriptor, String signature, Object value) {
-                if (name.equals("LAMBDA_INSTANCE$")) {
-                    return super.visitField(ACC_PUBLIC | ACC_STATIC | ACC_FINAL, name, descriptor, signature, value);
-                }
-                return super.visitField(access, name, descriptor, signature, value);
+        var cf = ClassFile.of();
+        return cf.transformClass(cf.parse(classBytes), (builder, element) -> {
+            if (element instanceof FieldModel fm && fm.fieldName().stringValue().equals("LAMBDA_INSTANCE$")) {
+                builder.transformField(fm, (fb, fe) -> {
+                    fb.with(fe);
+                    fb.withFlags(ACC_PUBLIC | ACC_STATIC | ACC_FINAL);
+                });
+            } else if (element instanceof MethodModel mm && mm.methodName().stringValue().equals("<init>")) {
+                builder.transformMethod(mm, (mb, me) -> {
+                    mb.with(me);
+                    mb.withFlags(ACC_PUBLIC);
+                });
+            } else {
+                builder.with(element);
             }
+        });
+    }
 
-            @Override
-            public MethodVisitor visitMethod(final int access, final String name, final String descriptor, final String signature, final String[] exceptions) {
-                if (name.equals("<init>")) {
-                    return super.visitMethod(ACC_PUBLIC, name, descriptor, signature, exceptions);
-                }
-                return super.visitMethod(access, name, descriptor, signature, exceptions);
-            }
-        }, 0);
-
-        return cw.toByteArray();
+    private static byte[] dropDebuggingAttributes(byte[] data) {
+        var cf = ClassFile.of(DROP_DEBUG, DROP_LINE_NUMBERS, NEW_POOL);
+        return cf.transformClass(cf.parse(data), ClassTransform
+                        .dropping(cle -> cle instanceof SourceFileAttribute || cle instanceof SourceDebugExtensionAttribute)
+                        .andThen(ClassTransform.transformingMethods(MethodTransform
+                                        .dropping(me -> me instanceof MethodParametersAttribute)
+                                        .andThen(MethodTransform
+                                                        .transformingCode(CodeTransform.ACCEPT_ALL)))));
     }
 }

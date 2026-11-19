@@ -26,12 +26,13 @@ package com.oracle.svm.core.jni.headers;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 
 import org.graalvm.nativeimage.c.CContext;
 
 import com.oracle.svm.core.OS;
+import com.oracle.svm.core.c.ProjectHeaderFile;
 
 public class JNIHeaderDirectives implements CContext.Directives {
 
@@ -39,11 +40,11 @@ public class JNIHeaderDirectives implements CContext.Directives {
 
     @Override
     public List<String> getHeaderFiles() {
-        return Collections.singletonList("\"" + jdkIncludeDir.resolve("jni.h") + "\"");
+        return Arrays.asList("\"" + jdkIncludeDir.resolve("jni.h") + "\"", ProjectHeaderFile.resolve("com.oracle.svm.native.libchelper", "include/svm_jvm.h"));
     }
 
     @Override
     public List<String> getOptions() {
-        return Collections.singletonList("-I" + jdkIncludeDir.resolve(OS.getCurrent() == OS.WINDOWS ? "win32" : OS.getCurrent().asPackageName()));
+        return Arrays.asList("-I" + jdkIncludeDir, "-I" + jdkIncludeDir.resolve(OS.getCurrent() == OS.WINDOWS ? "win32" : OS.getCurrent().asPackageName()));
     }
 }

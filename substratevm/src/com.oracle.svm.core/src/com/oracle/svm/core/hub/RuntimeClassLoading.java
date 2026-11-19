@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.oracle.svm.core.hub;
+
+import static com.oracle.svm.guest.staging.option.RuntimeOptionKey.RuntimeOptionKeyFlag.Immutable;
+import static jdk.graal.compiler.options.OptionStability.EXPERIMENTAL;
+
+import java.util.function.BooleanSupplier;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.hub.crema.CremaSupport;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
+import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.espresso.classfile.descriptors.Symbol;
+import com.oracle.svm.espresso.classfile.descriptors.Type;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.hub.ClassDefinitionInfo;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
+import com.oracle.svm.guest.staging.option.RuntimeOptionValidation;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.options.Option;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
+public class RuntimeClassLoading {
+    /**
+     * Marker for threads that must not load or define a new class. Queries that return an
+     * already-loaded class remain allowed.
+     */
+    public interface NoClassLoadingThread {
+    }
+
+    public enum VerifyMode {
+        /**
+         * Disables bytecode verification for all class loaders.
+         */
+        NONE,
+        /**
+         * Disables bytecode verification for the boot class loader. Classes loaded for any other
+         * loader are still verified. This is usually the default mode.
+         */
+        REMOTE,
+        /**
+         * Enables bytecode verification for all class loaders.
+         */
+        ALL;
+
+        public boolean needsVerification(ClassLoader loader) {
+            return switch (this) {
+                case NONE -> false;
+                case REMOTE -> loader != null;
+                case ALL -> true;
+            };
+        }
+    }
+
+    public static final class Options {
+        @Option(help = "Enable support for runtime class loading. This implies open world (-ClosedTypeWorld) and respecting class loader hierarchy (+ClassForNameRespectsClassLoader).", stability = EXPERIMENTAL) //
+        public static final HostedOptionKey<Boolean> RuntimeClassLoading = new HostedOptionKey<>(false, Options::validateRuntimeClassLoading) {
+
+            @Override
+            protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Boolean oldValue, Boolean newValue) {
+                super.onValueUpdate(values, oldValue, newValue);
+                if (newValue) {
+                    /* requires open type world */
+                    SubstrateOptions.ClosedTypeWorld.update(values, false);
+                    ClassRegistries.Options.ClassForNameRespectsClassLoader.update(values, true);
+                    PredefinedClassesSupport.Options.SupportPredefinedClasses.update(values, false);
+                    SubstrateOptions.EnableJVMCIGuest.update(values, true);
+                }
+            }
+        };
+
+        @Option(help = "Enable interpreter JNI registration fallback for non-registered AOT classes, methods, and fields. Requires runtime class loading.", stability = EXPERIMENTAL) //
+        public static final HostedOptionKey<Boolean> JNIRegistrationFallback = new HostedOptionKey<>(false, Options::validateJNIRegistrationFallback);
+
+        private static void validateRuntimeClassLoading(HostedOptionKey<Boolean> optionKey) {
+            if (!optionKey.getValue()) {
+                return;
+            }
+            if (SubstrateOptions.ClosedTypeWorld.getValue()) {
+                throw UserError.invalidOptionValue(RuntimeClassLoading, RuntimeClassLoading.getValue(),
+                                "Requires an open type world, please use " + SubstrateOptionsParser.commandArgument(SubstrateOptions.ClosedTypeWorld, "-"));
+            }
+            if (!ClassRegistries.Options.ClassForNameRespectsClassLoader.getValue()) {
+                throw UserError.invalidOptionValue(RuntimeClassLoading, RuntimeClassLoading.getValue(),
+                                "Requires Class.forName to respect the classloader argument, please use " +
+                                                SubstrateOptionsParser.commandArgument(ClassRegistries.Options.ClassForNameRespectsClassLoader, "+"));
+            }
+            if (PredefinedClassesSupport.Options.SupportPredefinedClasses.getValue()) {
+                throw UserError.invalidOptionValue(RuntimeClassLoading, RuntimeClassLoading.getValue(),
+                                "Requires predefined class support to be disabled, please use " +
+                                                SubstrateOptionsParser.commandArgument(PredefinedClassesSupport.Options.SupportPredefinedClasses, "-"));
+            }
+        }
+
+        private static void validateJNIRegistrationFallback(HostedOptionKey<Boolean> optionKey) {
+            if (optionKey.getValue() && !RuntimeClassLoading.getValue()) {
+                throw UserError.invalidOptionValue(JNIRegistrationFallback, JNIRegistrationFallback.getValue(),
+                                "Requires runtime class loading, please use " + SubstrateOptionsParser.commandArgument(RuntimeClassLoading, "+"));
+            }
+        }
+
+        @Option(help = "Verification mode for runtime class loading.") //
+        public static final RuntimeOptionKey<VerifyMode> ClassVerification = new RuntimeOptionKey<>(VerifyMode.REMOTE, Immutable);
+
+        @Option(help = "Trace runtime class loading events.") //
+        public static final RuntimeOptionKey<Boolean> TraceClassLoading = new RuntimeOptionKey<>(false, null, Options::validateTraceRuntimeClassLoading);
+
+        @Option(help = "Logs a stack trace when a class is defined. " +
+                        "The logging is applied to all classes whose fully qualified name contains this string. " +
+                        "(\"*\" matches any class.)") //
+        public static final RuntimeOptionKey<String> LogClassLoadingCauseFor = new RuntimeOptionKey<>(null, null, Options::validateLogClassLoadingCauseFor);
+
+        private static void validateTraceRuntimeClassLoading(RuntimeOptionKey<Boolean> optionKey) {
+            if (optionKey.getValue() && !isSupported()) {
+                throw RuntimeOptionValidation.abort("Option '" + optionKey.getName() + "' requires runtime class-loading support to be enabled via '-H:+RuntimeClassLoading'.");
+            }
+        }
+
+        private static void validateLogClassLoadingCauseFor(RuntimeOptionKey<String> optionKey) {
+            if (optionKey.getValue() != null && !isSupported()) {
+                throw RuntimeOptionValidation.abort("Option '" + optionKey.getName() + "' requires runtime class-loading support to be enabled via '-H:+RuntimeClassLoading'.");
+            }
+        }
+    }
+
+    @Fold
+    public static boolean isSupported() {
+        return Options.RuntimeClassLoading.getValue();
+    }
+
+    @Fold
+    public static boolean isJNIRegistrationFallbackSupported() {
+        return Options.JNIRegistrationFallback.getValue();
+    }
+
+    /**
+     * Fails if the current thread must not load or define a new class.
+     *
+     * @param typeOrNull the requested type, or null for an unnamed class definition
+     */
+    public static void guaranteeClassLoadingAllowed(Symbol<Type> typeOrNull) {
+        if (Thread.currentThread() instanceof NoClassLoadingThread) {
+            Log log = Log.log().string("Requested class: ");
+            if (typeOrNull == null) {
+                log.string("<unspecified>");
+            } else {
+                // Print the descriptor bytes without allocating a decoded name.
+                for (int i = 0; i < typeOrNull.length(); i++) {
+                    log.character((char) typeOrNull.unsignedByteAt(i));
+                }
+            }
+            log.newline();
+            throw VMError.shouldNotReachHere("Class loading is prohibited in the current thread");
+        }
+    }
+
+    public static Class<?> defineClass(ClassLoader loader, String expectedName, byte[] b, int off, int len, ClassDefinitionInfo info) {
+        if (PredefinedClassesSupport.hasBytecodeClasses()) {
+            Class<?> knownClass = PredefinedClassesSupport.knownClass(b, off, len);
+            if (knownClass != null) {
+                if (expectedName != null) {
+                    String dotName = expectedName.replace('/', '.');
+                    if (!dotName.equals(knownClass.getName())) {
+                        throw new NoClassDefFoundError(knownClass.getName() + " (wrong name: " + dotName + ')');
+                    }
+                }
+                PredefinedClassesSupport.loadClass(loader, info.protectionDomain, knownClass);
+                return knownClass;
+            }
+            String name = (expectedName != null) ? expectedName : "(name not specified)";
+            throw VMError.unsupportedFeature(
+                            "Class " + name + " with hash " + PredefinedClassesSupport.getHash(b, off, len) +
+                                            " was not provided during the image build via the 'predefined-classes-config.json' file. Please see 'BuildConfiguration.md'.");
+        } else if (RuntimeClassLoading.isSupported()) {
+            return ClassRegistries.defineClass(loader, expectedName, b, off, len, info);
+        } else {
+            throw throwNoBytecodeClasses(expectedName);
+        }
+    }
+
+    // This should also mention Crema when it can load non-trivial classes (GR-60118)
+    private static final String DEFINITION_NOT_SUPPORTED_MESSAGE = """
+                    To make this work, you have the following options:
+                      1) Modify or reconfigure your application (or a third-party library) so that it does not generate classes at runtime or load them via non-built-in class loaders.
+                      2) If the classes must be generated, try to generate them at build time in a static initializer of a dedicated class.\
+                     The generated java.lang.Class objects should be stored in static fields and the dedicated class initialized by passing '--initialize-at-build-time=<class_name>' as the build argument.
+                      3) If none of the above is applicable, use the tracing agent to run this application and collect predefined classes with\
+                     'java -agentlib:native-image-agent=config-output-dir=<config-dir>,experimental-class-define-support <application-arguments>'.\
+                     Note that this is an experimental feature and that it does not guarantee success. Furthermore, the resulting classes can contain entries\
+                     from the classpath that should be manually filtered out to reduce image size. The agent should be used only in cases where modifying the source of the project is not possible.
+                    """
+                    .replace("\n", System.lineSeparator());
+
+    public static RuntimeException throwNoBytecodeClasses(String className) {
+        assert !PredefinedClassesSupport.hasBytecodeClasses() && !RuntimeClassLoading.isSupported();
+        throw VMError.unsupportedFeature(
+                        "Classes cannot be defined at runtime by default when using ahead-of-time Native Image compilation. Tried to define class:" + System.lineSeparator() + System.lineSeparator() +
+                                        "    " + className + System.lineSeparator() + System.lineSeparator() +
+                                        DEFINITION_NOT_SUPPORTED_MESSAGE);
+    }
+
+    public static ResolvedJavaType createInterpreterType(DynamicHub hub, ResolvedJavaType analysisType) {
+        return CremaSupport.singleton().createInterpreterType(hub, analysisType);
+    }
+
+    public static void ensureLinked(DynamicHub dynamicHub) {
+        dynamicHub.getClassInitializationInfo().ensureLinked(dynamicHub);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static final class NoRuntimeClassLoading implements BooleanSupplier {
+        @Override
+        public boolean getAsBoolean() {
+            return !isSupported();
+        }
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static final class WithRuntimeClassLoading implements BooleanSupplier {
+        @Override
+        public boolean getAsBoolean() {
+            return isSupported();
+        }
+    }
+}

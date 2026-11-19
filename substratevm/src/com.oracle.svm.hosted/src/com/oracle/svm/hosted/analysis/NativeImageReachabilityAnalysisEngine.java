@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,8 +23,6 @@
  * questions.
  */
 package com.oracle.svm.hosted.analysis;
-
-import java.util.List;
 
 import com.oracle.graal.pointsto.ClassInclusionPolicy;
 import com.oracle.graal.pointsto.meta.AnalysisField;
@@ -58,16 +56,7 @@ public class NativeImageReachabilityAnalysisEngine extends ReachabilityAnalysisE
                         reachabilityMethodProcessingHandler, classInclusionPolicy);
         this.annotationSubstitutionProcessor = annotationSubstitutionProcessor;
         this.dynamicHubInitializer = new DynamicHubInitializer(this);
-        this.unknownFieldHandler = new CustomTypeFieldHandler(this, metaAccess) {
-            @Override
-            public void injectFieldTypes(AnalysisField aField, List<AnalysisType> declaredTypes, boolean canBeNull) {
-                assert aField.getJavaKind().isObject();
-                aField.registerAsAccessed("@UnknownObjectField annotated field.");
-                for (AnalysisType declaredType : declaredTypes) {
-                    declaredType.registerAsReachable("injected field types for unknown annotated field " + aField.format("%H.%n"));
-                }
-            }
-        };
+        this.unknownFieldHandler = new CustomTypeFieldHandler(metaAccess);
     }
 
     @Override
@@ -82,7 +71,7 @@ public class NativeImageReachabilityAnalysisEngine extends ReachabilityAnalysisE
 
     @Override
     public void onTypeReachable(AnalysisType type) {
-        postTask(d -> type.getInitializeMetaDataTask().ensureDone());
+        postTask(_ -> type.getInitializeMetaDataTask().ensureDone());
     }
 
     @Override

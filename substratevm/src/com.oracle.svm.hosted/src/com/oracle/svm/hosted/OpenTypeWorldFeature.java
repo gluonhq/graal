@@ -24,29 +24,30 @@
  */
 package com.oracle.svm.hosted;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.hub.DynamicHubSupport;
+import com.oracle.svm.guest.staging.hub.DynamicHubSupport;
 import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
-import com.oracle.svm.core.layeredimagesingleton.ImageSingletonLoader;
-import com.oracle.svm.core.layeredimagesingleton.ImageSingletonWriter;
-import com.oracle.svm.core.layeredimagesingleton.LayeredImageSingleton;
-import com.oracle.svm.core.layeredimagesingleton.LayeredImageSingletonBuilderFlags;
+import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
+import com.oracle.svm.hosted.imagelayer.SVMImageLayerLoader;
 import com.oracle.svm.hosted.meta.HostedType;
+import com.oracle.svm.hosted.meta.TypeCheckBuilder;
+import com.oracle.svm.shared.singletons.ImageSingletonLoader;
+import com.oracle.svm.shared.singletons.ImageSingletonWriter;
+import com.oracle.svm.shared.singletons.LayeredPersistFlags;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.LayeredCallbacksSingletonTrait;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredCallbacksSupplier;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
 import jdk.graal.compiler.debug.Assertions;
 
@@ -55,156 +56,141 @@ public class OpenTypeWorldFeature implements InternalFeature {
 
     @Override
     public boolean isInConfiguration(Feature.IsInConfigurationAccess access) {
-        return !SubstrateOptions.closedTypeWorld();
+        return !SubstrateOptions.useClosedTypeWorldHubLayout();
     }
 
     @Override
     public void beforeUniverseBuilding(BeforeUniverseBuildingAccess access) {
         if (ImageLayerBuildingSupport.buildingInitialLayer()) {
-            ImageSingletons.add(LayerTypeInfo.class, new LayerTypeInfo());
-        } else {
-            assert !(ImageLayerBuildingSupport.buildingImageLayer() && !ImageSingletons.contains(LayerTypeInfo.class)) : "Layered image is missing layer type info";
+            ImageSingletons.add(LayerTypeCheckInfo.class, new LayerTypeCheckInfo(0, 0));
         }
     }
 
     @Override
+    public void duringSetup(DuringSetupAccess access) {
+        FeatureImpl.DuringSetupAccessImpl config = (FeatureImpl.DuringSetupAccessImpl) access;
+        OpenTypeWorldSupport support = new OpenTypeWorldSupport();
+        ImageSingletons.add(OpenTypeWorldSupport.class, support);
+        config.registerOnTypeCreatedCallback(support::calculateOpenTypeWorldDispatchTableMethods);
+    }
+
+    @Override
     public void beforeCompilation(BeforeCompilationAccess access) {
+        OpenTypeWorldSupport.singleton().cleanupBeforeCompilation();
         var impl = (FeatureImpl.BeforeCompilationAccessImpl) access;
         for (HostedType type : impl.getUniverse().getTypes()) {
             DynamicHub hub = type.getHub();
             impl.registerAsImmutable(hub.getOpenTypeWorldTypeCheckSlots());
+            impl.registerAsImmutable(hub.getOpenTypeWorldInterfaceHashTable());
         }
     }
 
-    public static int loadTypeInfo(Collection<HostedType> types) {
-        if (ImageSingletons.contains(LayerTypeInfo.class) && ImageLayerBuildingSupport.buildingExtensionLayer()) {
+    public static TypeCheckBuilder.StartingTypeIDs loadTypeInfo(Collection<HostedType> types) {
+        if (ImageLayerBuildingSupport.buildingExtensionLayer()) {
             /*
              * Load analysis must be enabled or otherwise the same Analysis Type id will not be
              * reassigned across layers.
              */
-            return ImageSingletons.lookup(LayerTypeInfo.class).loadTypeID(types);
-        }
-
-        return 0;
-    }
-
-    public static void persistTypeInfo(Collection<HostedType> types) {
-        if (ImageSingletons.contains(LayerTypeInfo.class)) {
-            ImageSingletons.lookup(LayerTypeInfo.class).persistTypeInfo(types);
+            return ImageSingletons.lookup(LayerTypeCheckInfo.class).loadTypeID(types);
+        } else {
+            return new TypeCheckBuilder.StartingTypeIDs(0, 1);
         }
     }
 
-    record TypeInfo(int typeID, int numClassTypes, int numInterfaceTypes, int[] typecheckSlots) {
-        private List<Integer> toIntList() {
-            ArrayList<Integer> list = new ArrayList<>();
-            list.add(typeID);
-            list.add(numClassTypes);
-            list.add(numInterfaceTypes);
-            Arrays.stream(typecheckSlots).forEach(list::add);
-
-            return list;
-        }
-
-        private static TypeInfo fromIntList(List<Integer> list) {
-            int typeID = list.get(0);
-            int numClassTypes = list.get(1);
-            int numInterfaceTypes = list.get(2);
-            int[] typecheckSlots = list.subList(3, list.size()).stream().mapToInt(i -> i).toArray();
-            return new TypeInfo(typeID, numClassTypes, numInterfaceTypes, typecheckSlots);
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            TypeInfo typeInfo = (TypeInfo) o;
-            return typeID == typeInfo.typeID && numClassTypes == typeInfo.numClassTypes && numInterfaceTypes == typeInfo.numInterfaceTypes && Arrays.equals(typecheckSlots, typeInfo.typecheckSlots);
-        }
-
-        @Override
-        public int hashCode() {
-            int result = Objects.hash(typeID, numClassTypes, numInterfaceTypes);
-            result = 31 * result + Arrays.hashCode(typecheckSlots);
-            return result;
-        }
-    }
-
-    private static class LayerTypeInfo implements LayeredImageSingleton {
-        Map<Integer, TypeInfo> identifierToTypeInfo = new HashMap<>();
-        int maxTypeID = 0;
-
-        public int loadTypeID(Collection<HostedType> types) {
-            ArrayList<Integer> usedIDs = new ArrayList<>();
+    @SuppressWarnings("unused")
+    public static boolean validateTypeInfo(Collection<HostedType> types) {
+        if (ImageLayerBuildingSupport.buildingExtensionLayer()) {
+            var loader = HostedImageLayerBuildingSupport.singleton().getLoader();
             for (HostedType type : types) {
-                int identifierID = type.getWrapped().getId();
-                TypeInfo info = identifierToTypeInfo.get(identifierID);
-                if (info != null) {
-                    usedIDs.add(info.typeID);
-                    type.loadTypeID(info.typeID);
-                }
-            }
-
-            return maxTypeID;
-        }
-
-        public void persistTypeInfo(Collection<HostedType> types) {
-            for (HostedType type : types) {
-                if (type.getTypeID() != -1) {
-                    int identifierID = type.getWrapped().getId();
+                if (type.getWrapped().isInSharedLayer()) {
+                    var priorInfo = getTypecheckInfo(loader, type);
+                    if (!priorInfo.installed()) {
+                        // no need to validate this hub, as it was not installed
+                        continue;
+                    }
                     int typeID = type.getTypeID();
+                    int interfaceID = type.getInterfaceID();
                     int numClassTypes = type.getNumClassTypes();
                     int numInterfaceTypes = type.getNumInterfaceTypes();
                     int[] typecheckSlots = type.getOpenTypeWorldTypeCheckSlots();
-                    var priorInfo = identifierToTypeInfo.get(identifierID);
-                    var newTypeInfo = new TypeInfo(typeID, numClassTypes, numInterfaceTypes, typecheckSlots);
-                    if (priorInfo == null) {
-                        identifierToTypeInfo.put(identifierID, newTypeInfo);
-                    } else {
-                        assert newTypeInfo.equals(priorInfo) : Assertions.errorMessage("Mismatch for ", type, priorInfo, newTypeInfo, Arrays.toString(priorInfo.typecheckSlots),
-                                        Arrays.toString(newTypeInfo.typecheckSlots));
+                    boolean matches = typeID == priorInfo.typeID && numClassTypes == priorInfo.numClassTypes && numInterfaceTypes == priorInfo.numInterfaceTypes &&
+                                    Arrays.equals(typecheckSlots, priorInfo.typecheckSlots);
+                    if (!matches) {
+                        var typeInfo = new TypeCheckInfo(true, typeID, interfaceID, numClassTypes, numInterfaceTypes, typecheckSlots);
+                        assert false : Assertions.errorMessage("Mismatch for ", type, priorInfo, typeInfo, Arrays.toString(priorInfo.typecheckSlots),
+                                        Arrays.toString(typeInfo.typecheckSlots));
+
                     }
                 }
             }
         }
+        return true;
+    }
 
-        @Override
-        public EnumSet<LayeredImageSingletonBuilderFlags> getImageBuilderFlags() {
-            return LayeredImageSingletonBuilderFlags.BUILDTIME_ACCESS_ONLY;
+    static TypeCheckInfo getTypecheckInfo(SVMImageLayerLoader loader, HostedType hType) {
+        if (hType.getWrapped().isInSharedLayer()) {
+            var hubInfo = loader.getDynamicHubInfo(hType.getWrapped());
+            var valuesReader = hubInfo.getTypecheckSlotValues();
+            int[] typecheckSlots = new int[valuesReader.size()];
+            for (int i = 0; i < typecheckSlots.length; i++) {
+                typecheckSlots[i] = valuesReader.get(i);
+            }
+            return new TypeCheckInfo(hubInfo.getInstalled(), hubInfo.getTypecheckId(), hubInfo.getInterfaceId(), hubInfo.getNumClassTypes(), hubInfo.getNumIterableInterfaceTypes(), typecheckSlots);
+        } else {
+            return null;
+        }
+    }
+
+    record TypeCheckInfo(boolean installed, int typeID, int interfaceID, int numClassTypes, int numInterfaceTypes, int[] typecheckSlots) {
+    }
+
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = LayerTypeCheckInfo.LayeredCallbacks.class)
+    private static final class LayerTypeCheckInfo {
+        final int maxTypeID;
+        final int maxInterfaceID;
+
+        LayerTypeCheckInfo(int maxTypeID, int maxInterfaceID) {
+            this.maxTypeID = maxTypeID;
+            this.maxInterfaceID = maxInterfaceID;
         }
 
-        @Override
-        public PersistFlags preparePersist(ImageSingletonWriter writer) {
-            /*
-             * Note all that is strictly needed to restore the typecheck information is the
-             * (identifierID -> typeID) mappings. In the future we can compact the amount of
-             * information we store.
-             */
-            var identifierIDs = identifierToTypeInfo.keySet().stream().sorted().toList();
-            writer.writeIntList("identifierIDs", identifierIDs);
-            writer.writeInt("maxTypeID", DynamicHubSupport.singleton().getMaxTypeId());
-
-            for (int identifierID : identifierIDs) {
-                var typeInfo = identifierToTypeInfo.get(identifierID);
-                writer.writeIntList(Integer.toString(identifierID), typeInfo.toIntList());
+        public TypeCheckBuilder.StartingTypeIDs loadTypeID(Collection<HostedType> types) {
+            var loader = HostedImageLayerBuildingSupport.singleton().getLoader();
+            for (HostedType type : types) {
+                TypeCheckInfo info = getTypecheckInfo(loader, type);
+                if (info != null) {
+                    type.loadTypeAndInterfaceID(info.typeID, info.interfaceID);
+                }
             }
 
-            return PersistFlags.CREATE;
+            return new TypeCheckBuilder.StartingTypeIDs(maxTypeID, maxInterfaceID);
         }
 
-        @SuppressWarnings("unused")
-        public static Object createFromLoader(ImageSingletonLoader loader) {
-            var info = new LayerTypeInfo();
-            info.maxTypeID = loader.readInt("maxTypeID");
-            List<Integer> identifierIDs = loader.readIntList("identifierIDs");
-            for (var identifierID : identifierIDs) {
-                var previous = info.identifierToTypeInfo.put(identifierID, TypeInfo.fromIntList(loader.readIntList(Integer.toString(identifierID))));
-                assert previous == null : previous;
+        static class LayeredCallbacks extends SingletonLayeredCallbacksSupplier {
+            @Override
+            public LayeredCallbacksSingletonTrait getLayeredCallbacksTrait() {
+                return new LayeredCallbacksSingletonTrait(new SingletonLayeredCallbacks<>() {
+                    @Override
+                    public LayeredPersistFlags doPersist(ImageSingletonWriter writer, Object singleton) {
+                        writer.writeInt("maxTypeID", DynamicHubSupport.currentLayer().getMaxTypeId());
+                        writer.writeInt("maxInterfaceID", DynamicHubSupport.currentLayer().getMaxInterfaceId());
+
+                        return LayeredPersistFlags.CREATE;
+                    }
+
+                    @Override
+                    public Class<? extends LayeredSingletonInstantiator<?>> getSingletonInstantiator() {
+                        return SingletonInstantiator.class;
+                    }
+                });
             }
-            return info;
+        }
+
+        static class SingletonInstantiator implements SingletonLayeredCallbacks.LayeredSingletonInstantiator<LayerTypeCheckInfo> {
+            @Override
+            public LayerTypeCheckInfo createFromLoader(ImageSingletonLoader loader) {
+                return new LayerTypeCheckInfo(loader.readInt("maxTypeID"), loader.readInt("maxInterfaceID"));
+            }
         }
     }
 }
